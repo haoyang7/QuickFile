@@ -133,8 +133,8 @@ def main():
     parser.add_argument("--records-directory", required=True, type=Path)
     parser.add_argument("--system-baseline", action="store_true")
     parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; compensation-enabled modes only")
-    parser.add_argument("--heap-control", action="store_true", help="Match all diagnostic checkpoints with an empty window and no target buttons; requires --heap-diagnostics")
-    parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; requires --heap-diagnostics")
+    parser.add_argument("--heap-control", action="store_true", help="Match the selected product scan checkpoints with an empty window and no target buttons; requires --heap-diagnostics or --malloc-scribble")
+    parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; uses ordinary live scans unless --heap-diagnostics is selected")
     parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
@@ -144,13 +144,13 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
-    if args.malloc_scribble and not args.heap_diagnostics:
-        parser.error("--malloc-scribble requires --heap-diagnostics")
+    if args.malloc_scribble and args.system_baseline:
+        parser.error("--malloc-scribble requires product mode")
     if args.copy_lifetime and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
-                                   args.ownership_trace, args.read_only)):
+                                   args.ownership_trace, args.read_only, args.malloc_scribble)):
         parser.error("--copy-lifetime requires independent product mode without other probes")
-    if args.heap_control and (not args.heap_diagnostics or args.system_baseline):
-        parser.error("--heap-control requires --heap-diagnostics and cannot use --system-baseline")
+    if args.heap_control and (not (args.heap_diagnostics or args.malloc_scribble) or args.system_baseline):
+        parser.error("--heap-control requires --heap-diagnostics or --malloc-scribble and cannot use --system-baseline")
     if args.heap_diagnostics and args.system_baseline:
         parser.error("--heap-diagnostics requires product mode")
     if args.read_only and not args.system_baseline:
@@ -245,8 +245,9 @@ def main():
     if reason:
         receipt = {"coverage": "not-covered", "reason": reason,
                    "host": capabilities, "reader": reader_capabilities}
-        if args.heap_diagnostics:
+        if args.heap_diagnostics or args.malloc_scribble:
             receipt["mode"] = "heap-control" if args.heap_control else "product"
+            receipt["scan_mode"] = "diagnostic" if args.heap_diagnostics else "live"
         if args.copy_lifetime:
             receipt.update(mode="copy-lifetime", instrumented=True)
         print(json.dumps(receipt))
@@ -448,7 +449,9 @@ def main():
                            "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
                            "images": capabilities["images"], "checkpoints": checkpoints,
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
-                           "scope": "empty-window control with the diagnostic product checkpoint sequence and strict heap guard; "
+                           "scope": "empty-window control with the "
+                                    + ("diagnostic" if args.heap_diagnostics else "ordinary live")
+                                    + " product checkpoint sequence and strict heap guard; "
                                     "application AX reads and observers active; zero target buttons; no product destruction coverage"}
             elif args.copy_lifetime:
                 summary = {"coverage": "passed", "mode": "copy-lifetime", "instrumented": True,
@@ -480,8 +483,9 @@ def main():
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors
                 write_json(records / "validation-errors.json", validation_errors)
-            if args.heap_diagnostics:
+            if args.heap_diagnostics or args.malloc_scribble:
                 summary["mode"] = "heap-control" if args.heap_control else "product"
+                summary["scan_mode"] = "diagnostic" if args.heap_diagnostics else "live"
             if args.malloc_scribble:
                 summary["malloc_scribble"] = allocator_receipt
                 summary["scope"] += "; MallocScribble environment experiment only; not an ownership fix or proof of completed free"

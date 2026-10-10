@@ -344,10 +344,16 @@ class AXAllocationCohortTests(unittest.TestCase):
 
 
 class AXCompatibilityPreflightTests(unittest.TestCase):
-    def test_malloc_scribble_is_only_an_explicit_heap_diagnostic(self):
-        for options in (("--malloc-scribble", "off"), ("--malloc-scribble", "on", "--copy-lifetime"),
+    def test_malloc_scribble_requires_product_scan_modes_and_the_original_window(self):
+        for options in (("--malloc-scribble", "off", "--system-baseline"),
+                        ("--malloc-scribble", "on", "--copy-lifetime"),
                         ("--malloc-scribble", "on", "--heap-diagnostics", "--system-baseline"),
-                        ("--malloc-scribble", "on", "--heap-diagnostics", "--copy-lifetime")):
+                        ("--malloc-scribble", "on", "--heap-diagnostics", "--copy-lifetime"),
+                        ("--malloc-scribble", "off", "--read-only"),
+                        ("--malloc-scribble", "off", "--ownership-trace"),
+                        ("--malloc-scribble", "off", "--balance-copies"),
+                        ("--malloc-scribble", "on", "--cycles", "2"),
+                        ("--malloc-scribble", "on", "--heap-control", "--idle-seconds", "10")):
             with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
                 work = pathlib.Path(directory) / "unused"
                 arguments = ["probe", "--work-directory", str(work), "--records-directory", str(work), *options]
@@ -604,6 +610,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         environment = _kwargs["env"]
                         assert environment["MallocStackLoggingNoCompact"] == "1"
                         assert ("MallocStackLogging" in environment) == (not heap_diagnostics)
+                        if not heap_diagnostics:
+                            assert environment["MallocStackLogging"] == "1"
                     self.pid = 1235 if self.is_reader else 1234
                     processes.append(self)
 
@@ -767,6 +775,12 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertEqual(len(live_scans), len(scan_labels))
                 self.assertTrue(all(any(value.startswith("--outputGraph=") for value in command) for command in live_scans))
                 self.assertEqual([point["label"] for point in diagnostic["checkpoints"]], list(REPORT.HEAP_LABELS[1:]))
+            else:
+                self.assertFalse((records / "heap-diagnostics.json").exists())
+                self.assertFalse((work / "heap").exists())
+                self.assertFalse(any(command[0] == "heap" for command in commands))
+                for scan_command in (command for command in commands if command[0] == "leaks"):
+                    self.assertEqual(scan_command, ["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", "1234"])
             if not copy_lifetime:
                 self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
                 self.assertEqual(scans[-1]["host"]["destroyedButtons"], 0 if heap_control else 30)
@@ -784,17 +798,19 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 registered = next(scan for scan in scans if scan["label"] == "registered-10")
                 self.assertEqual(registered["host"]["allocatedButtons"], 0 if heap_control else 10)
                 self.assertEqual(registered["host"]["destroyedButtons"], 0)
-            if heap_diagnostics:
+            if not system_baseline and not copy_lifetime:
                 add, remove = ("checkpoint", "checkpoint") if heap_control else ("add", "remove")
                 self.assertEqual(protocol, [
                     ("observe", 1), ("command", "checkpoint"), ("scan", "baseline"),
-                    ("command", add), ("scan", "added-10"), ("observe", 2),
+                    ("command", add), *([("scan", "added-10")] if heap_diagnostics else []), ("observe", 2),
                     ("command", "checkpoint"), ("scan", "registered-10"),
                     ("command", remove), ("observe", 3), ("scan", "removed-10"),
                     ("command", add), ("observe", 4), ("command", remove), ("observe", 5), ("scan", "removed-20"),
                     ("command", add), ("observe", 6), ("command", remove), ("observe", 7), ("scan", "removed-30"),
                     ("command", "checkpoint"), ("scan", "observer-exited")])
+            if heap_diagnostics or malloc_scribble:
                 self.assertEqual(summary["mode"], "heap-control" if heap_control else "product")
+                self.assertEqual(summary["scan_mode"], "diagnostic" if heap_diagnostics else "live")
             if heap_control:
                 for scan in scans:
                     PROBE.validate_control_host(scan["host"])
@@ -837,25 +853,26 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             return exit_code, summary
 
     def test_malloc_scribble_overrides_inherited_state_in_both_actual_processes(self):
-        for setting, control in itertools.product(("off", "on"), (False, True)):
-            with self.subTest(setting=setting, control=control), mock.patch.dict(os.environ, {"MallocScribble": "inherited"}):
-                exit_code, summary = self.exercise_runner(heap_diagnostics=True, heap_control=control, malloc_scribble=setting)
+        for setting, control, diagnostic in itertools.product(("off", "on"), (False, True), (False, True)):
+            with self.subTest(setting=setting, control=control, diagnostic=diagnostic), mock.patch.dict(os.environ, {"MallocScribble": "inherited"}):
+                exit_code, summary = self.exercise_runner(heap_diagnostics=diagnostic, heap_control=control, malloc_scribble=setting)
                 self.assertEqual(exit_code, 0)
                 expected = "unset" if setting == "off" else "1"
                 self.assertEqual(summary["malloc_scribble"], {"requested": setting, "host": expected, "reader": expected})
+                self.assertEqual(len(summary["scans"]), 7 if diagnostic else 6)
 
     def test_malloc_scribble_keeps_strict_heap_failures_and_all_later_checkpoints(self):
-        for setting, control in itertools.product(("off", "on"), (False, True)):
-            with self.subTest(setting=setting, control=control):
-                exit_code, summary = self.exercise_runner(heap_diagnostics=True, heap_control=control,
+        for setting, control, diagnostic in itertools.product(("off", "on"), (False, True), (False, True)):
+            with self.subTest(setting=setting, control=control, diagnostic=diagnostic):
+                exit_code, summary = self.exercise_runner(heap_diagnostics=diagnostic, heap_control=control,
                     malloc_scribble=setting, failed_scan="registered-10")
                 self.assertEqual(exit_code, 1)
                 self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["registered-10"])
 
     def test_missing_or_mismatched_actual_allocator_receipts_fail_without_losing_later_evidence(self):
-        for role, value in itertools.product(("host", "reader"), (None, "1", "/private/secret", True)):
-            with self.subTest(role=role, value=value):
-                exit_code, summary = self.exercise_runner(heap_diagnostics=True, malloc_scribble="off",
+        for role, value, diagnostic in itertools.product(("host", "reader"), (None, "1", "/private/secret", True), (False, True)):
+            with self.subTest(role=role, value=value, diagnostic=diagnostic):
+                exit_code, summary = self.exercise_runner(heap_diagnostics=diagnostic, malloc_scribble="off",
                                                          invalid_allocator=(role, value))
                 self.assertEqual(exit_code, 1)
                 self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["malloc-scribble"])
@@ -932,6 +949,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["ax_leak_nodes"], 0)
         self.assertNotIn("validation_errors", summary)
         self.assertNotIn("mode", summary)
+        self.assertNotIn("scan_mode", summary)
         self.assertNotIn("instrumented", summary)
         self.assertNotIn("copy_lifetime", summary)
 
@@ -999,15 +1017,45 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
 
 
 class AXMallocScribbleWorkflowTests(unittest.TestCase):
-    def run_measurement(self, *, enabled=True, first_failure=None):
+    @staticmethod
+    def workflow_script(step):
         workflow = (ROOT / ".github/workflows/ax-system-baseline.yml").read_text()
-        block = workflow.split("      - name: Measure five matched groups with strict heap checks\n", 1)[1]
+        block = workflow.split(f"      - name: {step}\n", 1)[1]
         script = block.split("          python3 - <<'PY'\n", 1)[1].split("          PY\n", 1)[0]
-        script = "\n".join(line[10:] for line in script.splitlines())
+        return "\n".join(line[10:] for line in script.splitlines())
+
+    def test_scan_mode_identity_and_invalid_combinations_before_starting_fixtures(self):
+        script = self.workflow_script("Verify investigation identity")
+        outputs = {('sw_vers', '-productVersion'): '26.6.2', ('sw_vers', '-buildVersion'): '25G83',
+                   ('uname', '-m'): 'arm64', ('xcodebuild', '-version'): 'Xcode 26.3\nBuild version 17C529',
+                   ('git', 'rev-parse', 'HEAD'): '1' * 40}
+        for mode, enabled, causal, allowed in (("live", True, False, True), ("diagnostic", True, False, True),
+                ("diagnostic", False, False, True), ("live", False, False, False),
+                ("unknown", True, False, False), ("live", True, True, False)):
+            with self.subTest(mode=mode, enabled=enabled, causal=causal), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory) / "records"
+                code = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
+                with mock.patch.dict(os.environ, {"AX_SCAN_MODE": mode, "CAUSAL_PROBE": str(causal).lower(),
+                                                  "MALLOC_SCRIBBLE_EXPERIMENT": str(enabled).lower()}), \
+                        mock.patch.object(subprocess, "check_output", side_effect=lambda command, **_: outputs[tuple(command)]), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    if allowed:
+                        exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        summary = json.loads((root / "summary.json").read_text())
+                        self.assertEqual(summary["identity"]["scan_mode"], mode)
+                        self.assertEqual(summary["expected_trials"], 20 if enabled else 10)
+                    else:
+                        with self.assertRaises(AssertionError):
+                            exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        self.assertFalse(root.exists())
+
+    def run_measurement(self, *, enabled=True, first_failure=None, scan_mode="diagnostic", unexpected_diagnostics=False,
+                        first_scan_change=None):
+        script = self.workflow_script("Measure five matched groups with strict heap checks")
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
             summary_file = root / "summary.json"
-            PROBE.write_json(summary_file, {"identity": {}, "trials": [], "completed": False,
+            PROBE.write_json(summary_file, {"identity": {"scan_mode": scan_mode}, "trials": [], "completed": False,
                                            "expected_trials": 20 if enabled else 10})
             script = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
             invocations = []
@@ -1022,6 +1070,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     invocations.append((setting, mode))
                     self.first = len(invocations) == 1
                     test.assertTrue(kwargs["start_new_session"])
+                    test.assertEqual("--heap-diagnostics" in command, scan_mode == "diagnostic")
                     if setting:
                         test.assertEqual(kwargs["env"].get("MallocScribble"), "1" if setting == "on" else None)
                     else:
@@ -1042,10 +1091,22 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     diagnostic = {"schema": 4, "status": "complete", "symbols": [], "omitted_symbols": 0,
                                   "symbols_status": "complete", "cohorts_status": "complete",
                                   "checkpoints": [point | {"label": label} for label in REPORT.HEAP_LABELS[1:]]}
-                    PROBE.write_json(records / "heap-diagnostics.json", diagnostic)
-                    PROBE.write_json(records / "scans.json", [{"label": label, "leak_nodes": 0, "leak_bytes": 0,
+                    if scan_mode == "diagnostic" and not (self.first and first_failure == "diagnostics"):
+                        PROBE.write_json(records / "heap-diagnostics.json", diagnostic)
+                    if scan_mode == "live" and unexpected_diagnostics:
+                        PROBE.write_json(records / "heap-diagnostics.json", diagnostic | {"private": "secret"})
+                    labels = [label for label in REPORT.HEAP_LABELS if scan_mode == "diagnostic" or label != "added-10"]
+                    if self.first and first_failure == "scans":
+                        labels.remove("registered-10")
+                    scans = [{"label": label, "leak_nodes": 3, "leak_bytes": 300,
+                        "groups": [{"root_type": "NSXPCConnection", "root_instances": 1},
+                                   {"root_type": "NSXPCConnection", "root_instances": 2}],
+                        "destroyed_notification_stack_present": False,
                         "unclassified_nodes": 0, "host": dict.fromkeys(("buttons", "allocatedButtons", "destroyedButtons",
-                        "compensations", "mutableCompensations"), 0)} for label in REPORT.HEAP_LABELS])
+                        "compensations", "mutableCompensations"), 0)} for label in labels]
+                    if self.first and first_scan_change:
+                        first_scan_change(scans[0])
+                    PROBE.write_json(records / "scans.json", scans)
                     # Raw records and arbitrary fields must never enter the public artifact.
                     (records / "host.log").write_text("private-raw-host-data")
 
@@ -1067,22 +1128,78 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
             self.assertEqual(summary["strict_checks_passed"], first_failure is None)
             self.assertTrue(summary["completed"])
             self.assertEqual(len(summary["trials"]), 20 if enabled else 10)
+            for trial_index, receipt in enumerate(summary["trials"]):
+                self.assertEqual(receipt["scan_mode"], scan_mode)
+                self.assertEqual(receipt["diagnostics_expected"], scan_mode == "diagnostic")
+                for scan_index, scan in enumerate(receipt['scan_totals']):
+                    if first_scan_change and trial_index == scan_index == 0:
+                        continue
+                    self.assertEqual(scan, {"label": scan["label"], "leak_nodes": 3, "leak_bytes": 300,
+                        "unclassified_nodes": 0, "root_instances": 3, "unexpected_root_groups": 0,
+                        "destroyed_notification_stack_present": False})
+                if scan_mode == "live":
+                    self.assertFalse(receipt["diagnostics_available"])
+                    self.assertNotIn("diagnostics", receipt)
             self.assertNotIn("secret", output.getvalue() + summary_file.read_text())
             self.assertNotIn("private-raw-host-data", output.getvalue() + summary_file.read_text())
             if first_failure == "timeout":
                 self.assertEqual(killpg.call_count, 2)
                 self.assertEqual(summary["trials"][0]["return_code"], 124)
-            return invocations
+            if first_failure == "scan-fields":
+                self.assertEqual(summary["trials"][0]["scan_totals"], [])
+            return invocations, summary
+
+    def test_scan_summary_counts_roots_without_exporting_arbitrary_class_names(self):
+        def change(scan):
+            scan["groups"].append({"root_type": "/private/secret", "root_instances": 4})
+            scan["destroyed_notification_stack_present"] = True
+        for mode in ("live", "diagnostic"):
+            with self.subTest(mode=mode):
+                _, summary = self.run_measurement(scan_mode=mode, first_failure="strict", first_scan_change=change)
+                first = summary["trials"][0]["scan_totals"][0]
+                self.assertEqual(first["root_instances"], 7)
+                self.assertEqual(first["unexpected_root_groups"], 1)
+                self.assertIs(first["destroyed_notification_stack_present"], True)
+                _, empty = self.run_measurement(scan_mode=mode, first_scan_change=lambda scan:
+                    scan.update(groups=[], leak_nodes=0, leak_bytes=0))
+                self.assertEqual(empty["trials"][0]["scan_totals"][0]["root_instances"], 0)
+                self.assertEqual(empty["trials"][0]["scan_totals"][0]["unexpected_root_groups"], 0)
+
+    def test_malformed_scan_root_fields_fail_closed_and_preserve_later_trials(self):
+        mutations = (
+            lambda scan: scan.pop("groups"),
+            lambda scan: scan.update(groups=None),
+            lambda scan: scan.update(groups={}),
+            lambda scan: scan.update(groups=[1]),
+            lambda scan: scan["groups"][0].pop("root_type"),
+            lambda scan: scan["groups"][0].update(root_type=None),
+            lambda scan: scan["groups"][0].update(root_type=""),
+            lambda scan: scan["groups"][0].pop("root_instances"),
+            lambda scan: scan["groups"][0].update(root_instances=True),
+            lambda scan: scan["groups"][0].update(root_instances=-1),
+            lambda scan: scan["groups"][0].update(root_instances=1_000_000_001),
+            lambda scan: scan["groups"][0].update(root_instances=1_000_000_000),
+            lambda scan: scan.pop("destroyed_notification_stack_present"),
+            lambda scan: scan.update(destroyed_notification_stack_present=1),
+            lambda scan: scan.update(destroyed_notification_stack_present="private-secret"),
+        )
+        for mode, mutation_index in itertools.product(("live", "diagnostic"), range(len(mutations))):
+            with self.subTest(mode=mode, mutation=mutation_index):
+                self.run_measurement(scan_mode=mode, first_failure="scan-fields", first_scan_change=mutations[mutation_index])
 
     def test_paired_experiment_alternates_all_four_conditions_and_keeps_failures(self):
-        for failure in (None, "strict", "receipt", "timeout"):
-            with self.subTest(failure=failure):
-                invocations = self.run_measurement(first_failure=failure)
+        for mode, failure in itertools.product(("live", "diagnostic"), (None, "strict", "receipt", "timeout", "scans")):
+            with self.subTest(mode=mode, failure=failure):
+                invocations, _ = self.run_measurement(first_failure=failure, scan_mode=mode)
                 odd = [("off", "control"), ("off", "product"), ("on", "control"), ("on", "product")]
                 self.assertEqual(invocations, odd + list(reversed(odd)) + odd + list(reversed(odd)) + odd)
 
+    def test_diagnostic_requires_allocation_evidence_and_live_never_claims_it(self):
+        self.run_measurement(first_failure="diagnostics")
+        self.run_measurement(scan_mode="live", unexpected_diagnostics=True)
+
     def test_original_diagnostics_still_have_ten_trials_without_allocator_override(self):
-        self.assertEqual(self.run_measurement(enabled=False),
+        self.assertEqual(self.run_measurement(enabled=False)[0],
                          [(None, mode) for pair in range(5) for mode in
                           (("control", "product") if pair % 2 == 0 else ("product", "control"))])
 

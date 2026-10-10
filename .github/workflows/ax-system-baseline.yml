@@ -14,10 +14,18 @@ on:
         required: false
         default: false
       malloc_scribble:
-        description: 'Run five macOS 26 matched groups of MallocScribble off/on x empty control/product; diagnostic only'
+        description: 'Run five macOS 26 matched groups of MallocScribble off/on x empty control/product; investigation only'
         type: boolean
         required: false
         default: false
+      scan_mode:
+        description: 'diagnostic: frozen graphs and seven checkpoints; live: ordinary CI scans and six checkpoints (requires malloc_scribble)'
+        type: choice
+        required: false
+        default: diagnostic
+        options:
+          - diagnostic
+          - live
 
 permissions:
   contents: read
@@ -32,7 +40,7 @@ defaults:
 
 jobs:
   ax-system-probe:
-    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble }}
+    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' }}
     name: macOS ${{ matrix.expected_os }} (arm64)
     strategy:
       fail-fast: false
@@ -132,14 +140,15 @@ jobs:
           PY
 
   ax-heap-diagnostics:
-    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble }}
-    name: macOS 26 heap diagnostics (arm64)
+    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' }}
+    name: macOS 26 ${{ inputs.scan_mode }} heap comparison (arm64)
     runs-on: macos-26
     timeout-minutes: ${{ inputs.malloc_scribble && 70 || 35 }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       CAUSAL_PROBE: ${{ inputs.ax_causal_probe }}
       MALLOC_SCRIBBLE_EXPERIMENT: ${{ inputs.malloc_scribble }}
+      AX_SCAN_MODE: ${{ inputs.scan_mode }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -154,6 +163,9 @@ jobs:
           def output(*command):
               return subprocess.check_output(command, text=True).strip()
           assert os.environ['CAUSAL_PROBE'] == 'false', 'Choose one investigation mode'
+          scan_mode = os.environ['AX_SCAN_MODE']
+          assert scan_mode in ('diagnostic', 'live'), 'Unknown heap scan mode'
+          assert scan_mode != 'live' or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires malloc_scribble'
           version = output('sw_vers', '-productVersion')
           architecture = output('uname', '-m')
           xcode = output('xcodebuild', '-version')
@@ -168,7 +180,7 @@ jobs:
                        'MallocStackLoggingNoCompact', 'MallocNanoZone', 'MallocGuardEdges'):
               value = os.environ.get(name)
               allocator_environment[name] = 'unset' if value is None else value if value in ('0', '1') else 'other'
-          identity = {'scope':'synthetic-AX-heap-investigation',
+          identity = {'scope':'synthetic-AX-heap-investigation', 'scan_mode':scan_mode,
               'checkout_sha':output('git', 'rev-parse', 'HEAD'), 'macos':version,
               'os_build':output('sw_vers', '-buildVersion'), 'architecture':architecture, 'xcode':xcode,
               'runner_image':{'os':image_field('ImageOS'), 'version':image_field('ImageVersion')},
@@ -192,6 +204,8 @@ jobs:
           root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
           summary_file = root / 'summary.json'
           public_summary = json.loads(summary_file.read_text())
+          scan_mode = public_summary['identity']['scan_mode']
+          diagnostics_expected = scan_mode == 'diagnostic'
           scribble_experiment = os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'
           failed = False
           for trial in range(1, 6):
@@ -211,7 +225,8 @@ jobs:
                       try:
                           process = subprocess.Popen([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
                               '--work-directory', str(directory / 'fixture'),
-                              '--records-directory', str(records), '--heap-diagnostics',
+                              '--records-directory', str(records),
+                              *(['--heap-diagnostics'] if diagnostics_expected else []),
                               *(['--malloc-scribble', scribble] if scribble else []),
                               *(['--heap-control'] if mode == 'control' else [])],
                               env=environment, stdout=log, stderr=log, start_new_session=True)
@@ -234,7 +249,8 @@ jobs:
                           process.wait(timeout=5)
                           return_code = 124
                   failed |= return_code != 0
-                  receipt = {'trial': trial, 'mode': mode, 'return_code': return_code, 'diagnostics_available': False}
+                  receipt = {'trial': trial, 'mode': mode, 'scan_mode': scan_mode, 'return_code': return_code,
+                             'diagnostics_expected': diagnostics_expected, 'diagnostics_available': False}
                   input_file = records / 'inputs.json'
                   if input_file.is_file() and not input_file.is_symlink() and input_file.stat().st_size <= 16384:
                       try:
@@ -261,7 +277,7 @@ jobs:
                               receipt.update(environment_verified=True, process_environment=actual_environment)
                       failed |= not receipt['environment_verified']
                   summary = records / 'heap-diagnostics.json'
-                  if summary.is_file() and not summary.is_symlink() and summary.stat().st_size <= 16384:
+                  if diagnostics_expected and summary.is_file() and not summary.is_symlink() and summary.stat().st_size <= 16384:
                       try:
                           data = json.loads(summary.read_text())
                           validate_heap_diagnostics_summary(data)
@@ -270,7 +286,7 @@ jobs:
                       else:
                           receipt.update(diagnostics_available=True, diagnostics=data)
                           failed |= data['status'] != 'complete' or data['cohorts_status'] != 'complete'
-                  if not receipt['diagnostics_available']:
+                  if diagnostics_expected and not receipt['diagnostics_available']:
                       failed = True
                   # Include only bounded original scan totals so a zero allocation
                   # diff cannot be mistaken for a passing heap-baseline assertion.
@@ -280,13 +296,27 @@ jobs:
                       try:
                           scans = json.loads(scan_file.read_text())
                           labels = ['baseline', 'added-10', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited']
+                          if scan_mode == 'live':
+                              labels.remove('added-10')
                           if type(scans) is not list or [item['label'] for item in scans] != labels:
                               raise ValueError('Incomplete scan totals')
                           totals = []
                           for item in scans:
                               fields = {name: item[name] for name in ['leak_nodes', 'leak_bytes', 'unclassified_nodes']}
+                              groups = item['groups']
+                              if (type(groups) is not list
+                                      or any(type(group) is not dict or type(group['root_type']) is not str or not group['root_type']
+                                             or type(group['root_instances']) is not int
+                                             or not 0 <= group['root_instances'] <= 1_000_000_000 for group in groups)):
+                                  raise ValueError('Invalid scan root groups')
+                              fields['root_instances'] = sum(group['root_instances'] for group in groups)
+                              fields['unexpected_root_groups'] = sum(group['root_type'] != 'NSXPCConnection' for group in groups)
                               if any(type(value) is not int or not 0 <= value <= 1_000_000_000 for value in fields.values()):
                                   raise ValueError('Invalid scan totals')
+                              destroyed_stack = item['destroyed_notification_stack_present']
+                              if type(destroyed_stack) is not bool:
+                                  raise ValueError('Invalid destroyed notification stack flag')
+                              fields['destroyed_notification_stack_present'] = destroyed_stack
                               totals.append(dict(label=item['label'], **fields))
                           if mode == 'control':
                               zero_fields = ['buttons', 'allocatedButtons', 'destroyedButtons', 'compensations', 'mutableCompensations']
