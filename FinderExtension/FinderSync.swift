@@ -127,16 +127,17 @@ final class FinderSync: FIFinderSync {
         let presentation = menuModelBuilder.presentation(fromEntries: entries, limit: menuSettingsCache.currentLimit())
         // Only this branch has an immutable destination proof. Recovery-only menus
         // never register creation tags and cannot upgrade a URL into a write target.
-        menuActionRegistry.beginMenu()
-        let menu = menuPresentation.templates(presentation) { entry in
-            menuActionRegistry.register(
-                templateID: entry.id,
-                context: context,
-                targetedURL: targetedURL,
-                selectedItemURLs: selectedURLs,
-                preparedDestination: destination,
-                menuTimingID: timing?.id
-            )
+        let menu = menuPresentation.templates(presentation) { entries in
+            menuActionRegistry.registerMenu(entries.map { entry in
+                FinderMenuAction(
+                    templateID: entry.id,
+                    context: context,
+                    targetedURL: targetedURL,
+                    selectedItemURLs: selectedURLs,
+                    preparedDestination: destination,
+                    menuTimingID: timing?.id
+                )
+            })
         }
         recordActivity(.menuPrepared)
         timing?.mark("menu.prepared")

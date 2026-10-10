@@ -285,7 +285,11 @@ def main():
                            "idle_seconds": args.idle_seconds, "instrumented": args.ownership_trace,
                            "checkpoints": checkpoints,
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
-                           "scope": "synthetic AppKit lifecycle with product compensation disabled; instrumented ownership tracking and uninstrumented heap scans are separate trials, not installed-app validation"}
+                           "scope": "synthetic AppKit lifecycle with product compensation disabled; "
+                                    + ("ownership tracking and heap scans use the same instrumented host; an uninstrumented heap control requires a separate run"
+                                       if args.ownership_trace else
+                                       "heap scans use an uninstrumented host; ownership tracking requires a separate run")
+                                    + "; not installed-app validation"}
                 if args.ownership_trace:
                     ownership = final["ownership"]
                     if ownership["duplicateLiveAddresses"] or ownership["offMainHits"] or not ownership["created"]:

@@ -113,7 +113,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
     """Inject process/scan results while exercising the real runner protocol."""
 
     def exercise_runner(self, *, failed_scan=None, invalid_notifications=False,
-                        system_baseline=False, insufficient_compensation=False):
+                        system_baseline=False, insufficient_compensation=False, ownership_trace=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -121,6 +121,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             state = work / "state"
             host_state = {"pid": 1234, "sequence": 0, "buttons": 0, "allocatedButtons": 0,
                           "destroyedButtons": 0, "compensations": 0, "mutableCompensations": 0}
+            if ownership_trace:
+                host_state["ownership"] = {"duplicateLiveAddresses": 0, "offMainHits": 0, "created": 1, "live": 1}
             notifications = {"notifications": 60, "all_notifications": 60, "unmatched_notifications": 0,
                              "tracked_buttons": 30, "target_notification_counts": [[1, 1] for _ in range(30)]}
             if invalid_notifications == "missing-count":
@@ -130,6 +132,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             scan_labels = (["baseline", "removed-10", "removed-30", "observer-exited"] if system_baseline else
                            ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
             scanned = []
+            commands = []
             processes = []
 
             class FixtureProcess:
@@ -150,6 +153,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     return 0
 
             def run(command, **_kwargs):
+                commands.append(command)
                 output = ""
                 if "--capabilities" in command:
                     capability = {"trusted": True} if pathlib.Path(command[0]).name == "ax-reader" else {
@@ -200,10 +204,14 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             arguments = ["verify-ax-compatibility.py", "--work-directory", str(work), "--records-directory", str(records)]
             if system_baseline:
                 arguments.append("--system-baseline")
+            if ownership_trace:
+                arguments.append("--ownership-trace")
             with mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
                     mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
                     mock.patch.object(PROBE.subprocess, "Popen", side_effect=FixtureProcess), \
                     mock.patch.object(PROBE, "wait_json", side_effect=wait_json), \
+                    mock.patch.object(PROBE.os, "uname", return_value=mock.Mock(machine="arm64")), \
+                    mock.patch.object(PROBE, "disassemble_symbols", return_value={"source": "owned mock"}) as disassembled, \
                     mock.patch.object(PROBE.time, "sleep"), \
                     mock.patch.object(PROBE.time, "monotonic", side_effect=itertools.count(step=0.25)), \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -218,6 +226,16 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             scans = json.loads((records / "scans.json").read_text())
             self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
             self.assertEqual(scans[-1]["host"]["destroyedButtons"], 30)
+            if system_baseline:
+                self.assertEqual(summary["instrumented"], ownership_trace)
+                host_build = next(command for command in commands if "-fobjc-arc" in command)
+                self.assertEqual("-DQUICKFILE_AX_OWNERSHIP_PROBE=1" in host_build, ownership_trace)
+                self.assertTrue(all(command[-1] == "1234" for command in commands if command[0] == "leaks"))
+                if ownership_trace:
+                    disassembled.assert_called_once_with(state, work, records)
+                    self.assertEqual(summary["ownership"], host_state["ownership"])
+                else:
+                    disassembled.assert_not_called()
             if not system_baseline:
                 self.assertEqual(scans[1]["host"]["allocatedButtons"], 10)
                 self.assertEqual(scans[1]["host"]["destroyedButtons"], 0)
@@ -256,10 +274,20 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["notifications"])
 
     def test_system_baseline_still_measures_growth_without_claiming_product_coverage(self):
-        exit_code, summary = self.exercise_runner(failed_scan="removed-30", system_baseline=True)
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(summary["coverage"], "measured")
-        self.assertFalse(summary["product_compensation_enabled"])
+        for ownership_trace in (False, True):
+            with self.subTest(ownership_trace=ownership_trace):
+                exit_code, summary = self.exercise_runner(failed_scan="removed-30", system_baseline=True,
+                                                         ownership_trace=ownership_trace)
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(summary["coverage"], "measured")
+                self.assertFalse(summary["product_compensation_enabled"])
+                self.assertNotIn("are separate trials", summary["scope"])
+                if ownership_trace:
+                    self.assertIn("ownership tracking and heap scans use the same instrumented host", summary["scope"])
+                    self.assertIn("an uninstrumented heap control requires a separate run", summary["scope"])
+                else:
+                    self.assertIn("heap scans use an uninstrumented host", summary["scope"])
+                    self.assertIn("ownership tracking requires a separate run", summary["scope"])
 
     def test_insufficient_compensation_preserves_evidence_and_fails(self):
         exit_code, summary = self.exercise_runner(insufficient_compensation=True)

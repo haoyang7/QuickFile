@@ -200,6 +200,18 @@ final class FileCreationServiceTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporaryDirectory.path).count, 2)
     }
 
+    func testPreservesMultibyteUTF8AndEmbeddedNULInLiteralAndRenderedContent() throws {
+        let content = "前缀\u{0}界🧪e\u{301}\u{0}尾部"
+        let service = FileCreationService()
+        for body in [content, "{{clipboard}}"] {
+            let result = try service.createFile(for: FileCreationRequest(
+                template: FileTemplate(name: "text", fileExtension: "txt", content: body),
+                destinationFolder: temporaryDirectory, requestedFilename: "bytes", clipboard: content
+            ))
+            XCTAssertEqual(try Data(contentsOf: result.fileURL), Data(content.utf8))
+        }
+    }
+
     func testOversizedLiteralAndClipboardExpansionDoNotMutateDestinationOrRequestStaging() throws {
         let stage = temporaryDirectory.appendingPathComponent("stage", isDirectory: true)
         try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: false)

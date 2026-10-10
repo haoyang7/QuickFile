@@ -69,7 +69,6 @@ final class FinderMenuDestinationIntegrityTests: XCTestCase {
         let oldTag = try prepareMenu(registry, template: template, target: target)
         try FileManager.default.moveItem(at: target, to: moved)
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
-        registry.beginMenu()
         let newTag = try prepareMenu(registry, template: template, target: target)
         let (store, defaults, suite) = try parentGrant(root)
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -128,7 +127,7 @@ final class FinderMenuDestinationIntegrityTests: XCTestCase {
 
     private func prepareMenu(_ registry: FinderMenuActionRegistry, template: FileTemplate, target: URL) throws -> Int {
         #if QUICKFILE_LEGACY_MENU_ACTIONS
-        return registry.register(templateID: template.id, context: .items, targetedURL: target, selectedItemURLs: [target])
+        return registry.registerMenu([FinderMenuAction(templateID: template.id, context: .items, targetedURL: target, selectedItemURLs: [target])])[0]
         #else
         let selection = FinderMenuSelection(context: .items, targetedURL: target, selectedItemURLs: [target])
         let cache = FinderMenuDestinationCache()
@@ -141,8 +140,8 @@ final class FinderMenuDestinationIntegrityTests: XCTestCase {
             XCTFail("Menu preparation did not finish")
             throw FinderFileCreationError.destinationUnavailable
         }
-        return registry.register(templateID: template.id, context: .items, targetedURL: target,
-                                 selectedItemURLs: [target], preparedDestination: destination)
+        return registry.registerMenu([FinderMenuAction(templateID: template.id, context: .items, targetedURL: target,
+                                 selectedItemURLs: [target], preparedDestination: destination)])[0]
         #endif
     }
 

@@ -809,6 +809,146 @@ final class QuickFileViewModelTests: XCTestCase {
         XCTAssertEqual(model.templates.map(\.id), [values[0].id, values[2].id])
     }
 
+    func testTemplateIndexCachesSurviveFilenameAndStatusChanges() async throws {
+        let values = [
+            FileTemplate(name: "Match first", fileExtension: "txt", content: "first"),
+            FileTemplate(name: "Match disabled", fileExtension: "md", content: "", isEnabled: false),
+            FileTemplate(name: "Match last", fileExtension: "txt", content: "last")
+        ]
+        let model = QuickFileViewModel(templateStore: TemplateStore(defaults: defaults), templates: values)
+        XCTAssertEqual(model.enabledTemplates, [values[0], values[2]])
+        XCTAssertEqual(model.filteredTemplates(search: " Match ", enabledOnly: true), [values[0], values[2]])
+        let enabledIndices = try XCTUnwrap(model.cachedEnabledTemplateIndices)
+        let filter = try XCTUnwrap(model.cachedTemplateFilter)
+
+        model.requestedFilename = "new filename"
+        await model.selectDestinationFolder(temporaryDirectory)
+        XCTAssertNotNil(model.status)
+        XCTAssertEqual(model.enabledTemplates, [values[0], values[2]])
+        XCTAssertEqual(model.filteredTemplates(search: "\nMatch\t", enabledOnly: true), [values[0], values[2]])
+
+        let reusedEnabledIndices = try XCTUnwrap(model.cachedEnabledTemplateIndices)
+        let reusedFilter = try XCTUnwrap(model.cachedTemplateFilter)
+        // Keeping both nonempty buffers alive proves reuse without a test-only counter.
+        enabledIndices.withUnsafeBufferPointer { original in
+            reusedEnabledIndices.withUnsafeBufferPointer { reused in
+                XCTAssertEqual(original.baseAddress, reused.baseAddress)
+            }
+        }
+        filter.indices.withUnsafeBufferPointer { original in
+            reusedFilter.indices.withUnsafeBufferPointer { reused in
+                XCTAssertEqual(original.baseAddress, reused.baseAddress)
+            }
+        }
+    }
+
+    func testTemplateIndexCachesInvalidateAfterEditsEnabledChangesAndReordering() async throws {
+        var first = FileTemplate(name: "Match first", fileExtension: "txt", content: "old")
+        let second = FileTemplate(name: "Match second", fileExtension: "txt", content: "second")
+        let store = TemplateStore(defaults: defaults)
+        try store.saveTemplates([first, second])
+        let model = QuickFileViewModel(templateStore: store, templates: [first, second])
+        XCTAssertEqual(model.enabledTemplates, [first, second])
+        XCTAssertEqual(model.filteredTemplates(search: "Match", enabledOnly: true), [first, second])
+
+        var edited = first
+        edited.name = "Renamed"
+        edited.fileExtension = "md"
+        edited.content = "latest body"
+        try await model.saveTemplate(edited, replacing: first)
+        first = edited
+        XCTAssertNil(model.cachedTemplateFilter)
+        XCTAssertEqual(model.filteredTemplates(search: "Match", enabledOnly: true), [second])
+        XCTAssertEqual(model.enabledTemplates, [first, second])
+        XCTAssertEqual(model.filteredTemplates(search: "md"), [first])
+
+        await model.setTemplateEnabled(false, id: first.id)
+        first.isEnabled = false
+        XCTAssertNil(model.cachedTemplateFilter)
+        XCTAssertEqual(model.filteredTemplates(search: "md", enabledOnly: true), [])
+        XCTAssertEqual(model.enabledTemplates, [second])
+        await model.setTemplateEnabled(true, id: first.id)
+        first.isEnabled = true
+        XCTAssertNil(model.cachedTemplateFilter)
+        XCTAssertEqual(model.filteredTemplates(search: "", enabledOnly: true), [first, second])
+        XCTAssertEqual(model.enabledTemplates, [first, second])
+
+        await assertTrueAsync(await model.moveTemplate(withID: second.id, to: .first))
+        XCTAssertNil(model.cachedTemplateFilter)
+        XCTAssertEqual(model.filteredTemplates(search: "", enabledOnly: true), [second, first])
+        XCTAssertEqual(model.enabledTemplates, [second, first])
+        await assertTrueAsync(await model.deleteTemplate(withID: first.id))
+        XCTAssertNil(model.cachedTemplateFilter)
+        XCTAssertEqual(model.filteredTemplates(search: "", enabledOnly: true), [second])
+        XCTAssertEqual(model.enabledTemplates, [second])
+    }
+
+    func testTemplateIndexCachesInvalidateAfterExternalReload() async throws {
+        let storageURL = temporaryDirectory.appendingPathComponent("templates.json")
+        let store = TemplateStore(defaults: defaults, storageURL: storageURL)
+        let writer = TemplateStore(defaults: defaults, storageURL: storageURL)
+        let first = FileTemplate(name: "Match first", fileExtension: "txt", content: "old")
+        var second = FileTemplate(name: "Match second", fileExtension: "txt", content: "second")
+        try store.saveTemplates([first, second])
+        let model = QuickFileViewModel(templateStore: store, templates: [first, second])
+        XCTAssertEqual(model.enabledTemplates, [first, second])
+        XCTAssertEqual(model.filteredTemplates(search: "Match", enabledOnly: true), [first, second])
+
+        second.isEnabled = false
+        var updatedFirst = first
+        updatedFirst.content = "external body"
+        let added = FileTemplate(name: "Match added", fileExtension: "md", content: "new")
+        try writer.saveTemplates([second, added, updatedFirst])
+        await model.reloadTemplates()
+
+        XCTAssertNil(model.cachedTemplateFilter)
+        XCTAssertEqual(model.filteredTemplates(search: "Match", enabledOnly: true), [added, updatedFirst])
+        XCTAssertEqual(model.enabledTemplates, [added, updatedFirst])
+        XCTAssertEqual(model.filteredTemplates(search: "Match"), [second, added, updatedFirst])
+    }
+
+    func testTemplateFilterKeepsTrimUnicodeAndCurrentLocaleSearchSemantics() throws {
+        let values = [
+            FileTemplate(name: "Café", fileExtension: "TXT", content: "body-only needle"),
+            FileTemplate(name: "ΟΣ Istanbul", fileExtension: "md", content: "", isEnabled: false),
+            FileTemplate(name: "中文", fileExtension: "xlsx", content: "")
+        ]
+        let model = QuickFileViewModel(templateStore: TemplateStore(defaults: defaults), templates: values)
+        for query in ["", " \n\t", " CaFe\u{301} \n", "é", "ος", "i", "中文", " XlSx ", "needle"] {
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            for enabledOnly in [false, true] {
+                let expected = values.filter {
+                    (!enabledOnly || $0.isEnabled) && (trimmed.isEmpty
+                        || $0.name.localizedCaseInsensitiveContains(trimmed)
+                        || $0.fileExtension.localizedCaseInsensitiveContains(trimmed))
+                }
+                XCTAssertEqual(model.filteredTemplates(search: query, enabledOnly: enabledOnly), expected)
+                XCTAssertEqual(model.filteredTemplates(search: query, enabledOnly: enabledOnly), expected)
+                let cache = try XCTUnwrap(model.cachedTemplateFilter)
+                XCTAssertEqual(cache.query, trimmed)
+                XCTAssertEqual(cache.enabledOnly, enabledOnly)
+                XCTAssertEqual(cache.localeIdentifier, Locale.current.identifier)
+            }
+        }
+    }
+
+    func testTemplateIndexCachesPreserveDuplicateIDsAndSelectFirstEnabledMatch() {
+        let id = UUID()
+        let disabled = FileTemplate(id: id, name: "Match disabled", fileExtension: "txt", content: "", isEnabled: false)
+        let first = FileTemplate(id: id, name: "Match first", fileExtension: "txt", content: "first")
+        let second = FileTemplate(id: id, name: "Match second", fileExtension: "md", content: "second")
+        let model = QuickFileViewModel(templateStore: TemplateStore(defaults: defaults), templates: [disabled, first, second])
+
+        XCTAssertEqual(model.selectedTemplate, first)
+        XCTAssertNil(model.cachedEnabledTemplateIndices)
+        XCTAssertEqual(model.enabledTemplates, [first, second])
+        XCTAssertEqual(model.enabledTemplates, [first, second])
+        XCTAssertEqual(model.filteredTemplates(search: "Match"), [disabled, first, second])
+        XCTAssertEqual(model.filteredTemplates(search: "Match"), [disabled, first, second])
+        XCTAssertEqual(model.filteredTemplates(search: "Match", enabledOnly: true), [first, second])
+        XCTAssertEqual(model.filteredTemplates(search: "Match", enabledOnly: true), [first, second])
+    }
+
     func testDropMovesBeforeAndAfterInBothDirectionsWithOneSavePerMove() async throws {
         let values = (0..<4).map { FileTemplate(name: "Template \($0)", fileExtension: "txt", content: "body \($0)") }
         let storageURL = temporaryDirectory.appendingPathComponent("templates.json")

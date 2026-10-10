@@ -90,12 +90,13 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: destination) }
         let registry = FinderMenuActionRegistry()
-        registry.beginMenu()
-        let tag = registry.register(templateID: hidden.id, context: .container, destinationFolder: destination,
-                                    destinationIdentity: try DirectoryIdentity.capture(at: destination))
-        registry.beginMenu()
+        let tag = registry.registerMenu([FinderMenuAction(templateID: hidden.id, context: .container, destinationFolder: destination,
+                                    destinationIdentity: try DirectoryIdentity.capture(at: destination))])[0]
         let entries = FinderMenuModelBuilder().entries(from: [visible, hidden], limit: try FinderMenuDisplayLimit(maximumCount: 1))
         XCTAssertEqual(entries.map(\.id), [visible.id])
+        _ = registry.registerMenu(entries.map {
+            FinderMenuAction(templateID: $0.id, context: .container, destinationFolder: destination)
+        })
         let action = try XCTUnwrap(registry.takeAction(for: tag))
         let authoritativeTemplates = LockedTestValue([visible, hidden])
         let createdTemplates = LockedTestValue<[FileTemplate]>([])
@@ -472,11 +473,11 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
                 return directory
             }
         )
-        let tag = registry.register(
+        let tag = registry.registerMenu([FinderMenuAction(
             templateID: template.id, context: .items,
             targetedURL: directory, selectedItemURLs: selected,
             preparedDestination: FinderMenuDestination(folder: directory, identity: try DirectoryIdentity.capture(at: directory))
-        )
+        )])[0]
         let action = try XCTUnwrap(registry.takeAction(for: tag))
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -526,11 +527,11 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let template = FileTemplate(name: "Markdown", fileExtension: "md", content: "sidebar content")
         let registry = FinderMenuActionRegistry()
-        let tag = registry.register(templateID: template.id, context: .sidebar,
+        let tag = registry.registerMenu([FinderMenuAction(templateID: template.id, context: .sidebar,
                                     targetedURL: window, selectedItemURLs: [sidebar],
                                     preparedDestination: try XCTUnwrap(FinderMenuDestination.prepare(for: FinderMenuSelection(
                                         context: .sidebar, targetedURL: window, selectedItemURLs: [sidebar]
-                                    ))))
+                                    ))))])[0]
         let service = FileCreationService()
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { _ in template },

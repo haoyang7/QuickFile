@@ -234,7 +234,12 @@ public enum TemplateTransfer {
         // Complete validation precedes any plan. A malformed final item cannot be
         // partially imported. The immutable plan has no persistence side effects.
         try validate(bundle, limits: limits)
-        var seen = Set(existing.map(TransferTemplate.init))
+        // Exact duplicates must share a source name. Avoid hashing unrelated
+        // historical bodies; keep every existing name below for collision naming.
+        let incomingNames = Set(bundle.templates.map(\.name))
+        // Materialize the candidates so Set can size itself before hashing bodies.
+        let candidates = existing.compactMap { incomingNames.contains($0.name) ? TransferTemplate($0) : nil }
+        var seen = Set(candidates)
         var names = Set(existing.map(\.name))
         var additions: [TemplateImportPlan.Item] = []
         var skipped = 0

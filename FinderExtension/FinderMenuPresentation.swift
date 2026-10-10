@@ -72,16 +72,18 @@ struct FinderMenuPresentation {
 
     func templates(
         _ presentation: FinderTemplateMenuPresentation,
-        register: (FinderTemplateMenuEntry) -> Int
+        register: ([FinderTemplateMenuEntry]) -> [Int]
     ) -> NSMenu {
+        let tags = register(presentation.entries)
+        precondition(tags.count == presentation.entries.count)
         guard !presentation.entries.isEmpty else {
             return unavailable(.noEnabledTemplates)
         }
         let (menu, submenu) = rootMenu()
-        for entry in presentation.entries {
+        for (entry, tag) in zip(presentation.entries, tags) {
             let item = NSMenuItem(title: entry.title, action: createAction, keyEquivalent: "")
             item.target = target
-            item.tag = register(entry)
+            item.tag = tag
             submenu.addItem(item)
         }
         return menu

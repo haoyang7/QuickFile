@@ -167,11 +167,11 @@ final class FinderMenuModelTests: XCTestCase {
         let destination = URL(fileURLWithPath: "/tmp/Menu Target", isDirectory: true)
         let registry = FinderMenuActionRegistry()
 
-        let tag = registry.register(
+        let tag = registry.registerMenu([FinderMenuAction(
             templateID: templateID,
             context: .container,
             destinationFolder: destination
-        )
+        )])[0]
 
         XCTAssertNotEqual(tag, 0)
         XCTAssertEqual(
@@ -192,17 +192,16 @@ final class FinderMenuModelTests: XCTestCase {
         let secondDestination = URL(fileURLWithPath: "/tmp/Second", isDirectory: true)
         let registry = FinderMenuActionRegistry()
 
-        let firstTag = registry.register(
+        let firstTag = registry.registerMenu([FinderMenuAction(
             templateID: firstID,
             context: .items,
             destinationFolder: firstDestination
-        )
-        registry.beginMenu()
-        let secondTag = registry.register(
+        )])[0]
+        let secondTag = registry.registerMenu([FinderMenuAction(
             templateID: secondID,
             context: .toolbar,
             destinationFolder: secondDestination
-        )
+        )])[0]
 
         XCTAssertNotEqual(firstTag, secondTag)
         XCTAssertEqual(
@@ -226,23 +225,21 @@ final class FinderMenuModelTests: XCTestCase {
     func testActionRegistryDiscardsActionsOlderThanRetainedMenuGenerations() {
         let registry = FinderMenuActionRegistry(retainedGenerationCount: 2)
         let destination = URL(fileURLWithPath: "/tmp", isDirectory: true)
-        let firstTag = registry.register(
+        let firstTag = registry.registerMenu([FinderMenuAction(
             templateID: UUID(),
             context: .items,
             destinationFolder: destination
-        )
-        registry.beginMenu()
-        let secondTag = registry.register(
+        )])[0]
+        let secondTag = registry.registerMenu([FinderMenuAction(
             templateID: UUID(),
             context: .container,
             destinationFolder: destination
-        )
-        registry.beginMenu()
-        let thirdTag = registry.register(
+        )])[0]
+        let thirdTag = registry.registerMenu([FinderMenuAction(
             templateID: UUID(),
             context: .sidebar,
             destinationFolder: destination
-        )
+        )])[0]
 
         XCTAssertNil(registry.takeAction(for: firstTag))
         XCTAssertNotNil(registry.takeAction(for: secondTag))
@@ -252,17 +249,59 @@ final class FinderMenuModelTests: XCTestCase {
     func testCurrentMenuDoesNotEvictActionsWhenTemplateCountExceedsFormerLimit() {
         let registry = FinderMenuActionRegistry()
         let destination = URL(fileURLWithPath: "/tmp", isDirectory: true)
-        registry.beginMenu()
 
-        let tags = (0..<300).map { _ in
-            registry.register(
+        let tags = registry.registerMenu((0..<300).map { _ in
+            FinderMenuAction(
                 templateID: UUID(),
                 context: .container,
                 destinationFolder: destination
             )
-        }
+        })
 
         XCTAssertEqual(tags.compactMap(registry.takeAction(for:)).count, 300)
+    }
+
+    func testConcurrentMenuBatchesAreRetainedOrEvictedAsAWhole() {
+        let registry = FinderMenuActionRegistry(retainedGenerationCount: 3)
+        let batches = LockedTestValue<[(tags: [Int], actions: [FinderMenuAction])]>([])
+        DispatchQueue.concurrentPerform(iterations: 12) { batch in
+            let destination = URL(fileURLWithPath: "/tmp/Menu-\(batch)", isDirectory: true)
+            let actions = (0..<300).map { _ in
+                FinderMenuAction(templateID: UUID(), context: .container, destinationFolder: destination,
+                                 menuTimingID: "menu-\(batch)")
+            }
+            let tags = registry.registerMenu(actions)
+            batches.update { $0.append((tags, actions)) }
+        }
+
+        // Tags are increasing within this bounded run, so their first value
+        // identifies registration order independently of worker completion order.
+        let ordered = batches.value.sorted { $0.tags[0] < $1.tags[0] }
+        let allTags = ordered.flatMap(\.tags)
+        XCTAssertEqual(Set(allTags).count, 3_600)
+        XCTAssertTrue(allTags.allSatisfy { $0 > 0 })
+        for (index, batch) in ordered.enumerated() {
+            let taken = batch.tags.compactMap(registry.takeAction(for:))
+            XCTAssertEqual(taken, index < 9 ? [] : batch.actions,
+                           "Eviction must never leave only part of a menu registered")
+            XCTAssertTrue(batch.tags.compactMap(registry.takeAction(for:)).isEmpty)
+        }
+    }
+
+    func testDuplicateTemplateIDsKeepDistinctActionsAndEmptyMenusAdvanceRetention() {
+        let registry = FinderMenuActionRegistry(retainedGenerationCount: 2)
+        let id = UUID()
+        let actions = ["First", "Second"].map {
+            FinderMenuAction(templateID: id, context: .container,
+                             destinationFolder: URL(fileURLWithPath: "/tmp/\($0)"))
+        }
+        let tags = registry.registerMenu(actions)
+        XCTAssertEqual(Set(tags).count, 2)
+        XCTAssertEqual(registry.takeAction(for: tags[0]), actions[0])
+        XCTAssertTrue(registry.registerMenu([]).isEmpty)
+        let newerTags = registry.registerMenu(actions)
+        XCTAssertNil(registry.takeAction(for: tags[1]))
+        XCTAssertEqual(newerTags.compactMap(registry.takeAction(for:)), actions)
     }
 
     func testRegistryCapturesRawSelectionWithoutResolvingTheVolume() throws {
@@ -270,10 +309,10 @@ final class FinderMenuModelTests: XCTestCase {
         let templateID = UUID()
         let original = URL(fileURLWithPath: "/Volumes/NotMounted/folder/item")
         var selection = [original]
-        let tag = registry.register(
+        let tag = registry.registerMenu([FinderMenuAction(
             templateID: templateID, context: .items,
             targetedURL: original, selectedItemURLs: selection
-        )
+        )])[0]
         selection.removeAll()
         let action = try XCTUnwrap(registry.takeAction(for: tag))
         XCTAssertEqual(action.target, .selection(targetedURL: original, selectedItemURLs: [original]))
@@ -283,9 +322,9 @@ final class FinderMenuModelTests: XCTestCase {
     func testRegistryPreservesMenuTraceIdentityAcrossMenuRebuild() throws {
         let registry = FinderMenuActionRegistry()
         let menuID = UUID().uuidString
-        let tag = registry.register(templateID: UUID(), context: .container,
-            targetedURL: URL(fileURLWithPath: "/tmp"), selectedItemURLs: [], menuTimingID: menuID)
-        registry.beginMenu()
+        let tag = registry.registerMenu([FinderMenuAction(templateID: UUID(), context: .container,
+            targetedURL: URL(fileURLWithPath: "/tmp"), selectedItemURLs: [], menuTimingID: menuID)])[0]
+        _ = registry.registerMenu([])
         XCTAssertEqual(try XCTUnwrap(registry.takeAction(for: tag)).menuTimingID, menuID)
         XCTAssertNil(registry.takeAction(for: tag))
     }

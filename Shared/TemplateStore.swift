@@ -122,6 +122,7 @@ public final class TemplateStore: @unchecked Sendable {
     private let readTemplatesData: @Sendable (URL) throws -> Data
     private let decodeTemplatesData: @Sendable (Data) throws -> [FileTemplate]
     private let decodeMenuEntriesData: @Sendable (Data) throws -> [FinderTemplateMenuEntry]
+    private let recoveryDefaultsMaximumBytes: Int
     private let backupWriteOverride: (@Sendable (Data, URL) throws -> Void)?
     private let exportCheckpoint: (@Sendable (TemplateTransferFile.ExportCheckpoint) throws -> Void)?
     private let migrationCheckpoint: (@Sendable (MigrationCheckpoint) throws -> Void)?
@@ -197,6 +198,7 @@ public final class TemplateStore: @unchecked Sendable {
         readTemplatesData = { try Data(contentsOf: $0) }
         decodeTemplatesData = { try JSONDecoder().decode(StoredTemplates.self, from: $0).templates }
         decodeMenuEntriesData = { try JSONDecoder().decode(MenuEntries.self, from: $0).entries }
+        recoveryDefaultsMaximumBytes = Self.maximumRecoveryFileBytes
         backupWriteOverride = nil
         exportCheckpoint = nil
         migrationCheckpoint = nil
@@ -224,6 +226,7 @@ public final class TemplateStore: @unchecked Sendable {
             try JSONDecoder().decode(StoredTemplates.self, from: $0).templates
         },
         decodeMenuEntriesData: (@Sendable (Data) throws -> [FinderTemplateMenuEntry])? = nil,
+        recoveryDefaultsMaximumBytes: Int = TemplateStore.maximumRecoveryFileBytes,
         backupWriteOverride: (@Sendable (Data, URL) throws -> Void)? = nil,
         exportCheckpoint: (@Sendable (TemplateTransferFile.ExportCheckpoint) throws -> Void)? = nil,
         migrationCheckpoint: (@Sendable (MigrationCheckpoint) throws -> Void)? = nil
@@ -239,6 +242,7 @@ public final class TemplateStore: @unchecked Sendable {
         self.decodeMenuEntriesData = decodeMenuEntriesData ?? {
             try JSONDecoder().decode(MenuEntries.self, from: $0).entries
         }
+        self.recoveryDefaultsMaximumBytes = recoveryDefaultsMaximumBytes
         self.backupWriteOverride = backupWriteOverride
         self.exportCheckpoint = exportCheckpoint
         self.migrationCheckpoint = migrationCheckpoint
@@ -729,19 +733,17 @@ public final class TemplateStore: @unchecked Sendable {
         do { file = try readRecoveryFile() }
         catch { throw StoreError.readFailed(error) }
         let legacy = defaults.object(forKey: legacyTemplatesKey)
-        if let data = legacy as? Data, data.count > Self.maximumRecoveryFileBytes {
-            throw StoreError.readFailed(TemplateTransferError.fileTooLarge(
-                maximumBytes: Self.maximumRecoveryFileBytes
-            ))
-        }
         let revision = defaults.object(forKey: revisionKey)
         do {
+            var remaining = recoveryDefaultsMaximumBytes
+            let legacyValue = try Self.serializedDefaultsValue(legacy, remainingBytes: &remaining)
+            let revisionValue = try Self.serializedDefaultsValue(revision, remainingBytes: &remaining)
             return RecoveryRawState(
                 fileData: file?.data,
                 fileIdentity: file?.identity,
                 legacyData: legacy as? Data,
-                legacyValue: try serializedDefaultsValue(legacy),
-                revisionValue: try serializedDefaultsValue(revision)
+                legacyValue: legacyValue,
+                revisionValue: revisionValue
             )
         } catch { throw StoreError.readFailed(error) }
     }
@@ -791,10 +793,43 @@ public final class TemplateStore: @unchecked Sendable {
         return (data, identity)
     }
 
-    private func serializedDefaultsValue(_ value: Any?) throws -> Data? {
+    /// A conservative allocation/work budget, not an exact XML size prediction.
+    /// Charge escaping, base64, indentation and every node before serialization;
+    /// depth is also bounded so malformed historical defaults cannot exhaust the stack.
+    /// The two defaults values share this budget. Small unexpected types stay lossless.
+    static func serializedDefaultsValue(_ value: Any?, remainingBytes: inout Int) throws -> Data? {
         guard let value else { return nil }
-        // A one-element array permits scalar defaults without guessing their type.
-        return try PropertyListSerialization.data(fromPropertyList: [value], format: .xml, options: 0)
+        let maximum = remainingBytes
+        func tooLarge() -> TemplateTransferError { .fileTooLarge(maximumBytes: maximum) }
+        func charge(_ count: Int, multiplier: Int = 1) throws {
+            guard remainingBytes >= 0, count <= remainingBytes / multiplier else { throw tooLarge() }
+            remainingBytes -= count * multiplier
+        }
+        func visit(_ value: Any, depth: Int) throws {
+            guard depth <= 32 else { throw tooLarge() }
+            try charge(256 + depth * 8)
+            if let string = value as? String {
+                // XML entities can expand an ASCII byte to as many as six bytes.
+                try charge(string.utf8.count, multiplier: 6)
+            } else if let data = value as? Data {
+                // Include base64 expansion and indentation on each wrapped line.
+                try charge(data.count, multiplier: 2 + depth)
+            } else if let array = value as? [Any] {
+                for element in array { try visit(element, depth: depth + 1) }
+            } else if let dictionary = value as? [String: Any] {
+                for (key, element) in dictionary {
+                    try visit(key, depth: depth + 1)
+                    try visit(element, depth: depth + 1)
+                }
+            } else if !(value is NSNumber) && !(value is Date) {
+                throw CocoaError(.propertyListWriteInvalid)
+            }
+        }
+        try charge(1024) // XML declaration, doctype and the scalar wrapper array.
+        try visit(value, depth: 1)
+        let data = try PropertyListSerialization.data(fromPropertyList: [value], format: .xml, options: 0)
+        guard data.count <= maximum else { throw tooLarge() }
+        return data
     }
 
     private func recoveryReason(for state: RecoveryRawState) -> RecoveryReason? {

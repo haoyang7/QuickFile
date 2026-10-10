@@ -26,9 +26,11 @@ final class FinderMenuPresentationTests: XCTestCase {
         let disabled = FileTemplate(name: "Off", fileExtension: "txt", content: "", isEnabled: false)
         for templates in [[], [disabled]] {
             var registrations = 0
-            let menu = presenter.templates(FinderMenuModelBuilder().presentation(from: templates)) { _ in
-                registrations += 1
-                return registrations
+            let menu = presenter.templates(FinderMenuModelBuilder().presentation(from: templates)) { entries in
+                entries.map { _ in
+                    registrations += 1
+                    return registrations
+                }
             }
             let items = try submenu(menu).items
             XCTAssertEqual(registrations, 0)
@@ -100,10 +102,9 @@ final class FinderMenuPresentationTests: XCTestCase {
 
     func testRecoveryNavigationCannotConsumeCreationTags() throws {
         let registry = FinderMenuActionRegistry()
-        registry.beginMenu()
         let template = FileTemplate(name: "Text", fileExtension: "txt", content: "")
         let destination = URL(fileURLWithPath: "/tmp/Original Menu Folder", isDirectory: true)
-        let tag = registry.register(templateID: template.id, context: .container, destinationFolder: destination)
+        let tag = registry.registerMenu([FinderMenuAction(templateID: template.id, context: .container, destinationFolder: destination)])[0]
         for state in FinderMenuPresentation.UnavailableState.allCases {
             let items = try submenu(presenter.unavailable(state)).items
             for item in items {
@@ -125,9 +126,11 @@ final class FinderMenuPresentationTests: XCTestCase {
         let limits: [FinderMenuDisplayLimit] = [.all, try FinderMenuDisplayLimit(maximumCount: 10)]
         for limit in limits {
             var registeredIDs: [FileTemplate.ID] = []
-            let menu = presenter.templates(FinderMenuModelBuilder().presentation(from: templates, limit: limit)) { entry in
-                registeredIDs.append(entry.id)
-                return registeredIDs.count
+            let menu = presenter.templates(FinderMenuModelBuilder().presentation(from: templates, limit: limit)) { entries in
+                entries.map { entry in
+                    registeredIDs.append(entry.id)
+                    return registeredIDs.count
+                }
             }
             let items = try submenu(menu).items
             XCTAssertEqual(registeredIDs, [templates[0].id, templates[2].id])
@@ -144,9 +147,11 @@ final class FinderMenuPresentationTests: XCTestCase {
             FileTemplate(name: " \t\n", fileExtension: " .txt ", content: "")
         ]
         var registeredIDs: [FileTemplate.ID] = []
-        let menu = presenter.templates(FinderMenuModelBuilder().presentation(from: templates)) { entry in
-            registeredIDs.append(entry.id)
-            return registeredIDs.count
+        let menu = presenter.templates(FinderMenuModelBuilder().presentation(from: templates)) { entries in
+            entries.map { entry in
+                registeredIDs.append(entry.id)
+                return registeredIDs.count
+            }
         }
         let items = try submenu(menu).items
         XCTAssertEqual(items.map(\.title), ["未命名模板", "未命名模板 (.txt)"])
@@ -159,14 +164,18 @@ final class FinderMenuPresentationTests: XCTestCase {
     func testLimitedReadyMenuContainsOnlyCreationEntriesWithoutFooterOrNavigation() throws {
         let templates = (0..<30).map { FileTemplate(name: "Template \($0)", fileExtension: "txt", content: "") }
         let registry = FinderMenuActionRegistry()
-        registry.beginMenu()
         let presentation = FinderMenuModelBuilder().presentation(
             from: templates, limit: try FinderMenuDisplayLimit(maximumCount: 10)
         )
         let destination = URL(fileURLWithPath: "/tmp/Original Menu Folder", isDirectory: true)
-        let menu = presenter.templates(presentation) { entry in
-            registry.register(templateID: entry.id, context: .container, destinationFolder: destination)
+        var registrations = 0
+        let menu = presenter.templates(presentation) { entries in
+            registrations += 1
+            return registry.registerMenu(entries.map { entry in
+                FinderMenuAction(templateID: entry.id, context: .container, destinationFolder: destination)
+            })
         }
+        XCTAssertEqual(registrations, 1, "A menu registers its complete visible batch exactly once")
         let items = try submenu(menu).items
         let creationItems = items.filter { $0.action == createAction }
         XCTAssertEqual(items.count, 10)

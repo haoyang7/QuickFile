@@ -975,6 +975,92 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertEqual(try PropertyListSerialization.propertyList(from: rawValue, format: nil) as? [String], ["unexpected string"])
     }
 
+    func testRecoveryDefaultsBudgetChargesEscapingAndExactBoundary() throws {
+        // This is an allocation budget, deliberately more conservative than XML length.
+        let value = String(repeating: "&", count: 100)
+        let required = 1024 + 264 + 6 * value.utf8.count
+        var exact = required
+        let encoded = try XCTUnwrap(TemplateStore.serializedDefaultsValue(value, remainingBytes: &exact))
+        XCTAssertEqual(exact, 0)
+        XCTAssertLessThanOrEqual(encoded.count, required)
+        XCTAssertEqual(try PropertyListSerialization.propertyList(from: encoded, format: nil) as? [String], [value])
+        var insufficient = required - 1
+        XCTAssertThrowsError(try TemplateStore.serializedDefaultsValue(value, remainingBytes: &insufficient))
+        var emptyBudget = 0
+        XCTAssertNil(try TemplateStore.serializedDefaultsValue(nil, remainingBytes: &emptyBudget))
+        XCTAssertThrowsError(try TemplateStore.serializedDefaultsValue("", remainingBytes: &emptyBudget))
+    }
+
+    func testRecoveryDefaultsBudgetBoundsNestedDataNodeCountAndDepth() throws {
+        let values: [Any] = [
+            ["nested": [Data(repeating: 0, count: 1024)]],
+            Array(repeating: false, count: 32),
+            [String(repeating: "&", count: 600): true]
+        ]
+        for value in values {
+            var budget = 4096
+            XCTAssertThrowsError(try TemplateStore.serializedDefaultsValue(value, remainingBytes: &budget))
+        }
+        var nested: Any = false
+        for _ in 0..<33 { nested = [nested] }
+        var budget = 1024 * 1024
+        XCTAssertThrowsError(try TemplateStore.serializedDefaultsValue(nested, remainingBytes: &budget))
+    }
+
+    func testRecoveryDefaultsBudgetFailurePreservesFileAndBothDefaults() throws {
+        let url = temporaryDirectory.appendingPathComponent("templates.json")
+        let original = Data("broken".utf8)
+        try original.write(to: url)
+        let values: [(Any, Any)] = [
+            (String(repeating: "&", count: 600), "revision"),
+            (["nested": [Data(repeating: 0, count: 1024)]], "revision"),
+            ("legacy", String(repeating: "&", count: 600)),
+            // Each fits alone, but the two snapshots must share one budget.
+            (String(repeating: "a", count: 200), String(repeating: "b", count: 200))
+        ]
+        let store = TemplateStore(defaults: defaults, storageURL: url, recoveryDefaultsMaximumBytes: 4096)
+        for (legacy, revision) in values {
+            defaults.set(legacy, forKey: "templates.v1")
+            defaults.set(revision, forKey: "templates.revision.v2")
+            let before = try PropertyListSerialization.data(
+                fromPropertyList: [defaults.object(forKey: "templates.v1")!, defaults.object(forKey: "templates.revision.v2")!],
+                format: .binary, options: 0
+            )
+            XCTAssertThrowsError(try store.prepareRecovery()) { error in
+                guard case let TemplateStore.StoreError.readFailed(underlying) = error,
+                      case TemplateTransferError.fileTooLarge = underlying else { return XCTFail("\(error)") }
+            }
+            let after = try PropertyListSerialization.data(
+                fromPropertyList: [defaults.object(forKey: "templates.v1")!, defaults.object(forKey: "templates.revision.v2")!],
+                format: .binary, options: 0
+            )
+            XCTAssertEqual(before, after)
+            XCTAssertEqual(try Data(contentsOf: url), original)
+            XCTAssertTrue(try recoveryBackupURLs().isEmpty)
+        }
+    }
+
+    func testRecoveryPreservesSmallNestedUnexpectedDefaultsAndTheirCAS() throws {
+        let url = temporaryDirectory.appendingPathComponent("templates.json")
+        let legacy: [String: Any] = ["values": [Data([0, 255]), "<&", true, 42, 1.5, Date(timeIntervalSince1970: 0)]]
+        defaults.set(legacy, forKey: "templates.v1")
+        defaults.set(["unexpected": 7], forKey: "templates.revision.v2")
+        let store = TemplateStore(defaults: defaults, storageURL: url)
+        let stale = try store.prepareRecovery()
+        defaults.set(["unexpected": 8], forKey: "templates.revision.v2")
+        XCTAssertThrowsError(try store.recoverTemplates([], expectedRecoveryState: stale)) { error in
+            guard case TemplateStore.RecoveryError.configurationChanged = error else { return XCTFail("\(error)") }
+        }
+        let snapshot = try store.prepareRecovery()
+        let result = try store.recoverTemplates([], expectedRecoveryState: snapshot)
+        let metadata = try recoveryMetadata(result.backupURL)
+        let legacyBytes = try XCTUnwrap(metadata["legacyValuePropertyList"] as? Data)
+        let restored = try XCTUnwrap(try PropertyListSerialization.propertyList(from: legacyBytes, format: nil) as? [NSDictionary])
+        XCTAssertEqual(restored, [legacy as NSDictionary])
+        let revisionBytes = try XCTUnwrap(metadata["revisionValuePropertyList"] as? Data)
+        XCTAssertEqual(try PropertyListSerialization.propertyList(from: revisionBytes, format: nil) as? [[String: Int]], [["unexpected": 8]])
+    }
+
     func testPrepareRecoveryDoesNotMutateCorruptionOrDefaults() throws {
         let url = temporaryDirectory.appendingPathComponent("templates.json")
         let raw = Data(" { broken json \n".utf8)

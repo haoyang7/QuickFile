@@ -149,6 +149,36 @@ final class TemplateTransferTests: XCTestCase {
         XCTAssertNotEqual(Array(plan.templates[0].content.utf8), Array(plan.templates[1].content.utf8))
     }
 
+    func testExistingCanonicallyEquivalentNamesStillUseByteExactDeduplication() throws {
+        let composed = record("é")
+        let decomposed = record("e\u{301}")
+        let reserved = record("e\u{301}（导入）", body: "reserved")
+        let plan = try TemplateTransfer.makeImportPlan(
+            bundle: .init(templates: [composed, decomposed, decomposed]),
+            existing: [composed.makeTemplate(), reserved.makeTemplate()]
+        )
+        XCTAssertEqual(plan.skippedCount, 2)
+        XCTAssertEqual(plan.addedCount, 1)
+        XCTAssertEqual(plan.additions[0].sourceIndex, 1)
+        XCTAssertEqual(Array(plan.additions[0].template.name.utf8), Array("e\u{301}（导入 2）".utf8))
+    }
+
+    func testEmptyAndAllSkippedImportsPreserveUnrelatedOverLimitHistory() throws {
+        let duplicate = record("small")
+        let existing = [record("historical", body: String(repeating: "x", count: 128)).makeTemplate(),
+                        duplicate.makeTemplate()]
+        let limits = TemplateTransferLimits(maximumTemplates: 1, maximumContentBytes: 8)
+        for sources in [[], [duplicate]] {
+            let plan = try TemplateTransfer.makeImportPlan(
+                bundle: .init(templates: sources), existing: existing, limits: limits
+            )
+            XCTAssertEqual(plan.baseline, existing)
+            XCTAssertEqual(plan.templates, existing)
+            XCTAssertEqual(plan.addedCount, 0)
+            XCTAssertEqual(plan.skippedCount, sources.count)
+        }
+    }
+
     func testNameAndBodyAreNotSilentlyTrimmed() throws {
         let source = record(" name ", extension: ".txt", body: "\n  body  \r\n")
         XCTAssertEqual(try TemplateTransfer.decode(data([source])).templates, [source])

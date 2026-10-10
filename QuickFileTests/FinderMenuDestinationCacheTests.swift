@@ -311,8 +311,8 @@ final class FinderMenuDestinationCacheTests: XCTestCase {
         XCTAssertEqual(cache.currentSnapshot(for: selection), .loading)
         try waitUntil { cache.cachedSnapshot(for: selection) == .ready(original) }
         let registry = FinderMenuActionRegistry()
-        let tag = registry.register(templateID: UUID(), context: .container,
-                                    destinationFolder: original.folder, destinationIdentity: original.identity)
+        let tag = registry.registerMenu([FinderMenuAction(templateID: UUID(), context: .container,
+                                    destinationFolder: original.folder, destinationIdentity: original.identity)])[0]
         try FileManager.default.moveItem(at: original.folder, to: moved)
         try FileManager.default.createDirectory(at: original.folder, withIntermediateDirectories: false)
         let replacement = FinderMenuDestination(folder: original.folder, identity: try DirectoryIdentity.capture(at: original.folder))

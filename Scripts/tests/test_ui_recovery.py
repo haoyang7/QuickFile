@@ -32,6 +32,7 @@ def load_script(name, filename):
 
 BUILD = load_script("build_ui_recovery", "build-ui-recovery.py")
 RUN = load_script("run_ui_recovery", "run-ui-recovery.py")
+ROW_MEMORY = load_script("run_ax_row_memory", "run-ax-row-memory.py")
 
 
 class UIRecoveryBuildCommandTests(unittest.TestCase):
@@ -77,6 +78,111 @@ class UIRecoveryBuildCommandTests(unittest.TestCase):
         self.assertIsNone(info)
         self.assertTrue(all(path.startswith("Shared/") for path in manifest["sources"]))
         self.assertTrue(all(command[:2] == ["xcrun", "swiftc"] for command in calls))
+
+
+class UIRecoveryMemoryScanTests(unittest.TestCase):
+    def test_leak_scan_accepts_zero_and_one_and_records_heap(self):
+        for exit_code, nodes, size in ((0, 0, 0), (1, 2, 64)):
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory(prefix="quickfile-memory-test-") as temporary:
+                output = Path(temporary)
+                raw = f"Process 1234: {nodes} leaks for {size} total leaked bytes.\n"
+                if nodes:
+                    raw += "  2 (64 bytes) ROOT LEAK: NSArray 0xabc\n"
+                heap = "  3 96 32.0 NSArray\n"
+                results = [subprocess.CompletedProcess([], exit_code, raw, "leaks diagnostic\n"),
+                           subprocess.CompletedProcess([], 0, heap, "")]
+                with patch.object(RUN.subprocess, "run", side_effect=results) as commands:
+                    result = RUN.scan(1234, output, "baseline")
+                self.assertEqual([call.args[0][0] for call in commands.call_args_list], ["leaks", "heap"])
+                self.assertEqual(result["leaks"], nodes)
+                self.assertEqual(result["leakedBytes"], size)
+                self.assertEqual(result["rootGroups"], [{"nodesInGroup": 2, "root": "NSArray <address>"}] if nodes else [])
+                self.assertEqual(result["selectedHeapClasses"], {"NSArray": {"instances": 3, "bytes": 96}})
+                self.assertEqual(json.loads((output / "memory-baseline.json").read_text()), result)
+                self.assertEqual((output / "private-baseline-leaks.txt").read_text(), raw + "leaks diagnostic\n")
+                self.assertEqual((output / "private-baseline-heap.txt").read_text(), heap)
+
+    def test_unavailable_leak_scan_keeps_raw_without_heap_or_memory_receipt(self):
+        summary = "Process 1234: 0 leaks for 0 total leaked bytes.\n"
+        for exit_code, stdout in ((2, summary), (-9, summary), (0, ""), (1, "")):
+            with self.subTest(exit_code=exit_code, stdout=stdout), tempfile.TemporaryDirectory(prefix="quickfile-memory-test-") as temporary:
+                output = Path(temporary)
+                failed = subprocess.CompletedProcess([], exit_code, stdout, "error: process unavailable\n")
+                with patch.object(RUN.subprocess, "run", return_value=failed) as commands:
+                    with self.assertRaisesRegex(RuntimeError, f"Leak scan could not inspect owned process; exit {exit_code}"):
+                        RUN.scan(1234, output, "baseline")
+                commands.assert_called_once()
+                self.assertEqual(commands.call_args.args[0][0], "leaks")
+                self.assertEqual((output / "private-baseline-leaks.txt").read_text(), stdout + failed.stderr)
+                self.assertFalse((output / "memory-baseline.json").exists())
+                self.assertFalse((output / "private-baseline-heap.txt").exists())
+
+    def test_allocation_roots_accepts_zero_and_one_and_keeps_raw(self):
+        for exit_code, nodes in ((0, 0), (1, 2)):
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory(prefix="quickfile-address-test-") as temporary:
+                output = Path(temporary)
+                raw = f"Process 1234: {nodes} leaks for {nodes * 32} total leaked bytes.\n"
+                if nodes:
+                    raw += "  2 (64 bytes) ROOT LEAK: 0xabc NSArray\n"
+                completed = subprocess.CompletedProcess([], exit_code, raw, "leaks diagnostic\n")
+                with patch.object(ROW_MEMORY.subprocess, "run", return_value=completed) as commands:
+                    roots = ROW_MEMORY.allocation_roots(1234, output, "baseline")
+                commands.assert_called_once()
+                self.assertEqual(roots, {"0xabc"} if nodes else set())
+                self.assertEqual((output / "private-baseline-addresses.txt").read_text(), raw + completed.stderr)
+
+    def test_unavailable_allocation_scan_keeps_raw_and_rejects_even_valid_summary(self):
+        summary = "Process 1234: 0 leaks for 0 total leaked bytes.\n"
+        for exit_code, stdout in ((2, summary), (-9, summary), (0, ""), (1, "")):
+            with self.subTest(exit_code=exit_code, stdout=stdout), tempfile.TemporaryDirectory(prefix="quickfile-address-test-") as temporary:
+                output = Path(temporary)
+                failed = subprocess.CompletedProcess([], exit_code, stdout, "error: process unavailable\n")
+                with patch.object(ROW_MEMORY.subprocess, "run", return_value=failed) as commands:
+                    with self.assertRaisesRegex(RuntimeError, f"Cannot collect per-address leak evidence; exit {exit_code}"):
+                        ROW_MEMORY.allocation_roots(1234, output, "baseline")
+                commands.assert_called_once()
+                self.assertEqual((output / "private-baseline-addresses.txt").read_text(), stdout + failed.stderr)
+                self.assertEqual(list(output.glob("*.json")), [])
+
+    def test_allocation_failure_aborts_case_before_history_release_or_success_receipts(self):
+        with tempfile.TemporaryDirectory(prefix="quickfile-address-protocol-test-") as temporary:
+            output = Path(temporary) / "case"
+
+            class FixtureProcess:
+                returncode = None
+
+                def __init__(self, command, **kwargs):
+                    self.pid = 1235 if command[0] == "reader" else 1234
+                    if self.pid == 1234:
+                        (output / "ready.json").write_text(json.dumps({"checkpoint": "baseline", "modelOperationsIdle": True}))
+                        (output / "ax-baseline.json").write_text(json.dumps({"pid": self.pid, "readCount": 1}))
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout):
+                    self.returncode = 0
+                    return 0
+
+                def terminate(self):
+                    self.returncode = -15
+
+            failed = subprocess.CompletedProcess([], 2, "Process 1234: 0 leaks for 0 total leaked bytes.\n", "error: unavailable\n")
+            with patch.object(ROW_MEMORY.UI, "CHECKPOINTS", ("baseline",)), \
+                    patch.object(ROW_MEMORY.subprocess, "Popen", side_effect=FixtureProcess), \
+                    patch.object(ROW_MEMORY.subprocess, "run", return_value=failed) as commands, \
+                    patch.object(ROW_MEMORY, "scan", return_value={"leaks": 0, "rssBytes": 0, "physicalFootprintBytes": 0}) as scans, \
+                    patch.object(ROW_MEMORY.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "Cannot collect per-address leak evidence; exit 2"):
+                    ROW_MEMORY.run_case(Path("fixture"), Path("reader"), output, observed=True)
+            scans.assert_called_once()
+            commands.assert_called_once()
+            self.assertEqual(commands.call_args.args[0][0], "leaks")
+            self.assertEqual((output / "private-before-reader-exit-addresses.txt").read_text(), failed.stdout + failed.stderr)
+            for receipt in ("summary.json", "address-persistence.json", "release-reader", "continue-baseline",
+                            "private-root-before-exit.txt", "private-root-after-exit.txt"):
+                self.assertFalse((output / receipt).exists(), receipt)
+            self.assertTrue((output / "abort").exists())
 
 
 class UIRecoveryProtocolTests(unittest.TestCase):
