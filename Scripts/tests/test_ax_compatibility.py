@@ -19,6 +19,70 @@ SPEC = importlib.util.spec_from_file_location("verify_ax_compatibility", INVESTI
 PROBE = importlib.util.module_from_spec(SPEC)
 with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
     SPEC.loader.exec_module(PROBE)
+REPORT = sys.modules["ax_probe_report"]
+
+
+class AXHeapDiagnosticTests(unittest.TestCase):
+    @staticmethod
+    def report(count=1, size=48, kind="NSMutableArray", stack="-[NSXPCConnection initWithMachServiceName:options:]"):
+        return (f"Process 123: {count} leak{'s' if count != 1 else ''} for {size * count} total leaked bytes.\n"
+                + "".join(f"\nLeak: 0x{index + 4096:x}  size={size}  zone: PrivateZone_0x4321   {kind}  ObjC  Foundation\n"
+                          f"\tCall stack:\n0 Foundation 0x9999 {stack} + 8\n" for index in range(count)))
+
+    def test_singular_and_plural_reports_retain_counts_without_raw_text(self):
+        for count in (1, 3):
+            result = REPORT.heap_diff_summary(self.report(count))
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["groups"], [{"type": "NSMutableArray", "size": 48, "count": count}])
+            self.assertEqual(result["stack_matches"]["xpc_connection"], count)
+            self.assertNotIn("0x", json.dumps(result))
+            self.assertNotIn("PrivateZone", json.dumps(result))
+
+    def test_unknown_types_stacks_and_malformed_reports_are_explicit(self):
+        result = REPORT.heap_diff_summary(self.report(kind="/private/user/secret", stack="secret_symbol"))
+        self.assertEqual(result["groups"][0]["type"], "unknown")
+        self.assertEqual(result["unknown_stack_nodes"], 1)
+        self.assertNotIn("secret", json.dumps(result))
+        self.assertEqual(REPORT.heap_diff_summary("unsupported output")["status"], "unavailable")
+        malformed = self.report().replace("Leak: 0x1000", "Unexpected: 0x1000")
+        self.assertEqual(REPORT.heap_diff_summary(malformed)["status"], "partial")
+        self.assertEqual(REPORT.heap_diff_summary(malformed)["unparsed_nodes"], 1)
+        self.assertEqual(REPORT.heap_diff_summary(self.report().replace("48 total", "49 total"))["status"], "partial")
+
+    def test_public_validator_rejects_extra_fields_unbounded_values_and_text(self):
+        point = REPORT.heap_diff_summary(self.report()) | {"label": "registered-10"}
+        valid = {"schema": 1, "status": "partial", "checkpoints": [point]}
+        REPORT.validate_heap_diagnostics_summary(valid)
+        for mutate in (
+                lambda value: value.update(path="/private/secret"),
+                lambda value: value.update(status="secret"),
+                lambda value: value.update(schema=True),
+                lambda value: value.update(status="complete"),
+                lambda value: value["checkpoints"][0].update(new_bytes=10 ** 20),
+                lambda value: value["checkpoints"][0].update(label="secret"),
+                lambda value: value["checkpoints"][0].update(label="baseline"),
+                lambda value: value["checkpoints"][0]["groups"][0].update(type="secret"),
+                lambda value: value["checkpoints"][0]["stack_matches"].update(secret=1),
+                lambda value: value["checkpoints"][0].update(groups=point["groups"] * 33)):
+            invalid = json.loads(json.dumps(valid))
+            mutate(invalid)
+            with self.assertRaises(ValueError):
+                REPORT.validate_heap_diagnostics_summary(invalid)
+
+    def test_aggregation_has_a_global_row_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for label in REPORT.HEAP_LABELS:
+                (root / f"{label}.memgraph").touch()
+            report = "Process 123: 40 leaks for 820 total leaked bytes.\n" + "".join(
+                f"\nLeak: 0x{index + 4096:x}  size={index}  zone: zone   unknown\n" for index in range(1, 41))
+            with mock.patch.object(REPORT.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, report, "")):
+                REPORT.collect_heap_diagnostics(root, root)
+            summary = json.loads((root / "heap-diagnostics.json").read_text())
+            REPORT.validate_heap_diagnostics_summary(summary)
+            self.assertEqual(summary["status"], "partial")
+            self.assertEqual(sum(len(point["groups"]) for point in summary["checkpoints"]), 32)
+            self.assertLessEqual((root / "heap-diagnostics.json").stat().st_size, 16 * 1024)
 
 
 class AXCompatibilityPreflightTests(unittest.TestCase):
@@ -113,7 +177,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
     """Inject process/scan results while exercising the real runner protocol."""
 
     def exercise_runner(self, *, failed_scan=None, invalid_notifications=False,
-                        system_baseline=False, insufficient_compensation=False, ownership_trace=False):
+                        system_baseline=False, insufficient_compensation=False, ownership_trace=False, heap_diagnostics=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -161,6 +225,13 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         "images": {"AppKit": "synthetic", "CoreFoundation": "synthetic"}}
                     output = json.dumps(capability)
                 elif command[0] == "leaks":
+                    capture = next((value for value in command if value.startswith("--outputGraph=")), None)
+                    if capture:
+                        pathlib.Path(capture.split("=", 1)[1]).touch()
+                        return subprocess.CompletedProcess(command, 0, "", "")
+                    if "--list" in command:
+                        self.assertTrue(all(process.returncode == 0 for process in processes))
+                        return subprocess.CompletedProcess(command, 0, "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
                     label = scan_labels[len(scanned)]
                     scanned.append(label)
                     nodes, size = (287, 18_768) if label == failed_scan else (280, 18_416)
@@ -206,6 +277,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.append("--system-baseline")
             if ownership_trace:
                 arguments.append("--ownership-trace")
+            if heap_diagnostics:
+                arguments.append("--heap-diagnostics")
             with mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
                     mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
                     mock.patch.object(PROBE.subprocess, "Popen", side_effect=FixtureProcess), \
@@ -224,6 +297,13 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             self.assertTrue(all(process.returncode == 0 for process in processes))
             self.assertEqual(summary["scans"][0]["label"], "baseline")
             scans = json.loads((records / "scans.json").read_text())
+            if heap_diagnostics:
+                diagnostic = json.loads((records / "heap-diagnostics.json").read_text())
+                REPORT.validate_heap_diagnostics_summary(diagnostic)
+                self.assertEqual(diagnostic["status"], "complete")
+                live_scans = [command for command in commands if command[0] == "leaks" and command[-1] == "1234"]
+                self.assertEqual(len(live_scans), len(scan_labels))
+                self.assertTrue(all(any(value.startswith("--outputGraph=") for value in command) for command in live_scans))
             self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
             self.assertEqual(scans[-1]["host"]["destroyedButtons"], 30)
             if system_baseline:
@@ -249,6 +329,13 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["coverage"], "passed")
         self.assertEqual(summary["ax_leak_nodes"], 0)
         self.assertNotIn("validation_errors", summary)
+
+    def test_diagnostics_capture_once_per_stage_and_preserve_heap_failure(self):
+        exit_code, summary = self.exercise_runner(failed_scan="registered-10", heap_diagnostics=True)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["coverage"], "failed")
+        self.assertIsNone(summary["ax_leak_nodes"])
+        self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["registered-10"])
 
     def test_intermediate_growth_still_fails_after_heap_returns_to_baseline(self):
         for label in ("registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"):

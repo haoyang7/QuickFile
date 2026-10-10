@@ -8,6 +8,11 @@ on:
         type: boolean
         required: false
         default: false
+      heap_diagnostics:
+        description: 'Investigate macOS 26 heap growth with five independent product fixtures and bounded summaries'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ defaults:
 
 jobs:
   ax-system-probe:
+    if: ${{ !inputs.heap_diagnostics }}
     name: macOS ${{ matrix.expected_os }} (arm64)
     strategy:
       fail-fast: false
@@ -115,6 +121,123 @@ jobs:
           python3 - <<'PY'
           import pathlib, shutil
           root = pathlib.Path('.build/Temporary/ax-system-probe')
+          if root.exists():
+              assert not root.is_symlink()
+              shutil.rmtree(root)
+          PY
+
+  ax-heap-diagnostics:
+    if: ${{ inputs.heap_diagnostics }}
+    name: macOS 26 heap diagnostics (arm64)
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      CAUSAL_PROBE: ${{ inputs.ax_causal_probe }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Verify investigation identity
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          def output(*command):
+              return subprocess.check_output(command, text=True).strip()
+          assert os.environ['CAUSAL_PROBE'] == 'false', 'Choose one investigation mode'
+          version = output('sw_vers', '-productVersion')
+          architecture = output('uname', '-m')
+          xcode = output('xcodebuild', '-version')
+          assert version.split('.')[0] == '26' and architecture == 'arm64'
+          assert xcode.splitlines()[0] == 'Xcode 26.3'
+          print(json.dumps({'scope':'synthetic-AX-heap-investigation',
+              'checkout_sha':output('git', 'rev-parse', 'HEAD'), 'macos':version,
+              'os_build':output('sw_vers', '-buildVersion'), 'architecture':architecture, 'xcode':xcode}))
+          PY
+      - name: Measure five independent product fixtures
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, signal, subprocess, sys
+          sys.path.insert(0, 'Scripts/Investigations')
+          from ax_probe_report import validate_heap_diagnostics_summary
+          root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
+          root.mkdir(parents=True, exist_ok=False)
+          failed = False
+          for trial in range(1, 6):
+              directory = root / f'trial-{trial}'
+              directory.mkdir()
+              records = directory / 'records'
+              with (directory / 'runner.log').open('w') as log:
+                  try:
+                      process = subprocess.Popen([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
+                          '--work-directory', str(directory / 'fixture'),
+                          '--records-directory', str(records), '--heap-diagnostics'],
+                          stdout=log, stderr=log, start_new_session=True)
+                      return_code = process.wait(timeout=180)
+                  except subprocess.TimeoutExpired:
+                      # Reap this trial's complete private process group, including
+                      # the synthetic host and reader if the runner cannot clean up.
+                      try:
+                          os.killpg(process.pid, signal.SIGTERM)
+                      except ProcessLookupError:
+                          pass
+                      try:
+                          process.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          pass
+                      try:
+                          os.killpg(process.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                      process.wait(timeout=5)
+                      return_code = 124
+              failed |= return_code != 0
+              receipt = {'trial': trial, 'return_code': return_code, 'diagnostics_available': False}
+              summary = records / 'heap-diagnostics.json'
+              if summary.is_file() and not summary.is_symlink() and summary.stat().st_size <= 16384:
+                  try:
+                      data = json.loads(summary.read_text())
+                      validate_heap_diagnostics_summary(data)
+                  except (ValueError, TypeError, KeyError):
+                      failed = True
+                  else:
+                      receipt.update(diagnostics_available=True, diagnostics=data)
+                      failed |= data['status'] != 'complete'
+              if not receipt['diagnostics_available']:
+                  failed = True
+              # Include only bounded original scan totals so a zero allocation
+              # diff cannot be mistaken for a passing heap-baseline assertion.
+              scan_file = records / 'scans.json'
+              receipt['scan_totals'] = []
+              if scan_file.is_file() and not scan_file.is_symlink() and scan_file.stat().st_size <= 16384:
+                  try:
+                      scans = json.loads(scan_file.read_text())
+                      labels = ['baseline', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited']
+                      if type(scans) is not list or [item['label'] for item in scans] != labels:
+                          raise ValueError('Incomplete scan totals')
+                      totals = []
+                      for item in scans:
+                          fields = {name: item[name] for name in ['leak_nodes', 'leak_bytes', 'unclassified_nodes']}
+                          if any(type(value) is not int or not 0 <= value <= 1_000_000_000 for value in fields.values()):
+                              raise ValueError('Invalid scan totals')
+                          totals.append(dict(label=item['label'], **fields))
+                      receipt['scan_totals'] = totals
+                  except (ValueError, TypeError, KeyError):
+                      failed = True
+              if not receipt['scan_totals']:
+                  failed = True
+              print(json.dumps(receipt, separators=(',', ':')), flush=True)
+          raise SystemExit(1 if failed else 0)
+          PY
+      - name: Remove synthetic memory graphs and raw logs
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib, shutil
+          root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
           if root.exists():
               assert not root.is_symlink()
               shutil.rmtree(root)

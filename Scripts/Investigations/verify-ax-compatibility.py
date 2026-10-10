@@ -16,7 +16,7 @@ import plistlib
 import re
 import subprocess
 import time
-from ax_probe_report import disassemble_symbols, leak_groups
+from ax_probe_report import collect_heap_diagnostics, disassemble_symbols, leak_groups
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -91,6 +91,7 @@ def main():
     parser.add_argument("--work-directory", required=True, type=Path)
     parser.add_argument("--records-directory", required=True, type=Path)
     parser.add_argument("--system-baseline", action="store_true")
+    parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
     parser.add_argument("--balance-copies", action="store_true", help="Causal experiment: add one autorelease at the traced call sites; requires --ownership-trace")
@@ -99,6 +100,8 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.heap_diagnostics and args.system_baseline:
+        parser.error("--heap-diagnostics requires product mode")
     if args.read_only and not args.system_baseline:
         parser.error("--read-only requires --system-baseline")
     if args.ownership_trace and (not args.system_baseline or args.read_only):
@@ -119,6 +122,9 @@ def main():
     records.mkdir(parents=True, exist_ok=False)
     state = work / "state"
     state.mkdir()
+    graphs = work / "heap"
+    if args.heap_diagnostics:
+        graphs.mkdir()
     app = work / "AXCompatibilityFixture.app"
     executable = app / "Contents/MacOS/AXCompatibilityFixture"
     executable.parent.mkdir(parents=True)
@@ -204,7 +210,18 @@ def main():
 
         def scan(label, host_state):
             started = time.monotonic()
-            result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(host.pid)],
+            target = str(host.pid)
+            if args.heap_diagnostics:
+                graph = graphs / f"{label}.memgraph"
+                capture = subprocess.run(["leaks", "--noContent", "--fullStacks", f"--outputGraph={graph}", target],
+                                         capture_output=True, text=True, timeout=60)
+                (graphs / f"{label}-capture.txt").write_text(capture.stdout + capture.stderr)
+                if capture.returncode not in (0, 1) or not graph.is_file():
+                    raise RuntimeError("Diagnostic heap graph capture was unavailable")
+                # --outputGraph suppresses the text report. Decode that same
+                # snapshot offline; do not sample the live heap a second time.
+                target = str(graph)
+            result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", target],
                                     capture_output=True, text=True, timeout=60)
             (records / f"{label}-leaks.txt").write_text(result.stdout + result.stderr)
             match = re.search(r"(\d+) leaks for (\d+) total leaked bytes", result.stdout)
@@ -336,6 +353,8 @@ def main():
                     host.wait(timeout=5)
             subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
                             "-u", str(app)], capture_output=True, timeout=15)
+            if args.heap_diagnostics:
+                collect_heap_diagnostics(graphs, records)
     return 1 if validation_errors else 0
 
 

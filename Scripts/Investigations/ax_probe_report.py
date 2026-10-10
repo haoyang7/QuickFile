@@ -12,6 +12,141 @@ import subprocess
 
 DESTROYED = "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification"
 
+# Public diagnostic output uses only these literal labels, never names copied
+# from a heap report. Unknown classes/stacks remain explicitly unclassified.
+HEAP_TYPES = ("NSXPCConnection", "NSMutableArray", "NSMutableArray (Storage)",
+              "NSArray", "NSDictionary", "NSMutableDictionary", "NSString", "NSData")
+HEAP_STACK_PATTERNS = {
+    "ax_destroyed": r"\b_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification\b",
+    "ax_registration": r"\b_NSAccessibility(?:AddObserver|RegisterObserver)\b",
+    "xpc_connection": r"(?:\bxpc_connection_create(?:_mach_service)?\b|\-\[NSXPCConnection initWith)",
+    "button_initialization": r"\-\[NSButton initWithFrame:\]",
+}
+HEAP_LABELS = ("baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited")
+
+
+def validate_heap_diagnostics_summary(value):
+    """Fail closed before a caller prints diagnostics into a public CI log."""
+    def require(condition):
+        if not condition:
+            raise ValueError("Invalid bounded heap diagnostic summary")
+
+    integer = lambda item: type(item) is int and 0 <= item <= 1_000_000_000
+    require(type(value) is dict and set(value) == {"schema", "status", "checkpoints"})
+    require(type(value["schema"]) is int and value["schema"] == 1)
+    require(value["status"] in ("complete", "partial", "unavailable"))
+    require(type(value["checkpoints"]) is list and len(value["checkpoints"]) <= 6)
+    seen, rows = set(), 0
+    fields = {"label", "status", "new_nodes", "new_bytes", "classified_nodes", "unparsed_nodes",
+              "groups", "stack_matches", "unknown_stack_nodes", "omitted_groups"}
+    for point in value["checkpoints"]:
+        require(type(point) is dict and set(point) == fields)
+        require(type(point["label"]) is str and point["label"] in HEAP_LABELS[1:] and point["label"] not in seen)
+        seen.add(point["label"])
+        require(point["status"] in ("complete", "partial", "unavailable"))
+        for key in ("new_nodes", "new_bytes", "unparsed_nodes"):
+            require(point[key] is None or integer(point[key]))
+        for key in ("classified_nodes", "unknown_stack_nodes", "omitted_groups"):
+            require(integer(point[key]))
+        require(type(point["stack_matches"]) is dict and set(point["stack_matches"]) == set(HEAP_STACK_PATTERNS))
+        require(all(integer(count) for count in point["stack_matches"].values()))
+        require(type(point["groups"]) is list)
+        rows += len(point["groups"])
+        require(rows <= 32)
+        for group in point["groups"]:
+            require(type(group) is dict and set(group) == {"type", "size", "count"})
+            require(type(group["type"]) is str and group["type"] in (*HEAP_TYPES, "unknown"))
+            require(integer(group["size"]) and integer(group["count"]))
+        if point["status"] == "complete":
+            require(point["unparsed_nodes"] == 0 and point["omitted_groups"] == 0)
+            require(point["new_nodes"] == point["classified_nodes"] == sum(group["count"] for group in point["groups"]))
+            require(point["new_bytes"] == sum(group["size"] * group["count"] for group in point["groups"]))
+    if value["status"] == "complete":
+        require(seen == set(HEAP_LABELS[1:]) and all(point["status"] == "complete" for point in value["checkpoints"]))
+    require(len(json.dumps(value, ensure_ascii=True).encode("utf-8")) <= 16 * 1024)
+
+
+def heap_diff_summary(report):
+    """Summarize `leaks --list --diffFrom` without exposing arbitrary text.
+
+    At most 32 type/size groups and four fixed stack counters are exported.
+    Counts/sizes are bounded, and unsupported/truncated input cannot claim
+    complete classification. Stack matches are evidence, not causal verdicts.
+    """
+    limit = 1_000_000_000
+    summary = {"status": "unavailable", "new_nodes": None, "new_bytes": None,
+               "classified_nodes": 0, "unparsed_nodes": None, "groups": [],
+               "stack_matches": {name: 0 for name in HEAP_STACK_PATTERNS},
+               "unknown_stack_nodes": 0, "omitted_groups": 0}
+    if len(report) > 16 * 1024 * 1024:
+        return summary
+    total = re.search(r"^Process \d+: (\d+) leaks? for (\d+) total leaked bytes\.", report, re.MULTILINE)
+    if not total or any(len(value) > 10 or int(value) > limit for value in total.groups()):
+        return summary
+    summary.update(new_nodes=int(total[1]), new_bytes=int(total[2]))
+    groups = {}
+    parsed_bytes = 0
+    for block in report.split("Binary Images:", 1)[0].split("\nLeak: ")[1:]:
+        header = re.match(r"0x[0-9a-fA-F]+\s+size=(\d+)\s+zone:\s+\S+\s+([^\n]*)", block)
+        if not header or len(header[1]) > 10 or int(header[1]) > limit:
+            continue
+        size = int(header[1])
+        # leaks separates a type description, language, and image with 2+ spaces.
+        description = re.split(r"\s{2,}", header[2].strip())[0]
+        kind = description if description in HEAP_TYPES else "unknown"
+        key = (kind, size)
+        groups[key] = groups.get(key, 0) + 1
+        summary["classified_nodes"] += 1
+        parsed_bytes += size
+        stack = block.partition("Call stack:")[2]
+        matched = False
+        for name, pattern in HEAP_STACK_PATTERNS.items():
+            if re.search(pattern, stack):
+                summary["stack_matches"][name] += 1
+                matched = True
+        if not matched:
+            summary["unknown_stack_nodes"] += 1
+    summary["unparsed_nodes"] = max(0, summary["new_nodes"] - summary["classified_nodes"])
+    summary["groups"] = [{"type": kind, "size": size, "count": count}
+                         for (kind, size), count in sorted(groups.items())[:32]]
+    summary["omitted_groups"] = max(0, len(groups) - 32)
+    summary["status"] = ("complete" if summary["classified_nodes"] == summary["new_nodes"]
+                         and parsed_bytes == summary["new_bytes"] and not summary["omitted_groups"] else "partial")
+    return summary
+
+
+def collect_heap_diagnostics(graph_directory, records):
+    """Analyze captured graphs only after the owned fixture has stopped."""
+    checkpoints = []
+    remaining = 32
+    # The baseline is the comparison origin, not a new-node checkpoint. leaks
+    # rejects --diffFrom when both arguments refer to the same file.
+    for label in HEAP_LABELS[1:]:
+        graph = graph_directory / f"{label}.memgraph"
+        if not graph.is_file():
+            continue
+        command = ["leaks", "--noContent", "--nosources", "--fullStacks", "--list",
+                   f"--diffFrom={graph_directory / 'baseline.memgraph'}", str(graph)]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+            (graph_directory / f"{label}-diff.txt").write_text(result.stdout + result.stderr)
+            point = heap_diff_summary(result.stdout if result.returncode in (0, 1) else "")
+        except subprocess.TimeoutExpired:
+            point = heap_diff_summary("")
+        point["label"] = label
+        if len(point["groups"]) > remaining:
+            point["omitted_groups"] += len(point["groups"]) - remaining
+            point["groups"] = point["groups"][:remaining]
+            point["status"] = "partial"
+        remaining -= len(point["groups"])
+        checkpoints.append(point)
+    status = ("complete" if len(checkpoints) == len(HEAP_LABELS) - 1
+              and all(point["status"] == "complete" for point in checkpoints) else
+              "partial" if checkpoints else "unavailable")
+    summary = {"schema": 1, "status": status, "checkpoints": checkpoints}
+    validate_heap_diagnostics_summary(summary)
+    (records / "heap-diagnostics.json").write_text(json.dumps(summary) + "\n")
+
 
 def leak_groups(report):
     groups = []
