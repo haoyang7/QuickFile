@@ -21,9 +21,9 @@ import time
 from ax_process import reap_owned
 from ax_probe_report import (capture_terminal_snapshot, collect_heap_diagnostics, collect_terminal_snapshot,
                              disassemble_symbols, empty_terminal_snapshot, leak_groups)
-from ax_external_receipt import (EXECUTABLES, FIXTURE_SOURCES, fixture_hashes, fixture_sources, load_prepared_fixture,
+from ax_external_receipt import (EXECUTABLES, FIXTURE_SOURCES, INSTALL_ENV, INSTALL_MODES, fixture_hashes, fixture_sources, load_prepared_fixture,
                                  owned_child_receipt, require_fixture_hashes, validate_empty_control_build,
-                                 validate_external_receipt)
+                                 validate_external_receipt, validate_install_gate_build, validate_install_gate_state)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -57,7 +57,18 @@ def validate_empty_control_capabilities(host, mode):
         raise RuntimeError("Patched empty-control capability did not install the product patch")
 
 
-def preflight_reason(host, reader, system_baseline=False, empty_control_mode=None):
+def validate_install_gate_capabilities(host, mode):
+    if type(host) is not dict:
+        raise RuntimeError("Invalid install-gate capability")
+    validate_install_gate_state(host.get("install_probe"), mode)
+    if (host.get("enabled") is not (mode == "installed")
+            or host.get("status") != ("enabled" if mode == "installed" else "probe-preflight-only")):
+        raise RuntimeError("Install-gate capability does not match the method state")
+
+
+def preflight_reason(host, reader, system_baseline=False, empty_control_mode=None, install_gate=None):
+    if install_gate:
+        validate_install_gate_capabilities(host, install_gate)
     if empty_control_mode:
         validate_empty_control_capabilities(host, empty_control_mode)
     if not system_baseline and host["status"] in ("unsupported-images", "unsupported-architecture"):
@@ -65,7 +76,7 @@ def preflight_reason(host, reader, system_baseline=False, empty_control_mode=Non
     if system_baseline:
         if host["enabled"] or host["status"] != "system-baseline":
             raise RuntimeError("System baseline must preserve the unpatched implementation")
-    elif empty_control_mode != "pure-appkit" and not host["enabled"]:
+    elif empty_control_mode != "pure-appkit" and install_gate != "preflight-only" and not host["enabled"]:
         raise RuntimeError(f"Unexpected installation refusal: {host['status']}")
     if not isinstance(reader.get("trusted"), bool):
         raise RuntimeError("AX reader returned an invalid capability receipt")
@@ -154,6 +165,8 @@ def main():
     parser.add_argument("--heap-control", action="store_true", help="Match the selected product scan checkpoints with an empty window and no target buttons; requires --heap-diagnostics or --malloc-scribble")
     parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; uses ordinary live scans unless --heap-diagnostics is selected")
     parser.add_argument("--prepare-external-fixture", action="store_true", help="Build host/reader once without running them; ordinary binaries unless --empty-control-mode is explicit")
+    parser.add_argument("--prepare-install-gate-fixture", action="store_true", help="Prepare one diagnostic host/reader build for both install-gate modes")
+    parser.add_argument("--install-gate", choices=INSTALL_MODES, help="Use the prepared install-gate fixture; requires external off/live empty control")
     parser.add_argument("--external-startup-receipt", action="store_true", help="Read owned child startup metadata outside the ordinary fixture; requires live MallocScribble and a prepared fixture")
     parser.add_argument("--prepared-fixture-directory", type=Path)
     parser.add_argument("--empty-control-mode", choices=("patched", "pure-appkit"), help="Explicit empty-control build/measurement; pure-appkit excludes the production AX implementation; measurement requires external startup receipts, MallocScribble off and --heap-control")
@@ -167,6 +180,13 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.prepare_install_gate_fixture:
+        if args.install_gate or args.empty_control_mode:
+            parser.error("Install-gate preparation cannot select a measurement or empty-control build mode")
+        args.prepare_external_fixture = True
+    if args.install_gate and (args.prepare_external_fixture or args.empty_control_mode or args.terminal_origin
+            or not args.heap_control or not args.external_startup_receipt or args.malloc_scribble != "off"):
+        parser.error("--install-gate requires the prepared external off/live empty control")
     if args.empty_control_mode and not args.prepare_external_fixture and (
             not args.heap_control or not args.external_startup_receipt or args.malloc_scribble != "off" or args.terminal_origin):
         parser.error("--empty-control-mode requires an independent preparation or external off/live heap control without a terminal graph")
@@ -218,7 +238,7 @@ def main():
     app = work / "AXCompatibilityFixture.app"
     executable = app / "Contents/MacOS/AXCompatibilityFixture"
     reader_executable = work / "ax-reader"
-    build_mode = args.empty_control_mode or "ordinary"
+    build_mode = "install-gate" if args.prepare_install_gate_fixture or args.install_gate else args.empty_control_mode or "ordinary"
     sources = fixture_sources(build_mode)
     commands = []
 
@@ -248,6 +268,8 @@ def main():
             common += ["-I", str(ROOT / "QuickFileApp")]
         if args.empty_control_mode:
             common.append("-DQUICKFILE_AX_EMPTY_CONTROL")
+        if build_mode == "install-gate":
+            common.append("-DQUICKFILE_AX_INSTALL_PROBE")
         if build_mode == "pure-appkit":
             common.append("-DQUICKFILE_AX_PURE_APPKIT_CONTROL")
         if args.malloc_scribble:
@@ -277,8 +299,21 @@ def main():
         entitlements.write_bytes(plistlib.dumps({"com.apple.security.get-task-allow": True}))
         run(["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(app)])
     if args.prepare_external_fixture:
-        manifest = {"schema": 2 if args.empty_control_mode else 1, "build_mode": build_mode, "sources": source_hashes,
+        manifest = {"schema": 3 if build_mode == "install-gate" else 2 if args.empty_control_mode else 1, "build_mode": build_mode, "sources": source_hashes,
                     "executables": fixture_hashes(work)}
+        if build_mode == "install-gate":
+            presence = {}
+            for role, name in EXECUTABLES.items():
+                symbols = run(["xcrun", "nm", "-j", str(work / name)]).stdout.splitlines()
+                if "_main" not in symbols:
+                    raise RuntimeError("Install-gate executable symbol table unavailable")
+                presence[role] = "_QuickFileAXInstallProbeGate" in symbols
+            definitions = [flag[2:] for flag in common if flag.startswith("-D")]
+            manifest["build_evidence"] = {
+                "link_inputs": {"host": [FIXTURE_SOURCES[0]] + [Path(path).name for path in production_objects], "reader": [FIXTURE_SOURCES[1]]},
+                "compile_definitions": {"production": definitions, "host": definitions, "reader": []},
+                "gate_symbol_present": presence}
+            validate_install_gate_build(manifest["build_evidence"])
         if args.empty_control_mode:
             counts = {}
             for role, name in EXECUTABLES.items():
@@ -305,6 +340,8 @@ def main():
         external_receipt = {"receipt_mode": "external-startup", "requested": args.malloc_scribble,
                             "host": None, "reader": None, "executables": expected_hashes,
                             "binary_reuse_verified": False}
+        if args.install_gate:
+            external_receipt["install_gate"] = args.install_gate
         write_json(records / "external-startup.json", external_receipt)
     environment = dict(os.environ)
     environment.pop("QUICKFILE_DISABLE_AX_COMPATIBILITY", None)
@@ -318,6 +355,9 @@ def main():
             if args.malloc_scribble == "on":
                 target_environment["MallocScribble"] = "1"
         write_json(records / "malloc-scribble.json", allocator_receipt)
+    if args.install_gate:
+        for target_environment in (environment, reader_environment):
+            target_environment[INSTALL_ENV] = args.install_gate
     host_arguments = ["--system-baseline"] if args.system_baseline else []
     capability = subprocess.run([str(executable), "--capabilities", *host_arguments], env=environment,
                                 capture_output=True, text=True, check=True, timeout=15)
@@ -332,7 +372,7 @@ def main():
     write_json(records / "inputs.json", {"capabilities": capabilities, "reader_capabilities": reader_capabilities,
         "system": run(["sw_vers"]).stdout,
         "sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources}})
-    reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline, args.empty_control_mode)
+    reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline, args.empty_control_mode, args.install_gate)
     if reason:
         receipt = {"coverage": "not-covered", "reason": reason,
                    "host": capabilities, "reader": reader_capabilities}
@@ -381,6 +421,8 @@ def main():
             receipt = wait_json(state / "ready.json", lambda value: value["sequence"] == sequence, [host])
             if args.heap_control:
                 validate(f"control-host-{sequence}", validate_control_host, receipt)
+            if args.install_gate:
+                validate(f"install-gate-host-{sequence}", validate_install_gate_state, receipt.get("install_probe"), args.install_gate)
             if args.copy_lifetime:
                 record_copy_lifetime_host(receipt, expected_copies)
             return receipt
@@ -403,7 +445,7 @@ def main():
             write_json(records / "malloc-scribble.json", allocator_receipt)
 
         def record_external_environment(role, process, path, child_environment):
-            value = owned_child_receipt(process, path, child_environment, args.malloc_scribble, expected_hashes[role])
+            value = owned_child_receipt(process, path, child_environment, args.malloc_scribble, expected_hashes[role], args.install_gate)
             external_receipt[role] = value
             allocator_receipt[role] = value["malloc_scribble"]
             write_json(records / "external-startup.json", external_receipt)
@@ -414,7 +456,7 @@ def main():
             require_fixture_hashes(work, expected_hashes)
             external_receipt["binary_reuse_verified"] = True
             write_json(records / "external-startup.json", external_receipt)
-            validate_external_receipt(external_receipt, args.malloc_scribble, expected_hashes)
+            validate_external_receipt(external_receipt, args.malloc_scribble, expected_hashes, args.install_gate)
 
         def scan(label, host_state):
             if args.copy_lifetime:
@@ -454,6 +496,9 @@ def main():
         try:
             host = subprocess.Popen([str(executable), str(state), *host_arguments], env=environment, stdout=host_log, stderr=host_log)
             initial = wait_json(state / "ready.json", lambda value: value["sequence"] == 0, [host])
+            if args.install_gate:
+                write_json(records / "install-gate-initial.json", initial.get("install_probe"))
+                validate("install-gate-host-0", validate_install_gate_state, initial.get("install_probe"), args.install_gate)
             if args.external_startup_receipt:
                 validate("external-startup-host", record_external_environment, "host", host, executable, environment)
             elif args.malloc_scribble:
@@ -602,6 +647,10 @@ def main():
                 summary["empty_control_mode"] = args.empty_control_mode
                 summary["product_compensation_enabled"] = args.empty_control_mode == "patched"
                 summary["scope"] += "; " + args.empty_control_mode + " empty control; no product destruction coverage"
+            if args.install_gate:
+                summary["install_gate"] = args.install_gate
+                summary["product_compensation_enabled"] = args.install_gate == "installed"
+                summary["scope"] += "; install-gate empty control; no product destruction coverage"
             if validation_errors:
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors

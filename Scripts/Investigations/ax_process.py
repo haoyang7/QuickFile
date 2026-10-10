@@ -57,8 +57,10 @@ def group_exit_status(pgid, timeout=5):
             leader_seen = False
             for line in result.stdout.splitlines():
                 fields = line.split()
+                # macOS ps uses '?' when task/thread state is unavailable.
+                # An owned unknown state must still wait for confirmed exit.
                 if (len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit()
-                        or not re.fullmatch(r"[A-Z][A-Za-z0-9+<>Ns-]*", fields[2])):
+                        or not re.fullmatch(r"[A-Z?][A-Za-z0-9+<>Ns-]*", fields[2])):
                     return "parse_failed"
                 pid, group = int(fields[0]), int(fields[1])
                 if pid == pgid:

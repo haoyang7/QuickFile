@@ -39,6 +39,11 @@ on:
         type: boolean
         required: false
         default: false
+      install_gate_control:
+        description: 'Five live off pairs of installed/preflight-only empty controls from one probe build; other inputs must remain defaults'
+        required: false
+        type: boolean
+        default: false
       pure_appkit_control:
         description: 'Five live off pairs of patched/pure AppKit empty controls; requires all other inputs at defaults'
         type: boolean
@@ -58,7 +63,7 @@ defaults:
 
 jobs:
   ax-system-probe:
-    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin && !inputs.pure_appkit_control }}
+    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin && !inputs.pure_appkit_control && !inputs.install_gate_control }}
     name: macOS ${{ matrix.expected_os }} (arm64)
     strategy:
       fail-fast: false
@@ -158,10 +163,10 @@ jobs:
           PY
 
   ax-heap-diagnostics:
-    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin || inputs.pure_appkit_control }}
-    name: macOS 26 ${{ inputs.pure_appkit_control && 'pure AppKit live' || inputs.scan_mode }} heap comparison (arm64)
+    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin || inputs.pure_appkit_control || inputs.install_gate_control }}
+    name: macOS 26 ${{ inputs.install_gate_control && 'install gate live' || inputs.pure_appkit_control && 'pure AppKit live' || inputs.scan_mode }} heap comparison (arm64)
     runs-on: macos-26
-    timeout-minutes: ${{ inputs.malloc_scribble && 70 || inputs.pure_appkit_control && 40 || 35 }}
+    timeout-minutes: ${{ inputs.malloc_scribble && 70 || (inputs.pure_appkit_control || inputs.install_gate_control) && 40 || 35 }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       CAUSAL_PROBE: ${{ inputs.ax_causal_probe }}
@@ -171,6 +176,7 @@ jobs:
       AX_HEAP_DIAGNOSTICS: ${{ inputs.heap_diagnostics }}
       AX_TERMINAL_ORIGIN: ${{ inputs.terminal_origin }}
       AX_PURE_APPKIT_CONTROL: ${{ inputs.pure_appkit_control }}
+      AX_INSTALL_GATE_CONTROL: ${{ inputs.install_gate_control }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -189,15 +195,17 @@ jobs:
           receipt_mode = os.environ['AX_RECEIPT_MODE']
           terminal_origin = os.environ.get('AX_TERMINAL_ORIGIN', 'false') == 'true'
           pure_control = os.environ.get('AX_PURE_APPKIT_CONTROL', 'false') == 'true'
-          if pure_control:
+          install_control = os.environ.get('AX_INSTALL_GATE_CONTROL', 'false') == 'true'
+          assert not (pure_control and install_control), 'Choose one empty-control investigation'
+          if pure_control or install_control:
               assert (scan_mode == 'diagnostic' and receipt_mode == 'internal' and not terminal_origin
-                  and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == os.environ['AX_HEAP_DIAGNOSTICS'] == 'false'), 'Pure AppKit control requires other inputs at defaults'
+                  and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == os.environ['AX_HEAP_DIAGNOSTICS'] == 'false'), 'Empty-control investigation requires other inputs at defaults'
               scan_mode, receipt_mode = 'live', 'external-startup'
           assert receipt_mode in ('internal', 'external-startup'), 'Unknown receipt mode'
-          assert receipt_mode != 'external-startup' or (scan_mode == 'live' and (pure_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true')), 'External startup receipts require live MallocScribble'
+          assert receipt_mode != 'external-startup' or (scan_mode == 'live' and (pure_control or install_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true')), 'External startup receipts require live MallocScribble'
           assert receipt_mode != 'external-startup' or os.environ['AX_HEAP_DIAGNOSTICS'] == 'false', 'External startup receipts cannot request frozen diagnostics'
           assert scan_mode in ('diagnostic', 'live'), 'Unknown heap scan mode'
-          assert scan_mode != 'live' or pure_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires malloc_scribble'
+          assert scan_mode != 'live' or pure_control or install_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires malloc_scribble'
           assert not terminal_origin or (scan_mode == 'live' and receipt_mode == 'external-startup'), 'Terminal origin requires external live comparison'
           version = output('sw_vers', '-productVersion')
           architecture = output('uname', '-m')
@@ -223,6 +231,8 @@ jobs:
               'malloc_scribble_experiment':os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'}
           if pure_control:
               identity['pure_appkit_control'] = True
+          if install_control:
+              identity['install_gate_control'] = True
           root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
           root.mkdir(parents=True, exist_ok=False)
           (root / 'summary.json').write_text(json.dumps({'identity':identity, 'trials':[], 'completed':False,
@@ -235,7 +245,7 @@ jobs:
           import json, os, pathlib, re, sys
           sys.path.insert(0, 'Scripts/Investigations')
           from ax_probe_report import validate_heap_diagnostics_summary, validate_terminal_snapshot, validation_failure_counts
-          from ax_external_receipt import fixture_sources, load_prepared_build, validate_external_receipt
+          from ax_external_receipt import fixture_sources, load_prepared_build, validate_external_receipt, validate_install_gate_state
           from ax_process import run_owned
           import hashlib
           from importlib import import_module
@@ -249,16 +259,18 @@ jobs:
           external_receipt = public_summary['identity']['receipt_mode'] == 'external-startup'
           terminal_origin = public_summary['identity'].get('terminal_origin', False)
           pure_control = public_summary['identity'].get('pure_appkit_control', False)
+          install_control = public_summary['identity'].get('install_gate_control', False)
           scribble_experiment = os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'
           fixtures = {}
           if external_receipt:
-              for build_mode in (('patched', 'pure-appkit') if pure_control else ('ordinary',)):
+              for build_mode in (('install-gate',) if install_control else ('patched', 'pure-appkit') if pure_control else ('ordinary',)):
                   prepared = root / (build_mode + '-fixture')
                   prefix = build_mode + '-' if pure_control else ''
                   build_run = run_owned([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
                       '--prepare-external-fixture', '--work-directory', str(prepared),
                       '--records-directory', str(root / (prefix + 'build-records')),
-                      *(['--empty-control-mode', build_mode] if pure_control else [])], root / (prefix + 'build.log'), dict(os.environ))
+                      *(['--empty-control-mode', build_mode] if pure_control else []),
+                      *(['--prepare-install-gate-fixture'] if install_control else [])], root / (prefix + 'build.log'), dict(os.environ))
                   build_return_code = build_run['return_code']
                   if pure_control:
                       public_summary.setdefault('empty_control_builds', {})[build_mode] = {'return_code': build_return_code, 'process_run': build_run}
@@ -276,6 +288,8 @@ jobs:
                   else:
                       public_summary['fixture_executables'] = build['executables']
                       public_summary['fixture_sources'] = source_hashes
+                      if install_control:
+                          public_summary['install_gate_build'] = build
                   summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
           failed = False
           terminal_failed = False
@@ -284,10 +298,12 @@ jobs:
               modes = ('control', 'product') if trial % 2 else ('product', 'control')
               if pure_control:
                   modes = ('patched', 'pure-appkit') if trial % 2 else ('pure-appkit', 'patched')
-              settings = ('off',) if terminal_origin or pure_control else (('off', 'on') if trial % 2 else ('on', 'off')) if scribble_experiment else (None,)
+              if install_control:
+                  modes = ('installed', 'preflight-only') if trial % 2 else ('preflight-only', 'installed')
+              settings = ('off',) if terminal_origin or pure_control or install_control else (('off', 'on') if trial % 2 else ('on', 'off')) if scribble_experiment else (None,)
               for scribble, mode in ((setting, mode) for setting in settings for mode in modes):
                   if external_receipt:
-                      prepared, expected_hashes = fixtures[mode if pure_control else 'ordinary']
+                      prepared, expected_hashes = fixtures['install-gate' if install_control else mode if pure_control else 'ordinary']
                   directory = root / (f'pair-{trial}-{scribble}-{mode}' if scribble else f'pair-{trial}-{mode}')
                   directory.mkdir()
                   records = directory / 'records'
@@ -303,7 +319,8 @@ jobs:
                       *(['--external-startup-receipt', '--prepared-fixture-directory', str(prepared)] if external_receipt else []),
                       *(['--terminal-origin'] if terminal_origin else []),
                       *(['--empty-control-mode', mode] if pure_control else []),
-                      *(['--heap-control'] if mode == 'control' or pure_control else [])], directory / 'runner.log', environment)
+                      *(['--install-gate', mode] if install_control else []),
+                      *(['--heap-control'] if mode == 'control' or pure_control or install_control else [])], directory / 'runner.log', environment)
                   return_code = process_run['return_code']
                   failed |= return_code != 0 or not process_run['cleanup']['complete']
                   receipt = {'trial': trial, 'mode': mode, 'scan_mode': scan_mode, 'return_code': return_code,
@@ -311,6 +328,8 @@ jobs:
                              'receipt_mode': public_summary['identity']['receipt_mode']}
                   if pure_control:
                       receipt['fixture_mode_verified'] = False
+                  if install_control:
+                      receipt['capability_install_gate_verified'] = False
                   receipt['failure_classification_available'] = False
                   result_file = records / 'result.json'
                   if result_file.is_file() and not result_file.is_symlink() and result_file.stat().st_size <= 65536:
@@ -329,6 +348,9 @@ jobs:
                           if pure_control:
                               runner.validate_empty_control_capabilities(capabilities, mode)
                               receipt['fixture_mode_verified'] = True
+                          if install_control:
+                              runner.validate_install_gate_capabilities(capabilities, mode)
+                              receipt.update(capability_install_gate_verified=True, capability_install_gate=capabilities['install_probe'])
                           images = capabilities['images']
                           if (type(images) is not dict or set(images) != {'AppKit', 'CoreFoundation'}
                                   or any(type(value) is not str or not re.fullmatch(r'[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}', value)
@@ -357,12 +379,24 @@ jobs:
                       if startup_file.is_file() and not startup_file.is_symlink() and startup_file.stat().st_size <= 4096:
                           try:
                               startup = json.loads(startup_file.read_text())
-                              validate_external_receipt(startup, scribble, expected_hashes)
+                              validate_external_receipt(startup, scribble, expected_hashes, mode if install_control else None)
                           except (ValueError, TypeError, KeyError, RuntimeError):
                               pass
                           else:
                               receipt.update(external_startup_verified=True, startup_environment=startup)
                       failed |= not receipt['external_startup_verified']
+                  if install_control:
+                      receipt['initial_install_gate_verified'] = False
+                      initial_file = records / 'install-gate-initial.json'
+                      if initial_file.is_file() and not initial_file.is_symlink() and initial_file.stat().st_size <= 1024:
+                          try:
+                              initial_gate = json.loads(initial_file.read_text())
+                              validate_install_gate_state(initial_gate, mode)
+                          except (ValueError, TypeError, RuntimeError):
+                              pass
+                          else:
+                              receipt.update(initial_install_gate_verified=True, initial_install_gate=initial_gate)
+                      failed |= not receipt['initial_install_gate_verified'] or not receipt['capability_install_gate_verified']
                   summary = records / 'heap-diagnostics.json'
                   if diagnostics_expected and summary.is_file() and not summary.is_symlink() and summary.stat().st_size <= 16384:
                       try:
@@ -409,15 +443,18 @@ jobs:
                                   raise ValueError('Invalid scan tool exit code')
                               fields['tool_exit_code'] = tool_exit
                               failed |= tool_exit not in (0, 1)
+                              if install_control:
+                                  validate_install_gate_state(item['host'].get('install_probe'), mode)
+                                  fields['install_probe'] = item['host']['install_probe']
                               totals.append(dict(label=item['label'], **fields))
-                          if mode == 'control' or pure_control:
+                          if mode == 'control' or pure_control or install_control:
                               zero_fields = ['buttons', 'allocatedButtons', 'destroyedButtons', 'compensations', 'mutableCompensations']
                               if any(type(item['host'][key]) is not int or item['host'][key] != 0
                                      for item in scans for key in zero_fields):
                                   raise ValueError('Control had target activity')
                               receipt['control_zero_targets'] = True
                           receipt['scan_totals'] = totals
-                      except (ValueError, TypeError, KeyError):
+                      except (ValueError, TypeError, KeyError, RuntimeError):
                           failed = True
                   if not receipt['scan_totals']:
                       failed = True

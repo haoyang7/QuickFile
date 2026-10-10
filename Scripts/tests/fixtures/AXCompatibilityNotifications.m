@@ -5,6 +5,47 @@
 #ifndef QUICKFILE_AX_PURE_APPKIT_CONTROL
 #import "AXCompatibility.h"
 #endif
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+#if defined(QUICKFILE_AX_EMPTY_CONTROL) || defined(QUICKFILE_AX_MALLOC_RECEIPT) || defined(QUICKFILE_AX_OWNERSHIP_PROBE) || defined(QUICKFILE_AX_COPY_LIFETIME)
+#error Install gate controls do not support other fixture instrumentation
+#endif
+#import <objc/runtime.h>
+static Class installProbeClass;
+static IMP savedCopy, savedMutableCopy, replacementCopy, replacementMutableCopy;
+static NSUInteger installGateCalls;
+static BOOL installPreflightCompleted;
+
+static NSString *installProbeMode(void) {
+    const char *value = getenv("QUICKFILE_AX_INSTALL_PROBE_MODE");
+    if (value && !strcmp(value, "installed")) return @"installed";
+    if (value && !strcmp(value, "preflight-only")) return @"preflight-only";
+    return @"invalid";
+}
+
+BOOL QuickFileAXInstallProbeGate(Class cls, IMP copy, IMP mutableCopy, IMP corrected, IMP correctedMutable) {
+    installGateCalls++;
+    installProbeClass = cls;
+    savedCopy = copy; savedMutableCopy = mutableCopy;
+    replacementCopy = corrected; replacementMutableCopy = correctedMutable;
+    installPreflightCompleted = cls && copy && mutableCopy && corrected && correctedMutable
+        && copy != corrected && mutableCopy != correctedMutable
+        && class_getMethodImplementation(cls, @selector(copy)) == copy
+        && class_getMethodImplementation(cls, @selector(mutableCopy)) == mutableCopy;
+    return installPreflightCompleted && [installProbeMode() isEqual:@"installed"];
+}
+
+static NSString *installIMPState(SEL selector, IMP saved, IMP replacement) {
+    if (!installProbeClass || !saved || !replacement) return @"unavailable";
+    IMP current = class_getMethodImplementation(installProbeClass, selector);
+    return current == saved ? @"saved" : current == replacement ? @"replacement" : @"other";
+}
+
+static NSDictionary *installProbeSnapshot(void) {
+    return @{@"mode":installProbeMode(), @"preflight_completed":@(installPreflightCompleted),
+        @"gate_calls":@(installGateCalls), @"copy_imp":installIMPState(@selector(copy), savedCopy, replacementCopy),
+        @"mutable_copy_imp":installIMPState(@selector(mutableCopy), savedMutableCopy, replacementMutableCopy)};
+}
+#endif
 #if defined(QUICKFILE_AX_PURE_APPKIT_CONTROL) && !defined(QUICKFILE_AX_EMPTY_CONTROL)
 #error Pure AppKit requires the explicit empty-control build
 #endif
@@ -120,6 +161,9 @@ static NSUInteger allocatedButtons = 0, destroyedButtons = 0;
 #ifdef QUICKFILE_AX_MALLOC_RECEIPT
     record[@"malloc_scribble"] = mallocScribbleEnvironment();
 #endif
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+    record[@"install_probe"] = installProbeSnapshot();
+#endif
     NSData *data = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:NULL];
     [data writeToFile:[self.directory stringByAppendingPathComponent:@"ready.json"] atomically:YES];
 }
@@ -157,7 +201,7 @@ int main(int argc, const char **argv) {
  @autoreleasepool {
     BOOL systemBaseline = argc == 3 && !strcmp(argv[2], "--system-baseline");
     if (argc != 2 && !systemBaseline) return 2;
-#ifdef QUICKFILE_AX_EMPTY_CONTROL
+#if defined(QUICKFILE_AX_EMPTY_CONTROL) || defined(QUICKFILE_AX_INSTALL_PROBE)
     if (systemBaseline) return 2;
 #endif
 #ifdef QUICKFILE_AX_PURE_APPKIT_CONTROL
@@ -183,11 +227,19 @@ int main(int argc, const char **argv) {
 #ifdef QUICKFILE_AX_MALLOC_RECEIPT
         capabilities[@"malloc_scribble"] = mallocScribbleEnvironment();
 #endif
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+        capabilities[@"install_probe"] = installProbeSnapshot();
+#endif
         NSData *json = [NSJSONSerialization dataWithJSONObject:capabilities options:NSJSONWritingSortedKeys error:NULL];
         puts([[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
         return 0;
     }
-#ifndef QUICKFILE_AX_PURE_APPKIT_CONTROL
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+    NSDictionary *probe = installProbeSnapshot();
+    NSString *expected = [installProbeMode() isEqual:@"installed"] ? @"replacement" : @"saved";
+    if (!installPreflightCompleted || installGateCalls != 1 || [installProbeMode() isEqual:@"invalid"]
+        || ![probe[@"copy_imp"] isEqual:expected] || ![probe[@"mutable_copy_imp"] isEqual:expected]) return 3;
+#elif !defined(QUICKFILE_AX_PURE_APPKIT_CONTROL)
     if (!enabled && !systemBaseline) return 3;
 #endif
 #ifdef QUICKFILE_AX_OWNERSHIP_PROBE

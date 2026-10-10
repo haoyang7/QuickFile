@@ -19,6 +19,12 @@ static _Atomic(const char *) installationStatus = "not-attempted";
 #ifdef QUICKFILE_AX_COPY_LIFETIME
 extern void QuickFileAXObserveCopyLifetime(id result, BOOL mutableCopy);
 #endif
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+#ifdef QUICKFILE_AX_COPY_LIFETIME
+#error Install gate and copy lifetime probes are independent
+#endif
+extern BOOL QuickFileAXInstallProbeGate(Class cls, IMP copy, IMP mutableCopy, IMP replacementCopy, IMP replacementMutableCopy);
+#endif
 
 // The verified helper tail-calls copy, so the immediate return PC identifies
 // the exact destroyed-notification call site. Ordinary array copies are untouched.
@@ -123,6 +129,12 @@ BOOL QuickFileInstallAXCompatibility(void) {
         }
         originalCopy = (void *)method_getImplementation(copy);
         originalMutableCopy = (void *)method_getImplementation(mutableCopy);
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+        if (!QuickFileAXInstallProbeGate(cls, (IMP)originalCopy, (IMP)originalMutableCopy, (IMP)correctedCopy, (IMP)correctedMutableCopy)) {
+            atomic_store(&installationStatus, "probe-preflight-only");
+            return;
+        }
+#endif
         if (!class_addMethod(cls, @selector(copy), (IMP)correctedCopy, method_getTypeEncoding(copy))) method_setImplementation(copy, (IMP)correctedCopy);
         if (!class_addMethod(cls, @selector(mutableCopy), (IMP)correctedMutableCopy, method_getTypeEncoding(mutableCopy))) method_setImplementation(mutableCopy, (IMP)correctedMutableCopy);
         installed = YES;

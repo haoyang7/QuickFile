@@ -976,6 +976,100 @@ class AXPureAppKitControlTests(unittest.TestCase):
             PROBE.preflight_reason({"enabled": False, "status": "pure-appkit"}, {"trusted": True})
 
 
+class AXInstallGateTests(unittest.TestCase):
+    @staticmethod
+    def state(mode):
+        imp = "replacement" if mode == "installed" else "saved"
+        return {"mode": mode, "preflight_completed": True, "gate_calls": 1, "copy_imp": imp, "mutable_copy_imp": imp}
+
+    @staticmethod
+    def manifest(hashes):
+        return {"schema": 3, "build_mode": "install-gate", "executables": hashes,
+            "sources": {name: PROBE.hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in EXTERNAL.fixture_sources("install-gate")},
+            "build_evidence": {"link_inputs": {"host": [EXTERNAL.FIXTURE_SOURCES[0], "AXCompatibility.o"], "reader": [EXTERNAL.FIXTURE_SOURCES[1]]},
+                "compile_definitions": {"production": ["QUICKFILE_AX_INSTALL_PROBE"], "host": ["QUICKFILE_AX_INSTALL_PROBE"], "reader": []},
+                "gate_symbol_present": {"host": True, "reader": False}}}
+
+    def test_gate_requires_real_preflight_and_current_method_state(self):
+        for mode in EXTERNAL.INSTALL_MODES:
+            state = self.state(mode)
+            cap = {"enabled": mode == "installed", "status": "enabled" if mode == "installed" else "probe-preflight-only", "install_probe": state}
+            self.assertIsNone(PROBE.preflight_reason(cap, {"trusted": True}, install_gate=mode))
+            self.assertEqual(PROBE.preflight_reason(cap, {"trusted": False}, install_gate=mode), "reader-not-trusted")
+            invalid = [None, dict(state, gate_calls=True), dict(state, gate_calls=0), dict(state, gate_calls=2),
+                dict(state, preflight_completed=False), dict(state, preflight_completed=1), dict(state, private="secret"),
+                dict(state, copy_imp="other"), dict(state, mutable_copy_imp="unavailable"), dict(state, mode="secret"),
+                dict(state, copy_imp="saved" if mode == "installed" else "replacement")]
+            for value in invalid:
+                with self.assertRaises(RuntimeError):
+                    PROBE.preflight_reason(dict(cap, install_probe=value), {"trusted": True}, install_gate=mode)
+            for status in ("unsupported-images", "unsupported-architecture", "disabled-at-startup"):
+                with self.assertRaises(RuntimeError):
+                    PROBE.preflight_reason(dict(cap, status=status), {"trusted": True}, install_gate=mode)
+            with self.assertRaises(RuntimeError):
+                PROBE.preflight_reason(dict(cap, enabled=not cap["enabled"]), {"trusted": True}, install_gate=mode)
+
+    def test_gate_cli_rejects_incompatible_modes_before_launch(self):
+        measured = ["--heap-control", "--external-startup-receipt", "--prepared-fixture-directory", "unused", "--malloc-scribble", "off"]
+        invalid = [[], measured[1:], measured[:-1] + ["on"]]
+        invalid += [measured + [flag] for flag in ("--terminal-origin", "--heap-diagnostics", "--system-baseline", "--copy-lifetime", "--prepare-external-fixture")]
+        invalid += [measured + ["--empty-control-mode", "patched"]]
+        arguments = [["--install-gate", mode, *extra] for mode, extra in itertools.product(EXTERNAL.INSTALL_MODES, invalid)]
+        arguments += [["--prepare-install-gate-fixture", *extra] for extra in (["--empty-control-mode", "pure-appkit"], ["--install-gate", "installed"], ["--malloc-scribble", "off"], ["--heap-control"])]
+        for extra in arguments:
+            with self.subTest(extra=extra), mock.patch.object(sys, "argv", ["probe", "--work-directory", "unused", "--records-directory", "unused", *extra]), \
+                    mock.patch.object(PROBE.subprocess, "run") as run, contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                PROBE.main()
+            self.assertEqual(error.exception.code, 2)
+            run.assert_not_called()
+
+    def test_probe_build_manifest_binds_macros_sources_and_both_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory).resolve()
+            work, records = temporary / "fixture", temporary / "records"
+            class ProbeRoot:
+                def __truediv__(self, child):
+                    return temporary if child == ".build/Temporary" else ROOT / child
+            commands = []
+            def run(command, **kwargs):
+                commands.append(command)
+                if "-o" in command:
+                    path = pathlib.Path(command[command.index("-o") + 1]); path.write_bytes(path.name.encode()); path.chmod(0o700)
+                symbols = "_main\n" + ("_QuickFileAXInstallProbeGate\n" if not command[-1].endswith("ax-reader") else "")
+                return subprocess.CompletedProcess(command, 0, symbols if "nm" in command else "", "")
+            with mock.patch.object(PROBE, "ROOT", ProbeRoot()), mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
+                    mock.patch.object(PROBE.subprocess, "Popen") as start, contextlib.redirect_stdout(io.StringIO()), \
+                    mock.patch.object(sys, "argv", ["probe", "--prepare-install-gate-fixture", "--work-directory", str(work), "--records-directory", str(records)]):
+                self.assertEqual(PROBE.main(), 0)
+            start.assert_not_called()
+            expected = self.manifest(EXTERNAL.fixture_hashes(work))
+            self.assertEqual(EXTERNAL.load_prepared_build(work, expected["sources"], "install-gate"), expected)
+            for command in commands:
+                if "-fobjc-arc" in command or "-fno-objc-arc" in command:
+                    self.assertIn("-DQUICKFILE_AX_INSTALL_PROBE", command)
+                self.assertNotIn("-DQUICKFILE_AX_MALLOC_RECEIPT", command)
+                if "swiftc" in command:
+                    self.assertNotIn("-DQUICKFILE_AX_INSTALL_PROBE", command)
+            for wrong in ("ordinary", "patched", "pure-appkit"):
+                with self.assertRaises(RuntimeError):
+                    EXTERNAL.load_prepared_build(work, expected["sources"], wrong)
+            for mutate in (lambda v: v.update(schema=2), lambda v: v["build_evidence"]["compile_definitions"].update(production=[]),
+                    lambda v: v["build_evidence"]["compile_definitions"].update(reader=["QUICKFILE_AX_INSTALL_PROBE"]),
+                    lambda v: v["build_evidence"]["gate_symbol_present"].update(host=False),
+                    lambda v: v["build_evidence"]["gate_symbol_present"].update(host=1),
+                    lambda v: v["build_evidence"]["link_inputs"]["host"].append("secret.o"),
+                    lambda v: v["sources"].pop("QuickFileApp/AXCompatibility.m")):
+                value = json.loads(json.dumps(expected)); mutate(value); PROBE.write_json(work / "fixture-build.json", value)
+                with self.assertRaises(RuntimeError):
+                    EXTERNAL.load_prepared_build(work, expected["sources"], "install-gate")
+            PROBE.write_json(work / "fixture-build.json", expected)
+            for name in EXTERNAL.EXECUTABLES.values():
+                path = work / name; original = path.read_bytes(); path.write_bytes(b"drift")
+                with self.assertRaises(RuntimeError):
+                    EXTERNAL.load_prepared_build(work, expected["sources"], "install-gate")
+                path.write_bytes(original)
+
+
 class AXCompatibilityLifecycleTests(unittest.TestCase):
     """Inject process/scan results while exercising the real runner protocol."""
 
@@ -986,7 +1080,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         copy_lifetime=False, invalid_copy_lifetime=None,
                         malloc_scribble=None, invalid_allocator=None, external_receipt=False, binary_drift=False,
                         terminal_origin=False, terminal_timeout=False, empty_control_mode=None,
-                        cleanup_failure=None, ls_failure=False):
+                        cleanup_failure=None, ls_failure=False, install_gate=None, invalid_install_gate=None):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -994,6 +1088,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             state = work / "state"
             host_state = {"pid": 1234, "sequence": 0, "buttons": 0, "allocatedButtons": 0,
                           "destroyedButtons": 0, "compensations": 0, "mutableCompensations": 0}
+            if install_gate:
+                host_state["install_probe"] = AXInstallGateTests.state(install_gate)
             if ownership_trace:
                 host_state["ownership"] = {"duplicateLiveAddresses": 0, "offMainHits": 0, "created": 1, "live": 1}
             notifications = {"notifications": 60, "all_notifications": 60, "unmatched_notifications": 0,
@@ -1026,6 +1122,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     self.args = command
                     self.is_reader = pathlib.Path(command[0]).name == "ax-reader"
                     self.environment = _kwargs.get("env")
+                    if install_gate:
+                        assert self.environment[EXTERNAL.INSTALL_ENV] == install_gate
                     if malloc_scribble:
                         assert ("MallocScribble" in self.environment) == (malloc_scribble == "on")
                         if malloc_scribble == "on":
@@ -1077,6 +1175,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     if empty_control_mode and pathlib.Path(command[0]).name != "ax-reader":
                         capability.update(empty_control_mode=empty_control_mode, enabled=empty_control_mode == "patched",
                                           status="enabled" if empty_control_mode == "patched" else "pure-appkit")
+                    if install_gate and pathlib.Path(command[0]).name != "ax-reader":
+                        capability.update(enabled=install_gate == "installed", status="enabled" if install_gate == "installed" else "probe-preflight-only", install_probe=AXInstallGateTests.state(install_gate))
                     output = json.dumps(capability)
                 elif command[0] == "heap" and unavailable_cohorts:
                     raise OSError("allocation tool unavailable")
@@ -1156,6 +1256,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                                 receipt["copyLifetime"][key] = value
                     if invalid_control_host and receipt["sequence"] == invalid_control_host[0]:
                         receipt[invalid_control_host[1]] = 1
+                if install_gate and path.name == "ready.json" and invalid_install_gate and receipt["sequence"] == invalid_install_gate[0]:
+                    receipt["install_probe"] = invalid_install_gate[1]
                 if malloc_scribble and not external_receipt:
                     process = next(process for process in processes
                                    if process.is_reader == (path.name == "reader-ready.json"))
@@ -1190,6 +1292,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.extend(["--malloc-scribble", malloc_scribble])
             if terminal_origin:
                 arguments.append("--terminal-origin")
+            if install_gate:
+                arguments.extend(["--install-gate", install_gate])
             if empty_control_mode:
                 arguments.extend(["--empty-control-mode", empty_control_mode])
             def startup_metadata(pid):
@@ -1214,6 +1318,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     "executables": EXTERNAL.fixture_hashes(prepared)})
                 if empty_control_mode:
                     PROBE.write_json(prepared / "fixture-build.json", AXPureAppKitControlTests.manifest(empty_control_mode, EXTERNAL.fixture_hashes(prepared)))
+                if install_gate:
+                    PROBE.write_json(prepared / "fixture-build.json", AXInstallGateTests.manifest(EXTERNAL.fixture_hashes(prepared)))
                 arguments.extend(["--external-startup-receipt", "--prepared-fixture-directory", str(prepared)])
             with mock.patch.object(EXTERNAL, "read_procargs", side_effect=startup_metadata), \
                     mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
@@ -1269,7 +1375,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     self.assertEqual(EXTERNAL.fixture_hashes(work), EXTERNAL.fixture_hashes(prepared))
                 receipt = json.loads((records / "external-startup.json").read_text())
                 if not invalid_allocator and not binary_drift:
-                    EXTERNAL.validate_external_receipt(receipt, malloc_scribble, EXTERNAL.fixture_hashes(prepared))
+                    EXTERNAL.validate_external_receipt(receipt, malloc_scribble, EXTERNAL.fixture_hashes(prepared), install_gate)
             else:
                 product_build = next(command for command in commands if "-fno-objc-arc" in command)
                 host_build = next(command for command in commands if "-fobjc-arc" in command)
@@ -1410,6 +1516,20 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                                                      heap_control=control, failed_scan=failure)
                 self.assertEqual(code, int(failure is not None))
                 self.assertEqual(summary["receipt_mode"], "external-startup")
+
+    def test_install_gate_actual_hosts_keep_protocol_and_do_not_reuse_capability_state(self):
+        for mode, failed_scan in itertools.product(EXTERNAL.INSTALL_MODES, (None, "registered-10")):
+            code, summary = self.exercise_runner(install_gate=mode, external_receipt=True, malloc_scribble="off", heap_control=True, failed_scan=failed_scan)
+            self.assertEqual(code, int(failed_scan is not None))
+            self.assertEqual(summary["install_gate"], mode)
+            self.assertEqual(summary["product_compensation_enabled"], mode == "installed")
+            self.assertEqual(len(summary["scans"]), 6)
+        for mode, sequence, value in itertools.product(EXTERNAL.INSTALL_MODES, (0, 3, 9), (None, {"mode": "secret"})):
+            code, summary = self.exercise_runner(install_gate=mode, external_receipt=True, malloc_scribble="off", heap_control=True,
+                                                invalid_install_gate=(sequence, value))
+            self.assertEqual(code, 1)
+            self.assertEqual(len(summary["scans"]), 6)
+            self.assertIn("install-gate-host-" + str(sequence), [row["stage"] for row in summary["validation_errors"]])
 
     def test_pure_and_patched_empty_controls_keep_six_scans_and_transient_strict_failures(self):
         for mode, failure in itertools.product(("patched", "pure-appkit"), (None, "registered-10", "removed-20")):
@@ -1664,6 +1784,52 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         self.assertEqual(summary["identity"]["scan_mode"], "live")
                         self.assertEqual(summary["identity"]["receipt_mode"], "external-startup")
 
+    def test_install_gate_workflow_has_an_explicit_exclusive_opt_in(self):
+        script = self.workflow_script("Verify investigation identity")
+        environment = {"AX_INSTALL_GATE_CONTROL": "true", "AX_SCAN_MODE": "diagnostic", "AX_RECEIPT_MODE": "internal",
+                       "AX_TERMINAL_ORIGIN": "false", "MALLOC_SCRIBBLE_EXPERIMENT": "false", "AX_HEAP_DIAGNOSTICS": "false", "CAUSAL_PROBE": "false"}
+        outputs = {('sw_vers', '-productVersion'): '26.6.2', ('sw_vers', '-buildVersion'): '25G83',
+                   ('uname', '-m'): 'arm64', ('xcodebuild', '-version'): 'Xcode 26.3\nBuild version 17C529',
+                   ('git', 'rev-parse', 'HEAD'): '1' * 40}
+        variants = [None, ("AX_SCAN_MODE", "live"), ("AX_RECEIPT_MODE", "external-startup")]
+        variants += [(key, "true") for key in ("AX_TERMINAL_ORIGIN", "MALLOC_SCRIBBLE_EXPERIMENT", "AX_HEAP_DIAGNOSTICS", "CAUSAL_PROBE", "AX_PURE_APPKIT_CONTROL")]
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory) / "records"
+                code = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
+                changed = environment | (dict([variant]) if variant else {})
+                with mock.patch.dict(os.environ, changed), contextlib.redirect_stdout(io.StringIO()), \
+                        mock.patch.object(subprocess, "check_output", side_effect=lambda command, **_: outputs[tuple(command)]) as query:
+                    if variant:
+                        with self.assertRaises(AssertionError):
+                            exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        query.assert_not_called()
+                    else:
+                        exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        summary = json.loads((root / "summary.json").read_text())
+                        self.assertEqual(summary["expected_trials"], 10)
+                        self.assertTrue(summary["identity"]["install_gate_control"])
+                        self.assertEqual(summary["identity"]["scan_mode"], "live")
+                        self.assertEqual(summary["identity"]["receipt_mode"], "external-startup")
+
+    def test_install_gate_workflow_reuses_one_build_and_retains_failures(self):
+        for failure in (None, "strict", "timeout", "install-capability", "install-initial", "install-scan", "install-env", "external-missing"):
+            with self.subTest(failure=failure):
+                invocations, summary = self.run_measurement(enabled=False, scan_mode="live", receipt_mode="external-startup",
+                    install_control=True, first_failure=failure)
+                pair = [("off", "installed"), ("off", "preflight-only")]
+                self.assertEqual(invocations, pair + list(reversed(pair)) + pair + list(reversed(pair)) + pair)
+                self.assertEqual(summary["install_gate_build"]["build_mode"], "install-gate")
+                for trial in summary["trials"][1:]:
+                    self.assertTrue(trial["initial_install_gate_verified"])
+                    self.assertTrue(trial["capability_install_gate_verified"])
+                    self.assertTrue(trial["control_zero_targets"])
+                    self.assertEqual(trial["startup_environment"]["executables"], summary["fixture_executables"])
+                    self.assertEqual(trial["startup_environment"]["install_gate"], trial["mode"])
+                    self.assertEqual(len(trial["scan_totals"]), 6)
+        for failure in ("build", "build-timeout", "cleanup"):
+            self.run_measurement(enabled=False, scan_mode="live", receipt_mode="external-startup", install_control=True, first_failure=failure)
+
     def test_pure_control_workflow_reuses_each_build_and_keeps_all_ten_cases_after_failure(self):
         for failure in (None, "strict", "timeout", "control-mode", "cross-mode-receipt", "external-receipt", "external-private", "external-missing", "scan-fields"):
             with self.subTest(failure=failure):
@@ -1785,7 +1951,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         self.assertFalse(root.exists())
 
     def run_measurement(self, *, enabled=True, first_failure=None, scan_mode="diagnostic", unexpected_diagnostics=False,
-                        first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False):
+                        first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False, install_control=False):
         script = self.workflow_script("Measure matched cases with strict heap checks")
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
@@ -1795,6 +1961,10 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
             if pure_control:
                 value = json.loads(summary_file.read_text())
                 value["identity"]["pure_appkit_control"] = True
+                PROBE.write_json(summary_file, value)
+            if install_control:
+                value = json.loads(summary_file.read_text())
+                value["identity"]["install_gate_control"] = True
                 PROBE.write_json(summary_file, value)
             script = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
             invocations = []
@@ -1809,7 +1979,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if self.build:
                         self.first = False
                         builds.append(command)
-                        build_mode = command[command.index("--empty-control-mode") + 1] if pure_control else "ordinary"
+                        build_mode = "install-gate" if install_control else command[command.index("--empty-control-mode") + 1] if pure_control else "ordinary"
                         prepared = pathlib.Path(command[command.index("--work-directory") + 1])
                         for role, name in EXTERNAL.EXECUTABLES.items():
                             path = prepared / name
@@ -1823,6 +1993,9 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                             "executables": EXTERNAL.fixture_hashes(prepared)})
                         if pure_control:
                             PROBE.write_json(prepared / "fixture-build.json", AXPureAppKitControlTests.manifest(build_mode, EXTERNAL.fixture_hashes(prepared)))
+                        if install_control:
+                            test.assertIn("--prepare-install-gate-fixture", command)
+                            PROBE.write_json(prepared / "fixture-build.json", AXInstallGateTests.manifest(EXTERNAL.fixture_hashes(prepared)))
                         return
                     test.assertEqual("--external-startup-receipt" in command, receipt_mode == "external-startup")
                     test.assertEqual("--terminal-origin" in command, terminal_origin)
@@ -1831,6 +2004,9 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if pure_control:
                         test.assertEqual(mode, "control")
                         mode = command[command.index("--empty-control-mode") + 1]
+                    if install_control:
+                        test.assertEqual(mode, "control")
+                        mode = command[command.index("--install-gate") + 1]
                     invocations.append((setting, mode))
                     self.first = len(invocations) == 1
                     test.assertTrue(kwargs["start_new_session"])
@@ -1848,7 +2024,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if self.first and first_failure == "receipt":
                         receipt["reader"] = "/private/secret"
                     if receipt_mode == "external-startup":
-                        hashes = EXTERNAL.fixture_hashes(root / ((mode if pure_control else "ordinary") + "-fixture"))
+                        hashes = EXTERNAL.fixture_hashes(root / (("install-gate" if install_control else mode if pure_control else "ordinary") + "-fixture"))
                         if self.first and first_failure == "cross-mode-receipt":
                             hashes = EXTERNAL.fixture_hashes(root / "pure-appkit-fixture")
                         startup = {"receipt_mode": receipt_mode, "requested": setting, "executables": hashes,
@@ -1857,6 +2033,12 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                             startup[role] = {"malloc_scribble": expected, "path_matches": True,
                                 "startup_executable_matches": True, "alive_during_check": True,
                                 "executable_sha256": hashes[role]}
+                        if install_control:
+                            startup["install_gate"] = mode
+                            for role in hashes:
+                                startup[role]["install_gate"] = mode
+                            if self.first and first_failure == "install-env":
+                                startup["reader"]["install_gate"] = "secret"
                         if self.first and first_failure == "external-receipt":
                             startup["reader"]["executable_sha256"] = "0" * 64
                         if self.first and first_failure == "external-private":
@@ -1871,6 +2053,14 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         capabilities.update(empty_control_mode=mode, enabled=mode == "patched", status="enabled" if mode == "patched" else "pure-appkit")
                         if self.first and first_failure == "control-mode":
                             capabilities["empty_control_mode"] = "/private/secret"
+                    if install_control:
+                        capabilities.update(enabled=mode == "installed", status="enabled" if mode == "installed" else "probe-preflight-only", install_probe=AXInstallGateTests.state(mode))
+                        if self.first and first_failure == "install-capability":
+                            capabilities["install_probe"]["gate_calls"] = 0
+                        initial = AXInstallGateTests.state(mode)
+                        if self.first and first_failure == "install-initial":
+                            initial["mode"] = "secret"
+                        PROBE.write_json(records / "install-gate-initial.json", initial)
                     PROBE.write_json(records / "inputs.json", {"capabilities": capabilities})
                     point = REPORT.heap_diff_summary("Process 123: 0 leaks for 0 total leaked bytes.\n")
                     diagnostic = {"schema": 4, "status": "complete", "symbols": [], "omitted_symbols": 0,
@@ -1898,6 +2088,11 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         "destroyed_notification_stack_present": False,
                         "unclassified_nodes": 0, "host": dict.fromkeys(("buttons", "allocatedButtons", "destroyedButtons",
                         "compensations", "mutableCompensations"), 0)} for label in labels]
+                    if install_control:
+                        for scan in scans:
+                            scan["host"]["install_probe"] = AXInstallGateTests.state(mode)
+                        if self.first and first_failure == "install-scan":
+                            scans[2]["host"]["install_probe"]["copy_imp"] = "secret"
                     if self.first and first_scan_change:
                         first_scan_change(scans[0])
                     PROBE.write_json(records / "scans.json", scans)
@@ -1968,7 +2163,8 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         continue
                     self.assertEqual(scan, {"label": scan["label"], "leak_nodes": 3, "leak_bytes": 300,
                         "unclassified_nodes": 0, "root_instances": 3, "unexpected_root_groups": 0,
-                        "destroyed_notification_stack_present": False, "tool_exit_code": 0})
+                        "destroyed_notification_stack_present": False, "tool_exit_code": 0,
+                        **({"install_probe": AXInstallGateTests.state(receipt["mode"])} if install_control else {})})
                 if scan_mode == "live":
                     self.assertFalse(receipt["diagnostics_available"])
                     self.assertNotIn("diagnostics", receipt)

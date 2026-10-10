@@ -18,10 +18,12 @@ EXECUTABLES = {"host": "AXCompatibilityFixture.app/Contents/MacOS/AXCompatibilit
 ARGUMENT_LIMIT = 8 * 1024 * 1024
 FIXTURE_SOURCES = ("Scripts/tests/fixtures/AXCompatibilityNotifications.m", "Scripts/tests/fixtures/AXCompatibilityReader.swift")
 PRODUCTION_SOURCES = ("QuickFileApp/AXCompatibility.m", "QuickFileApp/AXCompatibility.h")
+INSTALL_MODES = ("installed", "preflight-only")
+INSTALL_ENV = "QUICKFILE_AX_INSTALL_PROBE_MODE"
 
 
 def fixture_sources(build_mode="ordinary"):
-    if build_mode not in ("ordinary", "patched", "pure-appkit"):
+    if build_mode not in ("ordinary", "patched", "pure-appkit", "install-gate"):
         raise RuntimeError("Unknown fixture build mode")
     return list((() if build_mode == "pure-appkit" else PRODUCTION_SOURCES) + FIXTURE_SOURCES)
 
@@ -38,6 +40,24 @@ def validate_empty_control_build(value, mode):
             or any(type(count) is not int or not 0 <= count <= 64 for count in counts.values())
             or counts["reader"] != 0 or (counts["host"] != 0 if mode == "pure-appkit" else counts["host"] < 4)):
         raise RuntimeError("Unexpected production AX symbols in empty-control build")
+
+
+def validate_install_gate_build(value):
+    expected = {"link_inputs": {"host": [FIXTURE_SOURCES[0], "AXCompatibility.o"], "reader": [FIXTURE_SOURCES[1]]},
+        "compile_definitions": {"production": ["QUICKFILE_AX_INSTALL_PROBE"], "host": ["QUICKFILE_AX_INSTALL_PROBE"], "reader": []},
+        "gate_symbol_present": {"host": True, "reader": False}}
+    if type(value) is not dict or value != expected or any(type(value["gate_symbol_present"][role]) is not bool for role in EXECUTABLES):
+        raise RuntimeError("Invalid install-gate build evidence")
+
+
+def validate_install_gate_state(value, mode):
+    expected_imp = "replacement" if mode == "installed" else "saved"
+    if (mode not in INSTALL_MODES or type(value) is not dict
+            or set(value) != {"mode", "preflight_completed", "gate_calls", "copy_imp", "mutable_copy_imp"}
+            or value["mode"] != mode or value["preflight_completed"] is not True
+            or type(value["gate_calls"]) is not int or value["gate_calls"] != 1
+            or value["copy_imp"] != expected_imp or value["mutable_copy_imp"] != expected_imp):
+        raise RuntimeError("Install-gate preflight or current method state differs")
 
 
 def executable_hash(path):
@@ -75,7 +95,7 @@ def load_prepared_build(directory, sources, build_mode="ordinary"):
     if build_mode != "ordinary":
         fields.add("build_evidence")
     if (type(value) is not dict or set(value) != fields
-            or type(value["schema"]) is not int or value["schema"] != (1 if build_mode == "ordinary" else 2)
+            or type(value["schema"]) is not int or value["schema"] != (1 if build_mode == "ordinary" else 3 if build_mode == "install-gate" else 2)
             or value["build_mode"] != build_mode
             or value["sources"] != sources):
         raise RuntimeError("Prepared fixture differs from expected source build")
@@ -83,7 +103,10 @@ def load_prepared_build(directory, sources, build_mode="ordinary"):
         if (type(sources) is not dict or set(sources) != set(fixture_sources(build_mode))
                 or any(type(item) is not str or not re.fullmatch(r"[0-9a-f]{64}", item) for item in sources.values())):
             raise RuntimeError("Invalid empty-control source hashes")
-        validate_empty_control_build(value["build_evidence"], build_mode)
+        if build_mode == "install-gate":
+            validate_install_gate_build(value["build_evidence"])
+        else:
+            validate_empty_control_build(value["build_evidence"], build_mode)
     require_fixture_hashes(directory, value["executables"])
     return value
 
@@ -155,7 +178,7 @@ def read_procargs(pid):
     return parse_procargs(buffer.raw[:size.value])
 
 
-def owned_child_receipt(process, executable, environment, requested, expected_hash):
+def owned_child_receipt(process, executable, environment, requested, expected_hash, install_gate=None):
     """Only the runner's actual Popen handle is accepted, never a PID CLI input.
 
     samefile accepts symlink spellings in startup metadata. The hash describes
@@ -178,26 +201,37 @@ def owned_child_receipt(process, executable, environment, requested, expected_ha
         expected = b"1" if requested == "on" else None
         if actual.get(b"MallocScribble") != expected:
             raise RuntimeError("Owned fixture startup allocator setting differs")
+        if install_gate is not None and (install_gate not in INSTALL_MODES or requested != "off"
+                or environment.get(INSTALL_ENV) != install_gate or actual.get(INSTALL_ENV.encode()) != install_gate.encode()):
+            raise RuntimeError("Owned fixture startup install gate differs")
         if executable_hash(Path(executable)) != expected_hash or process.poll() is not None:
             raise RuntimeError("Owned fixture identity or liveness changed")
     except OSError:
         raise RuntimeError("Owned fixture startup identity unavailable") from None
-    return {"malloc_scribble": "1" if requested == "on" else "unset", "path_matches": True,
-            "startup_executable_matches": True, "alive_during_check": True, "executable_sha256": expected_hash}
+    receipt = {"malloc_scribble": "1" if requested == "on" else "unset", "path_matches": True,
+               "startup_executable_matches": True, "alive_during_check": True, "executable_sha256": expected_hash}
+    if install_gate is not None:
+        receipt["install_gate"] = install_gate
+    return receipt
 
 
-def validate_external_receipt(value, requested, expected_hashes):
+def validate_external_receipt(value, requested, expected_hashes, install_gate=None):
     """Exact public allowlist; failed/incomplete observations never pass."""
     validate_hashes(expected_hashes)
-    if (type(value) is not dict or set(value) != {"receipt_mode", "requested", "host", "reader", "executables", "binary_reuse_verified"}
+    extra = {"install_gate"} if install_gate is not None else set()
+    if (type(value) is not dict or set(value) != {"receipt_mode", "requested", "host", "reader", "executables", "binary_reuse_verified"} | extra
             or value["receipt_mode"] != "external-startup" or requested not in ("off", "on")
             or value["requested"] != requested or value["executables"] != expected_hashes
             or value["binary_reuse_verified"] is not True):
         raise RuntimeError("External startup receipt incomplete")
+    if install_gate is not None and (install_gate not in INSTALL_MODES or requested != "off" or value["install_gate"] != install_gate):
+        raise RuntimeError("External startup install gate incomplete")
     for role in EXECUTABLES:
         entry = value[role]
-        if (type(entry) is not dict or set(entry) != {"malloc_scribble", "path_matches", "startup_executable_matches", "alive_during_check", "executable_sha256"}
+        if (type(entry) is not dict or set(entry) != {"malloc_scribble", "path_matches", "startup_executable_matches", "alive_during_check", "executable_sha256"} | extra
                 or entry["malloc_scribble"] != ("1" if requested == "on" else "unset")
                 or any(entry[key] is not True for key in ("path_matches", "startup_executable_matches", "alive_during_check"))
                 or entry["executable_sha256"] != expected_hashes[role]):
             raise RuntimeError("External startup receipt incomplete")
+        if install_gate is not None and entry["install_gate"] != install_gate:
+            raise RuntimeError("External startup install gate incomplete")

@@ -19,6 +19,40 @@ def procargs(environment, arguments=(b"/synthetic/host",), suffix=b""):
 
 
 class AXExternalStartupTests(unittest.TestCase):
+    def test_install_gate_startup_requires_exact_setting_and_public_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "host"
+            path.write_bytes(b"owned"); path.chmod(0o700)
+            digest = EXTERNAL.executable_hash(path)
+            for mode in EXTERNAL.INSTALL_MODES:
+                environment = {"PATH": "/synthetic/bin", EXTERNAL.INSTALL_ENV: mode}
+                for actual_mode in (mode, None, "secret", "preflight-only" if mode == "installed" else "installed"):
+                    actual = {b"PATH": b"/synthetic/bin"}
+                    if actual_mode is not None:
+                        actual[EXTERNAL.INSTALL_ENV.encode()] = actual_mode.encode()
+                    process = mock.Mock(args=[str(path)], pid=123)
+                    process.poll.return_value = None
+                    with mock.patch.object(EXTERNAL, "read_procargs", return_value=(os.fsencode(path), [os.fsencode(path)], actual)):
+                        if actual_mode != mode:
+                            with self.assertRaises(RuntimeError) as error:
+                                EXTERNAL.owned_child_receipt(process, path, environment, "off", digest, mode)
+                            self.assertNotIn("secret", str(error.exception))
+                        else:
+                            entry = EXTERNAL.owned_child_receipt(process, path, environment, "off", digest, mode)
+                            self.assertEqual(entry["install_gate"], mode)
+                hashes = {"host": digest, "reader": digest}
+                value = {"receipt_mode": "external-startup", "requested": "off", "host": dict(entry), "reader": dict(entry),
+                         "executables": hashes, "binary_reuse_verified": True, "install_gate": mode}
+                EXTERNAL.validate_external_receipt(value, "off", hashes, mode)
+                with self.assertRaises(RuntimeError):
+                    EXTERNAL.validate_external_receipt(value, "off", hashes)
+                for change in (lambda v: v.pop("install_gate"), lambda v: v["host"].pop("install_gate"),
+                               lambda v: v["reader"].update(install_gate="secret"), lambda v: v.update(install_gate="secret")):
+                    altered = json.loads(json.dumps(value)); change(altered)
+                    with self.assertRaises(RuntimeError) as error:
+                        EXTERNAL.validate_external_receipt(altered, "off", hashes, mode)
+                    self.assertNotIn("secret", str(error.exception))
+
     def test_sysctl_capacity_result_bounds_and_errors_fail_closed(self):
         raw = procargs([b"PATH=/synthetic/bin"])
         for failure in (None, "capacity-error", "capacity-size", "capacity-bound", "read-error", "result-size", "malformed"):

@@ -100,6 +100,32 @@ class AXOwnedProcessTests(unittest.TestCase):
                 leader.wait.assert_called_once_with(timeout=5)
                 signal_group.assert_called_once_with(123, signal.SIGKILL)
 
+    def test_unknown_state_outside_owned_group_does_not_block_confirmed_exit(self):
+        for state in ("?", "?E", "?Ns"):
+            with self.subTest(state=state), \
+                    mock.patch.object(PROCESS.subprocess, "run", return_value=mock.Mock(
+                        returncode=0, stdout="123 123 Zs\n456 456 " + state + "\n")):
+                self.assertEqual(PROCESS.group_exit_status(123), "exited")
+
+    def test_unknown_owned_state_requires_later_exit_confirmation(self):
+        for member in (123, 124):
+            for becomes_zombie in (False, True):
+                with self.subTest(member=member, becomes_zombie=becomes_zombie):
+                    unknown = ("123 123 ?s\n" if member == 123 else "123 123 Zs\n124 123 ?E\n")
+                    exited = "123 123 Zs\n124 123 Z\n"
+                    replies = [mock.Mock(returncode=0, stdout=unknown),
+                               mock.Mock(returncode=0, stdout=exited if becomes_zombie else unknown)]
+                    leader = mock.Mock(pid=123)
+                    with mock.patch.object(PROCESS.subprocess, "run", side_effect=replies) as query, \
+                            mock.patch.object(PROCESS.os, "killpg"), \
+                            mock.patch.object(PROCESS.time, "monotonic", side_effect=[0, 0, 1, 6]), \
+                            mock.patch.object(PROCESS.time, "sleep"):
+                        receipt = PROCESS.finish_group(leader)
+                    self.assertEqual(query.call_count, 2)
+                    self.assertEqual(receipt["group_inspection"], "exited" if becomes_zombie else "running")
+                    self.assertEqual(receipt["complete"], becomes_zombie)
+                    leader.wait.assert_called_once_with(timeout=5)
+
     def test_start_failure_never_signals_an_unowned_group(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(PROCESS.subprocess, "Popen", side_effect=OSError("private")), \
