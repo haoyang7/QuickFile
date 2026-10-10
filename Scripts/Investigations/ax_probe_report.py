@@ -537,7 +537,7 @@ def leak_groups(report):
 # describe one later snapshot; neither counts nor stack equality bind it to a
 # node from the preceding live scans. Bounds also apply at the public gate.
 TERMINAL_ROOT_LIMIT = 16
-TERMINAL_GROUP_LIMIT = 32
+TERMINAL_GROUP_LIMIT = 96
 TERMINAL_FRAME_LIMIT = 96
 TERMINAL_IMAGE_FRAME_LIMIT = 96
 TERMINAL_NODE_LIMIT = 4096

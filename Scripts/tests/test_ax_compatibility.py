@@ -707,15 +707,14 @@ class AXTerminalSnapshotTests(unittest.TestCase):
         return grouped, listed
 
     @staticmethod
-    def many_group_reports():
-        # 96 distinct private groups, each with three nodes. Truncation cuts
-        # through NSArray and omits whole other types; no system lookup is used.
+    def many_group_reports(group_count=96):
+        # Distinct private groups, each with three nodes; no system lookup is used.
         groups = [("NSArray" if index < 40 else "NSXPCConnection" if index == 40 else "private-type",
-                   16 * (index + 1)) for index in range(96)]
-        totals = f"Process 123: 288 leaks for {3 * sum(size for _, size in groups)} total leaked bytes.\n"
+                   16 * (index + 1)) for index in range(group_count)]
+        totals = f"Process 123: {3 * group_count} leaks for {3 * sum(size for _, size in groups)} total leaked bytes.\n"
         frame = "0 private-image 0x9999 secret_caller + 4\n"
         grouped = (totals + "\nSTACK OF 3 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n" + frame
-                   + "\n====\n    288 (bytes) ROOT CYCLE: NSXPCConnection\n")
+                   + f"\n====\n    {3 * group_count} (bytes) ROOT CYCLE: NSXPCConnection\n")
         listed = totals
         for index, (kind, size) in enumerate(groups):
             for instance in range(3):
@@ -789,25 +788,37 @@ class AXTerminalSnapshotTests(unittest.TestCase):
         value = self.summary(self.many_group_reports(), resolver)
         with mock.patch.object(REPORT, "SystemSymbols", return_value=resolver):
             REPORT.validate_terminal_snapshot(value)
-        self.assertEqual((len(value["allocation_groups"]), value["omitted_allocation_groups"]), (32, 64))
+        self.assertEqual((len(value["allocation_groups"]), value["omitted_allocation_groups"]), (96, 0))
         self.assertEqual(value["status"], "partial")
         self.assertEqual(value["root_groups"][0]["instances"], 3)
         self.assertEqual(value["root_groups"][0]["reported_image_counts"]["other"], 1)  # Frames are not instance-weighted.
         totals = value["allocation_type_totals"]
         self.assertEqual(set(totals), {*REPORT.HEAP_TYPES, "unknown"})
         self.assertEqual(totals["NSArray"], {"nodes": 120, "bytes": 3 * 16 * sum(range(1, 41)),
-            "retained_nodes": 96, "retained_bytes": 3 * 16 * sum(range(1, 33)),
-            "omitted_nodes": 24, "omitted_bytes": 3 * 16 * sum(range(33, 41))})
+            "retained_nodes": 120, "retained_bytes": 3 * 16 * sum(range(1, 41)),
+            "omitted_nodes": 0, "omitted_bytes": 0})
         self.assertEqual(totals["NSXPCConnection"], {"nodes": 3, "bytes": 3 * 16 * 41,
-            "retained_nodes": 0, "retained_bytes": 0, "omitted_nodes": 3, "omitted_bytes": 3 * 16 * 41})
+            "retained_nodes": 3, "retained_bytes": 3 * 16 * 41, "omitted_nodes": 0, "omitted_bytes": 0})
         self.assertEqual((totals["unknown"]["nodes"], totals["unknown"]["bytes"]), (165, 3 * 16 * sum(range(42, 97))))
         self.assertEqual(sum(row["nodes"] for row in totals.values()), value["leak_nodes"])
         self.assertEqual(sum(row["bytes"] for row in totals.values()), value["leak_bytes"])
-        self.assertEqual(sum(row["omitted_nodes"] for row in totals.values()), 192)
-        self.assertEqual(sum(row["omitted_bytes"] for row in totals.values()), value["leak_bytes"] - 3 * 16 * sum(range(1, 33)))
+        self.assertEqual(sum(row["omitted_nodes"] for row in totals.values()), 0)
+        self.assertEqual(sum(row["omitted_bytes"] for row in totals.values()), 0)
         resolver.verified.assert_not_called()
         for private in ("private", "secret", "0x", "zone"):
             self.assertNotIn(private, json.dumps(value))
+
+        truncated = self.summary(self.many_group_reports(128), resolver)
+        with mock.patch.object(REPORT, "SystemSymbols", return_value=resolver):
+            REPORT.validate_terminal_snapshot(truncated)
+        self.assertEqual((len(truncated["allocation_groups"]), truncated["omitted_allocation_groups"]), (96, 32))
+        self.assertEqual(truncated["allocation_groups"], value["allocation_groups"])
+        self.assertEqual(truncated["allocation_type_totals"]["unknown"], {
+            "nodes": 3 * 87, "bytes": 3 * 16 * sum(range(42, 129)),
+            "retained_nodes": 3 * 55, "retained_bytes": 3 * 16 * sum(range(42, 97)),
+            "omitted_nodes": 96, "omitted_bytes": 3 * 16 * sum(range(97, 129))})
+        self.assertEqual(sum(row["nodes"] for row in truncated["allocation_type_totals"].values()), truncated["leak_nodes"])
+        self.assertEqual(sum(row["bytes"] for row in truncated["allocation_type_totals"].values()), truncated["leak_bytes"])
 
     def test_empty_and_unavailable_ledgers_cannot_claim_missing_evidence_is_zero(self):
         empty = "Process 123: 0 leaks for 0 total leaked bytes.\n"
@@ -849,8 +860,8 @@ class AXTerminalSnapshotTests(unittest.TestCase):
             with self.subTest(mutation=index), mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), \
                     self.assertRaisesRegex(ValueError, "^Invalid bounded terminal snapshot$"):
                 REPORT.validate_terminal_snapshot(value)
-        for omitted in (0, 1, 193):
-            value = self.summary(self.many_group_reports())
+        for omitted in (0, 97, True):
+            value = self.summary(self.many_group_reports(128))
             value["omitted_allocation_groups"] = omitted
             with mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), self.assertRaises(ValueError):
                 REPORT.validate_terminal_snapshot(value)
@@ -925,6 +936,58 @@ class AXTerminalSnapshotTests(unittest.TestCase):
         self.assertEqual(value["status"], "partial")
         with mock.patch.object(REPORT, "REPORT_BYTE_LIMIT", 1):
             self.assertEqual(self.summary()["status"], "unavailable")
+
+    def test_96_groups_share_96_symbol_attempts_including_failures(self):
+        reports = tuple(text.replace("0 private-image 0x9999 secret_caller + 4",
+            "0 com.apple.Foundation 0x9999 NSAllocateObject + 4") for text in self.many_group_reports())
+        for verified in (True, False):
+            resolver = self.resolver()
+            resolver.verified.side_effect = None
+            resolver.verified.return_value = verified
+            value = self.summary(reports, resolver)
+            self.assertEqual((len(value["allocation_groups"]), value["omitted_allocation_groups"]), (96, 0))
+            self.assertEqual(resolver.verified.call_count, 96)
+            rows = value["root_groups"] + value["allocation_groups"]
+            self.assertEqual(sum(row["stack"]["budget_omitted_frames"] for row in rows), 1)
+            self.assertEqual(sum(row["stack"]["unverified_frames"] for row in rows), 0 if verified else 96)
+            with mock.patch.object(REPORT, "SystemSymbols", return_value=resolver):
+                REPORT.validate_terminal_snapshot(value)
+            self.assertEqual(resolver.lookup.call_count, 96 if verified else 0)
+
+    @classmethod
+    def large_public_summary(cls):
+        value = cls.summary(cls.many_group_reports())
+        budget = [96]
+        for row in value["allocation_groups"]:
+            row["stack"] = REPORT.terminal_stack(((0, "com.apple.Foundation", 0x9999, "A" * 128, 0),),
+                                                 0, cls.resolver(), budget)
+        root = value["root_groups"][0]
+        for _ in range(15):
+            extra = json.loads(json.dumps(root))
+            extra["tree_nodes"] = 3
+            value["root_groups"].append(extra)
+        root["tree_nodes"] -= 45
+        value["root_instances"] = 48
+        return value
+
+    def test_default_json_64k_limit_is_not_increased_with_group_cap(self):
+        value = self.large_public_summary()
+        image = {"basename": "A" * 96, "uuid": "11111111-1111-1111-1111-111111111111"}
+        for root in value["root_groups"]:
+            root["reported_image_counts"]["other"] = 6
+            root["reported_filtered_reason_counts"]["unrecognized_image"] = 6
+            root["stack"].update(reported_frames=6, omitted_frames=6, filtered_frames=6)
+            identity = root["other_image_identity"]
+            identity.update(status="complete", frames=[{"index": index, **image} for index in range(6)],
+                            reason_counts=dict.fromkeys(identity["reason_counts"], 0))
+        self.assertGreater(len(json.dumps(value).encode()), 65536)
+        with mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), \
+                mock.patch.object(REPORT.ax_system_images, "loaded_system_images") as catalog, \
+                mock.patch.object(REPORT.json, "dumps", wraps=json.dumps) as encode, \
+                self.assertRaisesRegex(ValueError, "^Invalid bounded terminal snapshot$"):
+            REPORT.validate_terminal_snapshot(value)
+        encode.assert_called_once_with(value)
+        catalog.assert_not_called()
 
     def test_public_gate_rechecks_symbols_and_counts_without_raw_output(self):
         valid = self.summary()
@@ -2149,20 +2212,40 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
             self.assertEqual(identity["status"], "partial")
 
     def test_terminal_ledger_does_not_turn_omitted_groups_or_strict_failures_into_success(self):
-        terminal = AXTerminalSnapshotTests.summary(AXTerminalSnapshotTests.many_group_reports())
-        for failure in ("terminal-omitted", "strict"):
-            with self.subTest(failure=failure):
+        for groups, failure in ((96, None), (96, "strict"), (128, "terminal-omitted"), (128, "strict")):
+            terminal = AXTerminalSnapshotTests.summary(AXTerminalSnapshotTests.many_group_reports(groups))
+            with self.subTest(groups=groups, failure=failure):
                 invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
                     terminal_origin=True, first_failure=failure, first_terminal_change=lambda value: value.update(terminal))
                 self.assertEqual(invocations, [("off", "control"), ("off", "product")])
-                self.assertFalse(summary["terminal_snapshot_checks_passed"])
+                self.assertEqual(summary["terminal_snapshot_checks_passed"], groups == 96)
                 self.assertEqual(summary["strict_checks_passed"], failure != "strict")
                 first, second = summary["trials"]
                 self.assertTrue(first["terminal_snapshot_available"])
                 self.assertEqual(first["terminal_snapshot"]["allocation_type_totals"], terminal["allocation_type_totals"])
-                self.assertEqual(first["terminal_snapshot"]["omitted_allocation_groups"], 64)
+                self.assertEqual(first["terminal_snapshot"]["omitted_allocation_groups"], max(0, groups - 96))
                 self.assertTrue(second["terminal_snapshot_checks_passed"])
                 self.assertEqual(sum(len(trial["scan_totals"]) for trial in summary["trials"]), 12)
+
+    def test_terminal_upload_keeps_actual_indented_file_64k_limit(self):
+        terminal = AXTerminalSnapshotTests.large_public_summary()
+        self.assertLessEqual(len(json.dumps(terminal).encode()), 65536)
+        with mock.patch.object(REPORT, "SystemSymbols", return_value=AXTerminalSnapshotTests.resolver()):
+            REPORT.validate_terminal_snapshot(terminal)
+        sizes, original_write = [], PROBE.write_json
+        def write(path, value):
+            original_write(path, value)
+            if path.name == "terminal-snapshot.json":
+                sizes.append(path.stat().st_size)
+        with mock.patch.object(PROBE, "write_json", side_effect=write):
+            _, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                terminal_origin=True, first_failure="terminal-size", first_terminal_change=lambda value: value.update(terminal))
+        self.assertEqual(sizes[0], len((json.dumps(terminal, indent=2) + "\n").encode()))
+        self.assertGreater(sizes[0], 65536)
+        self.assertTrue(summary["strict_checks_passed"])
+        self.assertFalse(summary["terminal_snapshot_checks_passed"])
+        self.assertFalse(summary["trials"][0]["terminal_snapshot_available"])
+        self.assertTrue(summary["trials"][1]["terminal_snapshot_checks_passed"])
 
     def test_terminal_workflow_rejects_private_or_inconsistent_new_fields(self):
         changes = [lambda value: value["allocation_type_totals"]["unknown"].update(retained_nodes=0),

@@ -47,7 +47,7 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 `terminal_origin=true` 是另一个有界入口，要求同时传入 `malloc_scribble=true`、`scan_mode=live`、`receipt_mode=external-startup`、`heap_diagnostics=false`、`ax_causal_probe=false`。它将上述 20 case 改为按顺序执行一次 off/control 和一次 off/product；同一构建的两个可执行文件继续逐次核对 SHA-256。每例先完成普通 CI 的全部六个实时扫描点，然后在 `observer-exited` 扫描之后、宿主停止之前仅捕获一份后续堆图；合计 12 个原扫描点和 2 次终点捕获。host/reader 均退出后，才用该图生成 grouped/list 两份离线文本，不增加基线前采样、不启用 NoCompact 优先模式、不记录分配年龄或代次。
 
-`terminal_snapshot` 将每个 grouped 根组与其自身分配栈关联，list 仅汇总全图的固定类型、大小与分配栈计数，不将 list 子节点归属到某个 NSXPC 根。公开帧按原帧号规范为 `allocation-first`（从分配端向调用者），保留重复帧及 index；这不是调用时序。每一保留帧必须通过本机 `SystemSymbols` 的系统映像、地址/偏移与符号核验，上传前再次独立查找符号。地址、路径、任意类型和未经核验的符号均不公开；非白名单类型仅记 `unknown`。摘要最多保留 16 个根组、32 个分配组和总计 96 个符号帧，另记缺帧、不可解析行、过滤帧、未验证帧及预算省略数；原始栈和堆图不上传。
+`terminal_snapshot` 将每个 grouped 根组与其自身分配栈关联，list 仅汇总全图的固定类型、大小与分配栈计数，不将 list 子节点归属到某个 NSXPC 根。公开帧按原帧号规范为 `allocation-first`（从分配端向调用者），保留重复帧及 index；这不是调用时序。每一保留帧必须通过本机 `SystemSymbols` 的系统映像、地址/偏移与符号核验，上传前再次独立查找符号。地址、路径、任意类型和未经核验的符号均不公开；非白名单类型仅记 `unknown`。摘要最多保留 16 个根组、96 个分配组和总计 96 次符号核验尝试（含失败查找），另记缺帧、不可解析行、过滤帧、未验证帧及预算省略数；原始栈和堆图不上传。终点对象的 JSON 编码与实际缩进文件分别受原有 64 KiB 上限约束；提高保留组数不改变这两处限制或无省略组的判定。
 
 终点摘要 schema 3 的每个保留根组另含 `reported_image_counts`，按报告中的图像标签计入固定的 AppKit、Foundation、CoreFoundation、libxpc、libobjc、libmalloc、libdispatch 或 `other` 桶。它只描述可解析帧中的报告标签，不是独立映像核验；未知标签不公开。`reported_filtered_reason_counts` 将图像前置过滤分为 `known_image_excluded`（后三个固定图像桶）和 `unrecognized_image`（`other`），不把过滤误记为符号核验失败。上述计数不增加符号查找，缺帧与不可解析行仍单独记录。`allocation_type_totals` 在 list 截断前累计全部节点，以固定 `HEAP_TYPES` 和 `unknown` 记录节点/字节总数及 `retained_*`、`omitted_*` 范围；公开 gate 核对逐类守恒、保留组计数和全图总数，未成功解析时该账本为 `null`。完整类型账本不补齐省略的分配栈，也不改变省略组的失败判定，不建立跨扫描对象身份、分配年龄或所有权关系。
 
