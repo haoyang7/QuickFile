@@ -215,7 +215,7 @@ jobs:
               if scan_file.is_file() and not scan_file.is_symlink() and scan_file.stat().st_size <= 16384:
                   try:
                       scans = json.loads(scan_file.read_text())
-                      labels = ['baseline', 'added-10', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited']
+                      labels = ['baseline', 'empty-control', 'added-10', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited']
                       if type(scans) is not list or [item['label'] for item in scans] != labels:
                           raise ValueError('Incomplete scan totals')
                       totals = []

@@ -54,7 +54,7 @@ class AXHeapDiagnosticTests(unittest.TestCase):
 
     @staticmethod
     def summary(point):
-        return {"schema": 2, "status": "partial", "checkpoints": [point],
+        return {"schema": 3, "status": "partial", "checkpoints": [point],
                 "symbols": [], "omitted_symbols": 0, "symbols_status": "partial"}
 
     def test_public_validator_rejects_extra_fields_unbounded_values_and_text(self):
@@ -65,6 +65,7 @@ class AXHeapDiagnosticTests(unittest.TestCase):
                 lambda value: value.update(path="/private/secret"),
                 lambda value: value.update(status="secret"),
                 lambda value: value.update(schema=True),
+                lambda value: value.update(schema=2),
                 lambda value: value.update(status="complete"),
                 lambda value: value["checkpoints"][0].update(new_bytes=10 ** 20),
                 lambda value: value["checkpoints"][0].update(label="secret"),
@@ -79,6 +80,16 @@ class AXHeapDiagnosticTests(unittest.TestCase):
             mutate(invalid)
             with self.assertRaises(ValueError):
                 REPORT.validate_heap_diagnostics_summary(invalid)
+
+    def test_complete_summary_requires_the_empty_control_checkpoint(self):
+        valid = {"schema": 3, "status": "complete", "symbols": [], "omitted_symbols": 0,
+                 "symbols_status": "complete", "checkpoints": [
+                     REPORT.heap_diff_summary(self.report(count=0)) | {"label": label}
+                     for label in REPORT.HEAP_LABELS[1:]]}
+        REPORT.validate_heap_diagnostics_summary(valid)
+        valid["checkpoints"] = [point for point in valid["checkpoints"] if point["label"] != "empty-control"]
+        with self.assertRaises(ValueError):
+            REPORT.validate_heap_diagnostics_summary(valid)
 
     def resolver(self, symbol="-[NSXPCConnection initWithMachServiceName:options:]", start=0x9991):
         resolver = object.__new__(REPORT.SystemSymbols)
@@ -272,7 +283,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
     """Inject process/scan results while exercising the real runner protocol."""
 
     def exercise_runner(self, *, failed_scan=None, invalid_notifications=False,
-                        system_baseline=False, insufficient_compensation=False, ownership_trace=False, heap_diagnostics=False):
+                        system_baseline=False, insufficient_compensation=False, ownership_trace=False,
+                        heap_diagnostics=False, invalid_empty_control=None):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -291,7 +303,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             scan_labels = (["baseline", "removed-10", "removed-30", "observer-exited"] if system_baseline else
                            ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
             if heap_diagnostics:
-                scan_labels.insert(1, "added-10")
+                scan_labels[1:1] = ["empty-control", "added-10"]
             scanned = []
             commands = []
             processes = []
@@ -331,10 +343,13 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         return subprocess.CompletedProcess(command, 0, "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
                     label = scan_labels[len(scanned)]
                     scanned.append(label)
-                    if label in ("added-10", "registered-10"):
+                    if label in ("empty-control", "added-10", "registered-10"):
                         reader_command = json.loads((state / "reader-command.json").read_text())
-                        self.assertEqual(reader_command["sequence"], 1 if label == "added-10" else 2)
+                        self.assertEqual(reader_command["sequence"], 2 if label == "registered-10" else 1)
                         self.assertEqual(host_state["destroyedButtons"], 0)
+                    if label == "empty-control":
+                        self.assertTrue(all(host_state[key] == 0 for key in (
+                            "buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")))
                     nodes, size = (287, 18_768) if label == failed_scan else (280, 18_416)
                     output = (f"Process 1234: {nodes} leaks for {size} total leaked bytes.\n"
                               "STACK OF 3 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
@@ -352,6 +367,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     if command_path.exists():
                         command = json.loads(command_path.read_text())
                         host_state.update(sequence=command["sequence"], action=command["action"])
+                        if heap_diagnostics and command["sequence"] == 2 and invalid_empty_control:
+                            host_state[invalid_empty_control] = 1
                         if command["action"] == "add":
                             host_state["buttons"] = 10
                             host_state["allocatedButtons"] += 10
@@ -419,8 +436,9 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 else:
                     disassembled.assert_not_called()
             if not system_baseline:
-                self.assertEqual(scans[1]["host"]["allocatedButtons"], 10)
-                self.assertEqual(scans[1]["host"]["destroyedButtons"], 0)
+                registered = next(scan for scan in scans if scan["label"] == "registered-10")
+                self.assertEqual(registered["host"]["allocatedButtons"], 10)
+                self.assertEqual(registered["host"]["destroyedButtons"], 0)
             if exit_code:
                 self.assertEqual(json.loads((records / "validation-errors.json").read_text()), summary["validation_errors"])
             return exit_code, summary
@@ -433,13 +451,18 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
         self.assertNotIn("validation_errors", summary)
 
     def test_diagnostics_capture_once_per_stage_and_preserve_heap_failure(self):
-        for stage in ("added-10", "registered-10"):
+        for stage in ("empty-control", "added-10", "registered-10"):
             with self.subTest(stage=stage):
                 exit_code, summary = self.exercise_runner(failed_scan=stage, heap_diagnostics=True)
                 self.assertEqual(exit_code, 1)
                 self.assertEqual(summary["coverage"], "failed")
                 self.assertIsNone(summary["ax_leak_nodes"])
                 self.assertEqual([error["stage"] for error in summary["validation_errors"]], [stage])
+
+    def test_empty_control_rejects_any_prior_owned_button_activity(self):
+        for field in ("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations"):
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "empty control contained"):
+                self.exercise_runner(heap_diagnostics=True, invalid_empty_control=field)
 
     def test_intermediate_growth_still_fails_after_heap_returns_to_baseline(self):
         for label in ("registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"):

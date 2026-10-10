@@ -30,7 +30,7 @@ HEAP_STACK_PATTERNS = {
     "xpc_container": r"\bxpc_(?:array|dictionary)_create\b",
     "notification_center": r"-\[NSNotificationCenter [^\]]+\]",
 }
-HEAP_LABELS = ("baseline", "added-10", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited")
+HEAP_LABELS = ("baseline", "empty-control", "added-10", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited")
 # Exact, OS-owned paths are used only for local verification and never emitted.
 HEAP_IMAGES = {
     "AppKit": ("com.apple.AppKit", "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit"),
@@ -157,9 +157,9 @@ def validate_heap_diagnostics_summary(value):
 
     integer = lambda item: type(item) is int and 0 <= item <= 1_000_000_000
     require(type(value) is dict and set(value) == {"schema", "status", "checkpoints", "symbols", "omitted_symbols", "symbols_status"})
-    require(type(value["schema"]) is int and value["schema"] == 2)
+    require(type(value["schema"]) is int and value["schema"] == 3)
     require(value["status"] in ("complete", "partial", "unavailable"))
-    require(type(value["checkpoints"]) is list and len(value["checkpoints"]) <= 6)
+    require(type(value["checkpoints"]) is list and len(value["checkpoints"]) < len(HEAP_LABELS))
     seen, rows = set(), 0
     fields = {"label", "status", "new_nodes", "new_bytes", "classified_nodes", "unparsed_nodes",
               "groups", "stack_matches", "unknown_stack_nodes", "omitted_groups",
@@ -310,7 +310,7 @@ def collect_heap_diagnostics(graph_directory, records):
     symbol_status = ("unavailable" if not checkpoints else "complete" if status == "complete" and not omitted
                      and all(not point["missing_stack_nodes"] and not point["unverified_stack_nodes"]
                              for point in checkpoints) else "partial")
-    summary = {"schema": 2, "status": status, "checkpoints": checkpoints,
+    summary = {"schema": 3, "status": status, "checkpoints": checkpoints,
                "symbols": [{"image": image, "symbol": symbol, "nodes": symbols[(image, symbol)]}
                            for image, symbol in sorted(selected)],
                "omitted_symbols": omitted, "symbols_status": symbol_status}

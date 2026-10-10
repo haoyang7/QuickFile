@@ -254,6 +254,14 @@ def main():
                 if warmed["buttons"] or warmed["registrations"] or warmed["notifications"]:
                     raise RuntimeError(f"AX baseline warm-up was not empty: {warmed}")
                 scan("baseline", command("checkpoint"))
+            if args.heap_diagnostics:
+                # One fixed empty-window control, with no add or new reader
+                # command. Keep the original baseline and every scan failure.
+                empty = command("checkpoint")
+                if any(empty[key] for key in ("buttons", "allocatedButtons", "destroyedButtons",
+                                              "compensations", "mutableCompensations")):
+                    raise RuntimeError("Heap empty control contained owned button activity")
+                scan("empty-control", empty)
             for cycle in range(1, args.cycles + 1):
                 added = command("add")
                 if args.heap_diagnostics and cycle == 1:
