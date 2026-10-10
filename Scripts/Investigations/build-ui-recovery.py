@@ -51,7 +51,7 @@ def main():
     app = out / f"{name}.app"
     executable = app / f"Contents/MacOS/{name}"
     executable.parent.mkdir(parents=True, exist_ok=True)
-    views = ["BackgroundWork", "AppModalPresentationGate", "FinderAuthorizationRequestPump", "QuickFileViewModel", "CreateFileView", "TemplateManagerView",
+    views = ["BackgroundWork", "AppModalPresentationGate", "FinderAuthorizationRequestPump", "QuickFileViewModel", "TemplateRefreshObserver", "CreateFileView", "TemplateManagerView",
              "FinderMenuSettingsSection", "TemplateContentPreview",
              "TemplateEditorView", "TemplateEditorState", "TemplatePreviewController", "TemplateTransferPreviewView", "FinderMenuSettingsViewModel", "FinderIntegrationViewModel", "FinderIntegrationAdapter",
              "FinderExtensionDiagnostics", "AppKitFileActions",

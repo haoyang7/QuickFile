@@ -245,6 +245,27 @@ public final class TemplateStore: @unchecked Sendable {
         self.changeNotificationName = changeNotificationName
     }
 
+    /// A cheap UI invalidation hint only. Execution and CAS must still read authority.
+    public struct ChangeToken: Equatable, Sendable {
+        fileprivate let revision: String?
+        fileprivate let fileIdentity: RecoveryFileIdentity?
+    }
+
+    public func changeToken() throws -> ChangeToken {
+        guard let defaults else { throw StoreError.sharedDefaultsUnavailable }
+        var identity: RecoveryFileIdentity?
+        if let storageURL {
+            var status = stat()
+            // Normal template reads follow symbolic links; inspect the same target.
+            if stat(storageURL.path, &status) == 0 {
+                identity = RecoveryFileIdentity(status)
+            } else if errno != ENOENT {
+                throw StoreError.readFailed(NSError(domain: NSPOSIXErrorDomain, code: Int(errno)))
+            }
+        }
+        return ChangeToken(revision: defaults.string(forKey: revisionKey), fileIdentity: identity)
+    }
+
     public func loadTemplates() throws -> [FileTemplate] {
         try loadTemplates(allowCached: true)
     }

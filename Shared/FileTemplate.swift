@@ -80,12 +80,6 @@ public enum BuiltInTemplates {
             content: ""
         ),
         FileTemplate(
-            id: UUID(uuidString: "4288B844-83E7-4F5B-8FE5-637958BDE7DF")!,
-            name: "Swift",
-            fileExtension: "swift",
-            content: "// Created by QuickFile on {{date}}.\n\n"
-        ),
-        FileTemplate(
             id: UUID(uuidString: "020E1DD5-C50D-436C-A433-39250EE60B3B")!,
             name: "Shell",
             fileExtension: "sh",

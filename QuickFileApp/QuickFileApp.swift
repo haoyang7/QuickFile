@@ -22,6 +22,7 @@ struct QuickFileApp: App {
             if ProcessInfo.processInfo.environment["XCTestBundlePath"] == nil {
                 ContentView(viewModel: viewModel, finderMenuSettings: finderMenuSettings,
                             finderIntegrationViewModel: finderIntegration)
+                    .task { viewModel.startTemplateSynchronization() }
             } else {
                 EmptyView()
             }
