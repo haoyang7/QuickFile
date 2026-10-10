@@ -39,6 +39,11 @@ on:
         type: boolean
         required: false
         default: false
+      pure_appkit_control:
+        description: 'Five live off pairs of patched/pure AppKit empty controls; requires all other inputs at defaults'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -53,7 +58,7 @@ defaults:
 
 jobs:
   ax-system-probe:
-    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin }}
+    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin && !inputs.pure_appkit_control }}
     name: macOS ${{ matrix.expected_os }} (arm64)
     strategy:
       fail-fast: false
@@ -153,10 +158,10 @@ jobs:
           PY
 
   ax-heap-diagnostics:
-    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin }}
-    name: macOS 26 ${{ inputs.scan_mode }} heap comparison (arm64)
+    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin || inputs.pure_appkit_control }}
+    name: macOS 26 ${{ inputs.pure_appkit_control && 'pure AppKit live' || inputs.scan_mode }} heap comparison (arm64)
     runs-on: macos-26
-    timeout-minutes: ${{ inputs.malloc_scribble && 70 || 35 }}
+    timeout-minutes: ${{ inputs.malloc_scribble && 70 || inputs.pure_appkit_control && 40 || 35 }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       CAUSAL_PROBE: ${{ inputs.ax_causal_probe }}
@@ -165,6 +170,7 @@ jobs:
       AX_RECEIPT_MODE: ${{ inputs.receipt_mode }}
       AX_HEAP_DIAGNOSTICS: ${{ inputs.heap_diagnostics }}
       AX_TERMINAL_ORIGIN: ${{ inputs.terminal_origin }}
+      AX_PURE_APPKIT_CONTROL: ${{ inputs.pure_appkit_control }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -182,11 +188,16 @@ jobs:
           scan_mode = os.environ['AX_SCAN_MODE']
           receipt_mode = os.environ['AX_RECEIPT_MODE']
           terminal_origin = os.environ.get('AX_TERMINAL_ORIGIN', 'false') == 'true'
+          pure_control = os.environ.get('AX_PURE_APPKIT_CONTROL', 'false') == 'true'
+          if pure_control:
+              assert (scan_mode == 'diagnostic' and receipt_mode == 'internal' and not terminal_origin
+                  and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == os.environ['AX_HEAP_DIAGNOSTICS'] == 'false'), 'Pure AppKit control requires other inputs at defaults'
+              scan_mode, receipt_mode = 'live', 'external-startup'
           assert receipt_mode in ('internal', 'external-startup'), 'Unknown receipt mode'
-          assert receipt_mode != 'external-startup' or (scan_mode == 'live' and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'), 'External startup receipts require live MallocScribble'
+          assert receipt_mode != 'external-startup' or (scan_mode == 'live' and (pure_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true')), 'External startup receipts require live MallocScribble'
           assert receipt_mode != 'external-startup' or os.environ['AX_HEAP_DIAGNOSTICS'] == 'false', 'External startup receipts cannot request frozen diagnostics'
           assert scan_mode in ('diagnostic', 'live'), 'Unknown heap scan mode'
-          assert scan_mode != 'live' or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires malloc_scribble'
+          assert scan_mode != 'live' or pure_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires malloc_scribble'
           assert not terminal_origin or (scan_mode == 'live' and receipt_mode == 'external-startup'), 'Terminal origin requires external live comparison'
           version = output('sw_vers', '-productVersion')
           architecture = output('uname', '-m')
@@ -210,6 +221,8 @@ jobs:
               'inherited_allocator_environment':allocator_environment,
               'dyld_insert_libraries_present':'DYLD_INSERT_LIBRARIES' in os.environ,
               'malloc_scribble_experiment':os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'}
+          if pure_control:
+              identity['pure_appkit_control'] = True
           root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
           root.mkdir(parents=True, exist_ok=False)
           (root / 'summary.json').write_text(json.dumps({'identity':identity, 'trials':[], 'completed':False,
@@ -219,13 +232,15 @@ jobs:
       - name: Measure matched cases with strict heap checks
         run: |
           python3 - <<'PY'
-          import json, os, pathlib, re, signal, subprocess, sys
+          import json, os, pathlib, re, sys
           sys.path.insert(0, 'Scripts/Investigations')
           from ax_probe_report import validate_heap_diagnostics_summary, validate_terminal_snapshot, validation_failure_counts
-          from ax_external_receipt import load_prepared_fixture, validate_external_receipt
+          from ax_external_receipt import fixture_sources, load_prepared_build, validate_external_receipt
+          from ax_process import run_owned
           import hashlib
           from importlib import import_module
-          validate_malloc_scribble_receipt = import_module('verify-ax-compatibility').validate_malloc_scribble_receipt
+          runner = import_module('verify-ax-compatibility')
+          validate_malloc_scribble_receipt = runner.validate_malloc_scribble_receipt
           root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
           summary_file = root / 'summary.json'
           public_summary = json.loads(summary_file.read_text())
@@ -233,53 +248,46 @@ jobs:
           diagnostics_expected = scan_mode == 'diagnostic'
           external_receipt = public_summary['identity']['receipt_mode'] == 'external-startup'
           terminal_origin = public_summary['identity'].get('terminal_origin', False)
+          pure_control = public_summary['identity'].get('pure_appkit_control', False)
           scribble_experiment = os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'
-          def run_owned(command, log_path, environment):
-              with log_path.open('w') as log:
-                  try:
-                      process = subprocess.Popen(command, env=environment, stdout=log, stderr=log, start_new_session=True)
-                      return process.wait(timeout=180)
-                  except subprocess.TimeoutExpired:
-                      # Reap this trial's complete private process group, including
-                      # the synthetic host and reader if the runner cannot clean up.
-                      try:
-                          os.killpg(process.pid, signal.SIGTERM)
-                      except ProcessLookupError:
-                          pass
-                      try:
-                          process.wait(timeout=5)
-                      except subprocess.TimeoutExpired:
-                          pass
-                      try:
-                          os.killpg(process.pid, signal.SIGKILL)
-                      except ProcessLookupError:
-                          pass
-                      process.wait(timeout=5)
-                      return 124
-          prepared = root / 'ordinary-fixture'
-          expected_hashes = None
+          fixtures = {}
           if external_receipt:
-              build_return_code = run_owned([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
-                  '--prepare-external-fixture', '--work-directory', str(prepared),
-                  '--records-directory', str(root / 'build-records')], root / 'build.log', dict(os.environ))
-              public_summary['fixture_build_return_code'] = build_return_code
-              summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
-              if build_return_code != 0:
-                  raise SystemExit(1)
-              sources = ['QuickFileApp/AXCompatibility.m', 'QuickFileApp/AXCompatibility.h',
-                         'Scripts/tests/fixtures/AXCompatibilityNotifications.m', 'Scripts/tests/fixtures/AXCompatibilityReader.swift']
-              source_hashes = {name: hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() for name in sources}
-              expected_hashes = load_prepared_fixture(prepared, source_hashes)
-              public_summary['fixture_executables'] = expected_hashes
-              public_summary['fixture_sources'] = source_hashes
-              summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+              for build_mode in (('patched', 'pure-appkit') if pure_control else ('ordinary',)):
+                  prepared = root / (build_mode + '-fixture')
+                  prefix = build_mode + '-' if pure_control else ''
+                  build_run = run_owned([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
+                      '--prepare-external-fixture', '--work-directory', str(prepared),
+                      '--records-directory', str(root / (prefix + 'build-records')),
+                      *(['--empty-control-mode', build_mode] if pure_control else [])], root / (prefix + 'build.log'), dict(os.environ))
+                  build_return_code = build_run['return_code']
+                  if pure_control:
+                      public_summary.setdefault('empty_control_builds', {})[build_mode] = {'return_code': build_return_code, 'process_run': build_run}
+                  else:
+                      public_summary['fixture_build_return_code'] = build_return_code
+                      public_summary['fixture_build_process_run'] = build_run
+                  summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+                  if build_return_code != 0 or not build_run['cleanup']['complete']:
+                      raise SystemExit(1)
+                  source_hashes = {name: hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() for name in fixture_sources(build_mode)}
+                  build = load_prepared_build(prepared, source_hashes, build_mode)
+                  fixtures[build_mode] = (prepared, build['executables'])
+                  if pure_control:
+                      public_summary['empty_control_builds'][build_mode]['manifest'] = build
+                  else:
+                      public_summary['fixture_executables'] = build['executables']
+                      public_summary['fixture_sources'] = source_hashes
+                  summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
           failed = False
           terminal_failed = False
           for trial in range(1, 2 if terminal_origin else 6):
               # Reverse both factors between groups to expose order effects.
               modes = ('control', 'product') if trial % 2 else ('product', 'control')
-              settings = ('off',) if terminal_origin else (('off', 'on') if trial % 2 else ('on', 'off')) if scribble_experiment else (None,)
+              if pure_control:
+                  modes = ('patched', 'pure-appkit') if trial % 2 else ('pure-appkit', 'patched')
+              settings = ('off',) if terminal_origin or pure_control else (('off', 'on') if trial % 2 else ('on', 'off')) if scribble_experiment else (None,)
               for scribble, mode in ((setting, mode) for setting in settings for mode in modes):
+                  if external_receipt:
+                      prepared, expected_hashes = fixtures[mode if pure_control else 'ordinary']
                   directory = root / (f'pair-{trial}-{scribble}-{mode}' if scribble else f'pair-{trial}-{mode}')
                   directory.mkdir()
                   records = directory / 'records'
@@ -288,17 +296,21 @@ jobs:
                       environment.pop('MallocScribble', None)
                       if scribble == 'on':
                           environment['MallocScribble'] = '1'
-                  return_code = run_owned([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
+                  process_run = run_owned([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
                       '--work-directory', str(directory / 'fixture'), '--records-directory', str(records),
                       *(['--heap-diagnostics'] if diagnostics_expected else []),
                       *(['--malloc-scribble', scribble] if scribble else []),
                       *(['--external-startup-receipt', '--prepared-fixture-directory', str(prepared)] if external_receipt else []),
                       *(['--terminal-origin'] if terminal_origin else []),
-                      *(['--heap-control'] if mode == 'control' else [])], directory / 'runner.log', environment)
-                  failed |= return_code != 0
+                      *(['--empty-control-mode', mode] if pure_control else []),
+                      *(['--heap-control'] if mode == 'control' or pure_control else [])], directory / 'runner.log', environment)
+                  return_code = process_run['return_code']
+                  failed |= return_code != 0 or not process_run['cleanup']['complete']
                   receipt = {'trial': trial, 'mode': mode, 'scan_mode': scan_mode, 'return_code': return_code,
-                             'diagnostics_expected': diagnostics_expected, 'diagnostics_available': False,
+                             'diagnostics_expected': diagnostics_expected, 'diagnostics_available': False, 'process_run': process_run,
                              'receipt_mode': public_summary['identity']['receipt_mode']}
+                  if pure_control:
+                      receipt['fixture_mode_verified'] = False
                   receipt['failure_classification_available'] = False
                   result_file = records / 'result.json'
                   if result_file.is_file() and not result_file.is_symlink() and result_file.stat().st_size <= 65536:
@@ -313,13 +325,17 @@ jobs:
                   input_file = records / 'inputs.json'
                   if input_file.is_file() and not input_file.is_symlink() and input_file.stat().st_size <= 16384:
                       try:
-                          images = json.loads(input_file.read_text())['capabilities']['images']
+                          capabilities = json.loads(input_file.read_text())['capabilities']
+                          if pure_control:
+                              runner.validate_empty_control_capabilities(capabilities, mode)
+                              receipt['fixture_mode_verified'] = True
+                          images = capabilities['images']
                           if (type(images) is not dict or set(images) != {'AppKit', 'CoreFoundation'}
                                   or any(type(value) is not str or not re.fullmatch(r'[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}', value)
                                          for value in images.values())):
                               raise ValueError('Invalid system image identities')
                           receipt['images'] = images
-                      except (ValueError, TypeError, KeyError):
+                      except (ValueError, TypeError, KeyError, RuntimeError):
                           failed = True
                   if 'images' not in receipt:
                       failed = True
@@ -394,7 +410,7 @@ jobs:
                               fields['tool_exit_code'] = tool_exit
                               failed |= tool_exit not in (0, 1)
                               totals.append(dict(label=item['label'], **fields))
-                          if mode == 'control':
+                          if mode == 'control' or pure_control:
                               zero_fields = ['buttons', 'allocatedButtons', 'destroyedButtons', 'compensations', 'mutableCompensations']
                               if any(type(item['host'][key]) is not int or item['host'][key] != 0
                                      for item in scans for key in zero_fields):
@@ -429,6 +445,9 @@ jobs:
                   print(json.dumps(receipt, separators=(',', ':')), flush=True)
                   public_summary['trials'].append(receipt)
                   summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+                  if not process_run['cleanup']['complete']:
+                      # Do not contaminate another case when group exit is unknown.
+                      raise SystemExit(1)
           public_summary['completed'] = True
           public_summary['strict_checks_passed'] = not failed
           if terminal_origin:

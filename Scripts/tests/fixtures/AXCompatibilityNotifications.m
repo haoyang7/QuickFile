@@ -2,7 +2,15 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <mach-o/dyld.h>
+#ifndef QUICKFILE_AX_PURE_APPKIT_CONTROL
 #import "AXCompatibility.h"
+#endif
+#if defined(QUICKFILE_AX_PURE_APPKIT_CONTROL) && !defined(QUICKFILE_AX_EMPTY_CONTROL)
+#error Pure AppKit requires the explicit empty-control build
+#endif
+#if defined(QUICKFILE_AX_EMPTY_CONTROL) && (defined(QUICKFILE_AX_MALLOC_RECEIPT) || defined(QUICKFILE_AX_OWNERSHIP_PROBE) || defined(QUICKFILE_AX_COPY_LIFETIME))
+#error Empty controls do not support internal diagnostic instrumentation
+#endif
 #ifdef QUICKFILE_AX_MALLOC_RECEIPT
 static NSString *mallocScribbleEnvironment(void) {
     const char *value = getenv("MallocScribble");
@@ -95,7 +103,13 @@ static NSUInteger allocatedButtons = 0, destroyedButtons = 0;
 @end
 @implementation Owner
 - (void)publish:(NSInteger)sequence action:(NSString *)action {
-    NSMutableDictionary *record = [@{@"compensations":@(QuickFileAXCompensatedCopies()), @"mutableCompensations":@(QuickFileAXCompensatedMutableCopies()), @"pid":@(getpid()), @"sequence":@(sequence), @"action":action,
+    NSMutableDictionary *record = [@{
+#ifdef QUICKFILE_AX_PURE_APPKIT_CONTROL
+       @"compensations":@0, @"mutableCompensations":@0,
+#else
+       @"compensations":@(QuickFileAXCompensatedCopies()), @"mutableCompensations":@(QuickFileAXCompensatedMutableCopies()),
+#endif
+       @"pid":@(getpid()), @"sequence":@(sequence), @"action":action,
        @"buttons":@(self.buttons.count), @"allocatedButtons":@(allocatedButtons), @"destroyedButtons":@(destroyedButtons)} mutableCopy];
 #ifdef QUICKFILE_AX_OWNERSHIP_PROBE
     record[@"ownership"] = AXOwnershipProbeSnapshot();
@@ -143,11 +157,29 @@ int main(int argc, const char **argv) {
  @autoreleasepool {
     BOOL systemBaseline = argc == 3 && !strcmp(argv[2], "--system-baseline");
     if (argc != 2 && !systemBaseline) return 2;
+#ifdef QUICKFILE_AX_EMPTY_CONTROL
+    if (systemBaseline) return 2;
+#endif
+#ifdef QUICKFILE_AX_PURE_APPKIT_CONTROL
+    BOOL enabled = NO;
+#else
     // A system baseline never installs or attempts the product compensation.
     BOOL enabled = systemBaseline ? NO : QuickFileInstallAXCompatibility();
+#endif
     if (!strcmp(argv[1], "--capabilities")) {
         NSMutableDictionary *capabilities = [@{@"enabled":@(enabled),
+#ifdef QUICKFILE_AX_PURE_APPKIT_CONTROL
+            @"status":@"pure-appkit", @"images":systemImages()} mutableCopy];
+#else
             @"status":systemBaseline ? @"system-baseline" : @(QuickFileAXCompatibilityStatus()), @"images":systemImages()} mutableCopy];
+#endif
+#ifdef QUICKFILE_AX_EMPTY_CONTROL
+#ifdef QUICKFILE_AX_PURE_APPKIT_CONTROL
+        capabilities[@"empty_control_mode"] = @"pure-appkit";
+#else
+        capabilities[@"empty_control_mode"] = @"patched";
+#endif
+#endif
 #ifdef QUICKFILE_AX_MALLOC_RECEIPT
         capabilities[@"malloc_scribble"] = mallocScribbleEnvironment();
 #endif
@@ -155,7 +187,9 @@ int main(int argc, const char **argv) {
         puts([[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
         return 0;
     }
+#ifndef QUICKFILE_AX_PURE_APPKIT_CONTROL
     if (!enabled && !systemBaseline) return 3;
+#endif
 #ifdef QUICKFILE_AX_OWNERSHIP_PROBE
     if (!systemBaseline) return 4;
     AXOwnershipProbeInstall(@(argv[1]), QUICKFILE_AX_OWNERSHIP_PROBE == 2);

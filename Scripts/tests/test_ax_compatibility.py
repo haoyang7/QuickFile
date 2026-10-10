@@ -21,6 +21,7 @@ with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
     SPEC.loader.exec_module(PROBE)
 REPORT = sys.modules["ax_probe_report"]
 EXTERNAL = sys.modules["ax_external_receipt"]
+PROCESSES = sys.modules["ax_process"]
 
 
 def notification_records(work, copy_lifetime=False):
@@ -854,6 +855,127 @@ class AXTerminalSnapshotTests(unittest.TestCase):
             self.assertEqual(value["tool_exit_codes"], {"grouped": 1, "list": None})
 
 
+class AXPureAppKitControlTests(unittest.TestCase):
+    @staticmethod
+    def manifest(mode, hashes):
+        sources = (["QuickFileApp/AXCompatibility.m", "QuickFileApp/AXCompatibility.h"] if mode == "patched" else [])
+        sources += ["Scripts/tests/fixtures/AXCompatibilityNotifications.m", "Scripts/tests/fixtures/AXCompatibilityReader.swift"]
+        return {"schema": 2, "build_mode": mode,
+                "sources": {name: PROBE.hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
+                "executables": hashes, "build_evidence": {
+                    "link_inputs": {"host": [sources[-2]] + (["AXCompatibility.o"] if mode == "patched" else []),
+                                    "reader": [sources[-1]]},
+                    "production_ax_symbol_counts": {"host": 4 if mode == "patched" else 0, "reader": 0}}}
+
+    def test_empty_control_cli_rejects_incompatible_or_implicit_modes(self):
+        measured = ["--heap-control", "--external-startup-receipt", "--prepared-fixture-directory", "prepared", "--malloc-scribble", "off"]
+        invalid = [[], ["--heap-control"], measured[:-1] + ["on"], measured[1:]]
+        invalid += [measured + [flag] for flag in ("--terminal-origin", "--heap-diagnostics", "--system-baseline", "--copy-lifetime", "--read-only", "--ownership-trace")]
+        invalid += [["--prepare-external-fixture", flag] for flag in ("--heap-control", "--terminal-origin", "--heap-diagnostics")]
+        for mode, extra in itertools.product(("patched", "pure-appkit"), invalid):
+            with self.subTest(mode=mode, extra=extra), mock.patch.object(sys, "argv", ["probe", "--empty-control-mode", mode,
+                    "--work-directory", "unused", "--records-directory", "unused", *extra]), \
+                    mock.patch.object(PROBE.subprocess, "run") as run, contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                PROBE.main()
+            self.assertEqual(error.exception.code, 2)
+            run.assert_not_called()
+
+    def test_prepare_builds_only_declared_inputs_and_audits_both_executables(self):
+        exports = ["_QuickFileInstallAXCompatibility", "_QuickFileAXCompatibilityStatus", "_QuickFileAXCompensatedCopies", "_QuickFileAXCompensatedMutableCopies"]
+        for mode, bad_symbols in itertools.product(("patched", "pure-appkit"), (None, "host", "reader", "empty")):
+            with self.subTest(mode=mode, bad_symbols=bad_symbols), tempfile.TemporaryDirectory() as directory:
+                temporary = pathlib.Path(directory).resolve()
+                work, records = temporary / "fixture", temporary / "records"
+                class ProbeRoot:
+                    def __truediv__(self, child):
+                        return temporary if child == ".build/Temporary" else ROOT / child
+                commands = []
+                def run(command, **kwargs):
+                    commands.append(command)
+                    output = ""
+                    if "-o" in command:
+                        path = pathlib.Path(command[command.index("-o") + 1])
+                        path.write_bytes((mode + path.name).encode())
+                        path.chmod(0o700)
+                    if "nm" in command:
+                        role = "reader" if command[-1].endswith("ax-reader") else "host"
+                        symbols = exports if role == "host" and mode == "patched" else []
+                        if role == bad_symbols:
+                            symbols = [] if symbols else ["_QuickFileAXUnexpected"]
+                        output = "\n".join(["_main", *symbols]) if bad_symbols != "empty" else ""
+                    return subprocess.CompletedProcess(command, 0, output, "")
+                with mock.patch.object(PROBE, "ROOT", ProbeRoot()), mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
+                        mock.patch.object(PROBE.subprocess, "Popen") as start, contextlib.redirect_stdout(io.StringIO()), \
+                        mock.patch.object(sys, "argv", ["probe", "--prepare-external-fixture", "--empty-control-mode", mode,
+                            "--work-directory", str(work), "--records-directory", str(records)]):
+                    if bad_symbols:
+                        with self.assertRaises(RuntimeError):
+                            PROBE.main()
+                        self.assertFalse((work / "fixture-build.json").exists())
+                    else:
+                        self.assertEqual(PROBE.main(), 0)
+                        manifest = EXTERNAL.load_prepared_build(work, self.manifest(mode, {})["sources"], mode)
+                        self.assertEqual(manifest, self.manifest(mode, EXTERNAL.fixture_hashes(work)))
+                        self.assertEqual(sum("nm" in command for command in commands), 2)
+                start.assert_not_called()
+                self.assertFalse(any("--capabilities" in command or "-DQUICKFILE_AX_MALLOC_RECEIPT" in command for command in commands))
+                host = next(command for command in commands if "-fobjc-arc" in command)
+                self.assertIn("-DQUICKFILE_AX_EMPTY_CONTROL", host)
+                self.assertEqual("-DQUICKFILE_AX_PURE_APPKIT_CONTROL" in host, mode == "pure-appkit")
+                self.assertEqual(any("-fno-objc-arc" in command for command in commands), mode == "patched")
+                if mode == "pure-appkit":
+                    self.assertFalse(any("QuickFileApp" in str(part) or str(part).endswith("AXCompatibility.o") for command in commands for part in command))
+
+    def test_prepared_modes_source_hashes_link_inputs_and_bytes_cannot_be_interchanged(self):
+        for mode in ("patched", "pure-appkit"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                prepared = pathlib.Path(directory)
+                for role, name in EXTERNAL.EXECUTABLES.items():
+                    path = prepared / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes((mode + role).encode())
+                    path.chmod(0o700)
+                valid = self.manifest(mode, EXTERNAL.fixture_hashes(prepared))
+                manifest_path = prepared / "fixture-build.json"
+                PROBE.write_json(manifest_path, valid)
+                for wrong_mode in ("ordinary", "pure-appkit" if mode == "patched" else "patched"):
+                    with self.assertRaises(RuntimeError):
+                        EXTERNAL.load_prepared_fixture(prepared, valid["sources"], wrong_mode)
+                changes = [lambda value: value.update(private="/private/secret"),
+                    lambda value: value["sources"].update({"/private/secret": "0" * 64}),
+                    lambda value: value["build_evidence"]["link_inputs"]["host"].append("/private/secret.o"),
+                    lambda value: value["build_evidence"]["production_ax_symbol_counts"].update(reader=1),
+                    lambda value: value["build_evidence"]["production_ax_symbol_counts"].update(host=True),
+                    lambda value: value["build_evidence"]["production_ax_symbol_counts"].update(host=1)]
+                for change in changes:
+                    value = json.loads(json.dumps(valid))
+                    change(value)
+                    PROBE.write_json(manifest_path, value)
+                    with self.assertRaises(RuntimeError) as error:
+                        EXTERNAL.load_prepared_fixture(prepared, valid["sources"], mode)
+                    self.assertNotIn("secret", str(error.exception))
+                PROBE.write_json(manifest_path, valid)
+                for role, name in EXTERNAL.EXECUTABLES.items():
+                    path = prepared / name
+                    previous = path.read_bytes()
+                    path.write_bytes(b"changed")
+                    with self.assertRaises(RuntimeError):
+                        EXTERNAL.load_prepared_fixture(prepared, valid["sources"], mode)
+                    path.write_bytes(previous)
+
+    def test_capability_identity_is_explicit_and_never_inferred_from_zero_counts(self):
+        for mode in ("patched", "pure-appkit"):
+            valid = {"empty_control_mode": mode, "enabled": mode == "patched", "status": "enabled" if mode == "patched" else mode}
+            self.assertIsNone(PROBE.preflight_reason(valid, {"trusted": True}, empty_control_mode=mode))
+            self.assertEqual(PROBE.preflight_reason(valid, {"trusted": False}, empty_control_mode=mode), "reader-not-trusted")
+            for changed in (dict(valid, empty_control_mode="wrong"), dict(valid, enabled=not valid["enabled"]),
+                            dict(valid, enabled=int(valid["enabled"])), dict(valid, status="system-baseline"), None, [], "private-secret"):
+                with self.assertRaises(RuntimeError):
+                    PROBE.preflight_reason(changed, {"trusted": True}, empty_control_mode=mode)
+        with self.assertRaises(RuntimeError):
+            PROBE.preflight_reason({"enabled": False, "status": "pure-appkit"}, {"trusted": True})
+
+
 class AXCompatibilityLifecycleTests(unittest.TestCase):
     """Inject process/scan results while exercising the real runner protocol."""
 
@@ -863,7 +985,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         invalid_control_host=None, invalid_control_reader=None,
                         copy_lifetime=False, invalid_copy_lifetime=None,
                         malloc_scribble=None, invalid_allocator=None, external_receipt=False, binary_drift=False,
-                        terminal_origin=False, terminal_timeout=False):
+                        terminal_origin=False, terminal_timeout=False, empty_control_mode=None,
+                        cleanup_failure=None, ls_failure=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -925,6 +1048,10 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     return self.returncode
 
                 def wait(self, timeout):
+                    role = "reader" if self.is_reader else "host"
+                    failure = (cleanup_failure or {}).get(role)
+                    if failure and (failure == "stuck" or not getattr(self, "killed", False)):
+                        raise subprocess.TimeoutExpired("original-reader-wait" if self.is_reader else "host-wait", timeout)
                     self.returncode = 0
                     if external_receipt and binary_drift and not self.is_reader:
                         pathlib.Path(self.args[0]).write_bytes(b"changed after measurement")
@@ -932,13 +1059,24 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         PROBE.write_json(state / "reader-completed.json", notifications)
                     return 0
 
+                def terminate(self):
+                    self.terminated = True
+
+                def kill(self):
+                    self.killed = True
+
             def run(command, **_kwargs):
                 commands.append(command)
                 output = ""
+                if command[0].endswith("/lsregister") and ls_failure:
+                    raise subprocess.TimeoutExpired("private-ls", 15)
                 if "--capabilities" in command:
                     capability = {"trusted": True} if pathlib.Path(command[0]).name == "ax-reader" else {
                         "enabled": not system_baseline, "status": "system-baseline" if system_baseline else "enabled",
                         "images": {"AppKit": "synthetic", "CoreFoundation": "synthetic"}}
+                    if empty_control_mode and pathlib.Path(command[0]).name != "ax-reader":
+                        capability.update(empty_control_mode=empty_control_mode, enabled=empty_control_mode == "patched",
+                                          status="enabled" if empty_control_mode == "patched" else "pure-appkit")
                     output = json.dumps(capability)
                 elif command[0] == "heap" and unavailable_cohorts:
                     raise OSError("allocation tool unavailable")
@@ -1052,6 +1190,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.extend(["--malloc-scribble", malloc_scribble])
             if terminal_origin:
                 arguments.append("--terminal-origin")
+            if empty_control_mode:
+                arguments.extend(["--empty-control-mode", empty_control_mode])
             def startup_metadata(pid):
                 process = next(process for process in processes if process.pid == pid)
                 role = "reader" if process.is_reader else "host"
@@ -1072,6 +1212,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 PROBE.write_json(prepared / "fixture-build.json", {"schema": 1, "build_mode": "ordinary",
                     "sources": {name: PROBE.hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
                     "executables": EXTERNAL.fixture_hashes(prepared)})
+                if empty_control_mode:
+                    PROBE.write_json(prepared / "fixture-build.json", AXPureAppKitControlTests.manifest(empty_control_mode, EXTERNAL.fixture_hashes(prepared)))
                 arguments.extend(["--external-startup-receipt", "--prepared-fixture-directory", str(prepared)])
             with mock.patch.object(EXTERNAL, "read_procargs", side_effect=startup_metadata), \
                     mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
@@ -1083,8 +1225,36 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     mock.patch.object(PROBE.time, "sleep"), \
                     mock.patch.object(PROBE.time, "monotonic", side_effect=itertools.count(step=0.25)), \
                     contextlib.redirect_stdout(io.StringIO()):
-                exit_code = PROBE.main()
+                try:
+                    exit_code = PROBE.main()
+                except subprocess.TimeoutExpired as error:
+                    if not cleanup_failure or "reader" not in cleanup_failure:
+                        raise
+                    self.assertEqual(error.cmd, "original-reader-wait")
+                    exit_code = 1
             summary = json.loads((records / "result.json").read_text())
+            if cleanup_failure:
+                cleanup = json.loads((records / "process-cleanup.json").read_text())
+                self.assertEqual(summary["cleanup"], cleanup)
+                self.assertTrue(any(command[0].endswith("/lsregister") for command in commands))
+                self.assertTrue((state / "quit").exists())
+                for role, failure in cleanup_failure.items():
+                    self.assertTrue(cleanup[role]["terminate_sent"])
+                    self.assertTrue(cleanup[role]["kill_sent"])
+                    self.assertEqual(cleanup[role]["exited"], failure != "stuck")
+                if "reader" in cleanup_failure:
+                    self.assertTrue(cleanup["primary_exception"])
+                    self.assertEqual(scanned, scan_labels[:-1])
+                else:
+                    self.assertEqual(scanned, scan_labels)
+                if external_receipt:
+                    final_receipt = json.loads((records / "external-startup.json").read_text())
+                    self.assertEqual(final_receipt["binary_reuse_verified"], cleanup["processes_exited"])
+                if terminal_origin and not cleanup["processes_exited"]:
+                    self.assertFalse(any(command[0] == "leaks" and command[-1].endswith("terminal.memgraph") for command in commands))
+                    self.assertEqual(json.loads((records / "terminal-snapshot.json").read_text())["parsing_status"], "unavailable")
+                self.assertNotIn("private-ls", json.dumps(cleanup))
+                return exit_code, summary
             self.assertEqual(scanned, scan_labels)
             self.assertEqual(json.loads((records / "notifications.json").read_text()), notifications)
             self.assertTrue((state / "stop-reader").exists())
@@ -1214,6 +1384,25 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertEqual(json.loads((records / "validation-errors.json").read_text()), summary["validation_errors"])
             return exit_code, summary
 
+    def test_cleanup_kills_each_stuck_process_without_masking_initial_failure(self):
+        for failures in ({"reader": "kill", "host": "kill"}, {"reader": "stuck", "host": "stuck"}):
+            code, summary = self.exercise_runner(cleanup_failure=failures, ls_failure=True,
+                malloc_scribble="off", external_receipt=True, failed_scan="registered-10")
+            self.assertEqual(code, 1)
+            self.assertEqual(summary["coverage"], "failed")
+            self.assertTrue(any(error["stage"] == "registered-10" for error in summary["validation_errors"]))
+            self.assertIn("launch_services", summary["cleanup"]["errors"])
+
+    def test_terminal_analysis_waits_for_confirmed_exit_and_keeps_strict_failure(self):
+        code, summary = self.exercise_runner(cleanup_failure={"host": "stuck"},
+            malloc_scribble="off", external_receipt=True, terminal_origin=True, failed_scan="registered-10")
+        self.assertEqual(code, 1)
+        self.assertFalse(summary["cleanup"]["processes_exited"])
+        self.assertTrue(any(error["stage"] == "registered-10" for error in summary["validation_errors"]))
+        code, summary = self.exercise_runner(cleanup_failure={"host": "kill"})
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["cleanup"]["processes_exited"])
+
     def test_external_startup_reuses_bytes_and_preserves_live_protocol_and_strict_failures(self):
         for setting, control, failure in itertools.product(("off", "on"), (False, True), (None, "registered-10")):
             with self.subTest(setting=setting, control=control, failure=failure):
@@ -1221,6 +1410,25 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                                                      heap_control=control, failed_scan=failure)
                 self.assertEqual(code, int(failure is not None))
                 self.assertEqual(summary["receipt_mode"], "external-startup")
+
+    def test_pure_and_patched_empty_controls_keep_six_scans_and_transient_strict_failures(self):
+        for mode, failure in itertools.product(("patched", "pure-appkit"), (None, "registered-10", "removed-20")):
+            with self.subTest(mode=mode, failure=failure):
+                code, summary = self.exercise_runner(empty_control_mode=mode, external_receipt=True,
+                    malloc_scribble="off", heap_control=True, failed_scan=failure)
+                self.assertEqual(code, int(failure is not None))
+                self.assertEqual(summary["coverage"], "failed" if failure else "measured")
+                self.assertEqual(summary["empty_control_mode"], mode)
+                self.assertEqual(summary["product_compensation_enabled"], mode == "patched")
+                self.assertEqual(len(summary["scans"]), 6)
+                if failure:
+                    self.assertEqual([row["stage"] for row in summary["validation_errors"]], [failure])
+        for mode, invalid in itertools.product(("patched", "pure-appkit"),
+                ({"invalid_control_host": (5, "allocatedButtons")}, {"invalid_control_reader": (3, "registrations")}, {"invalid_notifications": True})):
+            code, summary = self.exercise_runner(empty_control_mode=mode, external_receipt=True,
+                malloc_scribble="off", heap_control=True, **invalid)
+            self.assertEqual(code, 1)
+            self.assertEqual(len(summary["scans"]), 6)
 
     def test_external_executable_drift_after_measurement_remains_fatal(self):
         code, summary = self.exercise_runner(external_receipt=True, malloc_scribble="off", binary_drift=True)
@@ -1428,6 +1636,53 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 exec(compile(script, "ax-system-baseline.yml", "exec"), {})
             query.assert_not_called()
 
+    def test_pure_control_workflow_has_an_explicit_exclusive_opt_in(self):
+        script = self.workflow_script("Verify investigation identity")
+        environment = {"AX_PURE_APPKIT_CONTROL": "true", "AX_SCAN_MODE": "diagnostic", "AX_RECEIPT_MODE": "internal",
+                       "AX_TERMINAL_ORIGIN": "false", "MALLOC_SCRIBBLE_EXPERIMENT": "false", "AX_HEAP_DIAGNOSTICS": "false", "CAUSAL_PROBE": "false"}
+        outputs = {('sw_vers', '-productVersion'): '26.6.2', ('sw_vers', '-buildVersion'): '25G83',
+                   ('uname', '-m'): 'arm64', ('xcodebuild', '-version'): 'Xcode 26.3\nBuild version 17C529',
+                   ('git', 'rev-parse', 'HEAD'): '1' * 40}
+        variants = [None, ("AX_SCAN_MODE", "live"), ("AX_RECEIPT_MODE", "external-startup")]
+        variants += [(key, "true") for key in ("AX_TERMINAL_ORIGIN", "MALLOC_SCRIBBLE_EXPERIMENT", "AX_HEAP_DIAGNOSTICS", "CAUSAL_PROBE")]
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory) / "records"
+                code = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
+                changed = environment | (dict([variant]) if variant else {})
+                with mock.patch.dict(os.environ, changed), contextlib.redirect_stdout(io.StringIO()), \
+                        mock.patch.object(subprocess, "check_output", side_effect=lambda command, **_: outputs[tuple(command)]) as query:
+                    if variant:
+                        with self.assertRaises(AssertionError):
+                            exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        query.assert_not_called()
+                    else:
+                        exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        summary = json.loads((root / "summary.json").read_text())
+                        self.assertEqual(summary["expected_trials"], 10)
+                        self.assertTrue(summary["identity"]["pure_appkit_control"])
+                        self.assertEqual(summary["identity"]["scan_mode"], "live")
+                        self.assertEqual(summary["identity"]["receipt_mode"], "external-startup")
+
+    def test_pure_control_workflow_reuses_each_build_and_keeps_all_ten_cases_after_failure(self):
+        for failure in (None, "strict", "timeout", "control-mode", "cross-mode-receipt", "external-receipt", "external-private", "external-missing", "scan-fields"):
+            with self.subTest(failure=failure):
+                change = (lambda scan: scan["host"].update(buttons=1)) if failure == "scan-fields" else None
+                invocations, summary = self.run_measurement(enabled=False, scan_mode="live", receipt_mode="external-startup",
+                    pure_control=True, first_failure=failure, first_scan_change=change)
+                pair = [("off", "patched"), ("off", "pure-appkit")]
+                self.assertEqual(invocations, pair + list(reversed(pair)) + pair + list(reversed(pair)) + pair)
+                self.assertEqual(set(summary["empty_control_builds"]), {"patched", "pure-appkit"})
+                for trial in summary["trials"][1:]:
+                    self.assertTrue(trial["control_zero_targets"])
+                    self.assertTrue(trial["fixture_mode_verified"])
+                    self.assertEqual(len(trial["scan_totals"]), 6)
+                    self.assertEqual(trial["startup_environment"]["executables"], summary["empty_control_builds"][trial["mode"]]["manifest"]["executables"])
+                self.assertNotEqual(summary["empty_control_builds"]["patched"]["manifest"]["executables"]["host"],
+                                    summary["empty_control_builds"]["pure-appkit"]["manifest"]["executables"]["host"])
+        for failure in ("build", "build-timeout"):
+            self.run_measurement(enabled=False, scan_mode="live", receipt_mode="external-startup", pure_control=True, first_failure=failure)
+
     def test_failed_or_timed_out_preparation_cannot_claim_completed_trials(self):
         for failure in ("build", "build-timeout"):
             self.run_measurement(scan_mode="live", receipt_mode="external-startup", first_failure=failure)
@@ -1498,6 +1753,11 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
         for value in (True, None, "secret", 256, -129):
             self.run_measurement(scan_mode="live", first_failure="scan-fields", first_scan_change=lambda scan: scan.update(exit_code=value))
 
+    def test_unconfirmed_group_cleanup_stops_before_next_case(self):
+        self.run_measurement(scan_mode="live", first_failure="cleanup")
+        self.run_measurement(enabled=False, scan_mode="live", receipt_mode="external-startup",
+                             pure_control=True, first_failure="cleanup")
+
     def test_scan_mode_identity_and_invalid_combinations_before_starting_fixtures(self):
         script = self.workflow_script("Verify investigation identity")
         outputs = {('sw_vers', '-productVersion'): '26.6.2', ('sw_vers', '-buildVersion'): '25G83',
@@ -1525,13 +1785,17 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         self.assertFalse(root.exists())
 
     def run_measurement(self, *, enabled=True, first_failure=None, scan_mode="diagnostic", unexpected_diagnostics=False,
-                        first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None):
+                        first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False):
         script = self.workflow_script("Measure matched cases with strict heap checks")
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
             summary_file = root / "summary.json"
             PROBE.write_json(summary_file, {"identity": {"scan_mode": scan_mode, "receipt_mode": receipt_mode, "terminal_origin": terminal_origin}, "trials": [], "completed": False,
                                            "expected_trials": 2 if terminal_origin else 20 if enabled else 10})
+            if pure_control:
+                value = json.loads(summary_file.read_text())
+                value["identity"]["pure_appkit_control"] = True
+                PROBE.write_json(summary_file, value)
             script = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
             invocations = []
             builds = []
@@ -1545,22 +1809,28 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if self.build:
                         self.first = False
                         builds.append(command)
+                        build_mode = command[command.index("--empty-control-mode") + 1] if pure_control else "ordinary"
                         prepared = pathlib.Path(command[command.index("--work-directory") + 1])
                         for role, name in EXTERNAL.EXECUTABLES.items():
                             path = prepared / name
                             path.parent.mkdir(parents=True, exist_ok=True)
-                            path.write_bytes(role.encode())
+                            path.write_bytes((build_mode + role).encode() if pure_control else role.encode())
                             path.chmod(0o700)
                         sources = ["QuickFileApp/AXCompatibility.m", "QuickFileApp/AXCompatibility.h",
                                    "Scripts/tests/fixtures/AXCompatibilityNotifications.m", "Scripts/tests/fixtures/AXCompatibilityReader.swift"]
                         PROBE.write_json(prepared / "fixture-build.json", {"schema": 1, "build_mode": "ordinary",
                             "sources": {name: PROBE.hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
                             "executables": EXTERNAL.fixture_hashes(prepared)})
+                        if pure_control:
+                            PROBE.write_json(prepared / "fixture-build.json", AXPureAppKitControlTests.manifest(build_mode, EXTERNAL.fixture_hashes(prepared)))
                         return
                     test.assertEqual("--external-startup-receipt" in command, receipt_mode == "external-startup")
                     test.assertEqual("--terminal-origin" in command, terminal_origin)
                     setting = command[command.index("--malloc-scribble") + 1] if "--malloc-scribble" in command else None
                     mode = "control" if "--heap-control" in command else "product"
+                    if pure_control:
+                        test.assertEqual(mode, "control")
+                        mode = command[command.index("--empty-control-mode") + 1]
                     invocations.append((setting, mode))
                     self.first = len(invocations) == 1
                     test.assertTrue(kwargs["start_new_session"])
@@ -1578,7 +1848,9 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if self.first and first_failure == "receipt":
                         receipt["reader"] = "/private/secret"
                     if receipt_mode == "external-startup":
-                        hashes = EXTERNAL.fixture_hashes(root / "ordinary-fixture")
+                        hashes = EXTERNAL.fixture_hashes(root / ((mode if pure_control else "ordinary") + "-fixture"))
+                        if self.first and first_failure == "cross-mode-receipt":
+                            hashes = EXTERNAL.fixture_hashes(root / "pure-appkit-fixture")
                         startup = {"receipt_mode": receipt_mode, "requested": setting, "executables": hashes,
                                    "binary_reuse_verified": True}
                         for role in hashes:
@@ -1592,9 +1864,14 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         if not (self.first and first_failure == "external-missing"):
                             PROBE.write_json(records / "external-startup.json", startup)
                     PROBE.write_json(records / "malloc-scribble.json", receipt)
-                    PROBE.write_json(records / "inputs.json", {"capabilities": {"images": {
+                    capabilities = {"images": {
                         "AppKit": "B6B4BDAD-6428-3E64-8747-275700109B46",
-                        "CoreFoundation": "9B672762-7B1F-30BC-96DE-F176B372D66D"}}})
+                        "CoreFoundation": "9B672762-7B1F-30BC-96DE-F176B372D66D"}}
+                    if pure_control:
+                        capabilities.update(empty_control_mode=mode, enabled=mode == "patched", status="enabled" if mode == "patched" else "pure-appkit")
+                        if self.first and first_failure == "control-mode":
+                            capabilities["empty_control_mode"] = "/private/secret"
+                    PROBE.write_json(records / "inputs.json", {"capabilities": capabilities})
                     point = REPORT.heap_diff_summary("Process 123: 0 leaks for 0 total leaked bytes.\n")
                     diagnostic = {"schema": 4, "status": "complete", "symbols": [], "omitted_symbols": 0,
                                   "symbols_status": "complete", "cohorts_status": "complete",
@@ -1643,26 +1920,43 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         raise subprocess.TimeoutExpired("probe", timeout)
                     return 1 if self.first and first_failure == "strict" else 0
 
+            def run_owned(command, log_path, environment):
+                process = Process(command, env=environment, start_new_session=True)
+                try:
+                    code = process.wait(180)
+                    status, command_code = "completed", code
+                except subprocess.TimeoutExpired:
+                    code, command_code, status = 124, None, "timeout"
+                complete = not (process.first and first_failure == "cleanup")
+                return {"return_code": code if complete or code else 125, "command_return_code": command_code,
+                        "status": status, "cleanup": {"complete": complete, "group_members_exited": complete,
+                        "leader_reaped": True, "group_signal": "sent", "group_inspection": "exited" if complete else "running"}}
+
             with mock.patch.dict(os.environ, {"MALLOC_SCRIBBLE_EXPERIMENT": "true" if enabled else "false",
                                               "MallocScribble": "inherited-secret"}), \
                     mock.patch.dict(sys.modules, {"verify-ax-compatibility": PROBE}), \
                     mock.patch.object(sys, "path", list(sys.path)), \
-                    mock.patch.object(subprocess, "Popen", side_effect=Process), \
+                    mock.patch.object(PROCESSES, "run_owned", side_effect=run_owned), \
                     mock.patch.object(REPORT, "SystemSymbols", return_value=AXTerminalSnapshotTests.resolver()), \
-                    mock.patch.object(os, "killpg", create=True) as killpg, \
                     contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit) as result:
                 exec(compile(script, "ax-system-baseline.yml", "exec"), {})
             summary = json.loads(summary_file.read_text())
-            self.assertEqual(len(builds), int(receipt_mode == "external-startup"))
+            self.assertEqual(len(builds), 2 if pure_control and first_failure not in ("build", "build-timeout") else int(receipt_mode == "external-startup"))
             if first_failure in ("build", "build-timeout"):
                 self.assertEqual(result.exception.code, 1)
-                self.assertEqual(summary["fixture_build_return_code"], 124 if first_failure == "build-timeout" else 1)
+                build_code = summary["empty_control_builds"]["patched"]["return_code"] if pure_control else summary["fixture_build_return_code"]
+                self.assertEqual(build_code, 124 if first_failure == "build-timeout" else 1)
                 self.assertFalse(summary["completed"])
                 self.assertEqual(summary["trials"], [])
                 self.assertEqual(invocations, [])
-                self.assertEqual(killpg.call_count, 2 if first_failure == "build-timeout" else 0)
                 return invocations, summary
             self.assertEqual(result.exception.code, int(first_failure is not None))
+            if first_failure == "cleanup":
+                self.assertFalse(summary["completed"])
+                self.assertEqual(len(invocations), 1)
+                self.assertEqual(len(summary["trials"]), 1)
+                self.assertFalse(summary["trials"][0]["process_run"]["cleanup"]["complete"])
+                return invocations, summary
             self.assertEqual(summary["strict_checks_passed"], first_failure is None or first_failure.startswith("terminal"))
             self.assertTrue(summary["completed"])
             self.assertEqual(len(summary["trials"]), 2 if terminal_origin else 20 if enabled else 10)
@@ -1681,7 +1975,6 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
             self.assertNotIn("secret", output.getvalue() + summary_file.read_text())
             self.assertNotIn("private-raw-host-data", output.getvalue() + summary_file.read_text())
             if first_failure == "timeout":
-                self.assertEqual(killpg.call_count, 2)
                 self.assertEqual(summary["trials"][0]["return_code"], 124)
             if first_failure == "scan-fields":
                 self.assertEqual(summary["trials"][0]["scan_totals"], [])

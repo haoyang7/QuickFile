@@ -16,6 +16,28 @@ import sys
 EXECUTABLES = {"host": "AXCompatibilityFixture.app/Contents/MacOS/AXCompatibilityFixture",
                "reader": "ax-reader"}
 ARGUMENT_LIMIT = 8 * 1024 * 1024
+FIXTURE_SOURCES = ("Scripts/tests/fixtures/AXCompatibilityNotifications.m", "Scripts/tests/fixtures/AXCompatibilityReader.swift")
+PRODUCTION_SOURCES = ("QuickFileApp/AXCompatibility.m", "QuickFileApp/AXCompatibility.h")
+
+
+def fixture_sources(build_mode="ordinary"):
+    if build_mode not in ("ordinary", "patched", "pure-appkit"):
+        raise RuntimeError("Unknown fixture build mode")
+    return list((() if build_mode == "pure-appkit" else PRODUCTION_SOURCES) + FIXTURE_SOURCES)
+
+
+def validate_empty_control_build(value, mode):
+    """Only fixed build inputs and bounded symbol counts may be published."""
+    expected_inputs = {"host": [FIXTURE_SOURCES[0]] + (["AXCompatibility.o"] if mode == "patched" else []),
+                       "reader": [FIXTURE_SOURCES[1]]}
+    if (mode not in ("patched", "pure-appkit") or type(value) is not dict
+            or set(value) != {"link_inputs", "production_ax_symbol_counts"} or value["link_inputs"] != expected_inputs):
+        raise RuntimeError("Invalid empty-control build evidence")
+    counts = value["production_ax_symbol_counts"]
+    if (type(counts) is not dict or set(counts) != set(EXECUTABLES)
+            or any(type(count) is not int or not 0 <= count <= 64 for count in counts.values())
+            or counts["reader"] != 0 or (counts["host"] != 0 if mode == "pure-appkit" else counts["host"] < 4)):
+        raise RuntimeError("Unexpected production AX symbols in empty-control build")
 
 
 def executable_hash(path):
@@ -40,7 +62,7 @@ def require_fixture_hashes(directory, expected):
         raise RuntimeError("Fixture executable bytes changed")
 
 
-def load_prepared_fixture(directory, sources):
+def load_prepared_build(directory, sources, build_mode="ordinary"):
     manifest = directory / "fixture-build.json"
     if manifest.is_symlink() or not manifest.is_file() or manifest.stat().st_size > 16384:
         raise RuntimeError("Prepared fixture manifest unavailable")
@@ -48,12 +70,26 @@ def load_prepared_fixture(directory, sources):
         value = json.loads(manifest.read_text())
     except (ValueError, UnicodeError):
         raise RuntimeError("Invalid prepared fixture manifest") from None
-    if (type(value) is not dict or set(value) != {"schema", "build_mode", "sources", "executables"}
-            or type(value["schema"]) is not int or value["schema"] != 1 or value["build_mode"] != "ordinary"
+    fixture_sources(build_mode)
+    fields = {"schema", "build_mode", "sources", "executables"}
+    if build_mode != "ordinary":
+        fields.add("build_evidence")
+    if (type(value) is not dict or set(value) != fields
+            or type(value["schema"]) is not int or value["schema"] != (1 if build_mode == "ordinary" else 2)
+            or value["build_mode"] != build_mode
             or value["sources"] != sources):
-        raise RuntimeError("Prepared fixture differs from ordinary source build")
+        raise RuntimeError("Prepared fixture differs from expected source build")
+    if build_mode != "ordinary":
+        if (type(sources) is not dict or set(sources) != set(fixture_sources(build_mode))
+                or any(type(item) is not str or not re.fullmatch(r"[0-9a-f]{64}", item) for item in sources.values())):
+            raise RuntimeError("Invalid empty-control source hashes")
+        validate_empty_control_build(value["build_evidence"], build_mode)
     require_fixture_hashes(directory, value["executables"])
-    return value["executables"]
+    return value
+
+
+def load_prepared_fixture(directory, sources, build_mode="ordinary"):
+    return load_prepared_build(directory, sources, build_mode)["executables"]
 
 
 def parse_procargs(raw):

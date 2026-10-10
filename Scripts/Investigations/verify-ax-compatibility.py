@@ -16,11 +16,14 @@ import plistlib
 import re
 import shutil
 import subprocess
+import sys
 import time
+from ax_process import reap_owned
 from ax_probe_report import (capture_terminal_snapshot, collect_heap_diagnostics, collect_terminal_snapshot,
                              disassemble_symbols, empty_terminal_snapshot, leak_groups)
-from ax_external_receipt import (fixture_hashes, load_prepared_fixture, owned_child_receipt,
-                                 require_fixture_hashes, validate_external_receipt)
+from ax_external_receipt import (EXECUTABLES, FIXTURE_SOURCES, fixture_hashes, fixture_sources, load_prepared_fixture,
+                                 owned_child_receipt, require_fixture_hashes, validate_empty_control_build,
+                                 validate_external_receipt)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -45,13 +48,24 @@ def wait_json(path, predicate, processes):
     raise TimeoutError(f"Fixture handshake timed out: {path.name}")
 
 
-def preflight_reason(host, reader, system_baseline=False):
+def validate_empty_control_capabilities(host, mode):
+    if mode not in ("patched", "pure-appkit") or type(host) is not dict or host.get("empty_control_mode") != mode:
+        raise RuntimeError("Empty-control capability mode differs from prepared build")
+    if mode == "pure-appkit" and (host.get("enabled") is not False or host.get("status") != "pure-appkit"):
+        raise RuntimeError("Pure AppKit capability unexpectedly contains the product patch")
+    if mode == "patched" and (host.get("enabled") is not True or host.get("status") != "enabled"):
+        raise RuntimeError("Patched empty-control capability did not install the product patch")
+
+
+def preflight_reason(host, reader, system_baseline=False, empty_control_mode=None):
+    if empty_control_mode:
+        validate_empty_control_capabilities(host, empty_control_mode)
     if not system_baseline and host["status"] in ("unsupported-images", "unsupported-architecture"):
         return host["status"]
     if system_baseline:
         if host["enabled"] or host["status"] != "system-baseline":
             raise RuntimeError("System baseline must preserve the unpatched implementation")
-    elif not host["enabled"]:
+    elif empty_control_mode != "pure-appkit" and not host["enabled"]:
         raise RuntimeError(f"Unexpected installation refusal: {host['status']}")
     if not isinstance(reader.get("trusted"), bool):
         raise RuntimeError("AX reader returned an invalid capability receipt")
@@ -139,9 +153,10 @@ def main():
     parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; compensation-enabled modes only")
     parser.add_argument("--heap-control", action="store_true", help="Match the selected product scan checkpoints with an empty window and no target buttons; requires --heap-diagnostics or --malloc-scribble")
     parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; uses ordinary live scans unless --heap-diagnostics is selected")
-    parser.add_argument("--prepare-external-fixture", action="store_true", help="Build ordinary host/reader once, without running them, for external startup receipts")
+    parser.add_argument("--prepare-external-fixture", action="store_true", help="Build host/reader once without running them; ordinary binaries unless --empty-control-mode is explicit")
     parser.add_argument("--external-startup-receipt", action="store_true", help="Read owned child startup metadata outside the ordinary fixture; requires live MallocScribble and a prepared fixture")
     parser.add_argument("--prepared-fixture-directory", type=Path)
+    parser.add_argument("--empty-control-mode", choices=("patched", "pure-appkit"), help="Explicit empty-control build/measurement; pure-appkit excludes the production AX implementation; measurement requires external startup receipts, MallocScribble off and --heap-control")
     parser.add_argument("--terminal-origin", action="store_true", help="Capture one later heap graph after all six live scans; requires external startup receipts and MallocScribble off")
     parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
@@ -152,15 +167,18 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.empty_control_mode and not args.prepare_external_fixture and (
+            not args.heap_control or not args.external_startup_receipt or args.malloc_scribble != "off" or args.terminal_origin):
+        parser.error("--empty-control-mode requires an independent preparation or external off/live heap control without a terminal graph")
     if args.prepare_external_fixture and any((args.malloc_scribble, args.external_startup_receipt,
             args.prepared_fixture_directory, args.system_baseline, args.heap_diagnostics, args.heap_control,
             args.copy_lifetime, args.read_only, args.ownership_trace, args.balance_copies,
             args.expected_appkit_uuid, args.expected_corefoundation_uuid, args.terminal_origin)):
-        parser.error("--prepare-external-fixture requires an independent ordinary build")
+        parser.error("--prepare-external-fixture requires an independent fixture build")
     if args.external_startup_receipt and (not args.malloc_scribble or not args.prepared_fixture_directory
             or any((args.system_baseline, args.heap_diagnostics, args.copy_lifetime, args.read_only,
                     args.ownership_trace, args.balance_copies, args.expected_appkit_uuid, args.expected_corefoundation_uuid))):
-        parser.error("external startup receipts require live MallocScribble and a prepared ordinary fixture")
+        parser.error("external startup receipts require live MallocScribble and a prepared fixture")
     if args.prepared_fixture_directory and not args.external_startup_receipt:
         parser.error("--prepared-fixture-directory requires --external-startup-receipt")
     if args.terminal_origin and (not args.external_startup_receipt or args.malloc_scribble != "off"):
@@ -200,8 +218,8 @@ def main():
     app = work / "AXCompatibilityFixture.app"
     executable = app / "Contents/MacOS/AXCompatibilityFixture"
     reader_executable = work / "ax-reader"
-    sources = ["QuickFileApp/AXCompatibility.m", "QuickFileApp/AXCompatibility.h",
-               "Scripts/tests/fixtures/AXCompatibilityNotifications.m", "Scripts/tests/fixtures/AXCompatibilityReader.swift"]
+    build_mode = args.empty_control_mode or "ordinary"
+    sources = fixture_sources(build_mode)
     commands = []
 
     def run(command, timeout=60):
@@ -216,7 +234,7 @@ def main():
     if args.external_startup_receipt:
         prepared = args.prepared_fixture_directory.resolve()
         prepared.relative_to(ROOT / ".build/Temporary")
-        expected_hashes = load_prepared_fixture(prepared, source_hashes)
+        expected_hashes = load_prepared_fixture(prepared, source_hashes, build_mode)
         prepared_app = prepared / app.name
         if prepared_app.is_symlink() or any(path.is_symlink() for path in prepared_app.rglob("*")):
             raise RuntimeError("Prepared fixture contains symbolic links")
@@ -225,23 +243,32 @@ def main():
         require_fixture_hashes(work, expected_hashes)
     else:
         executable.parent.mkdir(parents=True)
-        common = ["xcrun", "clang", "-O2", "-I", str(ROOT / "QuickFileApp")]
+        common = ["xcrun", "clang", "-O2"]
+        if build_mode != "pure-appkit":
+            common += ["-I", str(ROOT / "QuickFileApp")]
+        if args.empty_control_mode:
+            common.append("-DQUICKFILE_AX_EMPTY_CONTROL")
+        if build_mode == "pure-appkit":
+            common.append("-DQUICKFILE_AX_PURE_APPKIT_CONTROL")
         if args.malloc_scribble:
             common.append("-DQUICKFILE_AX_MALLOC_RECEIPT")
         if args.copy_lifetime:
             common.append("-DQUICKFILE_AX_COPY_LIFETIME")
-        run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[0]), "-o", str(work / "AXCompatibility.o")])
+        production_objects = []
+        if build_mode != "pure-appkit":
+            run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[0]), "-o", str(work / "AXCompatibility.o")])
+            production_objects.append(str(work / "AXCompatibility.o"))
         probe_arguments = []
         if args.ownership_trace:
             sources.append("Scripts/Investigations/AXOwnershipProbe.m")
             run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[-1]), "-o", str(work / "AXOwnershipProbe.o")])
             probe_arguments = [f"-DQUICKFILE_AX_OWNERSHIP_PROBE={2 if args.balance_copies else 1}", str(work / "AXOwnershipProbe.o")]
         run(common + ["-fobjc-arc", "-framework", "AppKit", "-framework", "ApplicationServices",
-                      str(ROOT / sources[2]), str(work / "AXCompatibility.o"), *probe_arguments, "-o", str(executable)])
+                      str(ROOT / FIXTURE_SOURCES[0]), *production_objects, *probe_arguments, "-o", str(executable)])
         run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-parse-as-library",
              *(["-DQUICKFILE_AX_MALLOC_RECEIPT", "-module-cache-path", str(work / "swift-module-cache")]
                if args.malloc_scribble else ["-module-cache-path", str(work / "swift-module-cache")]
-               if args.prepare_external_fixture else []), str(ROOT / sources[3]),
+               if args.prepare_external_fixture else []), str(ROOT / FIXTURE_SOURCES[1]),
              "-o", str(reader_executable)])
         (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
             "CFBundleIdentifier": "local.quickfile.tests.ax-compatibility", "CFBundleName": "AXCompatibilityFixture",
@@ -250,8 +277,25 @@ def main():
         entitlements.write_bytes(plistlib.dumps({"com.apple.security.get-task-allow": True}))
         run(["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(app)])
     if args.prepare_external_fixture:
-        manifest = {"schema": 1, "build_mode": "ordinary", "sources": source_hashes,
+        manifest = {"schema": 2 if args.empty_control_mode else 1, "build_mode": build_mode, "sources": source_hashes,
                     "executables": fixture_hashes(work)}
+        if args.empty_control_mode:
+            counts = {}
+            for role, name in EXECUTABLES.items():
+                symbols = run(["xcrun", "nm", "-j", str(work / name)]).stdout.splitlines()
+                if "_main" not in symbols:
+                    raise RuntimeError("Empty-control executable symbol table unavailable")
+                production = {symbol for symbol in symbols if symbol.startswith(("_QuickFileInstallAXCompatibility", "QuickFileInstallAXCompatibility", "_QuickFileAX", "QuickFileAX"))}
+                counts[role] = len(production)
+                if role == "host" and build_mode == "patched" and not {
+                        "_QuickFileInstallAXCompatibility", "_QuickFileAXCompatibilityStatus",
+                        "_QuickFileAXCompensatedCopies", "_QuickFileAXCompensatedMutableCopies"} <= production:
+                    raise RuntimeError("Patched empty-control build is missing production exports")
+            manifest["build_evidence"] = {
+                "link_inputs": {"host": [FIXTURE_SOURCES[0]] + [Path(path).name for path in production_objects],
+                                "reader": [FIXTURE_SOURCES[1]]},
+                "production_ax_symbol_counts": counts}
+            validate_empty_control_build(manifest["build_evidence"], build_mode)
         write_json(work / "fixture-build.json", manifest)
         write_json(records / "fixture-build.json", manifest)
         print(json.dumps(manifest))
@@ -288,7 +332,7 @@ def main():
     write_json(records / "inputs.json", {"capabilities": capabilities, "reader_capabilities": reader_capabilities,
         "system": run(["sw_vers"]).stdout,
         "sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources}})
-    reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline)
+    reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline, args.empty_control_mode)
     if reason:
         receipt = {"coverage": "not-covered", "reason": reason,
                    "host": capabilities, "reader": reader_capabilities}
@@ -297,6 +341,8 @@ def main():
             receipt["scan_mode"] = "diagnostic" if args.heap_diagnostics else "live"
         if args.copy_lifetime:
             receipt.update(mode="copy-lifetime", instrumented=True)
+        if args.empty_control_mode:
+            receipt["empty_control_mode"] = args.empty_control_mode
         print(json.dumps(receipt))
         return 77
     environment.update(MallocStackLogging="1", MallocStackLoggingNoCompact="1")
@@ -552,6 +598,10 @@ def main():
             if args.external_startup_receipt:
                 validate("external-startup-complete", finish_external_receipt)
                 summary["receipt_mode"] = "external-startup"
+            if args.empty_control_mode:
+                summary["empty_control_mode"] = args.empty_control_mode
+                summary["product_compensation_enabled"] = args.empty_control_mode == "patched"
+                summary["scope"] += "; " + args.empty_control_mode + " empty control; no product destruction coverage"
             if validation_errors:
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors
@@ -563,40 +613,64 @@ def main():
                 summary["malloc_scribble"] = allocator_receipt
                 summary["scope"] += "; MallocScribble environment experiment only; not an ownership fix or proof of completed free"
             write_json(records / "result.json", summary)
-            print(json.dumps(summary))
         finally:
-            if reader and reader.poll() is None:
-                (state / "stop-reader").touch()
+            primary_exception = sys.exc_info()[0] is not None
+            cleanup = {"primary_exception": primary_exception, "errors": []}
+            if primary_exception:
+                validation_errors.append({"stage": "execution", "message": "Fixture execution failed"})
+
+            def cleanup_step(stage, operation):
                 try:
-                    reader.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    reader.terminate()
-                    reader.wait(timeout=5)
-            if host and host.poll() is None:
-                (state / "quit").touch()
-                try:
-                    host.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    host.terminate()
-                    host.wait(timeout=5)
-            subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
-                            "-u", str(app)], capture_output=True, timeout=15)
+                    return operation()
+                except Exception:
+                    # Cleanup must retain the original exception/strict failure,
+                    # and one failed operation must not skip independent cleanup.
+                    cleanup["errors"].append(stage)
+                    validation_errors.append({"stage": "cleanup", "message": stage})
+
+            for role, process, stop in (("reader", reader, "stop-reader"), ("host", host, "quit")):
+                value = cleanup_step(role, lambda: reap_owned(process, state / stop))
+                cleanup[role] = value
+                if value is not None and (not value["exited"] or value["errors"]):
+                    cleanup["errors"].append(role)
+                    validation_errors.append({"stage": "cleanup", "message": role})
+            exited = all(cleanup[role] is not None and cleanup[role]["exited"] for role in ("reader", "host"))
+            cleanup["processes_exited"] = exited
+
+            def unregister():
+                result = subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+                    "-u", str(app)], capture_output=True, timeout=15)
+                if result.returncode != 0:
+                    raise RuntimeError("Launch Services cleanup failed")
+
+            cleanup_step("launch_services", unregister)
             if args.external_startup_receipt:
-                # Repeat the byte comparison after both children have exited.
-                # Retain failure even if an earlier comparison passed.
-                external_receipt["binary_reuse_verified"] = False
-                write_json(records / "external-startup.json", external_receipt)
-                validate("external-startup-final", finish_external_receipt)
-                if "summary" in locals() and validation_errors:
-                    summary["coverage"] = "failed"
-                    summary["validation_errors"] = validation_errors
-                    write_json(records / "result.json", summary)
-            if args.heap_diagnostics:
-                collect_heap_diagnostics(graphs, records)
-            if args.terminal_origin:
-                # Symbol verification and both offline text views run only once
-                # both owned processes have stopped, including on strict failure.
-                collect_terminal_snapshot(graphs / "terminal.memgraph", records, terminal_snapshot)
+                def final_external_receipt():
+                    external_receipt["binary_reuse_verified"] = False
+                    write_json(records / "external-startup.json", external_receipt)
+                    if not exited:
+                        raise RuntimeError("Owned process exit not confirmed")
+                    validate("external-startup-final", finish_external_receipt)
+                cleanup_step("external_receipt", final_external_receipt)
+            # No offline analysis may treat a still-live owned process as exited.
+            if exited:
+                if args.heap_diagnostics:
+                    cleanup_step("heap_diagnostics", lambda: collect_heap_diagnostics(graphs, records))
+                if args.terminal_origin:
+                    cleanup_step("terminal_snapshot", lambda: collect_terminal_snapshot(graphs / "terminal.memgraph", records, terminal_snapshot))
+            elif args.terminal_origin:
+                cleanup_step("terminal_snapshot_receipt", lambda: write_json(records / "terminal-snapshot.json", terminal_snapshot))
+            cleanup_step("cleanup_receipt", lambda: write_json(records / "process-cleanup.json", cleanup))
+            if "summary" not in locals():
+                summary = {"coverage": "failed"}
+            if primary_exception or validation_errors:
+                summary["coverage"] = "failed"
+            summary["cleanup"] = cleanup
+            if validation_errors:
+                summary["validation_errors"] = validation_errors
+                cleanup_step("validation_receipt", lambda: write_json(records / "validation-errors.json", validation_errors))
+            cleanup_step("result_receipt", lambda: write_json(records / "result.json", summary))
+            print(json.dumps(summary))
     return 1 if validation_errors else 0
 
 
