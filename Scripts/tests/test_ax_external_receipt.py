@@ -138,7 +138,7 @@ class AXPreparedFixtureTests(unittest.TestCase):
 
     def test_prepare_build_has_no_receipt_macro_and_detects_byte_or_source_drift(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             work, records = root / "fixture", root / "records"
             class ProbeRoot:
                 def __truediv__(self, child):
