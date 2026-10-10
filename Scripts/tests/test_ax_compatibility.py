@@ -20,6 +20,7 @@ PROBE = importlib.util.module_from_spec(SPEC)
 with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
     SPEC.loader.exec_module(PROBE)
 REPORT = sys.modules["ax_probe_report"]
+EXTERNAL = sys.modules["ax_external_receipt"]
 
 
 def notification_records(work, copy_lifetime=False):
@@ -558,7 +559,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         heap_diagnostics=False, unavailable_cohorts=False, heap_control=False,
                         invalid_control_host=None, invalid_control_reader=None,
                         copy_lifetime=False, invalid_copy_lifetime=None,
-                        malloc_scribble=None, invalid_allocator=None):
+                        malloc_scribble=None, invalid_allocator=None, external_receipt=False, binary_drift=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -595,6 +596,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 returncode = None
 
                 def __init__(self, command, **_kwargs):
+                    self.args = command
                     self.is_reader = pathlib.Path(command[0]).name == "ax-reader"
                     self.environment = _kwargs.get("env")
                     if malloc_scribble:
@@ -620,6 +622,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
 
                 def wait(self, timeout):
                     self.returncode = 0
+                    if external_receipt and binary_drift and not self.is_reader:
+                        pathlib.Path(self.args[0]).write_bytes(b"changed after measurement")
                     if self.is_reader:
                         PROBE.write_json(state / "reader-completed.json", notifications)
                     return 0
@@ -701,7 +705,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                                 receipt["copyLifetime"][key] = value
                     if invalid_control_host and receipt["sequence"] == invalid_control_host[0]:
                         receipt[invalid_control_host[1]] = 1
-                if malloc_scribble:
+                if malloc_scribble and not external_receipt:
                     process = next(process for process in processes
                                    if process.is_reader == (path.name == "reader-ready.json"))
                     value = process.environment.get("MallocScribble")
@@ -733,7 +737,29 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.append("--copy-lifetime")
             if malloc_scribble:
                 arguments.extend(["--malloc-scribble", malloc_scribble])
-            with mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
+            def startup_metadata(pid):
+                process = next(process for process in processes if process.pid == pid)
+                role = "reader" if process.is_reader else "host"
+                if invalid_allocator and invalid_allocator[0] == role:
+                    raise RuntimeError("Owned child startup environment unavailable")
+                return (os.fsencode(process.args[0]), [os.fsencode(process.args[0])],
+                        {os.fsencode(key): os.fsencode(value) for key, value in process.environment.items()})
+
+            if external_receipt:
+                prepared = temporary / "prepared"
+                for role, name in EXTERNAL.EXECUTABLES.items():
+                    path = prepared / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(role.encode())
+                    path.chmod(0o700)
+                sources = ["QuickFileApp/AXCompatibility.m", "QuickFileApp/AXCompatibility.h",
+                           "Scripts/tests/fixtures/AXCompatibilityNotifications.m", "Scripts/tests/fixtures/AXCompatibilityReader.swift"]
+                PROBE.write_json(prepared / "fixture-build.json", {"schema": 1, "build_mode": "ordinary",
+                    "sources": {name: PROBE.hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
+                    "executables": EXTERNAL.fixture_hashes(prepared)})
+                arguments.extend(["--external-startup-receipt", "--prepared-fixture-directory", str(prepared)])
+            with mock.patch.object(EXTERNAL, "read_procargs", side_effect=startup_metadata), \
+                    mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
                     mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
                     mock.patch.object(PROBE.subprocess, "Popen", side_effect=FixtureProcess), \
                     mock.patch.object(PROBE, "wait_json", side_effect=wait_json), \
@@ -752,11 +778,19 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             if not copy_lifetime:
                 self.assertEqual(summary["scans"][0]["label"], "baseline")
             scans = [] if copy_lifetime else json.loads((records / "scans.json").read_text())
-            product_build = next(command for command in commands if "-fno-objc-arc" in command)
-            host_build = next(command for command in commands if "-fobjc-arc" in command)
-            reader_build = next(command for command in commands if "swiftc" in command)
-            for build in (host_build, reader_build):
-                self.assertEqual("-DQUICKFILE_AX_MALLOC_RECEIPT" in build, malloc_scribble is not None)
+            if external_receipt:
+                self.assertFalse(any("clang" in command or "swiftc" in command or "codesign" in command for command in commands))
+                if not binary_drift:
+                    self.assertEqual(EXTERNAL.fixture_hashes(work), EXTERNAL.fixture_hashes(prepared))
+                receipt = json.loads((records / "external-startup.json").read_text())
+                if not invalid_allocator and not binary_drift:
+                    EXTERNAL.validate_external_receipt(receipt, malloc_scribble, EXTERNAL.fixture_hashes(prepared))
+            else:
+                product_build = next(command for command in commands if "-fno-objc-arc" in command)
+                host_build = next(command for command in commands if "-fobjc-arc" in command)
+                reader_build = next(command for command in commands if "swiftc" in command)
+                for build in (host_build, reader_build):
+                    self.assertEqual("-DQUICKFILE_AX_MALLOC_RECEIPT" in build, malloc_scribble is not None)
             if malloc_scribble:
                 self.assertEqual(summary["malloc_scribble"], json.loads((records / "malloc-scribble.json").read_text()))
                 if not invalid_allocator:
@@ -764,8 +798,9 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             else:
                 self.assertNotIn("malloc_scribble", summary)
                 self.assertFalse((records / "malloc-scribble.json").exists())
-            for build in (product_build, host_build):
-                self.assertEqual("-DQUICKFILE_AX_COPY_LIFETIME" in build, copy_lifetime)
+            if not external_receipt:
+                for build in (product_build, host_build):
+                    self.assertEqual("-DQUICKFILE_AX_COPY_LIFETIME" in build, copy_lifetime)
             if heap_diagnostics:
                 diagnostic = json.loads((records / "heap-diagnostics.json").read_text())
                 REPORT.validate_heap_diagnostics_summary(diagnostic)
@@ -851,6 +886,28 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             if exit_code:
                 self.assertEqual(json.loads((records / "validation-errors.json").read_text()), summary["validation_errors"])
             return exit_code, summary
+
+    def test_external_startup_reuses_bytes_and_preserves_live_protocol_and_strict_failures(self):
+        for setting, control, failure in itertools.product(("off", "on"), (False, True), (None, "registered-10")):
+            with self.subTest(setting=setting, control=control, failure=failure):
+                code, summary = self.exercise_runner(external_receipt=True, malloc_scribble=setting,
+                                                     heap_control=control, failed_scan=failure)
+                self.assertEqual(code, int(failure is not None))
+                self.assertEqual(summary["receipt_mode"], "external-startup")
+
+    def test_external_executable_drift_after_measurement_remains_fatal(self):
+        code, summary = self.exercise_runner(external_receipt=True, malloc_scribble="off", binary_drift=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["coverage"], "failed")
+        self.assertIn("external-startup-final", [error["stage"] for error in summary["validation_errors"]])
+
+    def test_unreadable_external_environment_fails_and_retains_all_later_scans(self):
+        for role in ("host", "reader"):
+            code, summary = self.exercise_runner(external_receipt=True, malloc_scribble="off",
+                                                 invalid_allocator=(role, None))
+            self.assertEqual(code, 1)
+            self.assertEqual(len(summary["scans"]), 6)
+            self.assertEqual(summary["coverage"], "failed")
 
     def test_malloc_scribble_overrides_inherited_state_in_both_actual_processes(self):
         for setting, control, diagnostic in itertools.product(("off", "on"), (False, True), (False, True)):
@@ -1024,19 +1081,55 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
         script = block.split("          python3 - <<'PY'\n", 1)[1].split("          PY\n", 1)[0]
         return "\n".join(line[10:] for line in script.splitlines())
 
+    def test_external_receipt_requires_live_scribble_before_starting_fixtures(self):
+        script = self.workflow_script("Verify investigation identity")
+        for scan_mode, enabled, receipt, diagnostic in (("diagnostic", "true", "external-startup", "false"),
+                ("live", "false", "external-startup", "false"), ("live", "true", "unknown", "false"),
+                ("live", "true", "external-startup", "true")):
+            with mock.patch.dict(os.environ, {"CAUSAL_PROBE": "false", "AX_SCAN_MODE": scan_mode,
+                    "MALLOC_SCRIBBLE_EXPERIMENT": enabled, "AX_RECEIPT_MODE": receipt, "AX_HEAP_DIAGNOSTICS": diagnostic}), \
+                    mock.patch.object(subprocess, "check_output") as query, self.assertRaises(AssertionError):
+                exec(compile(script, "ax-system-baseline.yml", "exec"), {})
+            query.assert_not_called()
+
+    def test_failed_or_timed_out_preparation_cannot_claim_completed_trials(self):
+        for failure in ("build", "build-timeout"):
+            self.run_measurement(scan_mode="live", receipt_mode="external-startup", first_failure=failure)
+
+    def test_external_workflow_builds_once_and_keeps_every_case_after_failure(self):
+        for failure in (None, "strict", "classification", "timeout", "external-receipt", "external-private", "external-missing"):
+            with self.subTest(failure=failure):
+                invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup", first_failure=failure)
+                self.assertEqual(len(invocations), 20)
+                self.assertEqual(summary["fixture_build_return_code"], 0)
+                for receipt in summary["trials"][1:]:
+                    self.assertTrue(receipt["external_startup_verified"])
+                    self.assertEqual(receipt["startup_environment"]["executables"], summary["fixture_executables"])
+
+    def test_scan_tool_status_and_independent_assertion_categories_are_preserved(self):
+        _, summary = self.run_measurement(scan_mode="live", first_failure="strict")
+        first = summary["trials"][0]
+        self.assertEqual(first["validation_failure_counts"]["heap_baseline"], 1)
+        self.assertEqual(first["validation_failure_counts"]["notifications"], 1)
+        self.assertTrue(first["failure_classification_available"])
+        self.run_measurement(scan_mode="live", first_failure="tool", first_scan_change=lambda scan: scan.update(exit_code=2))
+        for value in (True, None, "secret", 256, -129):
+            self.run_measurement(scan_mode="live", first_failure="scan-fields", first_scan_change=lambda scan: scan.update(exit_code=value))
+
     def test_scan_mode_identity_and_invalid_combinations_before_starting_fixtures(self):
         script = self.workflow_script("Verify investigation identity")
         outputs = {('sw_vers', '-productVersion'): '26.6.2', ('sw_vers', '-buildVersion'): '25G83',
                    ('uname', '-m'): 'arm64', ('xcodebuild', '-version'): 'Xcode 26.3\nBuild version 17C529',
                    ('git', 'rev-parse', 'HEAD'): '1' * 40}
-        for mode, enabled, causal, allowed in (("live", True, False, True), ("diagnostic", True, False, True),
-                ("diagnostic", False, False, True), ("live", False, False, False),
-                ("unknown", True, False, False), ("live", True, True, False)):
+        for mode, enabled, causal, allowed, receipt_mode in (("live", True, False, True, "internal"), ("diagnostic", True, False, True, "internal"),
+                ("diagnostic", False, False, True, "internal"), ("live", False, False, False, "internal"),
+                ("unknown", True, False, False, "internal"), ("live", True, True, False, "internal"),
+                ("live", True, False, True, "external-startup")):
             with self.subTest(mode=mode, enabled=enabled, causal=causal), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory) / "records"
                 code = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
                 with mock.patch.dict(os.environ, {"AX_SCAN_MODE": mode, "CAUSAL_PROBE": str(causal).lower(),
-                                                  "MALLOC_SCRIBBLE_EXPERIMENT": str(enabled).lower()}), \
+                                                  "MALLOC_SCRIBBLE_EXPERIMENT": str(enabled).lower(), "AX_RECEIPT_MODE": receipt_mode, "AX_HEAP_DIAGNOSTICS": "false"}), \
                         mock.patch.object(subprocess, "check_output", side_effect=lambda command, **_: outputs[tuple(command)]), \
                         contextlib.redirect_stdout(io.StringIO()):
                     if allowed:
@@ -1050,21 +1143,39 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         self.assertFalse(root.exists())
 
     def run_measurement(self, *, enabled=True, first_failure=None, scan_mode="diagnostic", unexpected_diagnostics=False,
-                        first_scan_change=None):
+                        first_scan_change=None, receipt_mode="internal"):
         script = self.workflow_script("Measure five matched groups with strict heap checks")
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
             summary_file = root / "summary.json"
-            PROBE.write_json(summary_file, {"identity": {"scan_mode": scan_mode}, "trials": [], "completed": False,
+            PROBE.write_json(summary_file, {"identity": {"scan_mode": scan_mode, "receipt_mode": receipt_mode}, "trials": [], "completed": False,
                                            "expected_trials": 20 if enabled else 10})
             script = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
             invocations = []
+            builds = []
             test = self
 
             class Process:
                 pid = 12345
 
                 def __init__(self, command, **kwargs):
+                    self.build = "--prepare-external-fixture" in command
+                    if self.build:
+                        self.first = False
+                        builds.append(command)
+                        prepared = pathlib.Path(command[command.index("--work-directory") + 1])
+                        for role, name in EXTERNAL.EXECUTABLES.items():
+                            path = prepared / name
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_bytes(role.encode())
+                            path.chmod(0o700)
+                        sources = ["QuickFileApp/AXCompatibility.m", "QuickFileApp/AXCompatibility.h",
+                                   "Scripts/tests/fixtures/AXCompatibilityNotifications.m", "Scripts/tests/fixtures/AXCompatibilityReader.swift"]
+                        PROBE.write_json(prepared / "fixture-build.json", {"schema": 1, "build_mode": "ordinary",
+                            "sources": {name: PROBE.hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources},
+                            "executables": EXTERNAL.fixture_hashes(prepared)})
+                        return
+                    test.assertEqual("--external-startup-receipt" in command, receipt_mode == "external-startup")
                     setting = command[command.index("--malloc-scribble") + 1] if "--malloc-scribble" in command else None
                     mode = "control" if "--heap-control" in command else "product"
                     invocations.append((setting, mode))
@@ -1083,6 +1194,20 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     receipt = {"requested": setting, "host": expected, "reader": expected}
                     if self.first and first_failure == "receipt":
                         receipt["reader"] = "/private/secret"
+                    if receipt_mode == "external-startup":
+                        hashes = EXTERNAL.fixture_hashes(root / "ordinary-fixture")
+                        startup = {"receipt_mode": receipt_mode, "requested": setting, "executables": hashes,
+                                   "binary_reuse_verified": True}
+                        for role in hashes:
+                            startup[role] = {"malloc_scribble": expected, "path_matches": True,
+                                "startup_executable_matches": True, "alive_during_check": True,
+                                "executable_sha256": hashes[role]}
+                        if self.first and first_failure == "external-receipt":
+                            startup["reader"]["executable_sha256"] = "0" * 64
+                        if self.first and first_failure == "external-private":
+                            startup["reader"]["private"] = "/private/secret"
+                        if not (self.first and first_failure == "external-missing"):
+                            PROBE.write_json(records / "external-startup.json", startup)
                     PROBE.write_json(records / "malloc-scribble.json", receipt)
                     PROBE.write_json(records / "inputs.json", {"capabilities": {"images": {
                         "AppKit": "B6B4BDAD-6428-3E64-8747-275700109B46",
@@ -1098,7 +1223,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     labels = [label for label in REPORT.HEAP_LABELS if scan_mode == "diagnostic" or label != "added-10"]
                     if self.first and first_failure == "scans":
                         labels.remove("registered-10")
-                    scans = [{"label": label, "leak_nodes": 3, "leak_bytes": 300,
+                    scans = [{"label": label, "exit_code": 0, "leak_nodes": 3, "leak_bytes": 300,
                         "groups": [{"root_type": "NSXPCConnection", "root_instances": 1},
                                    {"root_type": "NSXPCConnection", "root_instances": 2}],
                         "destroyed_notification_stack_present": False,
@@ -1107,10 +1232,21 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if self.first and first_scan_change:
                         first_scan_change(scans[0])
                     PROBE.write_json(records / "scans.json", scans)
+                    result = {"coverage": "passed"}
+                    if self.first and first_failure == "strict":
+                        result.update(coverage="failed", validation_errors=[{"stage": "registered-10", "message": "/private/secret"},
+                            {"stage": "notifications", "message": "/private/secret"}])
+                    if self.first and first_failure == "classification":
+                        result.update(coverage="failed", validation_errors=[{"stage": 123, "message": "/private/secret"}])
+                    PROBE.write_json(records / "result.json", result)
                     # Raw records and arbitrary fields must never enter the public artifact.
                     (records / "host.log").write_text("private-raw-host-data")
 
                 def wait(self, timeout):
+                    if self.build and first_failure == "build-timeout" and timeout == 180:
+                        raise subprocess.TimeoutExpired("prepare", timeout)
+                    if self.build and first_failure == "build":
+                        return 1
                     if self.first and first_failure == "timeout" and timeout == 180:
                         raise subprocess.TimeoutExpired("probe", timeout)
                     return 1 if self.first and first_failure == "strict" else 0
@@ -1124,6 +1260,15 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit) as result:
                 exec(compile(script, "ax-system-baseline.yml", "exec"), {})
             summary = json.loads(summary_file.read_text())
+            self.assertEqual(len(builds), int(receipt_mode == "external-startup"))
+            if first_failure in ("build", "build-timeout"):
+                self.assertEqual(result.exception.code, 1)
+                self.assertEqual(summary["fixture_build_return_code"], 124 if first_failure == "build-timeout" else 1)
+                self.assertFalse(summary["completed"])
+                self.assertEqual(summary["trials"], [])
+                self.assertEqual(invocations, [])
+                self.assertEqual(killpg.call_count, 2 if first_failure == "build-timeout" else 0)
+                return invocations, summary
             self.assertEqual(result.exception.code, int(first_failure is not None))
             self.assertEqual(summary["strict_checks_passed"], first_failure is None)
             self.assertTrue(summary["completed"])
@@ -1136,7 +1281,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         continue
                     self.assertEqual(scan, {"label": scan["label"], "leak_nodes": 3, "leak_bytes": 300,
                         "unclassified_nodes": 0, "root_instances": 3, "unexpected_root_groups": 0,
-                        "destroyed_notification_stack_present": False})
+                        "destroyed_notification_stack_present": False, "tool_exit_code": 0})
                 if scan_mode == "live":
                     self.assertFalse(receipt["diagnostics_available"])
                     self.assertNotIn("diagnostics", receipt)

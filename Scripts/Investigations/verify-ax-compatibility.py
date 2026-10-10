@@ -14,9 +14,12 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import shutil
 import subprocess
 import time
 from ax_probe_report import collect_heap_diagnostics, disassemble_symbols, leak_groups
+from ax_external_receipt import (fixture_hashes, load_prepared_fixture, owned_child_receipt,
+                                 require_fixture_hashes, validate_external_receipt)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -135,6 +138,9 @@ def main():
     parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; compensation-enabled modes only")
     parser.add_argument("--heap-control", action="store_true", help="Match the selected product scan checkpoints with an empty window and no target buttons; requires --heap-diagnostics or --malloc-scribble")
     parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; uses ordinary live scans unless --heap-diagnostics is selected")
+    parser.add_argument("--prepare-external-fixture", action="store_true", help="Build ordinary host/reader once, without running them, for external startup receipts")
+    parser.add_argument("--external-startup-receipt", action="store_true", help="Read owned child startup metadata outside the ordinary fixture; requires live MallocScribble and a prepared fixture")
+    parser.add_argument("--prepared-fixture-directory", type=Path)
     parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
@@ -144,6 +150,17 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.prepare_external_fixture and any((args.malloc_scribble, args.external_startup_receipt,
+            args.prepared_fixture_directory, args.system_baseline, args.heap_diagnostics, args.heap_control,
+            args.copy_lifetime, args.read_only, args.ownership_trace, args.balance_copies,
+            args.expected_appkit_uuid, args.expected_corefoundation_uuid)):
+        parser.error("--prepare-external-fixture requires an independent ordinary build")
+    if args.external_startup_receipt and (not args.malloc_scribble or not args.prepared_fixture_directory
+            or any((args.system_baseline, args.heap_diagnostics, args.copy_lifetime, args.read_only,
+                    args.ownership_trace, args.balance_copies, args.expected_appkit_uuid, args.expected_corefoundation_uuid))):
+        parser.error("external startup receipts require live MallocScribble and a prepared ordinary fixture")
+    if args.prepared_fixture_directory and not args.external_startup_receipt:
+        parser.error("--prepared-fixture-directory requires --external-startup-receipt")
     if args.malloc_scribble and args.system_baseline:
         parser.error("--malloc-scribble requires product mode")
     if args.copy_lifetime and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
@@ -178,7 +195,6 @@ def main():
         graphs.mkdir()
     app = work / "AXCompatibilityFixture.app"
     executable = app / "Contents/MacOS/AXCompatibilityFixture"
-    executable.parent.mkdir(parents=True)
     reader_executable = work / "ax-reader"
     sources = ["QuickFileApp/AXCompatibility.m", "QuickFileApp/AXCompatibility.h",
                "Scripts/tests/fixtures/AXCompatibilityNotifications.m", "Scripts/tests/fixtures/AXCompatibilityReader.swift"]
@@ -192,29 +208,56 @@ def main():
         result.check_returncode()
         return result
 
-    common = ["xcrun", "clang", "-O2", "-I", str(ROOT / "QuickFileApp")]
-    if args.malloc_scribble:
-        common.append("-DQUICKFILE_AX_MALLOC_RECEIPT")
-    if args.copy_lifetime:
-        common.append("-DQUICKFILE_AX_COPY_LIFETIME")
-    run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[0]), "-o", str(work / "AXCompatibility.o")])
-    probe_arguments = []
-    if args.ownership_trace:
-        sources.append("Scripts/Investigations/AXOwnershipProbe.m")
-        run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[-1]), "-o", str(work / "AXOwnershipProbe.o")])
-        probe_arguments = [f"-DQUICKFILE_AX_OWNERSHIP_PROBE={2 if args.balance_copies else 1}", str(work / "AXOwnershipProbe.o")]
-    run(common + ["-fobjc-arc", "-framework", "AppKit", "-framework", "ApplicationServices",
-                  str(ROOT / sources[2]), str(work / "AXCompatibility.o"), *probe_arguments, "-o", str(executable)])
-    run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-parse-as-library",
-         *(["-DQUICKFILE_AX_MALLOC_RECEIPT", "-module-cache-path", str(work / "swift-module-cache")]
-           if args.malloc_scribble else []), str(ROOT / sources[3]),
-         "-o", str(reader_executable)])
-    (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
-        "CFBundleIdentifier": "local.quickfile.tests.ax-compatibility", "CFBundleName": "AXCompatibilityFixture",
-        "CFBundleExecutable": "AXCompatibilityFixture", "CFBundlePackageType": "APPL", "CFBundleVersion": "1"}))
-    entitlements = work / "entitlements.plist"
-    entitlements.write_bytes(plistlib.dumps({"com.apple.security.get-task-allow": True}))
-    run(["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(app)])
+    source_hashes = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources}
+    if args.external_startup_receipt:
+        prepared = args.prepared_fixture_directory.resolve()
+        prepared.relative_to(ROOT / ".build/Temporary")
+        expected_hashes = load_prepared_fixture(prepared, source_hashes)
+        prepared_app = prepared / app.name
+        if prepared_app.is_symlink() or any(path.is_symlink() for path in prepared_app.rglob("*")):
+            raise RuntimeError("Prepared fixture contains symbolic links")
+        shutil.copytree(prepared_app, app)
+        shutil.copy2(prepared / "ax-reader", reader_executable)
+        require_fixture_hashes(work, expected_hashes)
+    else:
+        executable.parent.mkdir(parents=True)
+        common = ["xcrun", "clang", "-O2", "-I", str(ROOT / "QuickFileApp")]
+        if args.malloc_scribble:
+            common.append("-DQUICKFILE_AX_MALLOC_RECEIPT")
+        if args.copy_lifetime:
+            common.append("-DQUICKFILE_AX_COPY_LIFETIME")
+        run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[0]), "-o", str(work / "AXCompatibility.o")])
+        probe_arguments = []
+        if args.ownership_trace:
+            sources.append("Scripts/Investigations/AXOwnershipProbe.m")
+            run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[-1]), "-o", str(work / "AXOwnershipProbe.o")])
+            probe_arguments = [f"-DQUICKFILE_AX_OWNERSHIP_PROBE={2 if args.balance_copies else 1}", str(work / "AXOwnershipProbe.o")]
+        run(common + ["-fobjc-arc", "-framework", "AppKit", "-framework", "ApplicationServices",
+                      str(ROOT / sources[2]), str(work / "AXCompatibility.o"), *probe_arguments, "-o", str(executable)])
+        run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-parse-as-library",
+             *(["-DQUICKFILE_AX_MALLOC_RECEIPT", "-module-cache-path", str(work / "swift-module-cache")]
+               if args.malloc_scribble else ["-module-cache-path", str(work / "swift-module-cache")]
+               if args.prepare_external_fixture else []), str(ROOT / sources[3]),
+             "-o", str(reader_executable)])
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "local.quickfile.tests.ax-compatibility", "CFBundleName": "AXCompatibilityFixture",
+            "CFBundleExecutable": "AXCompatibilityFixture", "CFBundlePackageType": "APPL", "CFBundleVersion": "1"}))
+        entitlements = work / "entitlements.plist"
+        entitlements.write_bytes(plistlib.dumps({"com.apple.security.get-task-allow": True}))
+        run(["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(app)])
+    if args.prepare_external_fixture:
+        manifest = {"schema": 1, "build_mode": "ordinary", "sources": source_hashes,
+                    "executables": fixture_hashes(work)}
+        write_json(work / "fixture-build.json", manifest)
+        write_json(records / "fixture-build.json", manifest)
+        print(json.dumps(manifest))
+        return 0
+    external_receipt = None
+    if args.external_startup_receipt:
+        external_receipt = {"receipt_mode": "external-startup", "requested": args.malloc_scribble,
+                            "host": None, "reader": None, "executables": expected_hashes,
+                            "binary_reuse_verified": False}
+        write_json(records / "external-startup.json", external_receipt)
     environment = dict(os.environ)
     environment.pop("QUICKFILE_DISABLE_AX_COMPATIBILITY", None)
     # Preserve the reader's existing inherited environment by default. The paired
@@ -296,7 +339,7 @@ def main():
             reader_sequence += 1
             write_json(state / "reader-command.json", {"sequence": reader_sequence})
             receipt = wait_json(state / "reader-ready.json", lambda value: value["sequence"] == reader_sequence, [host, reader])
-            if args.malloc_scribble and reader_sequence == 1:
+            if args.malloc_scribble and reader_sequence == 1 and not args.external_startup_receipt:
                 record_allocator_environment("reader", receipt)
                 validate("malloc-scribble", validate_malloc_scribble_receipt, allocator_receipt, args.malloc_scribble)
             if args.heap_control:
@@ -307,6 +350,20 @@ def main():
             value = receipt.get("malloc_scribble", "missing")
             allocator_receipt[role] = value if value in ("unset", "1", "other", "missing") else "other"
             write_json(records / "malloc-scribble.json", allocator_receipt)
+
+        def record_external_environment(role, process, path, child_environment):
+            value = owned_child_receipt(process, path, child_environment, args.malloc_scribble, expected_hashes[role])
+            external_receipt[role] = value
+            allocator_receipt[role] = value["malloc_scribble"]
+            write_json(records / "external-startup.json", external_receipt)
+            write_json(records / "malloc-scribble.json", allocator_receipt)
+
+        def finish_external_receipt():
+            require_fixture_hashes(prepared, expected_hashes)
+            require_fixture_hashes(work, expected_hashes)
+            external_receipt["binary_reuse_verified"] = True
+            write_json(records / "external-startup.json", external_receipt)
+            validate_external_receipt(external_receipt, args.malloc_scribble, expected_hashes)
 
         def scan(label, host_state):
             if args.copy_lifetime:
@@ -346,7 +403,9 @@ def main():
         try:
             host = subprocess.Popen([str(executable), str(state), *host_arguments], env=environment, stdout=host_log, stderr=host_log)
             initial = wait_json(state / "ready.json", lambda value: value["sequence"] == 0, [host])
-            if args.malloc_scribble:
+            if args.external_startup_receipt:
+                validate("external-startup-host", record_external_environment, "host", host, executable, environment)
+            elif args.malloc_scribble:
                 record_allocator_environment("host", initial)
             if args.heap_control:
                 validate("control-host-0", validate_control_host, initial)
@@ -357,6 +416,8 @@ def main():
             reader_arguments = ["--read-only"] if args.read_only else []
             reader = subprocess.Popen([str(reader_executable), str(host.pid), str(executable), str(state), *reader_arguments],
                                       env=reader_environment, stdout=reader_log, stderr=reader_log)
+            if args.external_startup_receipt:
+                validate("external-startup-reader", record_external_environment, "reader", reader, reader_executable, reader_environment)
             if not args.system_baseline:
                 # Establish AX/XPC setup before the baseline, with no owned test
                 # buttons yet. All target destruction remains after this scan.
@@ -479,6 +540,9 @@ def main():
                            "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
                            "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX groups and no increase over the non-AX startup baseline; not an installed-app or VoiceOver test"}
+            if args.external_startup_receipt:
+                validate("external-startup-complete", finish_external_receipt)
+                summary["receipt_mode"] = "external-startup"
             if validation_errors:
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors
@@ -508,6 +572,16 @@ def main():
                     host.wait(timeout=5)
             subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
                             "-u", str(app)], capture_output=True, timeout=15)
+            if args.external_startup_receipt:
+                # Repeat the byte comparison after both children have exited.
+                # Retain failure even if an earlier comparison passed.
+                external_receipt["binary_reuse_verified"] = False
+                write_json(records / "external-startup.json", external_receipt)
+                validate("external-startup-final", finish_external_receipt)
+                if "summary" in locals() and validation_errors:
+                    summary["coverage"] = "failed"
+                    summary["validation_errors"] = validation_errors
+                    write_json(records / "result.json", summary)
             if args.heap_diagnostics:
                 collect_heap_diagnostics(graphs, records)
     return 1 if validation_errors else 0

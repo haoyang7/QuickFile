@@ -29,7 +29,11 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 `malloc_scribble=true` 单独启动 macOS 26 配对调查：同一 runner 交替执行 5 组 `MallocScribble` 关闭/开启 × 空白对照/产品路径，共 20 次。关闭时删除继承变量，开启时设置为 `1`，并核对实际宿主与 AX reader 的环境回执。默认 `scan_mode=diagnostic` 保留完整分配历史，离线扫描冻结堆图及额外的 `added-10` 检查点；`scan_mode=live` 使用普通 CI 相同的实时扫描命令、栈记录配置与六个检查点，不采集或声明分配代次诊断。live 模式要求同时开启 `malloc_scribble`。
 
-两种模式只上传受限的 `ax-heap-diagnostics-summary`，明确记录扫描模式、checkout、系统映像、进程环境、扫描节点/字节/根数及未知根和目标堆栈标记；原始堆图和日志留在 runner 清理。原严格检查失败、回执缺失或该模式所需证据不完整都会使调查失败，同时继续收集后续对照。不同扫描模式的结果不能直接互相替代；live 仍编译了额外的环境回执代码，不与普通 CI 夹具二进制逐字节相同。Scribble 用于调查残留指针是否影响保守扫描，但也可能改变分配器行为；环境回执、通过的重复运行和计数变化均不能替代对象所有权或基线漏报的因果证据。
+`receipt_mode=internal` 是默认回执路径，在夹具中编译额外的环境读取代码。`receipt_mode=external-startup` 要求 `malloc_scribble=true`、`scan_mode=live`、`heap_diagnostics=false` 和 `ax_causal_probe=false`：只构建一次普通 host/reader，不定义 `QUICKFILE_AX_MALLOC_RECEIPT`，将同一签名 App 和 reader 按字节复制到 20 个独立 case。准备清单绑定当前夹具源码哈希；每次复制、实际子进程启动检查、测量完成和子进程退出后均校验两个可执行文件的 SHA-256，工作流再次对照统一构建哈希。这里保证本轮 off/on 和 control/product 复用相同字节，不宣称与另一个 CI job 的独立构建逐字节相同。
+
+外部回执只读取本轮持有的实际 `Popen` 子进程，通过 `KERN_PROCARGS2` 核验启动 executable 路径对应的文件、前后存活、非空且匹配的已知 `PATH`，再确认 `MallocScribble` 为 unset 或 `1`。不可读取、空环境、解析异常、身份或哈希不匹配均失败；仅公开字面状态、布尔和哈希，不导出环境内容。这是启动元数据与磁盘文件核验，不是当前 `getenv`、进程映射字节或对象所有权证明；其他进程和其他系统映像的环境可见性不能从 owned fixture 推广。Darwin 的环境访问限制见 [XNU sysctl_procargsx](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c)。
+
+两种扫描模式只上传受限的 `ax-heap-diagnostics-summary`，明确记录扫描/回执模式、checkout、系统映像、进程环境、扫描节点/字节/根数、未知根和目标堆栈标记，以及逐扫描工具返回码和固定类别的断言失败计数；原始堆图、环境和日志不上传。原严格检查失败、回执缺失或该模式所需证据不完整都会使调查失败，同时继续收集后续对照；构建失败则保留未完成状态。运行返回码、断言分类与分配诊断完整性分别记录，live 不宣称完整分配诊断。每 case 最多 180 秒，超时回收私有进程组；结束后清理夹具、缓存、堆图及原始日志。不同扫描模式的结果不能直接互相替代；内部回执仍会改变夹具二进制，外部读取也增加启动检查耗时。Scribble 用于调查残留指针是否影响保守扫描，但也可能改变分配器行为；环境回执、通过的重复运行和计数变化均不能替代对象所有权或基线漏报的因果证据。
 
 AX 读取权限由实际 reader 可执行文件检查；不匹配映像或缺权限明确报告未覆盖，已匹配映像安装拒绝、通知不足、扫描失败仍失败。目标按钮的两个观察者须逐项恰好收到一次，重复和缺失不能互相抵消；总通知和未匹配通知另行记录。产品扫描先建立不含目标按钮的 AX/XPC 启动基线，再要求目标 AX 泄漏为零、无未分类节点和未知根；已知 NSXPCConnection 基线的节点数、字节数与根数均不能增长。解析器分别保存 ROOT LEAK/CYCLE 分类与实际根类型。全堆报告与目标 AX 数量分别记录，不能将稳定的非零基线写成全堆零泄漏。专项使用一次性 synthetic AppKit 宿主，不代替签名安装 App、Finder 或 VoiceOver 验收。
 

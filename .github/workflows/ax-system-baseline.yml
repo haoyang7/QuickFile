@@ -26,6 +26,14 @@ on:
         options:
           - diagnostic
           - live
+      receipt_mode:
+        description: 'internal: fixture environment code; external-startup: ordinary binaries and owned-child startup metadata (requires live + malloc_scribble)'
+        type: choice
+        required: false
+        default: internal
+        options:
+          - internal
+          - external-startup
 
 permissions:
   contents: read
@@ -40,7 +48,7 @@ defaults:
 
 jobs:
   ax-system-probe:
-    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' }}
+    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' }}
     name: macOS ${{ matrix.expected_os }} (arm64)
     strategy:
       fail-fast: false
@@ -140,7 +148,7 @@ jobs:
           PY
 
   ax-heap-diagnostics:
-    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' }}
+    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' }}
     name: macOS 26 ${{ inputs.scan_mode }} heap comparison (arm64)
     runs-on: macos-26
     timeout-minutes: ${{ inputs.malloc_scribble && 70 || 35 }}
@@ -149,6 +157,8 @@ jobs:
       CAUSAL_PROBE: ${{ inputs.ax_causal_probe }}
       MALLOC_SCRIBBLE_EXPERIMENT: ${{ inputs.malloc_scribble }}
       AX_SCAN_MODE: ${{ inputs.scan_mode }}
+      AX_RECEIPT_MODE: ${{ inputs.receipt_mode }}
+      AX_HEAP_DIAGNOSTICS: ${{ inputs.heap_diagnostics }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -164,6 +174,10 @@ jobs:
               return subprocess.check_output(command, text=True).strip()
           assert os.environ['CAUSAL_PROBE'] == 'false', 'Choose one investigation mode'
           scan_mode = os.environ['AX_SCAN_MODE']
+          receipt_mode = os.environ['AX_RECEIPT_MODE']
+          assert receipt_mode in ('internal', 'external-startup'), 'Unknown receipt mode'
+          assert receipt_mode != 'external-startup' or (scan_mode == 'live' and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'), 'External startup receipts require live MallocScribble'
+          assert receipt_mode != 'external-startup' or os.environ['AX_HEAP_DIAGNOSTICS'] == 'false', 'External startup receipts cannot request frozen diagnostics'
           assert scan_mode in ('diagnostic', 'live'), 'Unknown heap scan mode'
           assert scan_mode != 'live' or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires malloc_scribble'
           version = output('sw_vers', '-productVersion')
@@ -180,7 +194,7 @@ jobs:
                        'MallocStackLoggingNoCompact', 'MallocNanoZone', 'MallocGuardEdges'):
               value = os.environ.get(name)
               allocator_environment[name] = 'unset' if value is None else value if value in ('0', '1') else 'other'
-          identity = {'scope':'synthetic-AX-heap-investigation', 'scan_mode':scan_mode,
+          identity = {'scope':'synthetic-AX-heap-investigation', 'scan_mode':scan_mode, 'receipt_mode':receipt_mode,
               'checkout_sha':output('git', 'rev-parse', 'HEAD'), 'macos':version,
               'os_build':output('sw_vers', '-buildVersion'), 'architecture':architecture, 'xcode':xcode,
               'runner_image':{'os':image_field('ImageOS'), 'version':image_field('ImageVersion')},
@@ -198,7 +212,9 @@ jobs:
           python3 - <<'PY'
           import json, os, pathlib, re, signal, subprocess, sys
           sys.path.insert(0, 'Scripts/Investigations')
-          from ax_probe_report import validate_heap_diagnostics_summary
+          from ax_probe_report import validate_heap_diagnostics_summary, validation_failure_counts
+          from ax_external_receipt import load_prepared_fixture, validate_external_receipt
+          import hashlib
           from importlib import import_module
           validate_malloc_scribble_receipt = import_module('verify-ax-compatibility').validate_malloc_scribble_receipt
           root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
@@ -206,7 +222,47 @@ jobs:
           public_summary = json.loads(summary_file.read_text())
           scan_mode = public_summary['identity']['scan_mode']
           diagnostics_expected = scan_mode == 'diagnostic'
+          external_receipt = public_summary['identity']['receipt_mode'] == 'external-startup'
           scribble_experiment = os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'
+          def run_owned(command, log_path, environment):
+              with log_path.open('w') as log:
+                  try:
+                      process = subprocess.Popen(command, env=environment, stdout=log, stderr=log, start_new_session=True)
+                      return process.wait(timeout=180)
+                  except subprocess.TimeoutExpired:
+                      # Reap this trial's complete private process group, including
+                      # the synthetic host and reader if the runner cannot clean up.
+                      try:
+                          os.killpg(process.pid, signal.SIGTERM)
+                      except ProcessLookupError:
+                          pass
+                      try:
+                          process.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          pass
+                      try:
+                          os.killpg(process.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                      process.wait(timeout=5)
+                      return 124
+          prepared = root / 'ordinary-fixture'
+          expected_hashes = None
+          if external_receipt:
+              build_return_code = run_owned([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
+                  '--prepare-external-fixture', '--work-directory', str(prepared),
+                  '--records-directory', str(root / 'build-records')], root / 'build.log', dict(os.environ))
+              public_summary['fixture_build_return_code'] = build_return_code
+              summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+              if build_return_code != 0:
+                  raise SystemExit(1)
+              sources = ['QuickFileApp/AXCompatibility.m', 'QuickFileApp/AXCompatibility.h',
+                         'Scripts/tests/fixtures/AXCompatibilityNotifications.m', 'Scripts/tests/fixtures/AXCompatibilityReader.swift']
+              source_hashes = {name: hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() for name in sources}
+              expected_hashes = load_prepared_fixture(prepared, source_hashes)
+              public_summary['fixture_executables'] = expected_hashes
+              public_summary['fixture_sources'] = source_hashes
+              summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
           failed = False
           for trial in range(1, 6):
               # Reverse both factors between groups to expose order effects.
@@ -221,36 +277,27 @@ jobs:
                       environment.pop('MallocScribble', None)
                       if scribble == 'on':
                           environment['MallocScribble'] = '1'
-                  with (directory / 'runner.log').open('w') as log:
-                      try:
-                          process = subprocess.Popen([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
-                              '--work-directory', str(directory / 'fixture'),
-                              '--records-directory', str(records),
-                              *(['--heap-diagnostics'] if diagnostics_expected else []),
-                              *(['--malloc-scribble', scribble] if scribble else []),
-                              *(['--heap-control'] if mode == 'control' else [])],
-                              env=environment, stdout=log, stderr=log, start_new_session=True)
-                          return_code = process.wait(timeout=180)
-                      except subprocess.TimeoutExpired:
-                          # Reap this trial's complete private process group, including
-                          # the synthetic host and reader if the runner cannot clean up.
-                          try:
-                              os.killpg(process.pid, signal.SIGTERM)
-                          except ProcessLookupError:
-                              pass
-                          try:
-                              process.wait(timeout=5)
-                          except subprocess.TimeoutExpired:
-                              pass
-                          try:
-                              os.killpg(process.pid, signal.SIGKILL)
-                          except ProcessLookupError:
-                              pass
-                          process.wait(timeout=5)
-                          return_code = 124
+                  return_code = run_owned([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
+                      '--work-directory', str(directory / 'fixture'), '--records-directory', str(records),
+                      *(['--heap-diagnostics'] if diagnostics_expected else []),
+                      *(['--malloc-scribble', scribble] if scribble else []),
+                      *(['--external-startup-receipt', '--prepared-fixture-directory', str(prepared)] if external_receipt else []),
+                      *(['--heap-control'] if mode == 'control' else [])], directory / 'runner.log', environment)
                   failed |= return_code != 0
                   receipt = {'trial': trial, 'mode': mode, 'scan_mode': scan_mode, 'return_code': return_code,
-                             'diagnostics_expected': diagnostics_expected, 'diagnostics_available': False}
+                             'diagnostics_expected': diagnostics_expected, 'diagnostics_available': False,
+                             'receipt_mode': public_summary['identity']['receipt_mode']}
+                  receipt['failure_classification_available'] = False
+                  result_file = records / 'result.json'
+                  if result_file.is_file() and not result_file.is_symlink() and result_file.stat().st_size <= 65536:
+                      try:
+                          failure_counts = validation_failure_counts(json.loads(result_file.read_text()))
+                      except (ValueError, TypeError, KeyError):
+                          pass
+                      else:
+                          receipt.update(failure_classification_available=True, validation_failure_counts=failure_counts)
+                          failed |= any(failure_counts.values())
+                  failed |= not receipt['failure_classification_available']
                   input_file = records / 'inputs.json'
                   if input_file.is_file() and not input_file.is_symlink() and input_file.stat().st_size <= 16384:
                       try:
@@ -276,6 +323,18 @@ jobs:
                           else:
                               receipt.update(environment_verified=True, process_environment=actual_environment)
                       failed |= not receipt['environment_verified']
+                  if external_receipt:
+                      receipt['external_startup_verified'] = False
+                      startup_file = records / 'external-startup.json'
+                      if startup_file.is_file() and not startup_file.is_symlink() and startup_file.stat().st_size <= 4096:
+                          try:
+                              startup = json.loads(startup_file.read_text())
+                              validate_external_receipt(startup, scribble, expected_hashes)
+                          except (ValueError, TypeError, KeyError, RuntimeError):
+                              pass
+                          else:
+                              receipt.update(external_startup_verified=True, startup_environment=startup)
+                      failed |= not receipt['external_startup_verified']
                   summary = records / 'heap-diagnostics.json'
                   if diagnostics_expected and summary.is_file() and not summary.is_symlink() and summary.stat().st_size <= 16384:
                       try:
@@ -317,6 +376,11 @@ jobs:
                               if type(destroyed_stack) is not bool:
                                   raise ValueError('Invalid destroyed notification stack flag')
                               fields['destroyed_notification_stack_present'] = destroyed_stack
+                              tool_exit = item['exit_code']
+                              if type(tool_exit) is not int or not -128 <= tool_exit <= 255:
+                                  raise ValueError('Invalid scan tool exit code')
+                              fields['tool_exit_code'] = tool_exit
+                              failed |= tool_exit not in (0, 1)
                               totals.append(dict(label=item['label'], **fields))
                           if mode == 'control':
                               zero_fields = ['buttons', 'allocatedButtons', 'destroyedButtons', 'compensations', 'mutableCompensations']

@@ -52,6 +52,36 @@ C_SYMBOL = r"[A-Za-z_][A-Za-z_0-9]*"
 OBJC_SYMBOL = r"([-+])\[([A-Za-z_][A-Za-z_0-9]*) ([A-Za-z_][A-Za-z_0-9:]*)\]"
 
 
+def validation_failure_counts(result):
+    """Project private assertion records into fixed categories, never messages."""
+    counts = dict.fromkeys(("heap_baseline", "control_activity", "notifications", "compensation_branches",
+                           "allocator_environment", "other"), 0)
+    if type(result) is not dict or result.get("coverage") not in ("passed", "measured", "failed"):
+        raise ValueError("Invalid fixture result")
+    errors = result.get("validation_errors", [])
+    if type(errors) is not list or len(errors) > 64 or (result["coverage"] == "failed") != bool(errors):
+        raise ValueError("Incomplete validation failures")
+    for error in errors:
+        if type(error) is not dict or type(error.get("stage")) is not str or not 1 <= len(error["stage"]) <= 64:
+            raise ValueError("Invalid validation failure stage")
+        stage = error["stage"]
+        if stage in HEAP_LABELS:
+            category = "heap_baseline"
+        elif re.fullmatch(r"control-(?:host|reader)-\d{1,3}", stage):
+            category = "control_activity"
+        elif stage == "notifications":
+            category = "notifications"
+        elif stage == "compensation-branches":
+            category = "compensation_branches"
+        elif stage in ("malloc-scribble", "external-startup-host", "external-startup-reader",
+                       "external-startup-complete", "external-startup-final"):
+            category = "allocator_environment"
+        else:
+            category = "other"
+        counts[category] += 1
+    return counts
+
+
 def public_system_symbol(image, symbol):
     return (image in HEAP_SYMBOL_IMAGES and type(symbol) is str and len(symbol) <= 128
             and re.fullmatch(rf"(?:{C_SYMBOL}|{OBJC_SYMBOL})", symbol) is not None)
