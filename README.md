@@ -21,7 +21,13 @@ open QuickFile.xcodeproj
 
 脚本会生成工程、运行单元测试并检查 Release 产物的架构、嵌入扩展、标识和权限配置。Linux 只能运行适用的 Python 脚本测试；macOS 原生检查由 [CI](CI.md) 或本机 Xcode 执行。
 
-签名运行需要自己的 Apple 开发团队及相应 App ID、扩展 ID 和 App Group 能力。将 `YOUR_TEAM_ID` 替换为有权使用这些标识的团队：
+没有 Apple 开发者会员时，可使用实验性的[免费自行分发流程](COMMUNITY_DISTRIBUTION.md)，生成保留沙盒的 ad-hoc Universal DMG，支持拖拽至“应用程序”安装。该应用未经公证，跨机器安装、Finder 集成及升级仍须单独验收：
+
+```bash
+./Scripts/build-community.sh --output .build/Packages/community-candidate
+```
+
+证书签名构建需要自己的 Apple 开发团队及相应 App ID、扩展 ID 和 App Group 能力。将 `YOUR_TEAM_ID` 替换为有权使用这些标识的团队：
 
 ```bash
 xcodebuild \
@@ -47,7 +53,7 @@ xcodebuild \
 
 ## 安装与使用
 
-1. 核对候选版本与签名，备份用户数据和现有安装。退出旧版 QuickFile，将构建目录中的 `Build/Products/Release/QuickFile.app` 安装到 `/Applications`。
+1. 核对候选版本、签名和校验和，备份用户数据和现有安装，退出旧版 QuickFile。Community 构建打开 DMG，将 `QuickFile.app` 拖到“应用程序”后推出镜像；证书签名构建将构建目录中的 `Build/Products/Release/QuickFile.app` 安装到 `/Applications`。
 2. 启动 QuickFile，在系统扩展设置中启用 Finder 扩展。在主应用选择目标目录，或首次从 Finder 创建时通过系统面板授权。
 3. 在 Finder 文件夹背景右键，选择“新建文件 → Markdown”，确认生成并选中 `未命名.md`。
 4. 升级后核对实际加载的主应用和扩展版本。旧扩展仍在运行时，保存当前工作后重新启动 Finder，再验证菜单。
@@ -90,6 +96,6 @@ pluginkit -m -A -D -v -i com.haoyoung.QuickFile.FinderExtension
 
 ## 文档与隐私
 
-开发维护参阅 [架构](ARCHITECTURE.md)、[贡献流程](CONTRIBUTING.md) 和 [CI](CI.md)；测试与分发参阅 [Beta 规则](BETA_RELEASE.md)、[反馈模板](BETA_FEEDBACK.md)、[更新配置](UPDATES.md) 和 [变更记录](CHANGELOG.md)。
+开发维护参阅 [架构](ARCHITECTURE.md)、[贡献流程](CONTRIBUTING.md) 和 [CI](CI.md)；测试与分发参阅 [免费自行分发](COMMUNITY_DISTRIBUTION.md)、[Beta 规则](BETA_RELEASE.md)、[反馈模板](BETA_FEEDBACK.md)、[更新配置](UPDATES.md) 和 [变更记录](CHANGELOG.md)。
 
 核心文件操作在本机完成，不含账号、遥测或分析 SDK，不请求完全磁盘访问。联网仅用于用户选择的软件更新，未配置更新源时保持离线。详见 [隐私说明](PRIVACY.md) 和 [MIT License](LICENSE)。

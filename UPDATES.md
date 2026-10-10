@@ -1,6 +1,8 @@
 # QuickFile 更新发布说明
 
-QuickFile 使用 Sparkle 2，默认构建不启用在线更新。正式更新源和签名公钥尚未确定；Developer ID、公证、真实 HTTPS 跨版本升级和完整运行准入仍需完成，尚未对外发布。源码版本以 [project.yml](project.yml) 为准，发布门槛见 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)。
+QuickFile 的证书签名更新路线使用 Sparkle 2，默认构建不启用在线更新。正式更新源和签名公钥尚未确定；Developer ID、公证、真实 HTTPS 跨版本升级和完整运行准入仍需完成，尚未对外发布。源码版本以 [project.yml](project.yml) 为准，发布门槛见 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)。
+
+[Community 免费构建](COMMUNITY_DISTRIBUTION.md) 通过条件编译移除 Sparkle 并采用手动覆盖升级。目前没有在线版本查询；未来可通过固定 HTTPS 清单或 GitHub Releases 查询版本，这不需要 Apple 会员，也不等于已实现自动安装。以下 Sparkle 配置和发布步骤适用于证书签名路线。
 
 ## 应用行为
 

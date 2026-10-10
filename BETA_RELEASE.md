@@ -1,6 +1,6 @@
 # QuickFile v0.1 Beta 冻结与分发规则
 
-QuickFile 0.1.0 尚未发布，完整运行与分发准入尚未通过。当前路线是本机开发候选及源码自编译测试；面向普通用户的安装包须完成 Developer ID、公证和默认安全设置新机器验收后才能放行。源码版本以 [project.yml](project.yml) 为准，不能据此推断已安装产物或验收状态。
+QuickFile 0.1.0 尚未发布，完整运行与分发准入尚未通过。免费自行分发使用独立的 [community 实验流程](COMMUNITY_DISTRIBUTION.md)，必须明确未经公证及实际验证范围。本文的证书签名路线面向 Developer ID、公证发布和注册设备测试；两类产物不能互相继承签名或运行验收。源码版本以 [project.yml](project.yml) 为准，不能据此推断已安装产物或验收状态。
 
 ## 冻结范围与安全边界
 
@@ -20,7 +20,7 @@ QuickFile 0.1.0 尚未发布，完整运行与分发准入尚未通过。当前�
 4. 在系统默认安全设置下安装、启动并启用扩展。拒绝安装或启动时保留错误原文并停止该项，不关闭 Gatekeeper、移除隔离属性、重签包或用注册修复掩盖失败。
 5. 按 [测试指南](BETA_TEST_GUIDE.md) 和 [29 项验收清单](RELEASE_CHECKLIST.md) 填写自己的结果。开发签名只覆盖构建者或同时被主 App 与扩展描述文件覆盖的注册设备，不能代替普通用户分发验收。
 
-## 普通用户分发准入
+## Developer ID 分发准入
 
 - 固定源码基线、工具链、依赖和构建参数；每个新候选递增 build，主 App 与扩展一致，营销版本使用数字格式，Beta 标记写在发布材料中。
 - Clean Archive，使用 Developer ID 导出，完成公证和装订；核对最终产物的签名、权限、嵌入扩展、双架构与 SHA-256。导出配置见 [Developer ID 配置](Release/ExportOptions-DeveloperID.plist)；[注册设备配置](Release/ExportOptions-RegisteredDevices.plist) 只用于对应开发测试范围。
