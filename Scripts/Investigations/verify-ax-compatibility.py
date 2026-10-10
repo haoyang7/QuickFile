@@ -255,7 +255,11 @@ def main():
                     raise RuntimeError(f"AX baseline warm-up was not empty: {warmed}")
                 scan("baseline", command("checkpoint"))
             for cycle in range(1, args.cycles + 1):
-                command("add")
+                added = command("add")
+                if args.heap_diagnostics and cycle == 1:
+                    # Split button construction from the first AX subscription;
+                    # this remains subject to the original empty-window baseline.
+                    scan("added-10", added)
                 observed = observe()
                 if observed["buttons"] != 10 or observed["registrations"] != expected_registrations:
                     raise RuntimeError(f"AX registrations incomplete: {observed}")

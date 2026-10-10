@@ -42,16 +42,24 @@ class AXHeapDiagnosticTests(unittest.TestCase):
         result = REPORT.heap_diff_summary(self.report(kind="/private/user/secret", stack="secret_symbol"))
         self.assertEqual(result["groups"][0]["type"], "unknown")
         self.assertEqual(result["unknown_stack_nodes"], 1)
+        self.assertEqual(result["unverified_stack_nodes"], 1)
         self.assertNotIn("secret", json.dumps(result))
         self.assertEqual(REPORT.heap_diff_summary("unsupported output")["status"], "unavailable")
         malformed = self.report().replace("Leak: 0x1000", "Unexpected: 0x1000")
         self.assertEqual(REPORT.heap_diff_summary(malformed)["status"], "partial")
         self.assertEqual(REPORT.heap_diff_summary(malformed)["unparsed_nodes"], 1)
         self.assertEqual(REPORT.heap_diff_summary(self.report().replace("48 total", "49 total"))["status"], "partial")
+        missing = REPORT.heap_diff_summary(self.report(stack="").replace("0 Foundation 0x9999  + 8", "stack unavailable"))
+        self.assertEqual(missing["missing_stack_nodes"], 1)
+
+    @staticmethod
+    def summary(point):
+        return {"schema": 2, "status": "partial", "checkpoints": [point],
+                "symbols": [], "omitted_symbols": 0, "symbols_status": "partial"}
 
     def test_public_validator_rejects_extra_fields_unbounded_values_and_text(self):
         point = REPORT.heap_diff_summary(self.report()) | {"label": "registered-10"}
-        valid = {"schema": 1, "status": "partial", "checkpoints": [point]}
+        valid = self.summary(point)
         REPORT.validate_heap_diagnostics_summary(valid)
         for mutate in (
                 lambda value: value.update(path="/private/secret"),
@@ -63,11 +71,79 @@ class AXHeapDiagnosticTests(unittest.TestCase):
                 lambda value: value["checkpoints"][0].update(label="baseline"),
                 lambda value: value["checkpoints"][0]["groups"][0].update(type="secret"),
                 lambda value: value["checkpoints"][0]["stack_matches"].update(secret=1),
+                lambda value: value["checkpoints"][0]["image_nodes"].update(secret=1),
+                lambda value: value["checkpoints"][0].update(missing_stack_nodes=2),
+                lambda value: value.update(symbols_status="complete"),
                 lambda value: value["checkpoints"][0].update(groups=point["groups"] * 33)):
             invalid = json.loads(json.dumps(valid))
             mutate(invalid)
             with self.assertRaises(ValueError):
                 REPORT.validate_heap_diagnostics_summary(invalid)
+
+    def resolver(self, symbol="-[NSXPCConnection initWithMachServiceName:options:]", start=0x9991):
+        resolver = object.__new__(REPORT.SystemSymbols)
+        resolver.cache = {}
+        resolver.library = mock.Mock()
+        resolver.library.method_getImplementation.return_value = start
+        resolver.library.dlsym.return_value = start
+        resolver.metadata = mock.Mock(return_value=(REPORT.HEAP_IMAGES["Foundation"][1], symbol, start))
+        return resolver
+
+    def test_symbols_require_matching_system_metadata_and_are_unordered_per_node(self):
+        symbol = "-[NSXPCConnection initWithMachServiceName:options:]"
+        resolver = self.resolver()
+        counts = {}
+        report = self.report().replace("0 Foundation 0x9999", "0 com.apple.Foundation 0x9999")
+        report += f"1 com.apple.Foundation 0x9999 {symbol} + 8\n"
+        result = REPORT.heap_diff_summary(report, resolver=resolver, symbol_counts=counts)
+        self.assertEqual(counts, {("Foundation", symbol): 1})
+        self.assertEqual(result["image_nodes"]["Foundation"], 1)
+        self.assertEqual(result["unverified_stack_nodes"], 0)
+        point = result | {"label": "registered-10"}
+        summary = self.summary(point) | {"symbols": [{"image": "Foundation", "symbol": symbol,
+                                                     "nodes": {"registered-10": 1}}]}
+        with mock.patch.object(REPORT, "SystemSymbols", return_value=resolver):
+            REPORT.validate_heap_diagnostics_summary(summary)
+            # A syntactically plausible name still needs independent lookup.
+            summary["symbols"][0]["symbol"] = "CustomerSecret"
+            with self.assertRaises(ValueError):
+                REPORT.validate_heap_diagnostics_summary(summary)
+
+    def test_unverified_symbols_never_fall_back_to_report_text(self):
+        symbol = "-[NSXPCConnection initWithMachServiceName:options:]"
+        foundation = REPORT.HEAP_IMAGES["Foundation"][1]
+        for metadata in (("/private/user/Foundation", symbol, 0x9991),
+                         (foundation, "OtherSymbol", 0x9991), (foundation, symbol, 0x9990), None):
+            with self.subTest(metadata=metadata):
+                resolver = self.resolver()
+                resolver.metadata.return_value = metadata
+                counts = {}
+                result = REPORT.heap_diff_summary(self.report(), resolver=resolver, symbol_counts=counts)
+                self.assertEqual(counts, {})
+                self.assertEqual(result["unverified_stack_nodes"], 1)
+        for raw_symbol in ("private/path", "0x123456", "name " * 40, "Secret<Template>", "-[Secret token:]\nprivate"):
+            with self.subTest(symbol=raw_symbol):
+                resolver = self.resolver(raw_symbol)
+                self.assertFalse(resolver.verified("Foundation", raw_symbol, 0x9999, 8))
+                resolver.metadata.assert_not_called()
+        resolver = self.resolver()
+        self.assertFalse(resolver.verified("Foundation", symbol, 0x9999, 7))
+        self.assertFalse(resolver.verified("PrivateFoundation", symbol, 0x9999, 8))
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires Apple system symbol metadata")
+    def test_actual_system_symbol_lookup_at_collection_and_public_gate(self):
+        resolver = REPORT.SystemSymbols()
+        for image, symbol in (("CoreFoundation", "CFArrayCreate"),
+                              ("Foundation", "-[NSXPCConnection initWithMachServiceName:options:]")):
+            with self.subTest(symbol=symbol):
+                address = resolver.lookup(image, symbol)
+                self.assertIsNotNone(address)
+                self.assertTrue(resolver.verified(image, symbol, address, 0))
+                counts = {}
+                report = self.report(stack=symbol).replace("Foundation 0x9999", f"{REPORT.HEAP_IMAGES[image][0]} 0x{address:x}").replace(" + 8", " + 0")
+                point = REPORT.heap_diff_summary(report, resolver=resolver, symbol_counts=counts) | {"label": "added-10"}
+                summary = self.summary(point) | {"symbols": [{"image": image, "symbol": symbol, "nodes": {"added-10": 1}}]}
+                REPORT.validate_heap_diagnostics_summary(summary)
 
     def test_aggregation_has_a_global_row_budget(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -82,6 +158,25 @@ class AXHeapDiagnosticTests(unittest.TestCase):
             REPORT.validate_heap_diagnostics_summary(summary)
             self.assertEqual(summary["status"], "partial")
             self.assertEqual(sum(len(point["groups"]) for point in summary["checkpoints"]), 32)
+            self.assertLessEqual((root / "heap-diagnostics.json").stat().st_size, 16 * 1024)
+
+    def test_symbol_dictionary_has_a_global_budget_and_checkpoint_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for label in REPORT.HEAP_LABELS:
+                (root / f"{label}.memgraph").touch()
+            report = self.report(stack="_function0") + "".join(
+                f"{index} com.apple.Foundation 0x9999 _function{index} + 8\n" for index in range(1, 30))
+            resolver = mock.Mock()
+            with mock.patch.object(REPORT.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, report, "")), \
+                    mock.patch.object(REPORT, "SystemSymbols", return_value=resolver):
+                REPORT.collect_heap_diagnostics(root, root)
+                summary = json.loads((root / "heap-diagnostics.json").read_text())
+                REPORT.validate_heap_diagnostics_summary(summary)
+            self.assertEqual(len(summary["symbols"]), 24)
+            self.assertEqual(summary["omitted_symbols"], 6)
+            self.assertEqual(summary["symbols_status"], "partial")
+            self.assertEqual(summary["symbols"][0]["nodes"], dict.fromkeys(REPORT.HEAP_LABELS[1:], 1))
             self.assertLessEqual((root / "heap-diagnostics.json").stat().st_size, 16 * 1024)
 
 
@@ -195,6 +290,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 notifications["target_notification_counts"][0] = [0, 2]
             scan_labels = (["baseline", "removed-10", "removed-30", "observer-exited"] if system_baseline else
                            ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
+            if heap_diagnostics:
+                scan_labels.insert(1, "added-10")
             scanned = []
             commands = []
             processes = []
@@ -234,6 +331,10 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         return subprocess.CompletedProcess(command, 0, "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
                     label = scan_labels[len(scanned)]
                     scanned.append(label)
+                    if label in ("added-10", "registered-10"):
+                        reader_command = json.loads((state / "reader-command.json").read_text())
+                        self.assertEqual(reader_command["sequence"], 1 if label == "added-10" else 2)
+                        self.assertEqual(host_state["destroyedButtons"], 0)
                     nodes, size = (287, 18_768) if label == failed_scan else (280, 18_416)
                     output = (f"Process 1234: {nodes} leaks for {size} total leaked bytes.\n"
                               "STACK OF 3 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
@@ -304,6 +405,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 live_scans = [command for command in commands if command[0] == "leaks" and command[-1] == "1234"]
                 self.assertEqual(len(live_scans), len(scan_labels))
                 self.assertTrue(all(any(value.startswith("--outputGraph=") for value in command) for command in live_scans))
+                self.assertEqual([point["label"] for point in diagnostic["checkpoints"]], list(REPORT.HEAP_LABELS[1:]))
             self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
             self.assertEqual(scans[-1]["host"]["destroyedButtons"], 30)
             if system_baseline:
@@ -331,11 +433,13 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
         self.assertNotIn("validation_errors", summary)
 
     def test_diagnostics_capture_once_per_stage_and_preserve_heap_failure(self):
-        exit_code, summary = self.exercise_runner(failed_scan="registered-10", heap_diagnostics=True)
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(summary["coverage"], "failed")
-        self.assertIsNone(summary["ax_leak_nodes"])
-        self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["registered-10"])
+        for stage in ("added-10", "registered-10"):
+            with self.subTest(stage=stage):
+                exit_code, summary = self.exercise_runner(failed_scan=stage, heap_diagnostics=True)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(summary["coverage"], "failed")
+                self.assertIsNone(summary["ax_leak_nodes"])
+                self.assertEqual([error["stage"] for error in summary["validation_errors"]], [stage])
 
     def test_intermediate_growth_still_fails_after_heap_returns_to_baseline(self):
         for label in ("registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"):
