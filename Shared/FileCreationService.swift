@@ -67,6 +67,9 @@ public struct FileCreationService: @unchecked Sendable {
             timing?.mark("writer.end")
         }
         timing?.mark("writer.preflight.begin")
+        try request.template.officeFormat?.validate(
+            content: request.template.content, fileExtension: request.template.fileExtension
+        )
         let destinationFolder = request.destinationFolder.standardizedFileURL
         guard destinationFolder.isFileURL else {
             throw FileCreationError.destinationIsNotFileURL
@@ -136,21 +139,26 @@ public struct FileCreationService: @unchecked Sendable {
                 throw FileCreationError.writeFailed(fileURL, posixError())
             }
 
-            let inputs: (date: Date, clipboard: String)
-            if let renderingInputs {
-                inputs = renderingInputs
+            let data: Data
+            if let format = request.template.officeFormat {
+                data = format.data
             } else {
-                let capturedInputs = (dateProvider(), request.template.usesClipboard ? clipboardProvider() ?? "" : "")
-                renderingInputs = capturedInputs
-                inputs = capturedInputs
+                let inputs: (date: Date, clipboard: String)
+                if let renderingInputs {
+                    inputs = renderingInputs
+                } else {
+                    let capturedInputs = (dateProvider(), request.template.usesClipboard ? clipboardProvider() ?? "" : "")
+                    renderingInputs = capturedInputs
+                    inputs = capturedInputs
+                }
+                let context = TemplateRenderingContext(
+                    date: inputs.date,
+                    folderName: destinationFolder.lastPathComponent,
+                    clipboard: inputs.clipboard,
+                    sequence: sequence
+                )
+                data = Data(try templateRenderer.render(request.template.content, context: context).utf8)
             }
-            let context = TemplateRenderingContext(
-                date: inputs.date,
-                folderName: destinationFolder.lastPathComponent,
-                clipboard: inputs.clipboard,
-                sequence: sequence
-            )
-            let data = Data(try templateRenderer.render(request.template.content, context: context).utf8)
             do {
                 if let committedURL = try commit(data, named: filename, in: directoryFD, folderURL: destinationFolder, timing: timing) {
                     timing?.mark("writer.result.ready")

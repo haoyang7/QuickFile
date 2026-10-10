@@ -2405,7 +2405,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let gate = CreationGate()
         defer { gate.release.signal() }
         let store = TemplateStore(defaults: defaults)
-        var template = BuiltInTemplates.all[0]
+        var template = BuiltInTemplates.all.first { $0.fileExtension == "txt" }!
         template.content = "{{clipboard}}"
         try store.saveTemplates([template])
         let model = QuickFileViewModel(
@@ -2420,7 +2420,7 @@ final class QuickFileViewModelTests: XCTestCase {
         XCTAssertTrue(started)
         let requests = makeRequestStore()
         try requests.save(FinderAuthorizationRequest(
-            templateID: BuiltInTemplates.all[0].id,
+            templateID: BuiltInTemplates.all.first { $0.fileExtension == "txt" }!.id,
             destinationFolder: temporaryDirectory
         ))
         await model.processPendingFinderAuthorizationRequests(
@@ -2500,7 +2500,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let gate = CreationGate()
         defer { gate.release.signal() }
         let store = TemplateStore(defaults: defaults)
-        var template = BuiltInTemplates.all[0]
+        var template = BuiltInTemplates.all.first { $0.fileExtension == "txt" }!
         template.content = "{{clipboard}}"
         try store.saveTemplates([template])
         let model = QuickFileViewModel(
@@ -2598,7 +2598,7 @@ final class QuickFileViewModelTests: XCTestCase {
     }
 
     func testCancelPausesAcrossWindowsAndNotificationsUntilExplicitContinuation() async throws {
-        let template = BuiltInTemplates.all[0]
+        let template = BuiltInTemplates.all.first { $0.fileExtension == "txt" }!
         let store = TemplateStore(defaults: defaults)
         try store.saveTemplates([template])
         let model = QuickFileViewModel(templateStore: store, templates: [template],
@@ -2736,7 +2736,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let gate = CreationGate()
         defer { gate.release.signal() }
         let store = TemplateStore(defaults: defaults)
-        var template = BuiltInTemplates.all[0]
+        var template = BuiltInTemplates.all.first { $0.fileExtension == "txt" }!
         template.content = "{{clipboard}}"
         try store.saveTemplates([template])
         let model = QuickFileViewModel(templateStore: store, templates: [template],
@@ -2896,7 +2896,7 @@ final class QuickFileViewModelTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: requestDirectory.appendingPathComponent(".legacy-v1-migrated").path))
         let pinnedReadCount = LockedTestValue(0)
-        let request = FinderAuthorizationRequest(templateID: BuiltInTemplates.all[0].id,
+        let request = FinderAuthorizationRequest(templateID: BuiltInTemplates.all.first { $0.fileExtension == "txt" }!.id,
             destinationFolder: temporaryDirectory)
         try requests.save(request)
         let reader = FinderAuthorizationRequestStore(defaults: defaults, directoryURL: requestDirectory,
@@ -2905,7 +2905,7 @@ final class QuickFileViewModelTests: XCTestCase {
                 gate.blockOnce()
                 return try FinderAuthorizationRequestStore.readBoundedRequest(descriptor: descriptor)
             })
-        let template = BuiltInTemplates.all[0]
+        let template = BuiltInTemplates.all.first { $0.fileExtension == "txt" }!
         let templateStore = TemplateStore(defaults: defaults)
         try templateStore.saveTemplates([template])
         let model = QuickFileViewModel(templateStore: templateStore, templates: [template],
@@ -2949,7 +2949,7 @@ final class QuickFileViewModelTests: XCTestCase {
             "Cancellation is not proof that a synchronous descriptor read has ended")
         // A producer can still save while the pinned payload is blocked outside
         // flock, but this does not release the app's separate processing admission.
-        let retained = FinderAuthorizationRequest(templateID: BuiltInTemplates.all[0].id,
+        let retained = FinderAuthorizationRequest(templateID: BuiltInTemplates.all.first { $0.fileExtension == "txt" }!.id,
             destinationFolder: temporaryDirectory)
         try requests.save(retained)
         gate.release.signal()
@@ -3577,7 +3577,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let now = Date()
         let requests = (0..<3).map { index in
             FinderAuthorizationRequest(
-                templateID: BuiltInTemplates.all[0].id,
+                templateID: BuiltInTemplates.all.first { $0.fileExtension == "txt" }!.id,
                 destinationFolder: temporaryDirectory,
                 createdAt: now.addingTimeInterval(Double(index) - 3)
             )
@@ -3740,7 +3740,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let gate = CreationGate()
         defer { gate.release.signal() }
         let store = TemplateStore(defaults: defaults)
-        var finderTemplate = BuiltInTemplates.all[0]
+        var finderTemplate = BuiltInTemplates.all.first { $0.fileExtension == "txt" }!
         finderTemplate.content = "{{clipboard}}"
         let formTemplate = FileTemplate(name: "Form", fileExtension: "md", content: "form")
         try store.saveTemplates([finderTemplate, formTemplate])
@@ -3776,7 +3776,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let gate = CreationGate()
         defer { gate.release.signal() }
         let store = TemplateStore(defaults: defaults)
-        var template = BuiltInTemplates.all[0]
+        var template = BuiltInTemplates.all.first { $0.fileExtension == "txt" }!
         template.content = "{{clipboard}}"
         try store.saveTemplates([template])
         let model = QuickFileViewModel(

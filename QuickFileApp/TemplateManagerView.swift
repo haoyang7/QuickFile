@@ -320,7 +320,8 @@ struct TemplateManagerView: View {
             .help(isEnabled ? "在创建菜单中停用" : "在创建菜单中启用")
             VStack(alignment: .leading, spacing: 2) {
                 Text(template.name)
-                Text(template.content.isEmpty ? "不预填内容" : contentSummary(template.content))
+                Text(template.officeFormat?.blankDocumentDescription
+                     ?? (template.content.isEmpty ? "不预填内容" : contentSummary(template.content)))
                     .font(.caption).foregroundColor(.secondary).lineLimit(1)
             }
             Spacer()

@@ -493,7 +493,7 @@ final class QuickFileViewModel: ObservableObject {
                 let latest = try load()
                 let copy = FileTemplate(name: draft.name, fileExtension: draft.fileExtension,
                                         content: draft.content, isEnabled: draft.isEnabled,
-                                        defaultFilename: draft.defaultFilename)
+                                        defaultFilename: draft.defaultFilename, officeFormat: draft.officeFormat)
                 let updated = latest + [copy]
                 try store.saveTemplates(updated, expectedTemplates: latest)
                 return (templates: updated, id: copy.id)

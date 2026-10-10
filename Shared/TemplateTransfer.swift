@@ -69,17 +69,19 @@ public struct TransferTemplate: Codable, Equatable, Hashable, Sendable {
     public let content: String
     public let defaultFilename: String
     public let isEnabled: Bool
+    public let officeFormat: OfficeDocumentFormat?
 
-    public init(name: String, fileExtension: String, content: String, isEnabled: Bool, defaultFilename: String = "") {
+    public init(name: String, fileExtension: String, content: String, isEnabled: Bool, defaultFilename: String = "", officeFormat: OfficeDocumentFormat? = nil) {
         self.defaultFilename = defaultFilename
         self.name = name
         self.fileExtension = fileExtension
         self.content = content
         self.isEnabled = isEnabled
+        self.officeFormat = officeFormat
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, fileExtension, content, isEnabled, defaultFilename
+        case name, fileExtension, content, isEnabled, defaultFilename, officeFormat
     }
 
     public init(from decoder: Decoder) throws {
@@ -89,24 +91,28 @@ public struct TransferTemplate: Codable, Equatable, Hashable, Sendable {
         content = try values.decode(String.self, forKey: .content)
         isEnabled = try values.decode(Bool.self, forKey: .isEnabled)
         defaultFilename = values.contains(.defaultFilename) ? try values.decode(String.self, forKey: .defaultFilename) : ""
+        officeFormat = values.contains(.officeFormat) ? try values.decode(OfficeDocumentFormat.self, forKey: .officeFormat) : nil
     }
 
     public init(_ template: FileTemplate) {
         self.init(name: template.name, fileExtension: template.fileExtension,
-                  content: template.content, isEnabled: template.isEnabled, defaultFilename: template.defaultFilename)
+                  content: template.content, isEnabled: template.isEnabled, defaultFilename: template.defaultFilename,
+                  officeFormat: template.officeFormat)
     }
 
     public var usesClipboard: Bool {
         // Detect the token only. Import/export never renders or reads the pasteboard.
-        TemplateRenderer.containsVariable("clipboard", in: content)
+        officeFormat == nil && TemplateRenderer.containsVariable("clipboard", in: content)
     }
 
     public func makeTemplate() -> FileTemplate {
-        FileTemplate(name: name, fileExtension: fileExtension, content: content, isEnabled: isEnabled, defaultFilename: defaultFilename)
+        FileTemplate(name: name, fileExtension: fileExtension, content: content, isEnabled: isEnabled,
+                     defaultFilename: defaultFilename, officeFormat: officeFormat)
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.isEnabled == rhs.isEnabled
+            && lhs.officeFormat == rhs.officeFormat
             && TemplateByteOperations.areEqual(lhs.name.utf8, rhs.name.utf8)
             && TemplateByteOperations.areEqual(lhs.fileExtension.utf8, rhs.fileExtension.utf8)
             && TemplateByteOperations.areEqual(lhs.content.utf8, rhs.content.utf8)
@@ -119,6 +125,7 @@ public struct TransferTemplate: Codable, Equatable, Hashable, Sendable {
         TemplateByteOperations.hash(content.utf8, into: &hasher)
         TemplateByteOperations.hash(defaultFilename.utf8, into: &hasher)
         hasher.combine(isEnabled)
+        hasher.combine(officeFormat)
     }
 }
 
@@ -151,7 +158,7 @@ public struct TemplateImportPlan: Equatable, Sendable {
 
 public enum TemplateTransfer {
     public static let format = "quickfile.templates"
-    public static let version = 2
+    public static let version = 3
 
     public static func decode(
         _ data: Data, limits: TemplateTransferLimits = .default
@@ -252,7 +259,7 @@ public enum TemplateTransfer {
             names.insert(name)
             let template = FileTemplate(name: name, fileExtension: source.fileExtension,
                                         content: source.content, isEnabled: source.isEnabled,
-                                        defaultFilename: source.defaultFilename)
+                                        defaultFilename: source.defaultFilename, officeFormat: source.officeFormat)
             additions.append(.init(sourceIndex: index, originalName: source.name, template: template,
                                    usesClipboard: source.usesClipboard))
             // Also recognize an exact copy of a previous item's final, renamed form.
@@ -308,6 +315,7 @@ public enum TemplateTransfer {
         draft.fileExtension = template.fileExtension
         draft.content = template.content
         draft.isEnabled = template.isEnabled
+        draft.officeFormat = template.officeFormat
         do { _ = try draft.makeTemplate() }
         catch {
             throw TemplateTransferError.invalidTemplate(index: index, reason: error.localizedDescription)
@@ -333,7 +341,7 @@ public enum TemplateTransfer {
                 throw TemplateTransferError.invalidFormat
             }
             let version = try container.decode(Int.self, forKey: .version)
-            guard version == 1 || version == TemplateTransfer.version else { throw TemplateTransferError.unsupportedVersion(version) }
+            guard (1...TemplateTransfer.version).contains(version) else { throw TemplateTransferError.unsupportedVersion(version) }
             var values = try container.nestedUnkeyedContainer(forKey: .templates)
             var templates: [TransferTemplate] = []
             while !values.isAtEnd {
@@ -345,6 +353,11 @@ public enum TemplateTransfer {
                 guard version != 1 || template.defaultFilename.isEmpty else {
                     throw TemplateTransferError.invalidTemplate(
                         index: templates.count, reason: "默认文件名需要模板文件版本 2。"
+                    )
+                }
+                guard version >= 3 || template.officeFormat == nil else {
+                    throw TemplateTransferError.invalidTemplate(
+                        index: templates.count, reason: "Office 模板需要模板文件版本 3。"
                     )
                 }
                 try TemplateTransfer.validate(template, index: templates.count, limits: limits)
@@ -434,7 +447,8 @@ private enum TemplateJSONEmission {
     }()
 
     static func write<Sink: TemplateJSONSink>(_ bundle: TemplateTransferBundle, to sink: inout Sink) throws {
-        let version = bundle.templates.contains { !$0.defaultFilename.isEmpty } ? TemplateTransfer.version : 1
+        let version = bundle.templates.contains { $0.officeFormat != nil } ? TemplateTransfer.version
+            : (bundle.templates.contains { !$0.defaultFilename.isEmpty } ? 2 : 1)
         try sink.append("{\"format\":\"quickfile.templates\",\"version\":\(version),\"templates\":[".utf8)
         for (index, template) in bundle.templates.enumerated() {
             if index != 0 { try sink.append(",".utf8) }
@@ -444,6 +458,10 @@ private enum TemplateJSONEmission {
             try appendString(template.fileExtension, to: &sink)
             try sink.append(",\"content\":".utf8)
             try appendString(template.content, to: &sink)
+            if let format = template.officeFormat {
+                try sink.append(",\"officeFormat\":".utf8)
+                try appendString(format.rawValue, to: &sink)
+            }
             if !template.defaultFilename.isEmpty {
                 try sink.append(",\"defaultFilename\":".utf8)
                 try appendString(template.defaultFilename, to: &sink)

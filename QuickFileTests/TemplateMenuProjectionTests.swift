@@ -152,14 +152,20 @@ final class TemplateMenuProjectionTests: XCTestCase {
     }
 
     func testCreationReadFailureDoesNotFallBackToLegacyOrBuiltIns() throws {
-        let selected = BuiltInTemplates.all[0]
-        defaults.set(try JSONEncoder().encode([selected]), forKey: "templates.v1")
+        let selected = FileTemplate(name: "Legacy", fileExtension: "txt", content: "legacy body")
+        let legacyData = try JSONEncoder().encode([selected])
+        defaults.set(legacyData, forKey: "templates.v1")
         let reader = TemplateStore(defaults: defaults, storageURL: url, changeNotificationName: suite,
                                    readTemplatesData: { _ in throw CocoaError(.fileReadNoPermission) })
         XCTAssertThrowsError(try reader.reloadCreationSnapshot(templateID: selected.id)) {
-            guard case TemplateStore.StoreError.readFailed = $0 else { return XCTFail("Unexpected error: \($0)") }
+            guard case TemplateStore.StoreError.readFailed(let underlying) = $0 else {
+                return XCTFail("Unexpected error: \($0)")
+            }
+            let cause = underlying as NSError
+            XCTAssertEqual(cause.domain, NSCocoaErrorDomain)
+            XCTAssertEqual(cause.code, CocoaError.Code.fileReadNoPermission.rawValue)
         }
-        XCTAssertNotNil(defaults.object(forKey: "templates.v1"))
+        XCTAssertEqual(defaults.data(forKey: "templates.v1"), legacyData)
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
         XCTAssertThrowsError(try TemplateStore(defaults: nil, storageURL: url).reloadCreationSnapshot(templateID: selected.id)) {
             guard case TemplateStore.StoreError.sharedDefaultsUnavailable = $0 else { return XCTFail("Unexpected error: \($0)") }
@@ -249,15 +255,22 @@ final class TemplateMenuProjectionTests: XCTestCase {
                 return XCTFail("Unexpected error: \(error)")
             }
         }
-        defaults.set(try JSONEncoder().encode(BuiltInTemplates.all), forKey: "templates.v1")
+        let legacy = [FileTemplate(name: "Legacy", fileExtension: "txt", content: "legacy body")]
+        let legacyData = try JSONEncoder().encode(legacy)
+        defaults.set(legacyData, forKey: "templates.v1")
         let reader = TemplateStore(defaults: defaults, storageURL: url, readTemplatesData: { _ in
             throw CocoaError(.fileReadNoPermission)
         })
         XCTAssertThrowsError(try reader.reloadMenuEntries()) { error in
-            guard case TemplateStore.StoreError.readFailed = error else {
+            guard case TemplateStore.StoreError.readFailed(let underlying) = error else {
                 return XCTFail("Unexpected error: \(error)")
             }
+            let cause = underlying as NSError
+            XCTAssertEqual(cause.domain, NSCocoaErrorDomain)
+            XCTAssertEqual(cause.code, CocoaError.Code.fileReadNoPermission.rawValue)
         }
+        XCTAssertEqual(defaults.data(forKey: "templates.v1"), legacyData)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
     func testMenuReuseReadsEveryTimeAndDetectsEqualSizeEqualMtimeEdits() throws {
