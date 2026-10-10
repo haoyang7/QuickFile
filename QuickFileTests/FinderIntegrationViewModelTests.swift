@@ -94,7 +94,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
         let refresh = Task { await viewModel.refresh() }
         await fulfillment(of: [started], timeout: 1)
         enabled = false
-        await viewModel.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await viewModel.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         XCTAssertFalse(viewModel.isEnabled, "Another action has overwritten the published input")
         resumeProbe?.resume()
         await refresh.value
@@ -185,7 +185,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
         let model = try verificationModel(client: client, folderOpener: { _ in opens += 1; return true })
         await model.confirmVisibleFile()
         XCTAssertEqual(model.verificationState, .idle)
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         XCTAssertEqual(model.verificationState, .awaitingCreation)
         XCTAssertEqual(opens, 1)
         await model.confirmVisibleFile()
@@ -203,7 +203,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
         client.beginResult = .unavailable
         var opens = 0
         let model = try verificationModel(client: client, folderOpener: { _ in opens += 1; return true })
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         XCTAssertEqual(model.verificationState, .unavailable)
         XCTAssertEqual(opens, 0)
         XCTAssertEqual(model.setupPresentation(hasDestination: true, authorization: .saved, hasTemplates: true).action, .openFolder)
@@ -215,7 +215,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
             runtimeProvider: { self.snapshot(enabled: $0, responded: true) }, managementOpener: {},
             verificationClientProvider: { client },
             directoryIdentityProvider: { _ in throw CocoaError(.fileNoSuchFile) }, folderOpener: { _ in true })
-        await model.startVerification(in: URL(fileURLWithPath: "/missing"))
+        await model.startVerification(in: URL(fileURLWithPath: "/missing"))?.value
         XCTAssertEqual(model.verificationState, .destinationUnavailable)
         XCTAssertEqual(client.beginCount, 0)
     }
@@ -223,7 +223,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
     func testCancellationDiscardsLateReceiptAndClearsBusyState() async throws {
         let client = VerificationClient()
         let model = try verificationModel(client: client)
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         let entered = expectation(description: "check entered")
         var resume: CheckedContinuation<FinderFirstUseVerificationStatus, Never>?
         client.checkProvider = {
@@ -235,7 +235,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
         model.cancelVerification()
         XCTAssertFalse(model.isCheckingVerification)
         XCTAssertTrue(model.isVerificationOperationInFlight, "Do not admit replacement work until the old operation actually ends")
-        await model.startVerification(in: URL(fileURLWithPath: "/replacement"))
+        await model.startVerification(in: URL(fileURLWithPath: "/replacement"))?.value
         XCTAssertEqual(client.beginCount, 1)
         resume?.resume(returning: .creationReported)
         await check.value
@@ -246,7 +246,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
     func testDestinationChangeAndDisabledExtensionInvalidateAttempt() async throws {
         let client = VerificationClient()
         let model = try verificationModel(client: client)
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         model.destinationDidChange(to: URL(fileURLWithPath: "/other-target"))
         XCTAssertEqual(model.verificationState, .idle)
         XCTAssertEqual(client.cancelCount, 1)
@@ -256,7 +256,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
         let changing = FinderIntegrationViewModel(statusProvider: { enabled },
             runtimeProvider: { self.snapshot(enabled: $0, responded: true) }, managementOpener: {},
             verificationClientProvider: { client }, directoryIdentityProvider: { _ in identity }, folderOpener: { _ in true })
-        await changing.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await changing.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         enabled = false
         await changing.refresh()
         XCTAssertEqual(changing.verificationState, .idle)
@@ -266,7 +266,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
     func testExpiredAttemptHasExplicitRestartAndCannotBeConfirmed() async throws {
         let client = VerificationClient()
         let model = try verificationModel(client: client)
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         client.checkResult = .expiredOrMissing
         await model.checkVerification()
         XCTAssertEqual(model.verificationState, .expired)
@@ -278,7 +278,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
     func testVisibleConfirmationRechecksReceiptInsteadOfAcceptingExpiredUI() async throws {
         let client = VerificationClient()
         let model = try verificationModel(client: client)
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         client.checkResult = .creationReported
         await model.checkVerification()
         XCTAssertEqual(model.verificationState, .creationReported)
@@ -290,7 +290,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
     func testResponseProbeAloneCannotCompleteFirstUseVerification() async throws {
         let client = VerificationClient()
         let model = try verificationModel(client: client)
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         await model.refresh()
         XCTAssertTrue(model.isResponding)
         XCTAssertEqual(model.verificationState, .awaitingCreation)
@@ -300,7 +300,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
 
     func testUserCancellationWarnsThatExistingFileWorkMayStillComplete() async throws {
         let model = try verificationModel(client: VerificationClient())
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         model.cancelUserVerification()
         XCTAssertEqual(model.verificationState, .cancelled)
         let presentation = model.setupPresentation(hasDestination: true, authorization: .saved, hasTemplates: true)
@@ -312,7 +312,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
         let client = VerificationClient()
         var opens = 0
         let model = try verificationModel(client: client, folderOpener: { _ in opens += 1; return true })
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         client.checkResult = .unavailable
         await model.checkVerification()
         XCTAssertEqual(model.verificationState, .responseUnavailable)
@@ -333,7 +333,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
         let first = UUID(), second = UUID()
         model.windowDidAppear(first)
         model.windowDidAppear(second)
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         model.windowDidDisappear(first)
         XCTAssertEqual(model.verificationState, .awaitingCreation)
         XCTAssertEqual(client.cancelCount, 0)
@@ -342,11 +342,138 @@ final class FinderIntegrationViewModelTests: XCTestCase {
         XCTAssertEqual(client.cancelCount, 1)
     }
 
+    func testClosingWindowBeforeVerificationStartsPreventsLateFinderOpenEvenAfterReopening() async throws {
+        let identity = try makeDirectoryIdentity()
+        for reopen in [false, true] {
+            let client = VerificationClient()
+            let identityReads = LockedTestValue(0)
+            var clientRequests = 0
+            var opens = 0
+            let model = FinderIntegrationViewModel(
+                statusProvider: { true }, runtimeProvider: { self.snapshot(enabled: $0, responded: true) },
+                managementOpener: {}, verificationClientProvider: { clientRequests += 1; return client },
+                directoryIdentityProvider: { _ in identityReads.update { $0 += 1 }; return identity },
+                folderOpener: { _ in opens += 1; return true }
+            )
+            let window = UUID()
+            let folder = URL(fileURLWithPath: "/test-target")
+            model.windowDidAppear(window)
+            let pending = model.startVerification(in: folder)
+            XCTAssertNotNil(pending)
+            model.windowDidDisappear(window)
+            if reopen { model.windowDidAppear(UUID()) }
+            XCTAssertTrue(model.isVerificationOperationInFlight)
+            XCTAssertNil(model.startVerification(in: folder), "The invalidated task still owns its admission until it ends")
+            await pending?.value
+            XCTAssertEqual(identityReads.value, 0)
+            XCTAssertEqual(clientRequests, 0)
+            XCTAssertEqual(client.beginCount, 0)
+            XCTAssertEqual(opens, 0)
+            XCTAssertEqual(model.verificationState, .idle)
+            XCTAssertFalse(model.isVerificationOperationInFlight)
+
+            model.windowDidAppear(UUID())
+            await model.startVerification(in: folder)?.value
+            XCTAssertEqual(client.beginCount, 1, "A fresh action after reopening must still work")
+            XCTAssertEqual(opens, 1)
+        }
+    }
+
+    func testQueuedVerificationHonorsCancellationAndDestinationChange() async throws {
+        for changeDestination in [false, true] {
+            let client = VerificationClient()
+            var opens = 0
+            let model = try verificationModel(client: client, folderOpener: { _ in opens += 1; return true })
+            let pending = model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+            if changeDestination {
+                model.destinationDidChange(to: URL(fileURLWithPath: "/replacement"))
+            } else {
+                model.cancelUserVerification()
+            }
+            await pending?.value
+            XCTAssertEqual(client.beginCount, 0)
+            XCTAssertEqual(opens, 0)
+            XCTAssertEqual(model.verificationState, changeDestination ? .idle : .cancelled)
+            XCTAssertFalse(model.isVerificationOperationInFlight)
+        }
+    }
+
+    func testQueuedVerificationDoesNotKeepDiscardedModelAlive() async throws {
+        let client = VerificationClient()
+        var opens = 0
+        var model: FinderIntegrationViewModel? = try verificationModel(
+            client: client, folderOpener: { _ in opens += 1; return true }
+        )
+        weak var releasedModel = model
+        let pending = model?.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        model = nil
+        await pending?.value
+        XCTAssertNil(releasedModel)
+        XCTAssertEqual(client.beginCount, 0)
+        XCTAssertEqual(opens, 0)
+    }
+
+    func testCancelledDirectoryCheckKeepsAdmissionUntilReadReturns() async throws {
+        let identity = try makeDirectoryIdentity()
+        let client = VerificationClient()
+        let started = DispatchSemaphore(value: 0)
+        let resume = DispatchSemaphore(value: 0)
+        let reads = LockedTestValue(0)
+        var opens = 0
+        let model = FinderIntegrationViewModel(
+            statusProvider: { true }, runtimeProvider: { self.snapshot(enabled: $0, responded: true) },
+            managementOpener: {}, verificationClientProvider: { client },
+            directoryIdentityProvider: { _ in
+                if reads.update({ $0 += 1; return $0 }) == 1 {
+                    started.signal()
+                    guard resume.wait(timeout: .now() + 10) == .success else { throw CocoaError(.fileReadUnknown) }
+                }
+                return identity
+            }, folderOpener: { _ in opens += 1; return true }
+        )
+        let folder = URL(fileURLWithPath: "/test-target")
+        let pending = model.startVerification(in: folder)
+        let didStart = await BackgroundWork.run { started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(didStart)
+        defer { resume.signal() }
+        model.cancelUserVerification()
+        XCTAssertTrue(model.isVerificationOperationInFlight)
+        XCTAssertNil(model.startVerification(in: folder))
+        XCTAssertEqual(reads.value, 1)
+        resume.signal()
+        await pending?.value
+        XCTAssertFalse(model.isVerificationOperationInFlight)
+        XCTAssertEqual(model.verificationState, .cancelled)
+        XCTAssertEqual(client.beginCount, 0)
+        XCTAssertEqual(opens, 0)
+        await model.startVerification(in: folder)?.value
+        XCTAssertEqual(client.beginCount, 1)
+        XCTAssertEqual(opens, 1)
+    }
+
+    func testClosingOneOfTwoWindowsAllowsQueuedVerificationToProceed() async throws {
+        let client = VerificationClient()
+        var opens = 0
+        let model = try verificationModel(client: client, folderOpener: { _ in opens += 1; return true })
+        let first = UUID(), second = UUID()
+        model.windowDidAppear(first)
+        model.windowDidAppear(second)
+        let pending = model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        model.windowDidDisappear(first)
+        await pending?.value
+        XCTAssertEqual(model.verificationState, .awaitingCreation)
+        XCTAssertEqual(client.beginCount, 1)
+        XCTAssertEqual(client.cancelCount, 0)
+        XCTAssertEqual(opens, 1)
+        model.windowDidDisappear(second)
+        XCTAssertEqual(client.cancelCount, 1)
+    }
+
     func testOldVisibleConfirmationCannotConfirmReplacementAttempt() async throws {
         let client = VerificationClient()
         let model = try verificationModel(client: client)
         let folder = URL(fileURLWithPath: "/test-target")
-        await model.startVerification(in: folder)
+        await model.startVerification(in: folder)?.value
         client.checkResult = .creationReported
         await model.checkVerification()
         let checkingOldReceipt = expectation(description: "Old confirmation is checking its receipt")
@@ -371,7 +498,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
             guard !model.isVerificationOperationInFlight else {
                 return XCTFail("The cancelled receipt check did not release its admission")
             }
-            await model.startVerification(in: folder)
+            await model.startVerification(in: folder)?.value
             await model.checkVerification()
         }
         resumeOldCheck?.resume(returning: .creationReported)
@@ -426,7 +553,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
         model.windowDidAppear(window)
         XCTAssertFalse(model.isGuideExpanded, "Optional Finder setup starts collapsed, including before the first use")
         await model.refresh()
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         XCTAssertEqual(writes, 0)
         client.checkResult = .creationReported
         await model.checkVerification()
@@ -482,7 +609,7 @@ final class FinderIntegrationViewModelTests: XCTestCase {
             directoryIdentityProvider: { _ in identity }, folderOpener: { _ in true }
         )
         await model.refresh()
-        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))
+        await model.startVerification(in: URL(fileURLWithPath: "/test-target"))?.value
         client.checkResult = .creationReported
         await model.checkVerification()
         await model.confirmVisibleFile()

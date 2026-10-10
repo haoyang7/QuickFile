@@ -105,6 +105,23 @@ sys.exit(entry["code"])
         self.assertIn(TIMEOUT, stdout)
         sleep.assert_called_once_with(2)
 
+    def test_optional_derived_data_path_is_passed_without_changing_default_commands(self):
+        self.set_plan(resolve=[{"code": 0}])
+        code = MODULE.resolve_packages(str(self.executable), "QuickFile.xcodeproj",
+                                       "source-packages", self.lock, self.lock_hash,
+                                       "invocation/Release")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.observed_calls()[0]["arguments"][-2:],
+                         ["-derivedDataPath", "invocation/Release"])
+
+    @unittest.skipUnless(Path("/usr/bin/python3").is_file(), "system Python is unavailable")
+    def test_cli_help_runs_with_system_python(self):
+        # macOS may provide Python 3.9 even when CI uses a newer interpreter.
+        result = subprocess.run(["/usr/bin/python3", "-B", str(SCRIPT), "--help"],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--derived-data-path", result.stdout)
+
     def test_three_timeouts_return_last_real_status(self):
         self.set_plan(resolve=[{"code": code, "log": TIMEOUT_LOG} for code in (65, 66, 74)])
         code, _, _, sleep = self.run_resolution()

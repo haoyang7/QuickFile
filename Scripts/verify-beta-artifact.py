@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 EXPECTED_APP_ID = "com.haoyoung.QuickFile"
@@ -96,8 +96,10 @@ def _parse_plist(data: bytes) -> dict[str, Any] | None:
         return None
 
 
-def _signature_metadata(runner: CommandRunner, bundle: Path) -> tuple[dict[str, str] | None, str | None]:
-    result = runner.run(["/usr/bin/codesign", "-d", "--verbose=4", str(bundle)])
+def _signature_metadata(
+    runner: CommandRunner, bundle: Path, architecture: str | None = None
+) -> tuple[dict[str, str] | None, str | None]:
+    result = runner.run(["/usr/bin/codesign", "-d", "--verbose=4", *(["--arch", architecture] if architecture else []), str(bundle)])
     if result.error:
         return None, result.error
     if result.returncode != 0:
@@ -126,8 +128,10 @@ def _signature_metadata(runner: CommandRunner, bundle: Path) -> tuple[dict[str, 
     return values, None
 
 
-def _entitlements(runner: CommandRunner, bundle: Path) -> tuple[dict[str, Any] | None, str | None]:
-    result = runner.run(["/usr/bin/codesign", "-d", "--entitlements", ":-", str(bundle)])
+def _entitlements(
+    runner: CommandRunner, bundle: Path, architecture: str | None = None
+) -> tuple[dict[str, Any] | None, str | None]:
+    result = runner.run(["/usr/bin/codesign", "-d", "--entitlements", ":-", *(["--arch", architecture] if architecture else []), str(bundle)])
     if result.error:
         return None, result.error
     if result.returncode != 0:
@@ -138,6 +142,36 @@ def _entitlements(runner: CommandRunner, bundle: Path) -> tuple[dict[str, Any] |
         start = result.stderr.find(b"<?xml")
         plist = _parse_plist(result.stderr[start:]) if start >= 0 else None
     return (plist, None) if plist is not None else (None, "invalid entitlements")
+
+
+def _all_architecture_values(
+    runner: CommandRunner,
+    bundle: Path,
+    read: Callable[..., tuple[dict[str, Any] | None, str | None]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    # codesign display defaults to the native slice even after universal verification.
+    results = [(architecture, *read(runner, bundle, architecture)) for architecture in sorted(EXPECTED_ARCHITECTURES)]
+    errors = [f"{architecture}: {error or 'unavailable'}" for architecture, values, error in results if values is None]
+    if errors:
+        return None, "; ".join(errors)
+    values = [value for _, value, _ in results if value is not None]
+    # Existing gates can accept a value only if every slice agrees, including its
+    # plist type (an integer 1 must not stand in for a boolean entitlement).
+    def matches(key: str, value: Any, other: Any) -> bool:
+        if type(other) is not type(value):
+            return False
+        # The updater gate defines this list as a set of permitted services.
+        # Other arrays retain their existing ordered comparison.
+        if (key == "com.apple.security.temporary-exception.mach-lookup.global-name"
+                and isinstance(value, list) and all(isinstance(item, str) for item in value + other)):
+            return set(other) == set(value)
+        return other == value
+
+    common = {
+        key: value for key, value in values[0].items()
+        if all(key in other and matches(key, value, other[key]) for other in values[1:])
+    }
+    return common, None
 
 
 def _version_is_13(value: Any) -> bool:
@@ -232,7 +266,7 @@ def _application_identifier_matches(allowed: str | None, signed: str | None) -> 
 
 
 def _leaf_certificate_matches_profile(
-    runner: CommandRunner, bundle: Path, profile: dict[str, Any] | None
+    runner: CommandRunner, bundle: Path, profile: dict[str, Any] | None, architecture: str | None = None
 ) -> tuple[bool | None, str]:
     certificates = profile.get("DeveloperCertificates") if profile else None
     if not isinstance(certificates, list) or not certificates or not all(isinstance(item, bytes) for item in certificates):
@@ -243,6 +277,7 @@ def _leaf_certificate_matches_profile(
             "/usr/bin/codesign",
             "-d",
             f"--extract-certificates={prefix}",
+            *(["--arch", architecture] if architecture else []),
             str(bundle),
         ])
         if result.error:
@@ -300,9 +335,9 @@ def inspect_artifact(
         checks.append(_check(f"{label}.version", version is not None, "valid" if version is not None else "missing or invalid version"))
         checks.append(_check(f"{label}.build", build is not None, "valid" if build is not None else "missing or invalid build"))
         checks.append(_check(f"{label}.executable", executable_matches, "matches expected executable" if executable_matches else "unexpected executable"))
-        checks.append(_run_check(runner, f"{label}.strict_signature", ["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(bundle)]))
+        checks.append(_run_check(runner, f"{label}.strict_signature", ["/usr/bin/codesign", "--verify", "--strict", "--all-architectures", "--verbose=2", str(bundle)]))
 
-        metadata, metadata_error = _signature_metadata(runner, bundle)
+        metadata, metadata_error = _all_architecture_values(runner, bundle, _signature_metadata)
         if metadata is None:
             checks.append(_check(f"{label}.signature_metadata", None, metadata_error or "unavailable"))
             components[label].update({"signature_identifier": None, "certificate_kind": "unknown"})
@@ -310,14 +345,14 @@ def inspect_artifact(
             signature_identifier_matches = metadata.get("identifier") == expected_id
             components[label].update({
                 "signature_identifier": expected_id if signature_identifier_matches else "invalid",
-                "certificate_kind": metadata["certificate_kind"],
+                "certificate_kind": metadata.get("certificate_kind", "invalid"),
                 "_team": metadata.get("team"),
             })
             checks.append(_check(f"{label}.signature_identifier", signature_identifier_matches, "matches bundle ID" if signature_identifier_matches else "does not match bundle ID"))
         runtime = metadata is not None and metadata.get("hardened_runtime") == "yes"
         checks.append(_check(f"{label}.hardened_runtime", runtime if metadata is not None else None, "enabled" if runtime else metadata_error or "missing Hardened Runtime"))
 
-        entitlements, entitlement_error = _entitlements(runner, bundle)
+        entitlements, entitlement_error = _all_architecture_values(runner, bundle, _entitlements)
         signed_entitlements[label] = entitlements
         groups = entitlements.get("com.apple.security.application-groups") if entitlements else None
         group_matches = isinstance(groups, list) and groups == [EXPECTED_APP_GROUP]
@@ -372,8 +407,8 @@ def inspect_artifact(
                 continue
             architecture_check, _ = _architecture_check(runner, binaries[label], f"{name}.architectures")
             checks.append(architecture_check)
-            checks.append(_run_check(runner, f"{name}.strict_signature", ["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(helper)]))
-            metadata, error = _signature_metadata(runner, helper)
+            checks.append(_run_check(runner, f"{name}.strict_signature", ["/usr/bin/codesign", "--verify", "--strict", "--all-architectures", "--verbose=2", str(helper)]))
+            metadata, error = _all_architecture_values(runner, helper, _signature_metadata)
             team_matches = metadata is not None and bool(teams[0]) and metadata.get("team") == teams[0]
             checks.append(_check(f"{name}.signing_team", team_matches if metadata is not None else None, "same signing team as app" if team_matches else error or "helper has missing or different signing team"))
             certificate_matches = metadata is not None and metadata.get("certificate_kind") == components["app"].get("certificate_kind")
@@ -439,9 +474,17 @@ def inspect_artifact(
     checks.append(_check("distribution.profile_application_identifier", profile_app_id_match, "profile App IDs authorize signed identifiers" if profile_app_id_match else "profile App ID authorization is missing"))
     profiles_by_label = dict(decoded_profiles)
     for label, bundle, _ in bundles:
-        certificate_match, detail = _leaf_certificate_matches_profile(
-            runner, bundle, profiles_by_label.get(label)
-        )
+        certificate_results = [
+            (architecture, *_leaf_certificate_matches_profile(runner, bundle, profiles_by_label.get(label), architecture))
+            for architecture in sorted(EXPECTED_ARCHITECTURES)
+        ]
+        if any(match is False for _, match, _ in certificate_results):
+            certificate_match = False
+        elif any(match is None for _, match, _ in certificate_results):
+            certificate_match = None
+        else:
+            certificate_match = True
+        detail = "; ".join(f"{architecture}: {message}" for architecture, _, message in certificate_results)
         checks.append(_check(f"{label}.profile_leaf_certificate", certificate_match, detail))
 
     entitlement_requirements = {

@@ -1,6 +1,13 @@
 import AppKit
 import ApplicationServices
 
+#if QUICKFILE_AX_MALLOC_RECEIPT
+private func mallocScribbleEnvironment() -> String {
+    guard let value = getenv("MallocScribble") else { return "unset" }
+    return strcmp(value, "1") == 0 ? "1" : "other"
+}
+#endif
+
 private final class NotificationCount {
     struct Target {
         let element: AXUIElement
@@ -39,7 +46,10 @@ private final class NotificationCount {
     static func main() throws {
         let args = CommandLine.arguments
         if args.count == 2, args[1] == "--capabilities" {
-            let result: [String: Any] = ["trusted": AXIsProcessTrusted()]
+            var result: [String: Any] = ["trusted": AXIsProcessTrusted()]
+#if QUICKFILE_AX_MALLOC_RECEIPT
+            result["malloc_scribble"] = mallocScribbleEnvironment()
+#endif
             let data = try JSONSerialization.data(withJSONObject: result, options: .sortedKeys)
             print(String(decoding: data, as: UTF8.self))
             return
@@ -117,6 +127,9 @@ private final class NotificationCount {
                 result["sequence"] = sequence
                 result["buttons"] = buttons
                 result["registrations"] = registrations
+#if QUICKFILE_AX_MALLOC_RECEIPT
+                result["malloc_scribble"] = mallocScribbleEnvironment()
+#endif
                 try JSONSerialization.data(withJSONObject: result, options: .sortedKeys)
                     .write(to: state.appendingPathComponent("reader-ready.json"), options: .atomic)
                 lastSequence = sequence

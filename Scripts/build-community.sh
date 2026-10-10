@@ -99,6 +99,7 @@ LOCK_HASH=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1
 python3 Scripts/resolve-packages.py \
     --xcodebuild "$(command -v xcodebuild)" --project QuickFile.xcodeproj \
     --package-directory "$TASK_DIRECTORY/SourcePackages" \
+    --derived-data-path "$TASK_DIRECTORY/DerivedData" \
     --package-lock "$PACKAGE_LOCK" --expected-lock-hash "$LOCK_HASH" \
     > "$TASK_DIRECTORY/records/resolve.log" 2>&1
 xcodebuild -project QuickFile.xcodeproj -scheme QuickFile \

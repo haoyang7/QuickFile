@@ -16,6 +16,9 @@ static uintptr_t destroyedReturn, mergedReturn;
 static atomic_ulong compensated;
 static atomic_ulong compensatedMutable;
 static _Atomic(const char *) installationStatus = "not-attempted";
+#ifdef QUICKFILE_AX_COPY_LIFETIME
+extern void QuickFileAXObserveCopyLifetime(id result, BOOL mutableCopy);
+#endif
 
 // The verified helper tail-calls copy, so the immediate return PC identifies
 // the exact destroyed-notification call site. Ordinary array copies are untouched.
@@ -23,6 +26,9 @@ static id correctedCopy(id object, SEL selector) {
     uintptr_t caller = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
     id result = originalCopy(object, selector);
     if (caller == destroyedReturn) {
+#ifdef QUICKFILE_AX_COPY_LIFETIME
+        QuickFileAXObserveCopyLifetime(result, NO);
+#endif
         [result autorelease];
         atomic_fetch_add_explicit(&compensated, 1, memory_order_relaxed);
     }
@@ -41,6 +47,9 @@ static id correctedMutableCopy(id object, SEL selector) {
     }
     id result = originalMutableCopy(object, selector);
     if (matches) {
+#ifdef QUICKFILE_AX_COPY_LIFETIME
+        QuickFileAXObserveCopyLifetime(result, YES);
+#endif
         [result autorelease];
         atomic_fetch_add_explicit(&compensated, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&compensatedMutable, 1, memory_order_relaxed);
