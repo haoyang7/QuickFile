@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import time
+import ax_system_images
 
 DESTROYED = "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification"
 
@@ -538,13 +539,14 @@ def leak_groups(report):
 TERMINAL_ROOT_LIMIT = 16
 TERMINAL_GROUP_LIMIT = 32
 TERMINAL_FRAME_LIMIT = 96
+TERMINAL_IMAGE_FRAME_LIMIT = 96
 TERMINAL_NODE_LIMIT = 4096
 TERMINAL_SECONDS = 45
 TERMINAL_FRAME = re.compile(r"(\d{1,3})\s+(\S+)\s+(0x[0-9a-fA-F]{1,16})\s+(.+?)\s+\+ (\d{1,10})\s*")
 
 
 def empty_terminal_snapshot():
-    return {"schema": 2, "status": "unavailable", "capture_status": "not-run", "capture_exit_code": None,
+    return {"schema": 3, "status": "unavailable", "capture_status": "not-run", "capture_exit_code": None,
             "analysis_status": "not-run", "tool_exit_codes": {"grouped": None, "list": None},
             "parsing_status": "unavailable", "stacks_status": "unavailable",
             "frame_order": "allocation-first", "leak_nodes": None, "leak_bytes": None,
@@ -598,6 +600,40 @@ def terminal_stack(frames, unparsed, resolver, budget):
     return {"status": status, "reported_frames": len(frames), "missing_frames": missing,
             "unparsed_lines": unparsed, "omitted_frames": omitted, "filtered_frames": filtered,
             "unverified_frames": unverified, "budget_omitted_frames": limited, "frames": public}
+
+
+def terminal_other_images(frames, context, budget):
+    """Image-only evidence; it neither consumes nor repairs symbol coverage."""
+    public, reasons = [], dict.fromkeys(ax_system_images.REASONS, 0)
+    for index, raw_image, address, *_ in frames:
+        if terminal_reported_image(raw_image) != "other":
+            continue
+        if not budget[0]:
+            reasons["budget_omitted"] += 1
+            continue
+        budget[0] -= 1
+        ranges = context["ranges"]
+        if ranges is None:
+            reasons["report_images_invalid"] += 1
+            continue
+        matches = [identifier for start, end, identifier in ranges if start <= address <= end]
+        if not matches:
+            reasons["report_range_missing"] += 1
+        elif matches[0] is None:
+            reasons["report_uuid_ambiguous"] += 1
+        else:
+            if "catalog" not in context:
+                context["catalog"] = ax_system_images.loaded_system_images()
+            catalog = context["catalog"]
+            if catalog is None:
+                reasons["local_catalog_unavailable"] += 1
+            elif matches[0] not in catalog:
+                reasons["uuid_not_verified"] += 1
+            else:
+                public.append({"index": index, **catalog[matches[0]]})
+    count = len(public) + sum(reasons.values())
+    return {"status": "not-needed" if not count else "partial" if sum(reasons.values()) else "complete",
+            "frames": public, "reason_counts": reasons}
 
 
 def terminal_snapshot_summary(grouped, listed, resolver):
@@ -669,6 +705,11 @@ def terminal_snapshot_summary(grouped, listed, resolver):
             raise ValueError("Incomplete terminal root groups")
         result["root_instances"] = sum(root["instances"] for root in roots)
         budget = [TERMINAL_FRAME_LIMIT]
+        image_budget = [TERMINAL_IMAGE_FRAME_LIMIT]
+        try:
+            image_context = {"ranges": ax_system_images.report_images(grouped)}
+        except ValueError:
+            image_context = {"ranges": None}
         for root in roots[:TERMINAL_ROOT_LIMIT]:
             frames, unparsed = root.pop("private_stack")
             # Fixed report-label buckets explain the image prefilter, without
@@ -681,6 +722,7 @@ def terminal_snapshot_summary(grouped, listed, resolver):
                 "known_image_excluded": sum(images[name] for name in HEAP_IMAGES if name not in HEAP_SYMBOL_IMAGES),
                 "unrecognized_image": images["other"]}
             root["stack"] = terminal_stack(frames, unparsed, resolver, budget)
+            root["other_image_identity"] = terminal_other_images(frames, image_context, image_budget)
             result["root_groups"].append(root)
         result["omitted_root_groups"] = max(0, len(roots) - TERMINAL_ROOT_LIMIT)
         for (kind, size, frames, unparsed), count in list(sorted(allocation_counts.items()))[:TERMINAL_GROUP_LIMIT]:
@@ -753,14 +795,18 @@ def collect_terminal_snapshot(graph, records, capture):
 
 
 def validate_terminal_snapshot(value):
-    """Exact allowlist plus a second independent system-symbol output gate."""
+    """Validate all fields, then prune only unverified image identities in place.
+
+    The symbol gate is unchanged. A fresh image catalog failure cannot discard
+    the preexisting terminal evidence or publish a merely well-formed identity.
+    """
     def require(condition):
         if not condition:
             raise ValueError("Invalid bounded terminal snapshot")
 
     integer = lambda item: type(item) is int and 0 <= item <= 1_000_000_000
     require(type(value) is dict and set(value) == set(empty_terminal_snapshot()))
-    require(type(value["schema"]) is int and value["schema"] == 2 and value["frame_order"] == "allocation-first")
+    require(type(value["schema"]) is int and value["schema"] == 3 and value["frame_order"] == "allocation-first")
     require(value["capture_status"] in ("not-run", "complete", "timeout", "failed"))
     require(value["analysis_status"] in ("not-run", "complete", "timeout", "failed"))
     require(value["parsing_status"] in ("unavailable", "complete") and value["stacks_status"] in ("unavailable", "complete", "partial"))
@@ -774,10 +820,12 @@ def validate_terminal_snapshot(value):
     for key in ("leak_nodes", "leak_bytes"):
         require(value[key] is None or integer(value[key]))
     resolver, frame_count = SystemSymbols(), 0
+    image_count, image_identities = 0, []
     rows = value["root_groups"] + value["allocation_groups"]
     for root, entries in ((True, value["root_groups"]), (False, value["allocation_groups"])):
         for row in entries:
-            fields = ({"type", "kind", "instances", "tree_nodes", "stack", "reported_image_counts", "reported_filtered_reason_counts"}
+            fields = ({"type", "kind", "instances", "tree_nodes", "stack", "reported_image_counts", "reported_filtered_reason_counts",
+                       "other_image_identity"}
                       if root else {"type", "size", "count", "stack"})
             require(type(row) is dict and set(row) == fields and row["type"] in (*HEAP_TYPES, "unknown"))
             if root:
@@ -814,11 +862,33 @@ def validate_terminal_snapshot(value):
                         and sum(reasons.values()) == stack["filtered_frames"])
                 retained_images = Counter(frame["image"] for frame in stack["frames"])
                 require(all(retained_images[image] <= images[image] for image in HEAP_SYMBOL_IMAGES))
+                identity = row["other_image_identity"]
+                require(type(identity) is dict and set(identity) == {"status", "frames", "reason_counts"})
+                why = identity["reason_counts"]
+                require(type(why) is dict and set(why) == set(ax_system_images.REASONS)
+                        and all(integer(count) for count in why.values()))
+                require(type(identity["frames"]) is list and len(identity["frames"]) <= TERMINAL_IMAGE_FRAME_LIMIT
+                        and len(identity["frames"]) + sum(why.values()) == images["other"])
+                identity_indices = []
+                for frame in identity["frames"]:
+                    require(type(frame) is dict and set(frame) == {"index", "basename", "uuid"})
+                    require(integer(frame["index"]) and frame["index"] < stack["reported_frames"] + stack["missing_frames"]
+                            and frame["index"] not in indices)
+                    image = {key: frame[key] for key in ("basename", "uuid")}
+                    require(ax_system_images.safe_identity(image))
+                    identity_indices.append(frame["index"])
+                require(identity_indices == sorted(set(identity_indices)))
+                image_count += images["other"] - why["budget_omitted"]
+                expected_identity = ("not-needed" if not images["other"] else "partial" if sum(why.values()) else "complete")
+                require(identity["status"] == expected_identity)
+                if identity["frames"]:
+                    image_identities.append(identity)
             frame_count += len(indices)
             expected = ("missing" if not stack["reported_frames"] else "partial" if
                         stack["missing_frames"] or stack["omitted_frames"] or stack["unparsed_lines"] else "complete")
             require(stack["status"] == expected)
     require(frame_count + sum(row["stack"]["unverified_frames"] for row in rows) <= TERMINAL_FRAME_LIMIT)
+    require(image_count <= TERMINAL_IMAGE_FRAME_LIMIT)
     if value["parsing_status"] == "complete":
         require(value["capture_status"] == value["analysis_status"] == "complete" and value["capture_exit_code"] in (0, 1)
                 and all(code in (0, 1) for code in value["tool_exit_codes"].values()))
@@ -857,6 +927,23 @@ def validate_terminal_snapshot(value):
                 and value["root_instances"] == value["omitted_root_groups"] == value["omitted_allocation_groups"] == 0
                 and value["stacks_status"] == value["status"] == "unavailable")
     require(len(json.dumps(value).encode()) <= 65536)
+    # Do not repair malformed input. Only after the entire original object has
+    # passed validation may this optional evidence be normalized. Both callers
+    # publish this same object. One fresh worker serves all roots, even on None.
+    if image_identities:
+        image_catalog = ax_system_images.loaded_system_images()
+        for identity in image_identities:
+            retained = []
+            for frame in identity["frames"]:
+                image = {key: frame[key] for key in ("basename", "uuid")}
+                reason = ("local_catalog_unavailable" if image_catalog is None else
+                          "uuid_not_verified" if image_catalog.get(image["uuid"]) != image else None)
+                if reason:
+                    identity["reason_counts"][reason] += 1
+                    identity["status"] = "partial"
+                else:
+                    retained.append(frame)
+            identity["frames"] = retained
 
 
 def disassemble_symbols(state, work, records):

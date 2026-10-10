@@ -553,6 +553,129 @@ class AXCompatibilityCopyLifetimeTests(unittest.TestCase):
 
 
 class AXTerminalSnapshotTests(unittest.TestCase):
+    def test_other_root_images_use_report_ranges_and_fresh_local_uuid_at_each_gate(self):
+        identifier = "12345678-1234-1234-1234-123456789ABC"
+        image = {"basename": "libsystem_pthread.dylib", "uuid": identifier}
+        grouped, listed = self.reports()
+        table = f" 0x1000 - 0x10ff +private-label (1) <{identifier}> /private/untrusted-path\n"
+        grouped = grouped.replace("private-data\n", table)
+        catalog = {identifier: image}
+        with mock.patch.object(REPORT.ax_system_images, "loaded_system_images", return_value=catalog) as load:
+            value = self.summary((grouped, listed))
+            self.assertEqual(load.call_count, 1)
+            with mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()):
+                REPORT.validate_terminal_snapshot(value)
+            self.assertEqual(load.call_count, 2)  # No reuse of the collection catalog at the output gate.
+        identity = value["root_groups"][0]["other_image_identity"]
+        self.assertEqual(identity, {"status": "complete", "frames": [{"index": 2, **image}],
+                                   "reason_counts": dict.fromkeys(REPORT.ax_system_images.REASONS, 0)})
+        baseline = self.summary()
+        self.assertEqual(value["root_groups"][0]["stack"], baseline["root_groups"][0]["stack"])
+        self.assertEqual(value["allocation_groups"], baseline["allocation_groups"])
+        self.assertEqual(value["status"], "partial")
+        for private in ("private", "secret", "0x", "path", "address"):
+            self.assertNotIn(private, json.dumps(value))
+        for invalid in (None, {}, {identifier: {"basename": "Other", "uuid": identifier}}):
+            changed = json.loads(json.dumps(value))
+            with mock.patch.object(REPORT.ax_system_images, "loaded_system_images", return_value=invalid), \
+                    mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()):
+                REPORT.validate_terminal_snapshot(changed)
+            identity = changed["root_groups"][0]["other_image_identity"]
+            self.assertEqual(identity["frames"], [])
+            reason = "local_catalog_unavailable" if invalid is None else "uuid_not_verified"
+            self.assertEqual(identity["reason_counts"][reason], 1)
+            self.assertEqual(identity["status"], "partial")
+        mutations = [lambda v: v.update(status="complete"),
+                     lambda v: v["root_groups"][0]["other_image_identity"]["frames"][0].update(index=True),
+                     lambda v: v["root_groups"][0]["other_image_identity"]["frames"][0].update(index=0),
+                     lambda v: v["root_groups"][0]["other_image_identity"]["frames"][0].update(basename="/private/secret"),
+                     lambda v: v["root_groups"][0]["other_image_identity"]["frames"][0].update(uuid="secret"),
+                     lambda v: v["root_groups"][0]["other_image_identity"].update(path="secret"),
+                     lambda v: v["root_groups"][0]["other_image_identity"]["reason_counts"].update(secret=0)]
+        for mutate in mutations:
+            changed = json.loads(json.dumps(value)); mutate(changed)
+            original = json.loads(json.dumps(changed))
+            with mock.patch.object(REPORT.ax_system_images, "loaded_system_images", return_value=catalog) as load, \
+                    mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), self.assertRaises(ValueError):
+                REPORT.validate_terminal_snapshot(changed)
+            load.assert_not_called()
+            self.assertEqual(changed, original)
+
+    @classmethod
+    def image_reports(cls):
+        first = "12345678-1234-1234-1234-123456789ABC"
+        second = "22345678-1234-1234-1234-123456789ABC"
+        catalog = {first: {"basename": "libsystem_pthread.dylib", "uuid": first},
+                   second: {"basename": "libsystem_kernel.dylib", "uuid": second}}
+        grouped, listed = cls.reports()
+        grouped = grouped.replace("2 private-fixture 0x1000 secret_caller + 4",
+                                  "3 private-fixture 0x2000 secret_caller + 4\n2 private-fixture 0x1000 secret_caller + 4")
+        table = (f" 0x1000 - 0x10ff private (1) <{first}> /private/path\n"
+                 f" 0x2000 - 0x20ff private (1) <{second}> /private/path\n")
+        return (grouped.replace("private-data\n", table), listed), catalog
+
+    @staticmethod
+    def without_image_identity(value):
+        result = json.loads(json.dumps(value))
+        for row in result["root_groups"]:
+            row.pop("other_image_identity")
+        return result
+
+    def test_collection_keeps_terminal_evidence_when_second_catalog_is_unavailable_or_partial(self):
+        reports, catalog = self.image_reports()
+        with mock.patch.object(REPORT.ax_system_images, "loaded_system_images", return_value=catalog):
+            baseline = self.summary(reports)
+        partial = {key: catalog[key] for key in list(catalog)[:1]}
+        for fresh in (None, partial):
+            with self.subTest(fresh=fresh), tempfile.TemporaryDirectory() as directory:
+                records = pathlib.Path(directory)
+                capture = REPORT.empty_terminal_snapshot()
+                capture.update(capture_status="complete", capture_exit_code=0)
+                outputs = [subprocess.CompletedProcess([], 1, text, "") for text in reports]
+                with mock.patch.object(REPORT.subprocess, "run", side_effect=outputs), \
+                        mock.patch.object(REPORT.ax_system_images, "loaded_system_images", side_effect=[catalog, fresh]) as load, \
+                        mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()):
+                    value = REPORT.collect_terminal_snapshot(records / "terminal.memgraph", records, capture)
+                self.assertEqual(load.call_count, 2)  # Once for extraction, once for this entire output gate.
+                self.assertEqual(json.loads((records / "terminal-snapshot.json").read_text()), value)
+                self.assertEqual(self.without_image_identity(value), self.without_image_identity(baseline))
+                identity = value["root_groups"][0]["other_image_identity"]
+                self.assertEqual(identity["frames"], [] if fresh is None else [{"index": 2, **next(iter(partial.values()))}])
+                reason = "local_catalog_unavailable" if fresh is None else "uuid_not_verified"
+                self.assertEqual(identity["reason_counts"][reason], 2 if fresh is None else 1)
+                self.assertEqual(identity["status"], "partial")
+
+    def test_other_root_images_keep_bounded_failure_reasons_separate_from_stack_coverage(self):
+        images = REPORT.ax_system_images
+        identifier = "12345678-1234-1234-1234-123456789ABC"
+        frame = (2, "secret", 0x1000, "arbitrary_symbol", 7)
+        for ranges, catalog, reason in ((None, {}, "report_images_invalid"), ([], {}, "report_range_missing"),
+                ([(0x1000, 0x10ff, None)], {}, "report_uuid_ambiguous"),
+                ([(0x1000, 0x10ff, identifier)], None, "local_catalog_unavailable"),
+                ([(0x1000, 0x10ff, identifier)], {}, "uuid_not_verified")):
+            with mock.patch.object(images, "loaded_system_images", return_value=catalog) as load:
+                value = REPORT.terminal_other_images([frame], {"ranges": ranges}, [96])
+                self.assertEqual(value["frames"], [])
+                self.assertEqual(value["status"], "partial")
+                self.assertEqual(value["reason_counts"], dict.fromkeys(images.REASONS, 0) | {reason: 1})
+                self.assertEqual(load.call_count, int(reason in ("local_catalog_unavailable", "uuid_not_verified")))
+        with mock.patch.object(images, "loaded_system_images") as load:
+            value = REPORT.terminal_other_images([frame], {"ranges": None}, [0])
+            self.assertEqual(value["reason_counts"]["budget_omitted"], 1)
+            load.assert_not_called()
+        grouped, listed = self.reports()
+        frames = "\n".join(f"{i} secret 0x1000 symbol + 4" for i in range(100))
+        start = grouped.index("\n", grouped.index("STACK OF "))
+        grouped = grouped[:start + 1] + frames + grouped[grouped.index("\n====\n"):]
+        value = self.summary((grouped, listed))
+        why = value["root_groups"][0]["other_image_identity"]["reason_counts"]
+        self.assertEqual((why["report_images_invalid"], why["budget_omitted"]), (96, 4))
+        with mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()):
+            REPORT.validate_terminal_snapshot(value)
+        why.update(report_images_invalid=97, budget_omitted=3)
+        with mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), self.assertRaises(ValueError):
+            REPORT.validate_terminal_snapshot(value)
+
     def test_terminal_cli_rejects_incompatible_modes_before_building(self):
         invalid = [[], ["--prepare-external-fixture"], ["--malloc-scribble", "off"],
                    ["--malloc-scribble", "on", "--external-startup-receipt", "--prepared-fixture-directory", "prepared"],
@@ -1993,6 +2116,37 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 self.assertEqual(invocations, [("off", "control"), ("off", "product")])
                 self.assertTrue(summary["trials"][1]["terminal_snapshot_checks_passed"])
                 self.assertEqual(summary["terminal_snapshot_checks_passed"], failure not in ("terminal", "terminal-private", "terminal-missing", "timeout"))
+
+    def test_terminal_upload_prunes_unverified_images_without_losing_strict_failure_or_old_evidence(self):
+        reports, catalog = AXTerminalSnapshotTests.image_reports()
+        with mock.patch.object(REPORT.ax_system_images, "loaded_system_images", return_value=catalog):
+            terminal = AXTerminalSnapshotTests.summary(reports)
+        partial = {key: catalog[key] for key in list(catalog)[:1]}
+        for fresh in (None, partial):
+            with self.subTest(fresh=fresh), \
+                    mock.patch.object(REPORT.ax_system_images, "loaded_system_images", return_value=fresh) as load:
+                invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                    terminal_origin=True, first_failure="strict", first_terminal_change=lambda value:
+                        value.update(json.loads(json.dumps(terminal))))
+            self.assertEqual(load.call_count, 1)
+            self.assertEqual(invocations, [("off", "control"), ("off", "product")])
+            self.assertFalse(summary["strict_checks_passed"])
+            self.assertTrue(summary["terminal_snapshot_checks_passed"])
+            first = summary["trials"][0]
+            self.assertEqual(first["return_code"], 1)
+            self.assertTrue(first["terminal_snapshot_available"])
+            self.assertTrue(first["failure_classification_available"])
+            self.assertEqual(first["validation_failure_counts"]["heap_baseline"], 1)
+            self.assertEqual(first["validation_failure_counts"]["notifications"], 1)
+            self.assertEqual(sum(len(row["scan_totals"]) for row in summary["trials"]), 12)
+            published = first["terminal_snapshot"]
+            self.assertEqual(AXTerminalSnapshotTests.without_image_identity(published),
+                             AXTerminalSnapshotTests.without_image_identity(terminal))
+            identity = published["root_groups"][0]["other_image_identity"]
+            self.assertEqual(identity["frames"], [] if fresh is None else [{"index": 2, **next(iter(partial.values()))}])
+            reason = "local_catalog_unavailable" if fresh is None else "uuid_not_verified"
+            self.assertEqual(identity["reason_counts"][reason], 2 if fresh is None else 1)
+            self.assertEqual(identity["status"], "partial")
 
     def test_terminal_ledger_does_not_turn_omitted_groups_or_strict_failures_into_success(self):
         terminal = AXTerminalSnapshotTests.summary(AXTerminalSnapshotTests.many_group_reports())
