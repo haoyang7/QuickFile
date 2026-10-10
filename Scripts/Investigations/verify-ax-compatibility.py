@@ -174,12 +174,22 @@ def main():
         return 77
     environment.update(MallocStackLogging="1", MallocStackLoggingNoCompact="1")
     results = []
+    validation_errors = []
     checkpoints = []
     expected_registrations = 0 if args.read_only else 20
     host = reader = None
     observer_exited = None
     sequence = reader_sequence = 0
     with (records / "host.log").open("w") as host_log, (records / "reader.log").open("w") as reader_log:
+        def validate(stage, validator, *values):
+            # Assertion failures must not discard later lifecycle evidence. They
+            # remain fatal even if a subsequent scan returns to the baseline.
+            try:
+                validator(*values)
+            except RuntimeError as error:
+                validation_errors.append({"stage": stage, "message": str(error)})
+                write_json(records / "validation-errors.json", validation_errors)
+
         def command(action):
             nonlocal sequence
             sequence += 1
@@ -210,7 +220,7 @@ def main():
             if not match or result.returncode not in (0, 1):
                 raise RuntimeError(f"Full-heap scan was unavailable: {entry}")
             if not args.system_baseline:
-                validate_product_scan(entry, results[0] if label != "baseline" else None)
+                validate(label, validate_product_scan, entry, results[0] if label != "baseline" else None)
 
         try:
             host = subprocess.Popen([str(executable), str(state), *host_arguments], env=environment, stdout=host_log, stderr=host_log)
@@ -232,23 +242,25 @@ def main():
                 observed = observe()
                 if observed["buttons"] != 10 or observed["registrations"] != expected_registrations:
                     raise RuntimeError(f"AX registrations incomplete: {observed}")
+                if not args.system_baseline and cycle == 1:
+                    # Locate setup growth without replacing the empty baseline
+                    # or destroying any target button before the first scan.
+                    scan("registered-10", command("checkpoint"))
                 removed = command("remove")
                 observe()
                 if removed["destroyedButtons"] != cycle * 10:
                     raise RuntimeError(f"Buttons did not deallocate: {removed}")
                 checkpoints.append({key: removed[key] for key in ("allocatedButtons", "destroyedButtons", "ownership") if key in removed})
-                if args.system_baseline and cycle in {1, 3, args.cycles}:
+                if not args.system_baseline or cycle in {1, 3, args.cycles}:
                     scan(f"removed-{cycle * 10}", removed)
-            if not args.system_baseline:
-                scan("removed-30", removed)
             (state / "stop-reader").touch()
             reader.wait(timeout=5)
             if reader.returncode != 0:
                 raise RuntimeError("AX observer did not exit successfully")
             notification_receipt = json.loads((state / "reader-completed.json").read_text())
             write_json(records / "notifications.json", notification_receipt)
-            validate_notifications(notification_receipt, args.cycles * 10, args.read_only)
-            notification_count = notification_receipt["notifications"]
+            validate("notifications", validate_notifications, notification_receipt, args.cycles * 10, args.read_only)
+            notification_count = notification_receipt.get("notifications")
             observer_exited = time.monotonic()
             if args.idle_seconds > 10:
                 time.sleep(10)
@@ -283,18 +295,24 @@ def main():
                     if args.balance_copies and (ownership["live"] or any(
                             group["destroyed_return_offsets"] for entry in results for group in entry.get("groups", []))):
                         raise RuntimeError(f"Diagnostic balance left live target arrays or AX leak groups: {ownership}")
-            elif ordinary < 30 or final["mutableCompensations"] < 30:
-                raise RuntimeError(f"Both destruction branches were not covered: {final}, notifications={notification_count}")
             else:
+                if ordinary < 30 or final["mutableCompensations"] < 30:
+                    validation_errors.append({"stage": "compensation-branches",
+                        "message": f"Both destruction branches were not covered: {final}, notifications={notification_count}"})
                 summary = {"coverage": "passed", "destroyed_buttons": final["destroyedButtons"],
                            "notifications": notification_count, "notification_receipt": notification_receipt,
                            "ordinary_compensations": ordinary,
-                           "mutable_compensations": final["mutableCompensations"], "ax_leak_nodes": 0,
+                           "mutable_compensations": final["mutableCompensations"],
+                           "ax_leak_nodes": None if validation_errors else 0,
                            "baseline_leak_nodes": results[0]["leak_nodes"],
                            "baseline_leak_bytes": results[0]["leak_bytes"],
                            "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
-                           "scope": "optimized production implementation, synthetic AppKit fixture; target AX groups absent and non-AX startup baseline not increased; not an installed-app or VoiceOver test"}
+                           "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX groups and no increase over the non-AX startup baseline; not an installed-app or VoiceOver test"}
+            if validation_errors:
+                summary["coverage"] = "failed"
+                summary["validation_errors"] = validation_errors
+                write_json(records / "validation-errors.json", validation_errors)
             write_json(records / "result.json", summary)
             print(json.dumps(summary))
         finally:
@@ -314,7 +332,7 @@ def main():
                     host.wait(timeout=5)
             subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
                             "-u", str(app)], capture_output=True, timeout=15)
-    return 0
+    return 1 if validation_errors else 0
 
 
 if __name__ == "__main__":
