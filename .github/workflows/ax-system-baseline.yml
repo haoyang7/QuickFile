@@ -1,0 +1,121 @@
+name: AX system baseline
+
+on:
+  workflow_dispatch:
+    inputs:
+      ax_causal_probe:
+        description: 'Run traced control and isolated balance experiment after reviewing system ownership evidence'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ax-system-baseline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ax-system-probe:
+    name: macOS ${{ matrix.expected_os }} (arm64)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            expected_os: '15'
+            expected_xcode: '26.3'
+            developer_directory: /Applications/Xcode_26.3.app/Contents/Developer
+            appkit_uuid: '934E3129-A982-329C-BACE-27CBE73D6320'
+            corefoundation_uuid: 'BDC82415-A029-3463-AC49-1A792208CE00'
+          - runner: macos-26
+            expected_os: '26'
+            expected_xcode: '26.3'
+            developer_directory: /Applications/Xcode_26.3.app/Contents/Developer
+            appkit_uuid: 'B6B4BDAD-6428-3E64-8747-275700109B46'
+            corefoundation_uuid: '9B672762-7B1F-30BC-96DE-F176B372D66D'
+          - runner: xcode-27
+            expected_os: '27'
+            expected_xcode: '27.0'
+            developer_directory: /Applications/Xcode_27.0.app/Contents/Developer
+            # Discover and review this runtime before enabling a balance experiment.
+            appkit_uuid: ''
+            corefoundation_uuid: ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: ${{ matrix.developer_directory }}
+      AX_EXPECTED_OS: ${{ matrix.expected_os }}
+      AX_EXPECTED_XCODE: ${{ matrix.expected_xcode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Verify and record investigation host
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          def output(*command):
+              return subprocess.check_output(command, text=True).strip()
+          version = output('sw_vers', '-productVersion')
+          architecture = output('uname', '-m')
+          xcode = output('xcodebuild', '-version')
+          assert version.split('.')[0] == os.environ['AX_EXPECTED_OS']
+          assert architecture == 'arm64' and xcode.splitlines()[0] == 'Xcode ' + os.environ['AX_EXPECTED_XCODE']
+          print(json.dumps({'scope':'synthetic-unpatched-AX-investigation',
+              'checkout_sha':output('git', 'rev-parse', 'HEAD'), 'macos':version,
+              'os_build':output('sw_vers', '-buildVersion'), 'architecture':architecture, 'xcode':xcode}))
+          PY
+      - name: Measure AX reads without subscriptions
+        if: ${{ !inputs.ax_causal_probe }}
+        run: >-
+          python3 Scripts/Investigations/verify-ax-compatibility.py
+          --system-baseline --read-only --cycles 10 --idle-seconds 60
+          --work-directory .build/Temporary/ax-system-probe/read-only
+          --records-directory .build/Temporary/ax-system-probe/records-read-only
+      - name: Measure AX destroyed notifications without compensation
+        if: ${{ !inputs.ax_causal_probe }}
+        run: >-
+          python3 Scripts/Investigations/verify-ax-compatibility.py
+          --system-baseline --cycles 10 --idle-seconds 60
+          --work-directory .build/Temporary/ax-system-probe/subscribed
+          --records-directory .build/Temporary/ax-system-probe/records-subscribed
+      - name: Trace owned array generations and system call sites
+        run: >-
+          python3 Scripts/Investigations/verify-ax-compatibility.py
+          --system-baseline --ownership-trace --cycles 10 --idle-seconds 60
+          --work-directory .build/Temporary/ax-system-probe/ownership
+          --records-directory .build/Temporary/ax-system-probe/records-ownership
+      - name: Balance one owned copy in the isolated fixture
+        if: ${{ inputs.ax_causal_probe && matrix.appkit_uuid != '' }}
+        run: >-
+          python3 Scripts/Investigations/verify-ax-compatibility.py
+          --system-baseline --ownership-trace --balance-copies --cycles 10 --idle-seconds 60
+          --expected-appkit-uuid '${{ matrix.appkit_uuid }}'
+          --expected-corefoundation-uuid '${{ matrix.corefoundation_uuid }}'
+          --work-directory .build/Temporary/ax-system-probe/balance
+          --records-directory .build/Temporary/ax-system-probe/records-balance
+      - name: Verify production compensation against real destroyed notifications
+        if: ${{ matrix.appkit_uuid != '' }}
+        run: >-
+          python3 Scripts/Investigations/verify-ax-compatibility.py
+          --work-directory .build/Temporary/ax-system-probe/product
+          --records-directory .build/Temporary/ax-system-probe/records-product
+      - name: Remove investigation products and raw logs
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib, shutil
+          root = pathlib.Path('.build/Temporary/ax-system-probe')
+          if root.exists():
+              assert not root.is_symlink()
+              shutil.rmtree(root)
+          PY

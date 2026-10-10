@@ -1,0 +1,61 @@
+# Xcode
+# Keep project files, shared schemes, and Package.resolved under version control.
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.moved-aside
+*.hmap
+
+# Build, archive, debug, and test products
+*.app/
+*.appex/
+*.xcarchive/
+*.xcresult/
+*.dSYM/
+*.dSYM.zip
+QuickFile-*.zip
+
+# Swift Package Manager and local caches
+.build/
+.swiftpm/
+.xcodegen/
+
+# Python helper scripts
+__pycache__/
+*.py[cod]
+
+# Private development notes, agent configuration, and investigation records
+.local/
+.codex/*
+!.codex/skills/
+.codex/skills/*
+!.codex/skills/apple-design/
+.codex/skills/apple-design/*
+!.codex/skills/apple-design/SKILL.md
+.gitnexus/
+/Investigation/
+/HANDOFF.md
+/TASK_STATUS.md
+/CURRENT_STATUS.md
+/DEVELOPMENT_PLAN.md
+
+# macOS
+.DS_Store
+._*
+.AppleDouble
+__MACOSX/
+
+# Local logs and temporary files
+*.log
+*.tmp
+
+# Local signing material
+*.p12
+*.pfx
+*.mobileprovision
+*.provisionprofile
+*.pem
+*.key
+*.cer
+codesign[0-9]*

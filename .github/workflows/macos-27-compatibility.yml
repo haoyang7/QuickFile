@@ -1,0 +1,109 @@
+name: macOS 27 compatibility
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - 'project.yml'
+      - 'QuickFile.xcodeproj/**'
+      - 'QuickFileApp/**'
+      - 'FinderExtension/**'
+      - 'Shared/**'
+      - 'QuickFileTests/**'
+      - 'Scripts/**'
+      - 'Release/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-27-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  compatibility:
+    name: macOS ${{ matrix.macos_major }} preview (${{ matrix.architecture }}, Xcode ${{ matrix.xcode_version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub's public-preview label, now hosted on real macOS 27.
+          - runner: xcode-27
+            macos_major: '27'
+            architecture: arm64
+            xcode_version: '27.0'
+            developer_directory: /Applications/Xcode_27.0.app/Contents/Developer
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: ${{ matrix.developer_directory }}
+      EXPECTED_RUNNER: ${{ matrix.runner }}
+      EXPECTED_MACOS_MAJOR: ${{ matrix.macos_major }}
+      EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+      EXPECTED_XCODE_VERSION: ${{ matrix.xcode_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Verify host OS, architecture and selected Xcode
+        id: identity
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: python3 Scripts/ci-evidence.py initialize
+      - name: Install XcodeGen 2.46.0
+        id: tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/quickfile-tools"
+          archive="$RUNNER_TEMP/quickfile-tools/xcodegen.zip"
+          curl --fail --silent --show-error --location \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip \
+            --output "$archive"
+          printf '%s  %s\n' \
+            4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806 \
+            "$archive" | shasum --algorithm 256 --check
+          unzip -q "$archive" -d "$RUNNER_TEMP/quickfile-tools"
+          test "$("$RUNNER_TEMP/quickfile-tools/xcodegen/bin/xcodegen" version)" = 'Version: 2.46.0'
+          echo "$RUNNER_TEMP/quickfile-tools/xcodegen/bin" >> "$GITHUB_PATH"
+      - name: Run script tests
+        id: scripts
+        run: python3 -m unittest discover -s Scripts/tests -v
+      - name: Run native tests and unsigned Universal self-check
+        id: native
+        env:
+          CI_EVIDENCE_ROOT: ${{ steps.identity.outputs.root }}
+        run: python3 Scripts/ci-evidence.py run-native "$CI_EVIDENCE_ROOT" -- ./Scripts/verify-release-readiness.sh
+      - name: Prepare allowlisted verification receipts
+        id: evidence
+        if: always() && steps.identity.outputs.root != ''
+        env:
+          CI_EVIDENCE_ROOT: ${{ steps.identity.outputs.root }}
+          IDENTITY_OUTCOME: ${{ steps.identity.outcome }}
+          TOOLS_OUTCOME: ${{ steps.tools.outcome }}
+          SCRIPTS_OUTCOME: ${{ steps.scripts.outcome }}
+          NATIVE_OUTCOME: ${{ steps.native.outcome }}
+          JOB_STATUS: ${{ job.status }}
+        run: python3 Scripts/ci-evidence.py finish "$CI_EVIDENCE_ROOT"
+      - name: Retain sanitized CI receipts for 7 days
+        if: always() && steps.evidence.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.identity.outputs.artifact_name }}
+          # Exact files only; no glob, raw xcresult, logs or build products.
+          path: |
+            ${{ steps.identity.outputs.root }}/upload/identity.json
+            ${{ steps.identity.outputs.root }}/upload/verification.json
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: false
+          overwrite: false
