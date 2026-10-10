@@ -27,6 +27,8 @@ Python 脚本测试同时运行 [架构守卫](Scripts/verify-architecture.py)�
 
 AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数组分配代次和系统调用点；已核对映像另测当前产品补偿。`ax_causal_probe=true` 跳过前两项无插桩运行，执行所有权插桩，并只对已审查 UUID 运行独立补释放对照。插桩结果中的堆扫描来自同一个插桩进程，必须与另次无插桩运行区分。macOS 27.0/27.0.1 的已测映像已自行释放目标 copy，调查矩阵不对其启用补释放。
 
+`malloc_scribble=true` 单独启动 macOS 26 配对调查：同一 runner 交替执行 5 组 `MallocScribble` 关闭/开启 × 空白对照/产品路径，共 20 次。关闭时删除继承变量，开启时设置为 `1`，并核对实际宿主与 AX reader 的环境回执。只上传受限的 `ax-heap-diagnostics-summary`，保留 checkout、系统映像、扫描计数及诊断完整性；原始堆图和日志留在 runner 清理。原严格检查失败、回执缺失或诊断不完整都会使调查失败，同时继续收集后续对照。该实验用于判断已释放内存中的残留指针是否影响保守堆扫描；环境回执和计数变化均不能替代对象所有权证据。
+
 AX 读取权限由实际 reader 可执行文件检查；不匹配映像或缺权限明确报告未覆盖，已匹配映像安装拒绝、通知不足、扫描失败仍失败。目标按钮的两个观察者须逐项恰好收到一次，重复和缺失不能互相抵消；总通知和未匹配通知另行记录。产品扫描先建立不含目标按钮的 AX/XPC 启动基线，再要求目标 AX 泄漏为零、无未分类节点和未知根；已知 NSXPCConnection 基线的节点数、字节数与根数均不能增长。解析器分别保存 ROOT LEAK/CYCLE 分类与实际根类型。全堆报告与目标 AX 数量分别记录，不能将稳定的非零基线写成全堆零泄漏。专项使用一次性 synthetic AppKit 宿主，不代替签名安装 App、Finder 或 VoiceOver 验收。
 
 产品验证另在首批按钮注册后、每批销毁后及观察者退出后扫描，始终与最初的空窗口基线比较。堆断言或逐按钮通知断言失败后继续收集剩余检查点；最终收据标为 `failed`，进程返回非零。后续堆恢复不能撤销前面的失败。扫描不可用、进程异常或协议握手失败仍立即中止，已有原始记录仅留在本地临时目录。
@@ -37,7 +39,9 @@ AX 读取权限由实际 reader 可执行文件检查；不匹配映像或缺权
 
 ## 有限、可追溯的 CI 证据
 
-每个 macOS job 创建独立 runner 临时目录，原生测试与 Release 构建分别显式指定 `tests.xcresult` / `release.xcresult` 的 `-resultBundlePath`。已有结果目录或符号链接会失败，不清除或覆盖上次失败结果。非 CI 本地运行默认在 `.build/VerificationResults.XXXXXX` 创建新目录。`run-native` 保留原失败退出码；退出成功但缺少任一结果 bundle 也判为失败。
+每个 macOS job 创建独立 runner 临时目录，原生测试与 Release 构建分别显式指定 `tests.xcresult` / `release.xcresult` 的 `-resultBundlePath`。已有结果目录或符号链接会失败，不清除或覆盖上次失败结果。原生自检每次在 `.build/Temporary/release-readiness.XXXXXX/` 创建独立的 Debug、Release 和包缓存，解析使用本轮 DerivedData，构建设置查询显式指定本轮产品和中间目录。成功、失败或收到 HUP/INT/TERM 时回收本轮缓存和 App，保留 `records/cleanup.json` 及结果 bundle；外部提供的结果目录只用于保存结果，不参与清理。非 CI 本地运行默认结果目录为本轮目录中的 `Results/`。`run-native` 保留原失败退出码；退出成功但缺少任一结果 bundle 也判为失败。
+
+Xcode 的 macOS App 构建会添加 Launch Services 注册步骤，文件回收不能证明注册状态已恢复。CI 临时 runner 没有日常安装版；本机验证结束后须按 [临时产物回收约定](CONTRIBUTING.md#临时产物回收) 恢复日常 App 与 Finder 扩展的实际加载身份，并在清理后验收真实 Finder 菜单。自检脚本的清理收据只记录本轮文件回收结果。
 
 每个 macOS job 只上传两份从有限字段生成的 synthetic CI JSON 回执，不读取或导出 xcresult 内容：
 

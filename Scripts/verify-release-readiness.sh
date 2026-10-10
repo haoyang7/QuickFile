@@ -4,9 +4,6 @@ set -euo pipefail
 
 SCRIPT_DIRECTORY=${0:A:h}
 PROJECT_DIRECTORY=${SCRIPT_DIRECTORY:h}
-TEST_DERIVED_DATA="${PROJECT_DIRECTORY}/.build/VerificationTests"
-RELEASE_DERIVED_DATA="${PROJECT_DIRECTORY}/.build/VerificationRelease"
-PACKAGE_DIRECTORY="${PROJECT_DIRECTORY}/.build/VerificationSourcePackages"
 PACKAGE_LOCK="${PROJECT_DIRECTORY}/QuickFile.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 TEST_ARCH=$(/usr/bin/uname -m)
 EXPECTED_APP_BUNDLE_ID="com.haoyoung.QuickFile"
@@ -31,14 +28,65 @@ fi
 
 cd -- "${PROJECT_DIRECTORY}"
 
+mkdir -p -- "${PROJECT_DIRECTORY}/.build/Temporary"
+TASK_DIRECTORY=$(/usr/bin/mktemp -d "${PROJECT_DIRECTORY}/.build/Temporary/release-readiness.XXXXXX")
+TEST_DERIVED_DATA="${TASK_DIRECTORY}/Tests"
+RELEASE_DERIVED_DATA="${TASK_DIRECTORY}/Release"
+PACKAGE_DIRECTORY="${TASK_DIRECTORY}/SourcePackages"
+mkdir -- "${TASK_DIRECTORY}/records"
+cleanup() {
+    local result=$?
+    local cleanup_result=0
+    trap - EXIT
+    trap '' HUP INT TERM
+    # Only these invocation-owned caches are reclaimed. Result bundles and
+    # records stay available after successful builds, failures and signals.
+    python3 - "${TASK_DIRECTORY}" "${result}" <<'PY' || cleanup_result=$?
+import json
+from pathlib import Path
+import shutil
+import sys
+
+root = Path(sys.argv[1])
+errors = []
+products = [root / name for name in ("Tests", "Release", "SourcePackages")]
+for path in products:
+    try:
+        if path.is_symlink():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+    except OSError as error:
+        errors.append(f"{path.name}: {error}")
+(root / "records/cleanup.json").write_text(json.dumps({
+    "verification_exit_code": int(sys.argv[2]),
+    "build_products_removed": all(not path.exists() and not path.is_symlink() for path in products),
+    "cleanup_errors": errors,
+}, indent=2) + "\n")
+if errors:
+    print("error: verification cache cleanup failed; see cleanup.json", file=sys.stderr)
+sys.exit(bool(errors))
+PY
+    print -- "Verification records: ${TASK_DIRECTORY}/records"
+    if [[ "${result}" -eq 0 ]]; then result=${cleanup_result}; fi
+    if [[ "${result}" -eq 0 ]]; then
+        print -- "Unsigned release readiness verification passed"
+    fi
+    exit "${result}"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # Give each invocation new, explicit result bundle paths. Never erase a previous
 # failure. CI keeps raw bundles runner-local; only synthetic receipts are uploaded.
 if [[ -n "${QUICKFILE_RESULT_DIRECTORY:-}" ]]; then
     RESULT_DIRECTORY=$(python3 "${SCRIPT_DIRECTORY}/ci-evidence.py" \
         prepare-results "${QUICKFILE_RESULT_DIRECTORY}")
 else
-    mkdir -p -- "${PROJECT_DIRECTORY}/.build"
-    RESULT_DIRECTORY=$(/usr/bin/mktemp -d "${PROJECT_DIRECTORY}/.build/VerificationResults.XXXXXX")
+    RESULT_DIRECTORY="${TASK_DIRECTORY}/Results"
+    mkdir -- "${RESULT_DIRECTORY}"
 fi
 TEST_RESULT_BUNDLE="${RESULT_DIRECTORY}/tests.xcresult"
 RELEASE_RESULT_BUNDLE="${RESULT_DIRECTORY}/release.xcresult"
@@ -129,6 +177,7 @@ verify_plist_value \
 python3 "${SCRIPT_DIRECTORY}/resolve-packages.py" \
     --xcodebuild "${XCODEBUILD_COMMAND}" \
     --project QuickFile.xcodeproj \
+    --derived-data-path "${RELEASE_DERIVED_DATA}" \
     --package-directory "${PACKAGE_DIRECTORY}" \
     --package-lock "${PACKAGE_LOCK}" \
     --expected-lock-hash "${PACKAGE_LOCK_HASH}"
@@ -145,6 +194,8 @@ python3 "${SCRIPT_DIRECTORY}/resolve-packages.py" \
     -showBuildSettings \
     -json \
     CODE_SIGNING_ALLOWED=NO \
+    SYMROOT="${RELEASE_DERIVED_DATA}/Build/Products" \
+    OBJROOT="${RELEASE_DERIVED_DATA}/Build/Intermediates.noindex" \
     | python3 "${SCRIPT_DIRECTORY}/verify-build-settings.py" \
         --expected-macos-version "${EXPECTED_MACOS_VERSION}"
 
@@ -183,6 +234,8 @@ verify_icon_image "icon_512x512@2x.png" "1024"
 
 # This macOS hosted XCTest run does not consume IDE indexing data.
 # Keep testability, diagnostics, debug info and all test/build validations intact.
+# Xcode registers macOS App products. Cleanup reclaims owned files; local
+# registration restoration follows CONTRIBUTING.md after verification.
 print -- "Running ${TEST_ARCH} unit tests"
 "${XCODEBUILD_COMMAND}" \
     -project QuickFile.xcodeproj \
@@ -300,4 +353,3 @@ if [[ "${FINAL_PACKAGE_LOCK_HASH}" != "${PACKAGE_LOCK_HASH}" ]]; then
     exit 1
 fi
 print -- "Package.resolved unchanged"
-print -- "Unsigned release readiness verification passed"

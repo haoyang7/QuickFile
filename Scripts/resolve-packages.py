@@ -40,12 +40,15 @@ def lock_is_unchanged(package_lock: Path, expected_hash: str) -> bool:
 
 
 def resolve_packages(xcodebuild: str, project: str, package_directory: str,
-                     package_lock: Path, expected_hash: str) -> int:
+                     package_lock: Path, expected_hash: str,
+                     derived_data_path=None) -> int:
     command = [
         xcodebuild, "-resolvePackageDependencies", "-project", project,
         "-scheme", "QuickFile", "-clonedSourcePackagesDirPath", package_directory,
         "-disableAutomaticPackageResolution",
     ]
+    if derived_data_path is not None:
+        command.extend(["-derivedDataPath", derived_data_path])
     for attempt in range(1, 4):
         print(f"Resolving pinned packages (attempt {attempt}/3)", flush=True)
         timeout_seen = False
@@ -90,11 +93,12 @@ def main() -> int:
     parser.add_argument("--xcodebuild", required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--package-directory", required=True)
+    parser.add_argument("--derived-data-path")
     parser.add_argument("--package-lock", required=True, type=Path)
     parser.add_argument("--expected-lock-hash", required=True)
     args = parser.parse_args()
     return resolve_packages(args.xcodebuild, args.project, args.package_directory,
-                            args.package_lock, args.expected_lock_hash)
+                            args.package_lock, args.expected_lock_hash, args.derived_data_path)
 
 
 if __name__ == "__main__":

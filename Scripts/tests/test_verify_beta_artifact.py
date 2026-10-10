@@ -1,6 +1,7 @@
 import datetime as dt
 import importlib.util
 import io
+import platform
 import plistlib
 import tempfile
 import unittest
@@ -111,6 +112,49 @@ class FakeRunner:
         raise AssertionError(arguments)
 
 
+class SliceRunner(FakeRunner):
+    """Model codesign display's native default and independently signed slices."""
+
+    def __init__(self, bundle, architecture, fault):
+        super().__init__(certificate="Apple Development: Example")
+        self.bundle = bundle
+        self.architecture = architecture
+        self.fault = fault
+        self.calls = []
+
+    def run(self, arguments):
+        self.calls.append(list(arguments))
+        result = super().run(arguments)
+        architecture = arguments[arguments.index("--arch") + 1] if "--arch" in arguments else platform.machine()
+        if Path(arguments[-1]).name != self.bundle or architecture != self.architecture:
+            return result
+        if arguments[:3] == ["/usr/bin/codesign", "-d", "--verbose=4"]:
+            replacements = {
+                "team": (b"TeamIdentifier=TEAM", b"TeamIdentifier=OTHER"),
+                "identifier": (MODULE.EXPECTED_APP_ID.encode(), b"com.other.App"),
+                "runtime": (b"flags=0x10000(runtime)", b"flags=0x0(none)"),
+                "certificate": (b"Apple Development:", b"Developer ID Application:"),
+            }
+            if self.fault in replacements:
+                old, new = replacements[self.fault]
+                return MODULE.CommandResult(0, stderr=result.stderr.replace(old, new))
+        if arguments[:3] == ["/usr/bin/codesign", "-d", "--entitlements"]:
+            values = plistlib.loads(result.stdout)
+            if self.fault == "sandbox":
+                values["com.apple.security.app-sandbox"] = False
+            elif self.fault == "sandbox_integer":
+                values["com.apple.security.app-sandbox"] = 1
+            elif self.fault == "app_group":
+                values["com.apple.security.application-groups"] = ["wrong.group"]
+            elif self.fault == "application_identifier":
+                values["com.apple.application-identifier"] = "TEAM.com.other.App"
+            return MODULE.CommandResult(0, stdout=plistlib.dumps(values))
+        if self.fault == "leaf" and arguments[:2] == ["/usr/bin/codesign", "-d"] and arguments[2].startswith("--extract-certificates="):
+            prefix = arguments[2].partition("=")[2]
+            Path(f"{prefix}0").write_bytes(b"UNAUTHORIZED-LEAF")
+        return result
+
+
 NOW = dt.datetime(2026, 9, 26, 4, 0, tzinfo=dt.timezone.utc)
 
 
@@ -153,6 +197,59 @@ class VerifyBetaArtifactTests(unittest.TestCase):
         report = self.inspect(profiles=True)
         self.assertEqual(report["verdict"], "pass")
         self.assertNotIn("Developer ID Application: Example", str(report))
+
+    def test_non_native_slice_cannot_bypass_registered_device_signature_gates(self):
+        non_native = "x86_64" if platform.machine() == "arm64" else "arm64"
+        gates = {
+            "team": "signing.same_team",
+            "identifier": "app.signature_identifier",
+            "runtime": "app.hardened_runtime",
+            "certificate": "distribution.certificate_kind",
+            "sandbox": "app.entitlement.app-sandbox",
+            "sandbox_integer": "app.entitlement.app-sandbox",
+            "app_group": "app.app_group",
+            "application_identifier": "app.signature_application_identifier",
+            "leaf": "app.profile_leaf_certificate",
+        }
+        for bundle, label in (("QuickFile.app", "app"), ("FinderExtension.appex", "finder_extension")):
+            for fault, gate in gates.items():
+                with self.subTest(bundle=bundle, fault=fault):
+                    runner = SliceRunner(bundle, non_native, fault)
+                    report = self.inspect(runner, "registered-devices", profiles=True)
+                    self.assertEqual(report["verdict"], "fail")
+                    self.assertEqual(self.status(report, gate.replace("app.", label + ".", 1)), "fail")
+                    self.assertNotIn("UNAUTHORIZED-LEAF", str(report))
+
+    def test_strict_verification_explicitly_covers_all_slices(self):
+        runner = SliceRunner("QuickFile.app", "x86_64", "none")
+        self.assertEqual(self.inspect(runner, "registered-devices", profiles=True)["verdict"], "pass")
+        verifications = [call for call in runner.calls if "--verify" in call]
+        self.assertEqual(len(verifications), 2)
+        self.assertTrue(all("--all-architectures" in call for call in verifications))
+
+    def test_each_slice_read_failure_prevents_acceptance(self):
+        operations = {
+            "--verbose=4": "hardened_runtime",
+            "--entitlements": "entitlement.app-sandbox",
+            "--extract-certificates=": "profile_leaf_certificate",
+        }
+        for architecture in ("arm64", "x86_64"):
+            for bundle, label in (("QuickFile.app", "app"), ("FinderExtension.appex", "finder_extension")):
+                for operation, gate in operations.items():
+                    with self.subTest(architecture=architecture, bundle=bundle, operation=operation):
+                        class Runner(FakeRunner):
+                            def run(self, arguments):
+                                if (arguments[:2] == ["/usr/bin/codesign", "-d"]
+                                        and "--arch" in arguments
+                                        and arguments[arguments.index("--arch") + 1] == architecture
+                                        and Path(arguments[-1]).name == bundle
+                                        and any(argument.startswith(operation) for argument in arguments)):
+                                    return MODULE.CommandResult(-1, error="unavailable")
+                                return super().run(arguments)
+
+                        report = self.inspect(Runner(certificate="Apple Development: Example"), "registered-devices", profiles=True)
+                        self.assertEqual(report["verdict"], "fail")
+                        self.assertEqual(self.status(report, f"{label}.{gate}"), "unknown")
 
     def test_minimum_system_version_requires_exact_string_in_both_modes(self):
         for mode, certificate in (("developer-id", "Developer ID Application: Example"),
@@ -436,19 +533,39 @@ class SparkleArtifactTests(unittest.TestCase):
                 ]
             }})
             self.helper_architecture_results = {}
+            self.helper_slice_faults = {}
+            self.app_service_lists = {}
+            self.calls = []
 
         def run(self, arguments):
+            self.calls.append(list(arguments))
             path = Path(arguments[-1])
             if "Sparkle.framework" in path.parts:
                 if arguments[:3] == ["/usr/bin/codesign", "-d", "--verbose=4"]:
-                    flags = "0x10000(runtime)" if self.helper_runtime else "0x0(none)"
-                    text = f"Identifier=org.sparkle.test\nAuthority={self.helper_certificate}\nTeamIdentifier={self.helper_team}\nCodeDirectory v=20500 flags={flags}\nExecutable Segment flags=0x0\n"
+                    architecture = arguments[arguments.index("--arch") + 1] if "--arch" in arguments else platform.machine()
+                    fault = self.helper_slice_faults.get((path.name, architecture), {})
+                    flags = "0x10000(runtime)" if fault.get("runtime", self.helper_runtime) else "0x0(none)"
+                    certificate = fault.get("certificate", self.helper_certificate)
+                    team = fault.get("team", self.helper_team)
+                    text = f"Identifier=org.sparkle.test\nAuthority={certificate}\nTeamIdentifier={team}\nCodeDirectory v=20500 flags={flags}\nExecutable Segment flags=0x0\n"
                     return MODULE.CommandResult(0, stderr=text.encode())
                 if arguments[:2] == ["/usr/bin/lipo", "-archs"]:
                     if not path.is_file():
                         return MODULE.CommandResult(1)
                     return self.helper_architecture_results.get(path.name, MODULE.CommandResult(0, stdout=b"arm64 x86_64"))
-            return super().run(arguments)
+            result = super().run(arguments)
+            if path.name == "QuickFile.app" and arguments[:3] == ["/usr/bin/codesign", "-d", "--entitlements"] and "--arch" in arguments:
+                architecture = arguments[arguments.index("--arch") + 1]
+                if architecture in self.app_service_lists:
+                    values = plistlib.loads(result.stdout)
+                    key = "com.apple.security.temporary-exception.mach-lookup.global-name"
+                    services = self.app_service_lists[architecture]
+                    if services is None:
+                        values.pop(key, None)
+                    else:
+                        values[key] = services
+                    return MODULE.CommandResult(0, stdout=plistlib.dumps(values))
+            return result
 
     def sparkle_fixture(self):
         fixture = ArtifactFixture(profiles=True)
@@ -487,6 +604,27 @@ class SparkleArtifactTests(unittest.TestCase):
                 self.assertEqual(report["verdict"], "fail")
                 setattr(runner, attribute, previous)
 
+    def test_updater_service_order_may_differ_between_slices(self):
+        fixture = self.sparkle_fixture()
+        runner = self.Runner()
+        services = [MODULE.EXPECTED_APP_ID + "-spks", MODULE.EXPECTED_APP_ID + "-spki"]
+        runner.app_service_lists = {"arm64": services, "x86_64": list(reversed(services))}
+        report = MODULE.inspect_artifact(fixture.app, "developer-id", runner, NOW)
+        self.assertEqual(next(item["status"] for item in report["checks"] if item["name"] == "sparkle.mach_lookup"), "pass")
+        self.assertEqual(report["verdict"], "pass")
+
+    def test_each_slice_requires_exact_updater_services(self):
+        fixture = self.sparkle_fixture()
+        services = [MODULE.EXPECTED_APP_ID + "-spks", MODULE.EXPECTED_APP_ID + "-spki"]
+        for architecture in ("arm64", "x86_64"):
+            for invalid in (None, [], services[:1], services + ["unexpected.service"]):
+                with self.subTest(architecture=architecture, services=invalid):
+                    runner = self.Runner()
+                    runner.app_service_lists = {architecture: invalid}
+                    report = MODULE.inspect_artifact(fixture.app, "developer-id", runner, NOW)
+                    self.assertEqual(next(item["status"] for item in report["checks"] if item["name"] == "sparkle.mach_lookup"), "fail")
+                    self.assertEqual(report["verdict"], "fail")
+
     def test_every_sparkle_binary_requires_both_architectures(self):
         fixture = self.sparkle_fixture()
         runner = self.Runner()
@@ -501,6 +639,30 @@ class SparkleArtifactTests(unittest.TestCase):
                     thin_report = MODULE.inspect_artifact(fixture.app, "developer-id", runner, NOW)
                     self.assertEqual(next(item["status"] for item in thin_report["checks"] if item["name"] == check_name), "fail")
                     self.assertEqual(thin_report["verdict"], "fail")
+
+    def test_each_sparkle_slice_requires_team_runtime_and_certificate(self):
+        fixture = self.sparkle_fixture()
+        component_names = {
+            "framework": "Sparkle.framework", "installer": "Installer.xpc",
+            "downloader": "Downloader.xpc", "autoupdate": "Autoupdate", "updater": "Updater.app",
+        }
+        for label, component in component_names.items():
+            for architecture in ("arm64", "x86_64"):
+                for field, value, gate in (("team", "OTHER", "signing_team"),
+                                           ("runtime", False, "hardened_runtime"),
+                                           ("certificate", "Apple Development: Other", "certificate_kind")):
+                    with self.subTest(component=component, architecture=architecture, field=field):
+                        runner = self.Runner()
+                        runner.helper_slice_faults[(component, architecture)] = {field: value}
+                        report = MODULE.inspect_artifact(fixture.app, "developer-id", runner, NOW)
+                        self.assertEqual(report["verdict"], "fail")
+                        self.assertEqual(next(item["status"] for item in report["checks"] if item["name"] == f"sparkle.{label}.{gate}"), "fail")
+
+        runner = self.Runner()
+        self.assertEqual(MODULE.inspect_artifact(fixture.app, "developer-id", runner, NOW)["verdict"], "pass")
+        verifications = [call for call in runner.calls if "--verify" in call]
+        self.assertEqual(len(verifications), 7)
+        self.assertTrue(all("--all-architectures" in call for call in verifications))
 
     def test_helper_architecture_errors_and_missing_binary_fail_closed(self):
         fixture = self.sparkle_fixture()
