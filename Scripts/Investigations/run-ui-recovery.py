@@ -49,7 +49,7 @@ def scan(pid, output, checkpoint):
     raw = leaks.stdout + leaks.stderr
     (output / f"private-{checkpoint}-leaks.txt").write_text(raw)
     count = re.search(r"Process\s+\d+:\s+(\d+)\s+leaks?\s+for\s+(\d+)\s+total leaked bytes", raw)
-    if count is None:
+    if leaks.returncode not in (0, 1) or count is None:
         raise RuntimeError(f"Leak scan could not inspect owned process; exit {leaks.returncode}")
     roots = []
     for line in raw.splitlines():

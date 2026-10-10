@@ -46,9 +46,9 @@ def allocation_roots(pid, output, stage):
     result = subprocess.run(["leaks", "--quiet", "--noContent", "--nosources", str(pid)],
                             capture_output=True, text=True, timeout=45)
     raw = result.stdout + result.stderr
-    if not re.search(r"Process\s+\d+:\s+\d+\s+leaks?", raw):
-        raise RuntimeError("Cannot collect per-address leak evidence")
     (output / f"private-{stage}-addresses.txt").write_text(raw)
+    if result.returncode not in (0, 1) or not re.search(r"Process\s+\d+:\s+\d+\s+leaks?", raw):
+        raise RuntimeError(f"Cannot collect per-address leak evidence; exit {result.returncode}")
     return {address for line in raw.splitlines() if "ROOT LEAK:" in line
             for address in re.findall(r"0x[0-9a-fA-F]+", line)}
 

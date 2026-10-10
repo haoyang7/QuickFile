@@ -257,7 +257,21 @@ final class QuickFileViewModel: ObservableObject {
         didSet { statusGeneration &+= 1 }
     }
     @Published private(set) var createdFileURL: URL?
-    @Published private(set) var templates: [FileTemplate]
+    @Published private(set) var templates: [FileTemplate] {
+        didSet {
+            cachedEnabledTemplateIndices = nil
+            cachedTemplateFilter = nil
+        }
+    }
+    // Cache positions only; returned values always come from the current snapshot.
+    private(set) var cachedEnabledTemplateIndices: [Int]?
+    struct TemplateFilterCache {
+        let query: String
+        let enabledOnly: Bool
+        let localeIdentifier: String
+        let indices: [Int]
+    }
+    private(set) var cachedTemplateFilter: TemplateFilterCache?
     @Published private(set) var templateLoadFailure: TemplateLoadFailure?
     // Compatibility projection; there is no second mutable error state.
     var templateLoadError: String? { templateLoadFailure?.message }
@@ -299,6 +313,7 @@ final class QuickFileViewModel: ObservableObject {
     private var persistedTemplates: [FileTemplate]
     private let templateStore: TemplateStore
     private let authoritativeTemplateLoader: @Sendable () throws -> [FileTemplate]
+    private let templateChangeTokenReader: @Sendable () throws -> TemplateStore.ChangeToken
     private let fileCreationService: FileCreationService
     private let authorizedDirectoryStore: AuthorizedDirectoryStore
     private let finderAuthorizationCoordinator: FinderAuthorizationCoordinator
@@ -306,6 +321,10 @@ final class QuickFileViewModel: ObservableObject {
     private let revealCreatedFile: @MainActor (URL) -> Void
     private var templateRefreshObserver: TemplateRefreshObserver?
     private var templateRefreshTask: Task<Void, Never>?
+    private enum TemplateRefreshPhase { case probing, loading }
+    private var templateRefreshPhase: TemplateRefreshPhase?
+    var isProbingTemplateRefresh: Bool { templateRefreshPhase == .probing }
+    var hasPendingTemplateRefresh: Bool { templateRefreshTask != nil || templateRefreshPending }
     private var templateRefreshPending = false
     private var templateRefreshForced = false
     private var templateRefreshNeedsAuthority = false
@@ -323,6 +342,7 @@ final class QuickFileViewModel: ObservableObject {
         fileCreationService: FileCreationService = FileCreationService(),
         clipboardProvider: (@MainActor () -> String?)? = nil,
         authoritativeTemplateLoader: (@Sendable () throws -> [FileTemplate])? = nil,
+        templateChangeTokenReader: (@Sendable () throws -> TemplateStore.ChangeToken)? = nil,
         finderAuthorizationCoordinator: FinderAuthorizationCoordinator? = nil,
         revealCreatedFile: @escaping @MainActor (URL) -> Void = { _ in }
     ) {
@@ -333,6 +353,9 @@ final class QuickFileViewModel: ObservableObject {
         self.templateStore = templateStore
         self.authoritativeTemplateLoader = authoritativeTemplateLoader ?? { [templateStore] in
             try templateStore.reloadTemplates()
+        }
+        self.templateChangeTokenReader = templateChangeTokenReader ?? { [templateStore] in
+            try templateStore.changeToken()
         }
         self.templates = loadedTemplates
         self.templateLoadFailure = nil
@@ -389,11 +412,16 @@ final class QuickFileViewModel: ObservableObject {
     }
 
     var enabledTemplates: [FileTemplate] {
-        templates.filter(\.isEnabled)
+        if let indices = cachedEnabledTemplateIndices {
+            return indices.map { templates[$0] }
+        }
+        let indices = templates.indices.filter { templates[$0].isEnabled }
+        cachedEnabledTemplateIndices = indices
+        return indices.map { templates[$0] }
     }
 
     var selectedTemplate: FileTemplate? {
-        enabledTemplates.first { $0.id == selectedTemplateID }
+        templates.first { $0.isEnabled && $0.id == selectedTemplateID }
     }
 
     var extensionHint: String {
@@ -515,11 +543,22 @@ final class QuickFileViewModel: ObservableObject {
     /// Search deliberately excludes template bodies, including large or private content.
     func filteredTemplates(search: String, enabledOnly: Bool = false) -> [FileTemplate] {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        return templates.filter {
-            (!enabledOnly || $0.isEnabled) && (query.isEmpty
-                || $0.name.localizedCaseInsensitiveContains(query)
-                || $0.fileExtension.localizedCaseInsensitiveContains(query))
+        let localeIdentifier = Locale.current.identifier
+        if let cache = cachedTemplateFilter,
+           cache.query == query, cache.enabledOnly == enabledOnly,
+           cache.localeIdentifier == localeIdentifier {
+            return cache.indices.map { templates[$0] }
         }
+        let indices = templates.indices.filter { index in
+            let template = templates[index]
+            return (!enabledOnly || template.isEnabled) && (query.isEmpty
+                || template.name.localizedCaseInsensitiveContains(query)
+                || template.fileExtension.localizedCaseInsensitiveContains(query))
+        }
+        cachedTemplateFilter = TemplateFilterCache(
+            query: query, enabledOnly: enabledOnly, localeIdentifier: localeIdentifier, indices: indices
+        )
+        return indices.map { templates[$0] }
     }
 
     enum TemplatePosition: Equatable { case first, last }
@@ -747,7 +786,7 @@ final class QuickFileViewModel: ObservableObject {
     func reloadTemplates() async {
         templateRefreshStatusGeneration = statusGeneration
         templateRefreshForced = true
-        if isSavingTemplates || isBusy || (isLoadingTemplates && templateRefreshTask == nil) {
+        if isSavingTemplates || isBusy || (isLoadingTemplates && templateRefreshPhase != .loading) {
             requestTemplateRefresh()
             return
         }
@@ -762,52 +801,71 @@ final class QuickFileViewModel: ObservableObject {
         guard templateRefreshPending, templateRefreshTask == nil,
               !isLoadingTemplates, !isSavingTemplates, !isBusy else { return }
         templateRefreshPending = false
+        let generation = templateStateGeneration
+        let readToken = templateChangeTokenReader
         let forced = templateRefreshForced
         let needsAuthority = forced || templateRefreshNeedsAuthority
+        if !needsAuthority, hasLoadedTemplates, templateLoadFailure == nil,
+           templateRefreshTokenGeneration == generation, let token = templateRefreshToken {
+            // A healthy activation only probes metadata. Interactive operations may
+            // run concurrently; completion must never clear their loading state.
+            templateRefreshPhase = .probing
+            templateRefreshTask = Task { @MainActor [weak self] in
+                let result = await BackgroundWork.result { try readToken() }
+                guard let self else { return }
+                let unchanged: Bool
+                if case let .success(current) = result { unchanged = current == token }
+                else { unchanged = false }
+                if !unchanged || self.templateStateGeneration != generation {
+                    self.templateRefreshNeedsAuthority = true
+                    self.templateRefreshPending = true
+                }
+                self.templateRefreshTask = nil
+                self.templateRefreshPhase = nil
+                self.drainTemplateRefresh()
+            }
+            return
+        }
         templateRefreshNeedsAuthority = false
         templateRefreshForced = false
         let waiters = templateRefreshWaiters
         templateRefreshWaiters.removeAll()
-        let generation = templateStateGeneration
         let statusVersion = templateRefreshStatusGeneration
         templateRefreshStatusGeneration = nil
         let baseline = persistedTemplates
-        let token = templateRefreshTokenGeneration == generation ? templateRefreshToken : nil
-        let store = templateStore
         let load = authoritativeTemplateLoader
         // Keep the lease until synchronous I/O actually returns. The task captures
         // values, not the model, so closing the application can release observers.
+        templateRefreshPhase = .loading
         isLoadingTemplates = true
         templateRefreshTask = Task { @MainActor [weak self] in
             let result = await BackgroundWork.result {
-                let before = try store.changeToken()
-                if !needsAuthority, let token, before == token {
-                    return (templates: Optional<[FileTemplate]>.none, changed: false, token: Optional(before))
-                }
+                // Tokens are invalidation hints, never a prerequisite for authority.
+                // Unavailable metadata leaves the result uncached until the next event.
+                let before = try? readToken()
                 let loaded = try load()
-                let after = try store.changeToken()
+                let after = try? readToken()
                 let changed = loaded.count != baseline.count || !zip(loaded, baseline).allSatisfy {
                     $0.id == $1.id && TransferTemplate($0) == TransferTemplate($1)
                 }
-                return (templates: Optional(loaded), changed: changed, token: before == after ? after : nil)
+                return (templates: loaded, changed: changed, token: before == after ? after : nil,
+                        changedDuringRead: before != nil && after != nil && before != after)
             }
             if let self {
                 if self.templateStateGeneration == generation {
                     switch result {
                     case let .success(snapshot):
                         self.templateRefreshToken = snapshot.token
-                        if let loaded = snapshot.templates {
-                            if snapshot.changed || !self.hasLoadedTemplates || self.templateLoadFailure != nil {
-                                self.templates = loaded
-                                self.persistedTemplates = loaded
-                                self.templateStateGeneration &+= 1
-                            }
-                            self.hasLoadedTemplates = true
-                            self.templateLoadFailure = nil
-                            self.ensureSelectedTemplateIsAvailable()
+                        if snapshot.changed || !self.hasLoadedTemplates || self.templateLoadFailure != nil {
+                            self.templates = snapshot.templates
+                            self.persistedTemplates = snapshot.templates
+                            self.templateStateGeneration &+= 1
                         }
+                        self.hasLoadedTemplates = true
+                        self.templateLoadFailure = nil
+                        self.ensureSelectedTemplateIsAvailable()
                         self.templateRefreshTokenGeneration = self.templateStateGeneration
-                        if snapshot.token == nil { self.templateRefreshPending = true }
+                        if snapshot.changedDuringRead { self.templateRefreshPending = true }
                         if forced, self.statusGeneration == statusVersion {
                             self.status = .success("模板已重新加载。")
                         }
@@ -823,6 +881,7 @@ final class QuickFileViewModel: ObservableObject {
                     self.templateRefreshPending = true
                 }
                 self.templateRefreshTask = nil
+                self.templateRefreshPhase = nil
                 self.isLoadingTemplates = false
             }
             waiters.forEach { $0.resume() }

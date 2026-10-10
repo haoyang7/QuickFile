@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import notify
 import XCTest
 @testable import QuickFile
@@ -15,7 +16,7 @@ final class TemplateRefreshTests: XCTestCase {
     override func setUpWithError() throws {
         suite = "QuickFileTests.Refresh.\(UUID().uuidString)"
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         store = TemplateStore(defaults: defaults, storageURL: directory.appendingPathComponent("templates.json"),
                               changeNotificationName: suite)
@@ -30,10 +31,319 @@ final class TemplateRefreshTests: XCTestCase {
 
     private func settle(_ model: QuickFileViewModel) async throws {
         for _ in 0..<300 {
-            if !model.isLoadingTemplates && !model.isSavingTemplates { return }
+            if !model.hasPendingTemplateRefresh && !model.isLoadingTemplates && !model.isSavingTemplates { return }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Template refresh did not settle")
+    }
+
+    private func waitForProbeCompletion(_ model: QuickFileViewModel) async throws {
+        for _ in 0..<300 {
+            if !model.isProbingTemplateRefresh { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Template probe did not complete")
+    }
+
+    func testUnchangedActivationPublishesNothingAndKeepsCreationAvailable() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        try store.saveTemplates([original])
+        let source = store!
+        let probe = RefreshGate()
+        defer { probe.release.signal() }
+        let tokens = RefreshCounter()
+        let reads = RefreshCounter()
+        let model = QuickFileViewModel(templateStore: source, authoritativeTemplateLoader: {
+            reads.increment()
+            return try source.reloadTemplates()
+        }, templateChangeTokenReader: {
+            tokens.increment()
+            if tokens.count == 3 { probe.blockOnce() }
+            return try source.changeToken()
+        })
+        await model.loadTemplatesIfNeeded()
+        model.destinationFolder = directory
+        let publications = RefreshCounter()
+        let subscription = model.objectWillChange.sink { publications.increment() }
+        defer { subscription.cancel() }
+        model.requestTemplateRefresh()
+        let started = await BackgroundWork.run { probe.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(started)
+        XCTAssertTrue(model.canCreate)
+        XCTAssertFalse(model.isLoadingTemplates)
+        for _ in 0..<20 { model.requestTemplateRefresh() }
+        probe.release.signal()
+        try await settle(model)
+        XCTAssertEqual(publications.count, 0)
+        XCTAssertEqual(reads.count, 1)
+        XCTAssertTrue(model.canCreate)
+    }
+
+    func testProbePreservesNotificationAndManualWaiter() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        try store.saveTemplates([original])
+        let source = store!
+        let probe = RefreshGate()
+        let authority = RefreshGate()
+        defer { probe.release.signal(); authority.release.signal() }
+        let tokens = RefreshCounter()
+        let reads = RefreshCounter()
+        let model = QuickFileViewModel(templateStore: source, authoritativeTemplateLoader: {
+            reads.increment()
+            if reads.count == 2 { authority.blockOnce() }
+            return try source.reloadTemplates()
+        }, templateChangeTokenReader: {
+            tokens.increment()
+            if tokens.count == 3 { probe.blockOnce() }
+            return try source.changeToken()
+        })
+        await model.loadTemplatesIfNeeded()
+        model.requestTemplateRefresh()
+        let started = await BackgroundWork.run { probe.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(started)
+        model.requestTemplateRefresh(force: true)
+        var manualStarted = false
+        var manualFinished = false
+        let manual = Task {
+            manualStarted = true
+            await model.reloadTemplates()
+            manualFinished = true
+        }
+        while !manualStarted { await Task.yield() }
+        XCTAssertFalse(manualFinished)
+        probe.release.signal()
+        let loading = await BackgroundWork.run { authority.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(loading)
+        XCTAssertFalse(manualFinished)
+        XCTAssertTrue(model.isLoadingTemplates)
+        authority.release.signal()
+        await manual.value
+        try await settle(model)
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(model.status, .success("模板已重新加载。"))
+    }
+
+    func testChangedProbeWaitsForExportAndPreservesItsLoadingOwnership() async throws {
+        try await checkProbeDuringOperation(.export, failProbe: false)
+    }
+
+    func testFailedProbeWaitsForCreationAndPreservesItsResult() async throws {
+        try await checkProbeDuringOperation(.create, failProbe: true)
+    }
+
+    func testGenerationChangeDuringProbeWaitsForSaveAndPreservesItsResult() async throws {
+        try await checkProbeDuringOperation(.save, failProbe: false)
+    }
+
+    private enum ProbeOperation: Sendable { case export, create, save }
+
+    private func checkProbeDuringOperation(_ operation: ProbeOperation, failProbe: Bool) async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        try store.saveTemplates([original])
+        let source = store!
+        let probe = RefreshGate()
+        let interactive = RefreshGate()
+        defer { probe.release.signal(); interactive.release.signal() }
+        let tokens = RefreshCounter()
+        let reads = RefreshCounter()
+        let model = QuickFileViewModel(templateStore: source, authoritativeTemplateLoader: {
+            reads.increment()
+            if reads.count == 2 { interactive.blockOnce() }
+            return try source.reloadTemplates()
+        }, templateChangeTokenReader: {
+            tokens.increment()
+            if tokens.count == 3 {
+                // Save changes generation while this unchanged token is in flight.
+                let token = try source.changeToken()
+                probe.blockOnce()
+                if failProbe { throw CocoaError(.fileReadUnknown) }
+                if operation == .save { return token }
+            }
+            return try source.changeToken()
+        })
+        await model.loadTemplatesIfNeeded()
+        model.destinationFolder = directory
+        model.requestedFilename = "created"
+        model.requestTemplateRefresh()
+        let probing = await BackgroundWork.run { probe.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(probing)
+        let exportURL = directory.appendingPathComponent("export.json")
+        let action = Task {
+            switch operation {
+            case .export: try await model.exportTemplates(to: exportURL)
+            case .create: await model.createFile()
+            case .save: _ = try await model.saveTemplateAsNew(original)
+            }
+        }
+        let acting = await BackgroundWork.run { interactive.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(acting)
+        if operation == .export {
+            var external = original
+            external.content = "external"
+            try JSONEncoder().encode([external]).write(to: directory.appendingPathComponent("templates.json"), options: .atomic)
+            // Busy reload returns after queuing, even though a probe owns the task.
+            await model.reloadTemplates()
+        }
+        probe.release.signal()
+        try await waitForProbeCompletion(model)
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertTrue(model.hasPendingTemplateRefresh)
+        switch operation {
+        case .export: XCTAssertTrue(model.isLoadingTemplates)
+        case .create: XCTAssertTrue(model.isCreatingFile); XCTAssertFalse(model.isLoadingTemplates)
+        case .save: XCTAssertTrue(model.isSavingTemplates); XCTAssertFalse(model.isLoadingTemplates)
+        }
+        interactive.release.signal()
+        try await action.value
+        let interactiveStatus = model.status
+        try await settle(model)
+        XCTAssertEqual(reads.count, 3)
+        XCTAssertEqual(model.status, interactiveStatus)
+        XCTAssertEqual(model.templates, try source.reloadTemplates())
+        if operation == .create { XCTAssertNotNil(model.createdFileURL) }
+        if operation == .save { XCTAssertEqual(model.templates.count, 2) }
+    }
+
+    func testUnavailableTokensStillLoadAuthorityWithoutRetryLoop() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        try store.saveTemplates([original])
+        let source = store!
+        let tokens = RefreshCounter()
+        let reads = RefreshCounter()
+        let model = QuickFileViewModel(templateStore: source, authoritativeTemplateLoader: {
+            reads.increment()
+            return try source.reloadTemplates()
+        }, templateChangeTokenReader: {
+            tokens.increment()
+            if tokens.count >= 3 { throw CocoaError(.fileReadUnknown) }
+            return try source.changeToken()
+        })
+        await model.loadTemplatesIfNeeded()
+        model.requestTemplateRefresh()
+        try await settle(model)
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(model.templates, [original])
+        XCTAssertNil(model.templateLoadFailure)
+        XCTAssertFalse(model.hasPendingTemplateRefresh)
+    }
+
+    func testReplacementDuringAuthorityAutomaticallyReloadsWithoutNotification() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "old")
+        let external = FileTemplate(name: "External", fileExtension: "txt", content: "new")
+        try store.saveTemplates([original])
+        let source = store!
+        let gate = RefreshGate()
+        defer { gate.release.signal() }
+        let reads = RefreshCounter()
+        let model = QuickFileViewModel(templateStore: source, templates: [original],
+            authoritativeTemplateLoader: {
+                reads.increment()
+                let loaded = try source.reloadTemplates()
+                gate.blockOnce()
+                return loaded
+            })
+        model.requestTemplateRefresh()
+        let started = await BackgroundWork.run { gate.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(started)
+        XCTAssertEqual(reads.count, 1)
+        XCTAssertEqual(model.templates, [original])
+        // No observer or notification: the token spanning the read must detect this replacement.
+        try JSONEncoder().encode([external]).write(to: directory.appendingPathComponent("templates.json"), options: .atomic)
+        gate.release.signal()
+        try await settle(model)
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(model.templates, [external])
+        XCTAssertNil(model.templateLoadFailure)
+        XCTAssertFalse(model.hasPendingTemplateRefresh)
+        XCTAssertFalse(model.isLoadingTemplates)
+    }
+
+    func testBeforeTokenFailureKeepsAuthorityAndRequiresNextEventToReadAgain() async throws {
+        try await checkOneSidedTokenFailure(failingCall: 1)
+    }
+
+    func testAfterTokenFailureKeepsAuthorityAndRequiresNextEventToReadAgain() async throws {
+        try await checkOneSidedTokenFailure(failingCall: 2)
+    }
+
+    private func checkOneSidedTokenFailure(failingCall: Int) async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "old")
+        let external = FileTemplate(name: "External", fileExtension: "txt", content: "new")
+        try store.saveTemplates([external])
+        let source = store!
+        let gate = RefreshGate()
+        defer { gate.release.signal() }
+        let tokens = RefreshCounter()
+        let reads = RefreshCounter()
+        let model = QuickFileViewModel(templateStore: source, templates: [original],
+            authoritativeTemplateLoader: {
+                reads.increment()
+                return try source.reloadTemplates()
+            }, templateChangeTokenReader: {
+                tokens.increment()
+                if tokens.count == failingCall {
+                    gate.blockOnce()
+                    throw CocoaError(.fileReadUnknown)
+                }
+                return try source.changeToken()
+            })
+        model.requestTemplateRefresh()
+        let started = await BackgroundWork.run { gate.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(started)
+        XCTAssertEqual(reads.count, failingCall == 1 ? 0 : 1)
+        XCTAssertEqual(model.templates, [original])
+        gate.release.signal()
+        try await settle(model)
+        XCTAssertEqual(reads.count, 1)
+        XCTAssertEqual(tokens.count, 2)
+        XCTAssertEqual(model.templates, [external])
+        XCTAssertNil(model.templateLoadFailure)
+        XCTAssertFalse(model.hasPendingTemplateRefresh)
+        XCTAssertFalse(model.isLoadingTemplates)
+
+        // A single valid token cannot bind the snapshot; the next event must read authority.
+        model.requestTemplateRefresh()
+        try await settle(model)
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(tokens.count, 4)
+        XCTAssertEqual(model.templates, [external])
+        XCTAssertNil(model.templateLoadFailure)
+        XCTAssertFalse(model.hasPendingTemplateRefresh)
+
+        // The successful pair reestablishes the healthy probe path.
+        model.requestTemplateRefresh()
+        try await settle(model)
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(tokens.count, 5)
+        XCTAssertFalse(model.hasPendingTemplateRefresh)
+    }
+
+    func testModelReleasesWhileHealthyProbeIsBlocked() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        try store.saveTemplates([original])
+        let source = store!
+        let probe = RefreshGate()
+        defer { probe.release.signal() }
+        let tokens = RefreshCounter()
+        var model: QuickFileViewModel? = QuickFileViewModel(templateStore: source, templateChangeTokenReader: {
+            tokens.increment()
+            if tokens.count == 3 {
+                defer { probe.finished.signal() }
+                probe.blockOnce()
+                return try source.changeToken()
+            }
+            return try source.changeToken()
+        })
+        await model?.loadTemplatesIfNeeded()
+        weak var weakModel = model
+        model?.requestTemplateRefresh()
+        let started = await BackgroundWork.run { probe.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(started)
+        model = nil
+        XCTAssertNil(weakModel)
+        probe.release.signal()
+        let finished = await BackgroundWork.run { probe.finished.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(finished)
     }
 
     func testActivationDetectsDirectReplacementAndUnchangedChecksSkipBodies() async throws {

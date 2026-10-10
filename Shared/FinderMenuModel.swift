@@ -123,7 +123,8 @@ public struct FinderMenuAction: Equatable, Sendable {
     }
 }
 
-public final class FinderMenuActionRegistry {
+// All mutable state is protected by the lock; returned actions are immutable values.
+public final class FinderMenuActionRegistry: @unchecked Sendable {
     private let retainedGenerationCount: Int
     private let lock = NSLock()
     private var nextTag = 1
@@ -134,60 +135,24 @@ public final class FinderMenuActionRegistry {
         self.retainedGenerationCount = max(1, retainedGenerationCount)
     }
 
-    public func beginMenu() {
+    /// Register and evict whole menus under one lock. Concurrent menu builders
+    /// cannot append their actions to another menu's generation.
+    public func registerMenu(_ menuActions: [FinderMenuAction]) -> [Int] {
         lock.lock()
         defer { lock.unlock() }
 
-        menuTagGenerations.append([])
-        guard menuTagGenerations.count > retainedGenerationCount else {
-            return
+        let tags = menuActions.map { action in
+            let tag = makeTag()
+            actions[tag] = action
+            return tag
         }
-
-        for tag in menuTagGenerations.removeFirst() {
-            actions.removeValue(forKey: tag)
+        menuTagGenerations.append(tags)
+        if menuTagGenerations.count > retainedGenerationCount {
+            for tag in menuTagGenerations.removeFirst() {
+                actions.removeValue(forKey: tag)
+            }
         }
-    }
-
-    public func register(
-        templateID: FileTemplate.ID,
-        context: FinderMenuContext,
-        destinationFolder: URL,
-        destinationIdentity: DirectoryIdentity? = nil,
-        menuTimingID: String? = nil
-    ) -> Int {
-        register(FinderMenuAction(
-            templateID: templateID, context: context, destinationFolder: destinationFolder,
-            destinationIdentity: destinationIdentity, menuTimingID: menuTimingID
-        ))
-    }
-
-    public func register(
-        templateID: FileTemplate.ID,
-        context: FinderMenuContext,
-        targetedURL: URL?,
-        selectedItemURLs: [URL],
-        preparedDestination: FinderMenuDestination? = nil,
-        menuTimingID: String? = nil
-    ) -> Int {
-        register(FinderMenuAction(
-            templateID: templateID, context: context,
-            targetedURL: targetedURL, selectedItemURLs: selectedItemURLs,
-            preparedDestination: preparedDestination, menuTimingID: menuTimingID
-        ))
-    }
-
-    private func register(_ action: FinderMenuAction) -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let tag = makeTag()
-        if menuTagGenerations.isEmpty {
-            menuTagGenerations.append([])
-        }
-        actions[tag] = action
-        menuTagGenerations[menuTagGenerations.index(before: menuTagGenerations.endIndex)].append(tag)
-
-        return tag
+        return tags
     }
 
     public func takeAction(for tag: Int) -> FinderMenuAction? {

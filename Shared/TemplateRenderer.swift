@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 struct TemplateRenderingContext: Sendable {
     let date: Date
@@ -33,9 +34,12 @@ struct TemplateRenderer: Sendable {
     }
 
     static func containsVariable(_ name: String, in content: String) -> Bool {
+        // An ASCII opening brace is required even when the surrounding text is Unicode.
+        guard containsOpeningBrace(in: content) else { return false }
+        let scanner = DelimiterScanner(content)
         var cursor = content.startIndex
-        while let opening = content.range(of: "{{", range: cursor..<content.endIndex) {
-            guard let closing = content.range(of: "}}", range: opening.upperBound..<content.endIndex) else {
+        while let opening = scanner.range(of: 0x7B, from: cursor) {
+            guard let closing = scanner.range(of: 0x7D, from: opening.upperBound) else {
                 return false
             }
             if content[opening.upperBound..<closing.lowerBound] == name { return true }
@@ -45,7 +49,8 @@ struct TemplateRenderer: Sendable {
     }
 
     func render(_ content: String, context: TemplateRenderingContext) throws -> String {
-        guard content.contains("{{") else {
+        let scanner = Self.containsOpeningBrace(in: content) ? DelimiterScanner(content) : nil
+        guard let scanner, scanner.range(of: 0x7B, from: content.startIndex) != nil else {
             guard content.utf8.count <= maximumOutputUTF8Bytes else {
                 throw FileCreationError.renderedContentTooLarge(maximumUTF8Bytes: maximumOutputUTF8Bytes)
             }
@@ -79,7 +84,7 @@ struct TemplateRenderer: Sendable {
         // source can exceed the budget while expanding to less (e.g. empty clipboard).
         // Both passes share immutable replacements, so providers are captured once.
         var outputUTF8Bytes = 0
-        try forEachSegment(in: content, replacements: replacements) { segment in
+        try forEachSegment(in: content, scanner: scanner, replacements: replacements) { segment in
             let byteCount = segment.utf8.count
             guard byteCount <= maximumOutputUTF8Bytes - outputUTF8Bytes else {
                 throw FileCreationError.renderedContentTooLarge(maximumUTF8Bytes: maximumOutputUTF8Bytes)
@@ -89,20 +94,21 @@ struct TemplateRenderer: Sendable {
 
         var rendered = ""
         rendered.reserveCapacity(outputUTF8Bytes)
-        forEachSegment(in: content, replacements: replacements) { rendered.append(contentsOf: $0) }
+        forEachSegment(in: content, scanner: scanner, replacements: replacements) { rendered.append(contentsOf: $0) }
         return rendered
     }
 
     private func forEachSegment(
         in content: String,
+        scanner: DelimiterScanner,
         replacements: [Substring: String],
         _ consume: (Substring) throws -> Void
     ) rethrows {
         var cursor = content.startIndex
 
-        while let openingRange = content.range(of: "{{", range: cursor..<content.endIndex) {
+        while let openingRange = scanner.range(of: 0x7B, from: cursor) {
             try consume(content[cursor..<openingRange.lowerBound])
-            guard let closingRange = content.range(of: "}}", range: openingRange.upperBound..<content.endIndex) else {
+            guard let closingRange = scanner.range(of: 0x7D, from: openingRange.upperBound) else {
                 try consume(content[openingRange.lowerBound...])
                 return
             }
@@ -118,5 +124,42 @@ struct TemplateRenderer: Sendable {
         }
 
         try consume(content[cursor...])
+    }
+
+    private static func containsOpeningBrace(in content: String) -> Bool {
+        // Borrow contiguous UTF-8 without materializing Data or bridging the string.
+        // Keep the collection path for strings that cannot expose such storage.
+        content.utf8.withContiguousStorageIfAvailable { bytes in
+            guard let base = bytes.baseAddress else { return false }
+            return memchr(base, 0x7B, bytes.count) != nil
+        } ?? content.utf8.contains(0x7B)
+    }
+
+    private struct DelimiterScanner {
+        let content: String
+        let isASCII: Bool
+
+        init(_ content: String) {
+            self.content = content
+            isASCII = content.utf8.allSatisfy { $0 < 0x80 }
+        }
+
+        func range(of brace: UInt8, from start: String.Index) -> Range<String.Index>? {
+            guard isASCII else {
+                // Foundation's default search observes Unicode character boundaries.
+                // Literal byte matches next to combining marks are not equivalent.
+                return content.range(of: brace == 0x7B ? "{{" : "}}", range: start..<content.endIndex)
+            }
+            let bytes = content.utf8
+            var cursor = start
+            while let first = bytes[cursor...].firstIndex(of: brace) {
+                let next = bytes.index(after: first)
+                if next != bytes.endIndex, bytes[next] == brace {
+                    return first..<bytes.index(after: next)
+                }
+                cursor = next
+            }
+            return nil
+        }
     }
 }

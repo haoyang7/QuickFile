@@ -139,10 +139,12 @@ public struct FileCreationService: @unchecked Sendable {
                 throw FileCreationError.writeFailed(fileURL, posixError())
             }
 
-            let data: Data
+            let data: Data?
+            var rendered = ""
             if let format = request.template.officeFormat {
                 data = format.data
             } else {
+                data = nil
                 let inputs: (date: Date, clipboard: String)
                 if let renderingInputs {
                     inputs = renderingInputs
@@ -157,10 +159,22 @@ public struct FileCreationService: @unchecked Sendable {
                     clipboard: inputs.clipboard,
                     sequence: sequence
                 )
-                data = Data(try templateRenderer.render(request.template.content, context: context).utf8)
+                rendered = try templateRenderer.render(request.template.content, context: context)
             }
             do {
-                if let committedURL = try commit(data, named: filename, in: directoryFD, folderURL: destinationFolder, timing: timing) {
+                // Validate the complete render before staging, then borrow its bytes only
+                // for this synchronous commit instead of copying the output into Data.
+                let committedURL: URL?
+                if let data {
+                    committedURL = try data.withUnsafeBytes { bytes in
+                        try commit(bytes, named: filename, in: directoryFD, folderURL: destinationFolder, timing: timing)
+                    }
+                } else {
+                    committedURL = try rendered.withUTF8 { bytes in
+                        try commit(UnsafeRawBufferPointer(bytes), named: filename, in: directoryFD, folderURL: destinationFolder, timing: timing)
+                    }
+                }
+                if let committedURL {
                     timing?.mark("writer.result.ready")
                     return FileCreationResult(fileURL: committedURL, didRenameForConflict: sequence > 1)
                 }
@@ -196,7 +210,7 @@ public struct FileCreationService: @unchecked Sendable {
 
     // An exclusive rename publishes only a fully written file after closing its write handle. Unsupported
     // filesystems fail safely; never fall back to an overwriting rename or a final-path write.
-    private func commit(_ data: Data, named filename: String, in directoryFD: Int32, folderURL: URL, timing: CreationTiming?) throws -> URL? {
+    private func commit(_ bytes: UnsafeRawBufferPointer, named filename: String, in directoryFD: Int32, folderURL: URL, timing: CreationTiming?) throws -> URL? {
         timing?.mark("staging.begin")
         let staging = try PrivateFileStagingDirectory.replacementDirectory(
             for: folderURL, directoryDescriptor: directoryFD, fileManager: fileManager
@@ -216,14 +230,12 @@ public struct FileCreationService: @unchecked Sendable {
         defer { if isOpen { close(descriptor) } }
         try staging.applyDestinationPermissions(to: descriptor, in: directoryFD)
         timing?.mark("payload.permissions.ready")
-        try data.withUnsafeBytes { bytes in
-            var offset = 0
-            while offset < bytes.count {
-                let written = Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
-                if written < 0 && errno == EINTR { continue }
-                guard written > 0 else { throw posixError(fallback: EIO) }
-                offset += written
-            }
+        var offset = 0
+        while offset < bytes.count {
+            let written = Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+            if written < 0 && errno == EINTR { continue }
+            guard written > 0 else { throw posixError(fallback: EIO) }
+            offset += written
         }
         // Capture identity before the final writer close. A duplicated descriptor
         // would postpone that close and could hide a writeback failure until publication.

@@ -138,6 +138,25 @@ final class TemplateRendererTests: XCTestCase {
         }
     }
 
+    func testASCIIDelimitersPreserveControlBytesAndIsolatedBraces() throws {
+        let content = "{\u{0}{\r\n{{clipboard}}} { {{sequence}}\u{0}"
+        let context = budgetContext(clipboard: "value\u{0}")
+        XCTAssertTrue(TemplateRenderer.containsVariable("clipboard", in: content))
+        let rendered = try TemplateRenderer().render(content, context: context)
+        XCTAssertEqual(Array(rendered.utf8), Array("{\u{0}{\r\nvalue\u{0}} { 1\u{0}".utf8))
+    }
+
+    func testDelimiterSearchPreservesUnicodeCharacterBoundaries() throws {
+        let context = budgetContext(clipboard: "CAPTURED")
+        for mark in ["\u{301}", "\u{FE0F}", "\u{200D}", "\u{034F}"] {
+            for content in ["{{\(mark)clipboard}}", "{{clipboard}}\(mark)", "{\(mark){clipboard}}"] {
+                XCTAssertFalse(TemplateRenderer.containsVariable("clipboard", in: content), content.debugDescription)
+                XCTAssertEqual(Array(try TemplateRenderer().render(content, context: context).utf8), Array(content.utf8))
+            }
+        }
+        XCTAssertEqual(try TemplateRenderer().render("界{{clipboard}}🧪", context: context), "界CAPTURED🧪")
+    }
+
     func testLiteralOutputRespectsBudgetBelowAtAndAboveLimit() throws {
         let renderer = TemplateRenderer(maximumOutputUTF8Bytes: 8)
         let context = budgetContext()

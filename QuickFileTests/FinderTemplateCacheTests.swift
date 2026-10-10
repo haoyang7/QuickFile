@@ -385,6 +385,255 @@ final class FinderTemplateCacheTests: XCTestCase {
         XCTAssertNil(try cache.templateForCreation(id: template.id))
     }
 
+    func testUnchangedCompensationSkipsFileReadsButCreationStillReadsBody() throws {
+        let template = FileTemplate(name: "Text", fileExtension: "txt", content: "body")
+        try makeStore().saveTemplates([template])
+        let fileReads = LockedTestValue(0)
+        let reader = TemplateStore(
+            defaults: defaults, storageURL: storageURL, cachesReads: false, cachesMenuReads: true,
+            changeNotificationName: notificationName,
+            readTemplatesData: { url in
+                fileReads.update { $0 += 1 }
+                return try Data(contentsOf: url)
+            }
+        )
+        let tokenLoader = PausedChangeTokenLoader { try reader.changeToken() }
+        defer { tokenLoader.release.signal() }
+        tokenLoader.pause(read: 3)
+        let cache = FinderTemplateCache(
+            loadForCreation: { try reader.reloadCreationSnapshot(templateID: $0) },
+            loadMenuEntries: { try reader.reloadMenuEntries() },
+            loadChangeToken: { try tokenLoader.load() },
+            changeNotificationName: notificationName, refreshInterval: 0
+        )
+        XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([template])))
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(fileReads.value, 1)
+
+        // The fourth token check starts only after the unchanged third check completes.
+        tokenLoader.pause(read: 4)
+        tokenLoader.release.signal()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(fileReads.value, 1)
+        XCTAssertEqual(try cache.templateForCreation(id: template.id), template)
+        XCTAssertEqual(fileReads.value, 2, "Creation must read the body even for an unchanged menu token")
+    }
+
+    func testChangedCompensationTokenLoadsAndPublishesNewMenu() throws {
+        let (oldToken, newToken) = try changeTokens()
+        let old = FileTemplate(name: "Old", fileExtension: "txt", content: "old")
+        let new = FileTemplate(name: "New", fileExtension: "md", content: "new")
+        let templates = LockedTestValue([old])
+        let token = LockedTestValue(oldToken)
+        let menuReads = LockedTestValue(0)
+        let tokenLoader = PausedChangeTokenLoader { token.value }
+        defer { tokenLoader.release.signal() }
+        tokenLoader.pause(read: 3)
+        let cache = makeTokenCache(templates, menuReads: menuReads, tokenLoader: tokenLoader)
+        XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([old])))
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        templates.value = [new]
+        token.value = newToken
+        // Finish the unchanged check, then bracket the changed authority read.
+        tokenLoader.pause(read: 6)
+        tokenLoader.release.signal()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(menuReads.value, 2)
+        XCTAssertEqual(cache.currentSnapshot(), .ready(entries([new])))
+    }
+
+    func testNotificationForcesAuthorityDespiteUnchangedToken() throws {
+        let (token, _) = try changeTokens()
+        let old = FileTemplate(name: "Old", fileExtension: "txt", content: "old")
+        let new = FileTemplate(name: "New", fileExtension: "md", content: "new")
+        let templates = LockedTestValue([old])
+        let menuReads = LockedTestValue(0)
+        let tokenLoader = PausedChangeTokenLoader { token }
+        defer { tokenLoader.release.signal() }
+        let cache = makeTokenCache(templates, menuReads: menuReads, tokenLoader: tokenLoader,
+                                   refreshInterval: 5)
+        XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([old])))
+        templates.value = [new]
+        tokenLoader.pause(read: 3)
+        postTemplateChangeNotification()
+        XCTAssertTrue(waitForSemaphore(tokenLoader.started))
+        XCTAssertEqual(cache.currentSnapshot(), .loading(previous: entries([old])))
+        tokenLoader.release.signal()
+        XCTAssertEqual(waitForReadyEntries(cache, expected: entries([new])), entries([new]))
+        XCTAssertEqual(menuReads.value, 2)
+        XCTAssertEqual(cache.currentSnapshot(), .ready(entries([new])))
+    }
+
+    func testFailedTokenCheckFallsBackToAuthorityAndDoesNotTrustAfterToken() throws {
+        let (token, _) = try changeTokens()
+        let old = FileTemplate(name: "Old", fileExtension: "txt", content: "old")
+        let new = FileTemplate(name: "New", fileExtension: "md", content: "new")
+        let templates = LockedTestValue([old])
+        let menuReads = LockedTestValue(0)
+        let tokenReads = LockedTestValue(0)
+        let tokenLoader = PausedChangeTokenLoader {
+            let read = tokenReads.update { $0 += 1; return $0 }
+            if read == 3 { throw CocoaError(.fileReadNoPermission) }
+            return token
+        }
+        defer { tokenLoader.release.signal() }
+        tokenLoader.pause(read: 3)
+        let cache = makeTokenCache(templates, menuReads: menuReads, tokenLoader: tokenLoader)
+        XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([old])))
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        templates.value = [new]
+        tokenLoader.pause(read: 5)
+        tokenLoader.release.signal()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(menuReads.value, 2)
+        XCTAssertEqual(cache.currentSnapshot(), .ready(entries([new])))
+        // The successful after-token cannot establish trust when the before-check failed.
+        tokenLoader.pause(read: 7)
+        tokenLoader.release.signal()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(menuReads.value, 3)
+    }
+
+    func testTokenChangeDuringAuthorityReadCannotPairNewTokenWithOlderMenu() throws {
+        let (oldToken, newToken) = try changeTokens()
+        let old = FileTemplate(name: "Old", fileExtension: "txt", content: "old")
+        let new = FileTemplate(name: "New", fileExtension: "md", content: "new")
+        let token = LockedTestValue(oldToken)
+        let menuReads = LockedTestValue(0)
+        let tokenLoader = PausedChangeTokenLoader { token.value }
+        defer { tokenLoader.release.signal() }
+        tokenLoader.pause(read: 3)
+        let cache = FinderTemplateCache(
+            loadForCreation: { id in Self.creationSnapshot([new], id: id) },
+            loadMenuEntries: {
+                let read = menuReads.update { $0 += 1; return $0 }
+                if read == 1 {
+                    token.value = newToken
+                    return FinderMenuModelBuilder().entries(from: [old])
+                }
+                return FinderMenuModelBuilder().entries(from: [new])
+            },
+            loadChangeToken: { try tokenLoader.load() },
+            changeNotificationName: notificationName, refreshInterval: 0
+        )
+        XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([old])))
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        tokenLoader.pause(read: 5)
+        tokenLoader.release.signal()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(menuReads.value, 2,
+                       "Changed before/after tokens must force the next authority read")
+        XCTAssertEqual(cache.currentSnapshot(), .ready(entries([new])))
+    }
+
+    func testFailedAfterTokenCheckDoesNotEstablishMenuTrust() throws {
+        let (token, _) = try changeTokens()
+        let template = FileTemplate(name: "Text", fileExtension: "txt", content: "body")
+        let templates = LockedTestValue([template])
+        let menuReads = LockedTestValue(0)
+        let tokenReads = LockedTestValue(0)
+        let tokenLoader = PausedChangeTokenLoader {
+            let read = tokenReads.update { $0 += 1; return $0 }
+            if read == 2 { throw CocoaError(.fileReadNoPermission) }
+            return token
+        }
+        defer { tokenLoader.release.signal() }
+        tokenLoader.pause(read: 3)
+        let cache = makeTokenCache(templates, menuReads: menuReads, tokenLoader: tokenLoader)
+        XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([template])))
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        tokenLoader.pause(read: 5)
+        tokenLoader.release.signal()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(menuReads.value, 2,
+                       "A failed after-check must force another authority read")
+    }
+
+    func testFailedAuthorityRefreshRecoversDespiteUnchangedToken() throws {
+        let (token, _) = try changeTokens()
+        let old = FileTemplate(name: "Old", fileExtension: "txt", content: "old")
+        let new = FileTemplate(name: "New", fileExtension: "md", content: "new")
+        let menuReads = LockedTestValue(0)
+        let shouldFail = LockedTestValue(false)
+        let tokenLoader = PausedChangeTokenLoader { token }
+        defer { tokenLoader.release.signal() }
+        let cache = FinderTemplateCache(
+            loadForCreation: { id in Self.creationSnapshot([new], id: id) },
+            loadMenuEntries: {
+                let read = menuReads.update { $0 += 1; return $0 }
+                if shouldFail.value { throw CocoaError(.fileReadNoPermission) }
+                return FinderMenuModelBuilder().entries(from: read == 1 ? [old] : [new])
+            },
+            loadChangeToken: { try tokenLoader.load() },
+            changeNotificationName: notificationName
+        )
+        XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([old])))
+        shouldFail.value = true
+        tokenLoader.pause(read: 4)
+        postTemplateChangeNotification()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(menuReads.value, 2)
+        XCTAssertEqual(cache.currentSnapshot(), .loading(previous: entries([old])))
+        shouldFail.value = false
+        tokenLoader.release.signal()
+        XCTAssertEqual(waitForReadyEntries(cache, expected: entries([new])), entries([new]))
+        XCTAssertEqual(menuReads.value, 3)
+    }
+
+    func testNotificationDuringUnchangedCheckCoalescesIntoAuthorityRead() throws {
+        let (token, _) = try changeTokens()
+        let old = FileTemplate(name: "Old", fileExtension: "txt", content: "old")
+        let new = FileTemplate(name: "New", fileExtension: "md", content: "new")
+        let templates = LockedTestValue([old])
+        let menuReads = LockedTestValue(0)
+        let tokenLoader = PausedChangeTokenLoader { token }
+        defer { tokenLoader.release.signal() }
+        tokenLoader.pause(read: 3)
+        let cache = makeTokenCache(templates, menuReads: menuReads, tokenLoader: tokenLoader)
+        XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([old])))
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        templates.value = [new]
+        postTemplateChangeNotification()
+        let loading = FinderTemplateCache.Snapshot.loading(previous: entries([old]))
+        XCTAssertEqual(waitForSnapshot(cache) { $0 == loading }, loading)
+        XCTAssertEqual(menuReads.value, 1, "The notification cannot start a second background slot")
+        tokenLoader.pause(read: 6)
+        tokenLoader.release.signal()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(menuReads.value, 2)
+        XCTAssertEqual(cache.currentSnapshot(), .ready(entries([new])))
+    }
+
+    func testCreationDuringUnchangedCheckCannotRestoreEarlierMenuToken() throws {
+        let (token, _) = try changeTokens()
+        let old = FileTemplate(name: "Old", fileExtension: "txt", content: "old")
+        var edited = old
+        edited.name = "New"
+        edited.content = "new body"
+        let new = edited
+        let templates = LockedTestValue([old])
+        let menuReads = LockedTestValue(0)
+        let tokenLoader = PausedChangeTokenLoader { token }
+        defer { tokenLoader.release.signal() }
+        tokenLoader.pause(read: 3)
+        let cache = makeTokenCache(templates, menuReads: menuReads, tokenLoader: tokenLoader)
+        XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([old])))
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        templates.value = [new]
+        XCTAssertEqual(try cache.templateForCreation(id: old.id), new)
+        XCTAssertEqual(cache.currentSnapshot(), .ready(entries([new])))
+        tokenLoader.pause(read: 4)
+        tokenLoader.release.signal()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(cache.currentSnapshot(), .ready(entries([new])))
+        tokenLoader.pause(read: 6)
+        tokenLoader.release.signal()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: tokenLoader.started))
+        XCTAssertEqual(menuReads.value, 2,
+                       "The obsolete unchanged check cannot restore trust after creation")
+        XCTAssertEqual(cache.currentSnapshot(), .ready(entries([new])))
+    }
+
     func testDarwinCallbackOwnsHandlerDuringConcurrentObserverDestruction() {
         let entered = expectation(description: "Darwin callback entered")
         let finished = expectation(description: "handler survived observer destruction")
@@ -427,6 +676,38 @@ final class FinderTemplateCacheTests: XCTestCase {
 
     private func entries(_ templates: [FileTemplate]) -> [FinderTemplateMenuEntry] {
         FinderMenuModelBuilder().entries(from: templates)
+    }
+
+    private func changeTokens() throws -> (TemplateStore.ChangeToken, TemplateStore.ChangeToken) {
+        let store = TemplateStore(defaults: defaults)
+        defaults.set("old", forKey: "templates.revision.v2")
+        let old = try store.changeToken()
+        defaults.set("new", forKey: "templates.revision.v2")
+        return (old, try store.changeToken())
+    }
+
+    private func makeTokenCache(
+        _ templates: LockedTestValue<[FileTemplate]>,
+        menuReads: LockedTestValue<Int>,
+        tokenLoader: PausedChangeTokenLoader,
+        refreshInterval: TimeInterval = 0
+    ) -> FinderTemplateCache {
+        FinderTemplateCache(
+            loadForCreation: { id in Self.creationSnapshot(templates.value, id: id) },
+            loadMenuEntries: {
+                menuReads.update { $0 += 1 }
+                return FinderMenuModelBuilder().entries(from: templates.value)
+            },
+            loadChangeToken: { try tokenLoader.load() },
+            changeNotificationName: notificationName, refreshInterval: refreshInterval
+        )
+    }
+
+    private func postTemplateChangeNotification() {
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            CFNotificationName(notificationName as CFString), nil, nil, true
+        )
     }
 
     private static func creationSnapshot(_ templates: [FileTemplate], id: UUID) -> TemplateStore.CreationSnapshot {
@@ -491,6 +772,42 @@ final class FinderTemplateCacheTests: XCTestCase {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
         } while Date() < deadline
         return semaphore.wait(timeout: .now()) == .success
+    }
+}
+
+// Captures the check's result before pausing, so a concurrent notification or creation
+// deterministically exercises a late result. All mutable scheduling state is locked.
+private final class PausedChangeTokenLoader: @unchecked Sendable {
+    private struct State: Sendable {
+        var readCount = 0
+        var pausedReads: Set<Int> = []
+    }
+
+    private let state = LockedTestValue(State())
+    private let loader: @Sendable () throws -> TemplateStore.ChangeToken
+    let started = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+
+    init(_ loader: @escaping @Sendable () throws -> TemplateStore.ChangeToken) {
+        self.loader = loader
+    }
+
+    func pause(read: Int) {
+        state.update { $0.pausedReads.insert(read) }
+    }
+
+    func load() throws -> TemplateStore.ChangeToken {
+        XCTAssertFalse(Thread.isMainThread, "Menu token checks must stay off the menu thread")
+        let shouldPause = state.update { state in
+            state.readCount += 1
+            return state.pausedReads.remove(state.readCount) != nil
+        }
+        let result = Result { try loader() }
+        if shouldPause {
+            started.signal()
+            XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+        }
+        return try result.get()
     }
 }
 
