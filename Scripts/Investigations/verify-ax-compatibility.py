@@ -179,6 +179,10 @@ def main():
                           "host": capabilities, "reader": reader_capabilities}))
         return 77
     environment.update(MallocStackLogging="1", MallocStackLoggingNoCompact="1")
+    if args.heap_diagnostics:
+        # Full frozen histories must preserve free/reallocation generations.
+        # MallocStackLogging would take precedence over NoCompact if both were set.
+        environment.pop("MallocStackLogging")
     results = []
     validation_errors = []
     checkpoints = []
@@ -213,7 +217,7 @@ def main():
             target = str(host.pid)
             if args.heap_diagnostics:
                 graph = graphs / f"{label}.memgraph"
-                capture = subprocess.run(["leaks", "--noContent", "--fullStacks", f"--outputGraph={graph}", target],
+                capture = subprocess.run(["leaks", "--noContent", "--fullStacks", "--fullStackHistory", f"--outputGraph={graph}", target],
                                          capture_output=True, text=True, timeout=60)
                 (graphs / f"{label}-capture.txt").write_text(capture.stdout + capture.stderr)
                 if capture.returncode not in (0, 1) or not graph.is_file():
@@ -254,14 +258,6 @@ def main():
                 if warmed["buttons"] or warmed["registrations"] or warmed["notifications"]:
                     raise RuntimeError(f"AX baseline warm-up was not empty: {warmed}")
                 scan("baseline", command("checkpoint"))
-            if args.heap_diagnostics:
-                # One fixed empty-window control, with no add or new reader
-                # command. Keep the original baseline and every scan failure.
-                empty = command("checkpoint")
-                if any(empty[key] for key in ("buttons", "allocatedButtons", "destroyedButtons",
-                                              "compensations", "mutableCompensations")):
-                    raise RuntimeError("Heap empty control contained owned button activity")
-                scan("empty-control", empty)
             for cycle in range(1, args.cycles + 1):
                 added = command("add")
                 if args.heap_diagnostics and cycle == 1:

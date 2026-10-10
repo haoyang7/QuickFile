@@ -5,12 +5,14 @@ Only grouped counts, symbols, offsets and relevant ownership instructions are
 printed by the investigation workflow.
 """
 import ctypes
+from collections import Counter
 import hashlib
 import json
 import re
 import struct
 import subprocess
 import sys
+import time
 
 DESTROYED = "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification"
 
@@ -30,7 +32,11 @@ HEAP_STACK_PATTERNS = {
     "xpc_container": r"\bxpc_(?:array|dictionary)_create\b",
     "notification_center": r"-\[NSNotificationCenter [^\]]+\]",
 }
-HEAP_LABELS = ("baseline", "empty-control", "added-10", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited")
+HEAP_LABELS = ("baseline", "added-10", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited")
+COHORT_FIELDS = ("preexisting_nodes", "new_allocation_nodes", "unknown_nodes")
+COHORT_ADDRESS_LIMIT = 128
+COHORT_SECONDS = 45
+REPORT_BYTE_LIMIT = 16 * 1024 * 1024
 # Exact, OS-owned paths are used only for local verification and never emitted.
 HEAP_IMAGES = {
     "AppKit": ("com.apple.AppKit", "/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit"),
@@ -156,14 +162,14 @@ def validate_heap_diagnostics_summary(value):
             raise ValueError("Invalid bounded heap diagnostic summary")
 
     integer = lambda item: type(item) is int and 0 <= item <= 1_000_000_000
-    require(type(value) is dict and set(value) == {"schema", "status", "checkpoints", "symbols", "omitted_symbols", "symbols_status"})
-    require(type(value["schema"]) is int and value["schema"] == 3)
+    require(type(value) is dict and set(value) == {"schema", "status", "checkpoints", "symbols", "omitted_symbols", "symbols_status", "cohorts_status"})
+    require(type(value["schema"]) is int and value["schema"] == 4)
     require(value["status"] in ("complete", "partial", "unavailable"))
     require(type(value["checkpoints"]) is list and len(value["checkpoints"]) < len(HEAP_LABELS))
     seen, rows = set(), 0
     fields = {"label", "status", "new_nodes", "new_bytes", "classified_nodes", "unparsed_nodes",
               "groups", "stack_matches", "unknown_stack_nodes", "omitted_groups",
-              "image_nodes", "missing_stack_nodes", "unverified_stack_nodes"}
+              "image_nodes", "missing_stack_nodes", "unverified_stack_nodes", "allocation_cohorts"}
     for point in value["checkpoints"]:
         require(type(point) is dict and set(point) == fields)
         require(type(point["label"]) is str and point["label"] in HEAP_LABELS[1:] and point["label"] not in seen)
@@ -175,6 +181,21 @@ def validate_heap_diagnostics_summary(value):
             require(integer(point[key]))
         for key in ("unknown_stack_nodes", "missing_stack_nodes", "unverified_stack_nodes"):
             require(point[key] <= point["classified_nodes"])
+        cohorts = point["allocation_cohorts"]
+        require(type(cohorts) is dict and set(cohorts) == {"status", *COHORT_FIELDS})
+        require(cohorts["status"] in ("complete", "partial", "unavailable"))
+        require(all(integer(cohorts[key]) for key in COHORT_FIELDS[:2]))
+        require(cohorts["unknown_nodes"] is None or integer(cohorts["unknown_nodes"]))
+        if point["new_nodes"] is None:
+            require(cohorts == empty_cohorts(None))
+        else:
+            require(cohorts["unknown_nodes"] is not None)
+            require(sum(cohorts[key] for key in COHORT_FIELDS) == point["new_nodes"])
+            require(cohorts["preexisting_nodes"] + cohorts["new_allocation_nodes"] <= COHORT_ADDRESS_LIMIT)
+        if cohorts["status"] == "complete":
+            require(cohorts["unknown_nodes"] == 0 and point["unparsed_nodes"] == 0)
+        if cohorts["status"] == "unavailable":
+            require(cohorts["preexisting_nodes"] == cohorts["new_allocation_nodes"] == 0)
         require(type(point["image_nodes"]) is dict and set(point["image_nodes"]) == set(HEAP_IMAGES))
         require(all(integer(count) and count <= point["classified_nodes"] for count in point["image_nodes"].values()))
         require(type(point["stack_matches"]) is dict and set(point["stack_matches"]) == set(HEAP_STACK_PATTERNS))
@@ -192,6 +213,8 @@ def validate_heap_diagnostics_summary(value):
             require(point["new_bytes"] == sum(group["size"] * group["count"] for group in point["groups"]))
     if value["status"] == "complete":
         require(seen == set(HEAP_LABELS[1:]) and all(point["status"] == "complete" for point in value["checkpoints"]))
+    require(value["cohorts_status"] in ("complete", "partial", "unavailable"))
+    require(value["cohorts_status"] == cohort_status(value["checkpoints"]))
     require(integer(value["omitted_symbols"]))
     require(value["symbols_status"] in ("complete", "partial", "unavailable"))
     if value["symbols_status"] == "complete":
@@ -213,6 +236,19 @@ def validate_heap_diagnostics_summary(value):
     require(len(json.dumps(value, ensure_ascii=True).encode("utf-8")) <= 16 * 1024)
 
 
+def empty_cohorts(nodes):
+    return {"status": "complete" if nodes == 0 else "unavailable", "preexisting_nodes": 0,
+            "new_allocation_nodes": 0, "unknown_nodes": nodes}
+
+
+def cohort_status(checkpoints):
+    if len(checkpoints) == len(HEAP_LABELS) - 1 and all(
+            point["allocation_cohorts"]["status"] == "complete" for point in checkpoints):
+        return "complete"
+    return ("partial" if any(point["allocation_cohorts"]["status"] != "unavailable" for point in checkpoints)
+            else "unavailable")
+
+
 def heap_diff_summary(report, *, resolver=None, symbol_counts=None):
     """Summarize `leaks --list --diffFrom` without exposing arbitrary text.
 
@@ -227,13 +263,14 @@ def heap_diff_summary(report, *, resolver=None, symbol_counts=None):
                "stack_matches": {name: 0 for name in HEAP_STACK_PATTERNS},
                "unknown_stack_nodes": 0, "omitted_groups": 0,
                "image_nodes": {name: 0 for name in HEAP_IMAGES},
-               "missing_stack_nodes": 0, "unverified_stack_nodes": 0}
-    if len(report) > 16 * 1024 * 1024:
+               "missing_stack_nodes": 0, "unverified_stack_nodes": 0, "allocation_cohorts": empty_cohorts(None)}
+    if len(report) > REPORT_BYTE_LIMIT:
         return summary
     total = re.search(r"^Process \d+: (\d+) leaks? for (\d+) total leaked bytes\.", report, re.MULTILINE)
     if not total or any(len(value) > 10 or int(value) > limit for value in total.groups()):
         return summary
     summary.update(new_nodes=int(total[1]), new_bytes=int(total[2]))
+    summary["allocation_cohorts"] = empty_cohorts(summary["new_nodes"])
     groups = {}
     parsed_bytes = 0
     for block in report.split("Binary Images:", 1)[0].split("\nLeak: ")[1:]:
@@ -270,12 +307,136 @@ def heap_diff_summary(report, *, resolver=None, symbol_counts=None):
     return summary
 
 
+def leak_allocations(report, point):
+    """Private addresses only; a partial leak listing cannot establish a cohort."""
+    if point["unparsed_nodes"] != 0 or point["new_nodes"] is None:
+        return None
+    rows = re.findall(r"^Leak: (0x[0-9a-fA-F]{1,16})\s+size=(\d{1,10})\s+zone:", report, re.MULTILINE)
+    nodes = {int(address, 16): int(size) for address, size in rows}
+    if (len(nodes) != len(rows) or len(nodes) != point["new_nodes"]
+            or sum(nodes.values()) != point["new_bytes"]):
+        return None
+    return nodes
+
+
+def heap_allocations(report):
+    """Require the complete all-zones address list, including for an empty diff."""
+    if len(report) > REPORT_BYTE_LIMIT:
+        return None
+    total = re.search(r"^All zones: (\d{1,6}) nodes malloced", report, re.MULTILINE)
+    rows = re.findall(r"^(0x[0-9a-fA-F]{1,16}): [^\n]+ \((\d{1,10}) bytes\)\s*$", report, re.MULTILINE)
+    nodes = {int(address, 16): int(size) for address, size in rows}
+    if (not total or int(total[1]) > 100_000 or len(nodes) != len(rows) or len(nodes) != int(total[1])
+            or any(size > 1_000_000_000 for size in nodes.values())
+            or len(re.findall(r"^0x", report, re.MULTILINE)) != len(rows)):
+        return None
+    return nodes
+
+
+def allocation_history(report, addresses):
+    """Read frozen NoCompact history, never use an address/stack match as identity.
+
+    malloc_history may repeat an event for several queried addresses inside the
+    same historical allocation. Every graph is queried with the identical address
+    set; retain those multiplicities instead of deduplicating allocation events.
+    """
+    if (len(report) > REPORT_BYTE_LIMIT or not report.endswith("\n")
+            or not report.startswith("malloc_history Report Version:  2.0\n")):
+        return None
+    events = {address: Counter() for address in addresses}
+    for line in report.splitlines()[1:]:
+        if not line or line == "----" or re.fullmatch(r"no stack logs found for 0x[0-9a-fA-F]{1,16}", line):
+            continue
+        event = re.fullmatch(r"(ALLOC|FREE|VM_ALLOC|VM_FREE)\s+(0x[0-9a-fA-F]{1,16})-(0x[0-9a-fA-F]{1,16})"
+                             r" \[size=(\d{1,16})\]:\s+.+", line)
+        if not event:
+            return None
+        kind, address, end, size = event.groups()
+        address, end, size = int(address, 16), int(end, 16), int(size)
+        if end - address + 1 != size:
+            return None
+        if kind in ("ALLOC", "FREE") and address in events:
+            events[address][(kind, size)] += 1
+    return events
+
+
+def allocation_generation(before, after, before_size, after_size):
+    # Missing, truncated or compacted histories cannot certify a generation.
+    if (not before or not after or not before[("ALLOC", before_size)]
+            or not after[("ALLOC", after_size)] or before - after):
+        return None
+    if before == after and before_size == after_size:
+        return "preexisting_nodes"
+    added = after - before
+    if any(kind == "ALLOC" for kind, _ in added) and any(kind == "FREE" for kind, _ in added):
+        return "new_allocation_nodes"
+    return None
+
+
+def collect_allocation_cohorts(graph_directory, checkpoints, reports):
+    """Bounded offline attribution; this cannot change the live heap verdict."""
+    allocations = {point["label"]: leak_allocations(reports[point["label"]], point) for point in checkpoints}
+    candidates = sorted({address for nodes in allocations.values() if nodes for address in nodes})[:COHORT_ADDRESS_LIMIT]
+    if not candidates:
+        return
+    deadline = time.monotonic() + COHORT_SECONDS
+
+    def run(name, command):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ""
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=min(15, remaining))
+            (graph_directory / f"{name}.txt").write_text(result.stdout + result.stderr)
+            return result.stdout if result.returncode == 0 and not result.stderr else ""
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    baseline = graph_directory / "baseline.memgraph"
+    before = heap_allocations(run("baseline-allocations", ["heap", "--noContent", "--addresses", "all", str(baseline)]))
+    if before is None:
+        return
+    history_addresses = [address for address in candidates if address in before]
+    address_args = [hex(address) for address in history_addresses]
+    old_history = (allocation_history(run("baseline-history", ["malloc_history", str(baseline), *address_args]), history_addresses)
+                   if history_addresses else None)
+    for point in checkpoints:
+        nodes = allocations[point["label"]]
+        if not nodes:
+            continue
+        graph = graph_directory / f"{point['label']}.memgraph"
+        new = heap_allocations(run(f"{point['label']}-allocations", ["heap", "--noContent", "--addresses", "all",
+                                f"--diffFrom={baseline}", str(graph)]))
+        history = (allocation_history(run(f"{point['label']}-history", ["malloc_history", str(graph), *address_args]), history_addresses)
+                   if old_history is not None and any(address in nodes for address in history_addresses) else None)
+        cohorts = point["allocation_cohorts"]
+        for address in candidates:
+            if address not in nodes:
+                continue
+            kind = None
+            if address not in before and new is not None and new.get(address) == nodes[address]:
+                kind = "new_allocation_nodes"
+            elif address in before and history is not None:
+                kind = allocation_generation(old_history[address], history[address], before[address], nodes[address])
+                # heap's independent allocation diff must agree with the history.
+                if new is None or (kind == "preexisting_nodes" and address in new):
+                    kind = None
+                if kind == "new_allocation_nodes" and new.get(address) != nodes[address]:
+                    kind = None
+            if kind:
+                cohorts[kind] += 1
+                cohorts["unknown_nodes"] -= 1
+        cohorts["status"] = ("complete" if cohorts["unknown_nodes"] == 0 else "partial"
+                             if cohorts["preexisting_nodes"] or cohorts["new_allocation_nodes"] else "unavailable")
+
+
 def collect_heap_diagnostics(graph_directory, records):
     """Analyze captured graphs only after the owned fixture has stopped."""
     checkpoints = []
     symbols = {}
     resolver = SystemSymbols()
     remaining = 32
+    reports = {}
     # The baseline is the comparison origin, not a new-node checkpoint. leaks
     # rejects --diffFrom when both arguments refer to the same file.
     for label in HEAP_LABELS[1:]:
@@ -288,19 +449,23 @@ def collect_heap_diagnostics(graph_directory, records):
             result = subprocess.run(command, capture_output=True, text=True, timeout=60)
             (graph_directory / f"{label}-diff.txt").write_text(result.stdout + result.stderr)
             counts = {}
-            point = heap_diff_summary(result.stdout if result.returncode in (0, 1) else "",
+            report = result.stdout if result.returncode in (0, 1) else ""
+            point = heap_diff_summary(report,
                                       resolver=resolver, symbol_counts=counts)
             for key, count in counts.items():
                 symbols.setdefault(key, {})[label] = count
-        except subprocess.TimeoutExpired:
+        except (OSError, subprocess.TimeoutExpired):
+            report = ""
             point = heap_diff_summary("")
         point["label"] = label
+        reports[label] = report
         if len(point["groups"]) > remaining:
             point["omitted_groups"] += len(point["groups"]) - remaining
             point["groups"] = point["groups"][:remaining]
             point["status"] = "partial"
         remaining -= len(point["groups"])
         checkpoints.append(point)
+    collect_allocation_cohorts(graph_directory, checkpoints, reports)
     status = ("complete" if len(checkpoints) == len(HEAP_LABELS) - 1
               and all(point["status"] == "complete" for point in checkpoints) else
               "partial" if checkpoints else "unavailable")
@@ -310,10 +475,10 @@ def collect_heap_diagnostics(graph_directory, records):
     symbol_status = ("unavailable" if not checkpoints else "complete" if status == "complete" and not omitted
                      and all(not point["missing_stack_nodes"] and not point["unverified_stack_nodes"]
                              for point in checkpoints) else "partial")
-    summary = {"schema": 3, "status": status, "checkpoints": checkpoints,
+    summary = {"schema": 4, "status": status, "checkpoints": checkpoints,
                "symbols": [{"image": image, "symbol": symbol, "nodes": symbols[(image, symbol)]}
                            for image, symbol in sorted(selected)],
-               "omitted_symbols": omitted, "symbols_status": symbol_status}
+               "omitted_symbols": omitted, "symbols_status": symbol_status, "cohorts_status": cohort_status(checkpoints)}
     validate_heap_diagnostics_summary(summary)
     (records / "heap-diagnostics.json").write_text(json.dumps(summary) + "\n")
 

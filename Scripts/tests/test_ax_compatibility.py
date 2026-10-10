@@ -54,8 +54,9 @@ class AXHeapDiagnosticTests(unittest.TestCase):
 
     @staticmethod
     def summary(point):
-        return {"schema": 3, "status": "partial", "checkpoints": [point],
-                "symbols": [], "omitted_symbols": 0, "symbols_status": "partial"}
+        return {"schema": 4, "status": "partial", "checkpoints": [point],
+                "symbols": [], "omitted_symbols": 0, "symbols_status": "partial",
+                "cohorts_status": REPORT.cohort_status([point])}
 
     def test_public_validator_rejects_extra_fields_unbounded_values_and_text(self):
         point = REPORT.heap_diff_summary(self.report()) | {"label": "registered-10"}
@@ -74,22 +75,19 @@ class AXHeapDiagnosticTests(unittest.TestCase):
                 lambda value: value["checkpoints"][0]["stack_matches"].update(secret=1),
                 lambda value: value["checkpoints"][0]["image_nodes"].update(secret=1),
                 lambda value: value["checkpoints"][0].update(missing_stack_nodes=2),
+                lambda value: value.update(cohorts_status="complete"),
+                lambda value: value["checkpoints"][0]["allocation_cohorts"].update(address="0x1000"),
+                lambda value: value["checkpoints"][0]["allocation_cohorts"].update(status="secret"),
+                lambda value: value["checkpoints"][0]["allocation_cohorts"].update(unknown_nodes=True),
+                lambda value: value["checkpoints"][0]["allocation_cohorts"].update(unknown_nodes=10 ** 20),
+                lambda value: value["checkpoints"][0]["allocation_cohorts"].update(unknown_nodes=2),
+                lambda value: value["checkpoints"][0]["allocation_cohorts"].update(status="complete"),
                 lambda value: value.update(symbols_status="complete"),
                 lambda value: value["checkpoints"][0].update(groups=point["groups"] * 33)):
             invalid = json.loads(json.dumps(valid))
             mutate(invalid)
             with self.assertRaises(ValueError):
                 REPORT.validate_heap_diagnostics_summary(invalid)
-
-    def test_complete_summary_requires_the_empty_control_checkpoint(self):
-        valid = {"schema": 3, "status": "complete", "symbols": [], "omitted_symbols": 0,
-                 "symbols_status": "complete", "checkpoints": [
-                     REPORT.heap_diff_summary(self.report(count=0)) | {"label": label}
-                     for label in REPORT.HEAP_LABELS[1:]]}
-        REPORT.validate_heap_diagnostics_summary(valid)
-        valid["checkpoints"] = [point for point in valid["checkpoints"] if point["label"] != "empty-control"]
-        with self.assertRaises(ValueError):
-            REPORT.validate_heap_diagnostics_summary(valid)
 
     def resolver(self, symbol="-[NSXPCConnection initWithMachServiceName:options:]", start=0x9991):
         resolver = object.__new__(REPORT.SystemSymbols)
@@ -191,6 +189,133 @@ class AXHeapDiagnosticTests(unittest.TestCase):
             self.assertLessEqual((root / "heap-diagnostics.json").stat().st_size, 16 * 1024)
 
 
+class AXAllocationCohortTests(unittest.TestCase):
+    @staticmethod
+    def heap(nodes):
+        return (f"All zones: {len(nodes)} nodes malloced - Sizes:\n"
+                + "".join(f"0x{address:x}: private type ({size} bytes)\n" for address, size in nodes.items()))
+
+    @staticmethod
+    def history(events):
+        return "malloc_history Report Version:  2.0\n" + "".join(
+            f"{kind} 0x{address:x}-0x{address + size - 1:x} [size={size}]: private allocation stack\n"
+            for kind, address, size in events)
+
+    def test_complete_heap_lists_reject_missing_duplicate_and_malformed_rows(self):
+        report = self.heap({0x1000: 48, 0x2000: 80})
+        self.assertEqual(REPORT.heap_allocations(report), {0x1000: 48, 0x2000: 80})
+        self.assertEqual(REPORT.heap_allocations(self.heap({})), {})
+        for invalid in ("", report.replace("2 nodes", "3 nodes"),
+                        report.replace("0x2000", "0x1000"), report.replace("(80 bytes)", "(truncated")):
+            self.assertIsNone(REPORT.heap_allocations(invalid))
+        with mock.patch.object(REPORT, "REPORT_BYTE_LIMIT", 10):
+            self.assertIsNone(REPORT.heap_allocations(report))
+
+    def test_histories_distinguish_same_generation_from_same_address_reuse(self):
+        before = self.history([("ALLOC", 0x1000, 48)])
+        # Reuse at the same address, size and allocation stack is a new generation.
+        after = before + self.history([("FREE", 0x1000, 48), ("ALLOC", 0x1000, 48)]).split("\n", 1)[1]
+        first = REPORT.allocation_history(before, [0x1000])[0x1000]
+        second = REPORT.allocation_history(after, [0x1000])[0x1000]
+        self.assertEqual(REPORT.allocation_generation(first, first, 48, 48), "preexisting_nodes")
+        self.assertEqual(REPORT.allocation_generation(first, second, 48, 48), "new_allocation_nodes")
+        self.assertIsNone(REPORT.allocation_generation(second, first, 48, 48))
+        self.assertIsNone(REPORT.allocation_generation({}, first, 48, 48))
+        self.assertIsNone(REPORT.allocation_generation(first, first, 80, 48))
+        for invalid in ("", before[:-10], before.replace("size=48", "size=47"), before + "history truncated\n"):
+            self.assertIsNone(REPORT.allocation_history(invalid, [0x1000]))
+        with mock.patch.object(REPORT, "REPORT_BYTE_LIMIT", 10):
+            self.assertIsNone(REPORT.allocation_history(before, [0x1000]))
+
+    def collect(self, nodes, before, new, old_events=(), new_events=(), failure=None, clock=None):
+        report = f"Process 123: {len(nodes)} leaks for {sum(nodes.values())} total leaked bytes.\n" + "".join(
+            f"\nLeak: 0x{address:x}  size={size}  zone: private   unknown\n" for address, size in nodes.items())
+        point = REPORT.heap_diff_summary(report) | {"label": "added-10"}
+        commands = []
+
+        def run(command, **kwargs):
+            commands.append((command, kwargs))
+            self.assertLessEqual(kwargs["timeout"], 15)
+            if failure:
+                raise failure
+            if command[0] == "heap":
+                output = self.heap(before if command[-1].endswith("baseline.memgraph") else new)
+            else:
+                self.assertLessEqual(len(command) - 2, REPORT.COHORT_ADDRESS_LIMIT)
+                output = self.history(old_events if command[1].endswith("baseline.memgraph") else new_events)
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(REPORT.subprocess, "run", side_effect=run), \
+                mock.patch.object(REPORT.time, "monotonic", side_effect=clock or itertools.repeat(0)):
+            REPORT.collect_allocation_cohorts(pathlib.Path(directory), [point], {"added-10": report})
+        summary = AXHeapDiagnosticTests.summary(point)
+        REPORT.validate_heap_diagnostics_summary(summary)
+        self.assertNotIn("0x", json.dumps(summary))
+        self.assertNotIn("private", json.dumps(summary))
+        return point["allocation_cohorts"], commands
+
+    def test_old_reachability_new_allocations_and_reuse_are_separate(self):
+        old = [("ALLOC", 0x1000, 48), ("ALLOC", 0x2000, 80)]
+        after = old + [("FREE", 0x2000, 80), ("ALLOC", 0x2000, 80)]
+        result, commands = self.collect({0x1000: 48, 0x2000: 80, 0x3000: 96},
+                                       {0x1000: 48, 0x2000: 80}, {0x2000: 80, 0x3000: 96}, old, after)
+        self.assertEqual(result, {"status": "complete", "preexisting_nodes": 1,
+                                  "new_allocation_nodes": 2, "unknown_nodes": 0})
+        histories = [command for command, _ in commands if command[0] == "malloc_history"]
+        self.assertEqual(histories[0][2:], histories[1][2:])
+
+    def test_missing_history_or_disagreeing_heap_diff_never_certifies_identity(self):
+        old = [("ALLOC", 0x1000, 48)]
+        for new, before_history, after_history in (({}, (), ()), ({0x1000: 48}, old, old),
+                                                  ({}, old, old + [("FREE", 0x1000, 48), ("ALLOC", 0x1000, 48)])):
+            result, _ = self.collect({0x1000: 48}, {0x1000: 48}, new, before_history, after_history)
+            self.assertEqual(result, REPORT.empty_cohorts(1))
+
+    def test_tools_unavailable_timeout_and_shared_deadline_are_explicit(self):
+        for failure in (OSError("unavailable"), subprocess.TimeoutExpired("heap", 15)):
+            result, _ = self.collect({0x1000: 48}, {}, {0x1000: 48}, failure=failure)
+            self.assertEqual(result, REPORT.empty_cohorts(1))
+        result, commands = self.collect({0x1000: 48}, {}, {0x1000: 48}, clock=iter([0, 40, 46]))
+        self.assertEqual(result, REPORT.empty_cohorts(1))
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][1]["timeout"], 5)
+
+    def test_address_budget_retains_unknown_nodes_and_zero_diff_needs_no_tools(self):
+        nodes = {0x1000 + index: 48 for index in range(REPORT.COHORT_ADDRESS_LIMIT + 2)}
+        result, _ = self.collect(nodes, {}, nodes)
+        self.assertEqual(result, {"status": "partial", "preexisting_nodes": 0,
+                                  "new_allocation_nodes": REPORT.COHORT_ADDRESS_LIMIT, "unknown_nodes": 2})
+        result, commands = self.collect({}, {}, {})
+        self.assertEqual(result, REPORT.empty_cohorts(0))
+        self.assertEqual(commands, [])
+
+    def test_oversized_public_summary_is_rejected_even_with_valid_symbols(self):
+        points = [REPORT.heap_diff_summary(AXHeapDiagnosticTests.report()) | {"label": label}
+                  for label in REPORT.HEAP_LABELS[1:]]
+        summary = {"schema": 4, "status": "complete", "checkpoints": points,
+                   "symbols": [{"image": "Foundation", "symbol": "_" + str(index) + "x" * 125,
+                                "nodes": dict.fromkeys(REPORT.HEAP_LABELS[1:], 1)} for index in range(24)],
+                   "omitted_symbols": 0, "symbols_status": "partial", "cohorts_status": "unavailable"}
+        for point in points:
+            point.update(status="partial", new_nodes=1_000_000_000, new_bytes=1_000_000_000,
+                         classified_nodes=1_000_000_000, unknown_stack_nodes=1_000_000_000,
+                         missing_stack_nodes=1_000_000_000, unverified_stack_nodes=1_000_000_000)
+            point["allocation_cohorts"] = REPORT.empty_cohorts(1_000_000_000)
+            point["image_nodes"] = dict.fromkeys(REPORT.HEAP_IMAGES, 1_000_000_000)
+            point["stack_matches"] = dict.fromkeys(REPORT.HEAP_STACK_PATTERNS, 1_000_000_000)
+            point["groups"] = [{"type": "NSMutableArray (Storage)", "size": 1_000_000_000, "count": 1_000_000_000}] * 5
+        for symbol in summary["symbols"]:
+            symbol["nodes"] = dict.fromkeys(REPORT.HEAP_LABELS[1:], 1_000_000_000)
+        for point in points[:2]:
+            point["groups"].append(point["groups"][0])
+        summary["omitted_symbols"] = 1_000_000_000
+        summary["status"] = "partial"
+        with mock.patch.object(REPORT, "SystemSymbols", return_value=mock.Mock()):
+            self.assertGreater(len(json.dumps(summary)), 16 * 1024)
+            with self.assertRaises(ValueError):
+                REPORT.validate_heap_diagnostics_summary(summary)
+
+
 class AXCompatibilityPreflightTests(unittest.TestCase):
     def test_only_the_actual_reader_controls_accessibility_preflight(self):
         for host_trusted in (False, True):
@@ -284,7 +409,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
 
     def exercise_runner(self, *, failed_scan=None, invalid_notifications=False,
                         system_baseline=False, insufficient_compensation=False, ownership_trace=False,
-                        heap_diagnostics=False, invalid_empty_control=None):
+                        heap_diagnostics=False, unavailable_cohorts=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -303,7 +428,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             scan_labels = (["baseline", "removed-10", "removed-30", "observer-exited"] if system_baseline else
                            ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
             if heap_diagnostics:
-                scan_labels[1:1] = ["empty-control", "added-10"]
+                scan_labels.insert(1, "added-10")
             scanned = []
             commands = []
             processes = []
@@ -313,6 +438,10 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
 
                 def __init__(self, command, **_kwargs):
                     self.is_reader = pathlib.Path(command[0]).name == "ax-reader"
+                    if not self.is_reader:
+                        environment = _kwargs["env"]
+                        assert environment["MallocStackLoggingNoCompact"] == "1"
+                        assert ("MallocStackLogging" in environment) == (not heap_diagnostics)
                     self.pid = 1235 if self.is_reader else 1234
                     processes.append(self)
 
@@ -333,23 +462,25 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         "enabled": not system_baseline, "status": "system-baseline" if system_baseline else "enabled",
                         "images": {"AppKit": "synthetic", "CoreFoundation": "synthetic"}}
                     output = json.dumps(capability)
+                elif command[0] == "heap" and unavailable_cohorts:
+                    raise OSError("allocation tool unavailable")
                 elif command[0] == "leaks":
                     capture = next((value for value in command if value.startswith("--outputGraph=")), None)
                     if capture:
+                        self.assertIn("--fullStackHistory", command)
                         pathlib.Path(capture.split("=", 1)[1]).touch()
                         return subprocess.CompletedProcess(command, 0, "", "")
                     if "--list" in command:
                         self.assertTrue(all(process.returncode == 0 for process in processes))
+                        if unavailable_cohorts:
+                            return subprocess.CompletedProcess(command, 1, AXHeapDiagnosticTests.report(), "")
                         return subprocess.CompletedProcess(command, 0, "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
                     label = scan_labels[len(scanned)]
                     scanned.append(label)
-                    if label in ("empty-control", "added-10", "registered-10"):
+                    if label in ("added-10", "registered-10"):
                         reader_command = json.loads((state / "reader-command.json").read_text())
                         self.assertEqual(reader_command["sequence"], 2 if label == "registered-10" else 1)
                         self.assertEqual(host_state["destroyedButtons"], 0)
-                    if label == "empty-control":
-                        self.assertTrue(all(host_state[key] == 0 for key in (
-                            "buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")))
                     nodes, size = (287, 18_768) if label == failed_scan else (280, 18_416)
                     output = (f"Process 1234: {nodes} leaks for {size} total leaked bytes.\n"
                               "STACK OF 3 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
@@ -367,8 +498,6 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     if command_path.exists():
                         command = json.loads(command_path.read_text())
                         host_state.update(sequence=command["sequence"], action=command["action"])
-                        if heap_diagnostics and command["sequence"] == 2 and invalid_empty_control:
-                            host_state[invalid_empty_control] = 1
                         if command["action"] == "add":
                             host_state["buttons"] = 10
                             host_state["allocatedButtons"] += 10
@@ -419,6 +548,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 diagnostic = json.loads((records / "heap-diagnostics.json").read_text())
                 REPORT.validate_heap_diagnostics_summary(diagnostic)
                 self.assertEqual(diagnostic["status"], "complete")
+                self.assertEqual(diagnostic["cohorts_status"], "unavailable" if unavailable_cohorts else "complete")
                 live_scans = [command for command in commands if command[0] == "leaks" and command[-1] == "1234"]
                 self.assertEqual(len(live_scans), len(scan_labels))
                 self.assertTrue(all(any(value.startswith("--outputGraph=") for value in command) for command in live_scans))
@@ -451,7 +581,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
         self.assertNotIn("validation_errors", summary)
 
     def test_diagnostics_capture_once_per_stage_and_preserve_heap_failure(self):
-        for stage in ("empty-control", "added-10", "registered-10"):
+        for stage in ("added-10", "registered-10"):
             with self.subTest(stage=stage):
                 exit_code, summary = self.exercise_runner(failed_scan=stage, heap_diagnostics=True)
                 self.assertEqual(exit_code, 1)
@@ -459,10 +589,12 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertIsNone(summary["ax_leak_nodes"])
                 self.assertEqual([error["stage"] for error in summary["validation_errors"]], [stage])
 
-    def test_empty_control_rejects_any_prior_owned_button_activity(self):
-        for field in ("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations"):
-            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "empty control contained"):
-                self.exercise_runner(heap_diagnostics=True, invalid_empty_control=field)
+    def test_allocation_tool_failure_does_not_replace_product_exit_code(self):
+        for stage in (None, "registered-10"):
+            with self.subTest(stage=stage):
+                exit_code, summary = self.exercise_runner(failed_scan=stage, heap_diagnostics=True, unavailable_cohorts=True)
+                self.assertEqual(exit_code, int(stage is not None))
+                self.assertEqual(summary["coverage"], "failed" if stage else "passed")
 
     def test_intermediate_growth_still_fails_after_heap_returns_to_baseline(self):
         for label in ("registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"):
