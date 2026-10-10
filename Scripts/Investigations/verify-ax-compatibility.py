@@ -16,7 +16,7 @@ import plistlib
 import re
 import subprocess
 import time
-from ax_probe_report import allocation_groups, disassemble_symbols, leak_groups
+from ax_probe_report import DESTROYED, allocation_groups, disassemble_symbols, leak_groups
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -54,21 +54,57 @@ def preflight_reason(host, reader, system_baseline=False):
     return None if reader["trusted"] else "reader-not-trusted"
 
 
-def validate_product_scan(entry, baseline=None):
-    # The reviewed macOS 26 fixture has a small NSXPCConnection startup baseline.
-    # Classify the entire heap and reject target AX groups, unknown roots, missed
-    # nodes, and any growth beyond that measured baseline. Never call this zero
-    # whole-heap leakage when the baseline itself contains reported nodes.
+def is_known_app_intents_allocation(stack, *, root=False):
+    # The macOS 26 read-only control reproduced these four allocation routes
+    # with both product compensation and AX subscriptions disabled. Require the
+    # adjacent frames, image names and reviewed call-site offsets, not merely a
+    # matching class or a symbol appearing somewhere in an unrelated backtrace.
+    frames = [(frame["image"], frame["symbol"], frame["offset"]) for frame in stack]
+    caller = ("com.apple.AppIntents", "__52-[LNProcessInstanceRegistryClient makeXPCConnection]_block_invoke.16", 52)
+    make = "-[LNProcessInstanceRegistryClient makeXPCConnection]"
+    if any(DESTROYED in frame[1] for frame in frames) or frames.count(caller) != 1:
+        return False
+    caller_index = frames.index(caller)
+    # Grouped-root stacks run caller-to-allocation; --list stacks run backwards.
+    for direction in (-1, 1):
+        method_index, provider_index = caller_index + direction, caller_index + 2 * direction
+        if not (0 <= method_index < len(frames) and 0 <= provider_index < len(frames)):
+            continue
+        image, symbol, offset = frames[method_index]
+        provider_image, provider_symbol, provider_offset = frames[provider_index]
+        if (image, symbol) != ("com.apple.AppIntents", make):
+            continue
+        service = "+[NSXPCConnection(ApplicationService) ln_applicationServiceWithError:]"
+        if offset == 68:
+            return ((provider_image, provider_symbol) == ("com.apple.LinkServices", service)
+                    and provider_offset in ((84,) if root else (84, 148)))
+        if root:
+            return False
+        return {204: ("libdispatch.dylib", "_dispatch_lane_create_with_target"),
+                240: ("com.apple.LinkServices", "LNDaemonApplicationXPCInterface"),
+                364: ("com.apple.Foundation", "-[NSXPCConnection setInterruptionHandler:]")}.get(offset) == (provider_image, provider_symbol)
+    return False
+
+
+def validate_product_scan(entry):
+    # Account for the complete snapshot. A known root must not hide an unknown
+    # child allocation. System residuals remain visible in the whole-heap report;
+    # their asynchronous setup is not a product destruction measurement.
     if entry["unclassified_nodes"] != 0 or entry["destroyed_notification_stack_present"]:
         raise RuntimeError(f"AX leakage or incomplete heap classification: {entry}")
-    if any(group["root_type"] != "NSXPCConnection" for group in entry["groups"]):
-        raise RuntimeError(f"Unexpected non-AX leak roots: {entry}")
-    if baseline is not None:
-        roots = lambda value: sum(group["root_instances"] for group in value["groups"])
-        if (entry["leak_nodes"] > baseline["leak_nodes"]
-                or entry["leak_bytes"] > baseline["leak_bytes"] or roots(entry) > roots(baseline)):
-            raise RuntimeError(
-                f"Heap leakage grew beyond the startup baseline: baseline={baseline}; current={entry}")
+    if any(group["root_type"] != "NSXPCConnection" or group.get("root_kind") != "CYCLE"
+           or not is_known_app_intents_allocation(group.get("allocation_stack", []), root=True)
+           for group in entry["groups"]):
+        raise RuntimeError(f"Unattributed leak roots: {entry}")
+    allocations = entry.get("allocations")
+    if (allocations is None or sum(group["tree_nodes"] for group in entry["groups"]) != entry["leak_nodes"]
+            or sum(item["count"] for item in allocations) != entry["leak_nodes"]
+            or sum(item["count"] * item["allocation_bytes"] for item in allocations) != entry["leak_bytes"]):
+        raise RuntimeError(f"Incomplete allocation accounting: {entry}")
+    if any(not is_known_app_intents_allocation(item.get("allocation_stack", [])) for item in allocations):
+        raise RuntimeError(f"Unattributed or target AX allocation: {entry}")
+    return {"system_leak_nodes": entry["leak_nodes"], "system_leak_bytes": entry["leak_bytes"],
+            "unattributed_leak_nodes": 0}
 
 
 def validate_notifications(receipt, expected_buttons, read_only=False):
@@ -169,7 +205,8 @@ def main():
         raise RuntimeError("Diagnostic balance refused: system images differ from the reviewed trace")
     write_json(records / "inputs.json", {"capabilities": capabilities, "reader_capabilities": reader_capabilities,
         "system": run(["sw_vers"]).stdout,
-        "sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources}})
+        "sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in
+                    [*sources, "Scripts/Investigations/verify-ax-compatibility.py", "Scripts/Investigations/ax_probe_report.py"]}})
     reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline)
     if reason:
         print(json.dumps({"coverage": "not-covered", "reason": reason,
@@ -188,7 +225,7 @@ def main():
             # Assertion failures must not discard later lifecycle evidence. They
             # remain fatal even if a subsequent scan returns to the baseline.
             try:
-                validator(*values)
+                return validator(*values)
             except RuntimeError as error:
                 validation_errors.append({"stage": stage, "message": str(error)})
                 write_json(records / "validation-errors.json", validation_errors)
@@ -208,13 +245,14 @@ def main():
         def scan(label, host_state):
             started = time.monotonic()
             graph = work / f"{label}.memgraph"
-            if args.startup_trace:
+            capture_snapshot = args.startup_trace or not args.system_baseline
+            if capture_snapshot:
                 capture = subprocess.run(["leaks", "--noContent", f"--outputGraph={graph}", str(host.pid)],
                                          capture_output=True, text=True, timeout=60)
                 (records / f"{label}-capture.txt").write_text(capture.stdout + capture.stderr)
                 if capture.returncode != 0 or not graph.is_file():
                     raise RuntimeError("Heap snapshot capture was unavailable")
-            result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(graph if args.startup_trace else host.pid)],
+            result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(graph if capture_snapshot else host.pid)],
                                     capture_output=True, text=True, timeout=60)
             (records / f"{label}-leaks.txt").write_text(result.stdout + result.stderr)
             match = re.search(r"(\d+) leaks? for (\d+) total leaked bytes", result.stdout)
@@ -229,10 +267,11 @@ def main():
             write_json(records / "scans.json", results)
             if not match or result.returncode not in (0, 1):
                 raise RuntimeError(f"Full-heap scan was unavailable: {entry}")
-            if args.startup_trace:
+            if capture_snapshot:
                 # Decode the same snapshot, not a second live-process scan. The
                 # differential includes children added under an existing root.
-                differences = [] if label == "baseline" else [f"--diffFrom={work / 'baseline.memgraph'}"]
+                differences = ([f"--diffFrom={work / 'baseline.memgraph'}"]
+                               if args.startup_trace and label != "baseline" else [])
                 detail = subprocess.run(["leaks", "--list", "--noContent", "--nosources", "--fullStacks",
                                          *differences, str(graph)], capture_output=True, text=True, timeout=60)
                 (records / f"{label}-allocations.txt").write_text(detail.stdout + detail.stderr)
@@ -242,11 +281,14 @@ def main():
                         or sum(item["count"] for item in allocations) != int(total[1])
                         or sum(item["count"] * item["allocation_bytes"] for item in allocations) != int(total[2])):
                     raise RuntimeError("Allocation provenance was unavailable or incomplete")
-                entry["allocation_delta_from"] = None if label == "baseline" else "baseline"
+                entry["allocation_delta_from"] = "baseline" if differences else None
                 entry["allocations"] = allocations
                 write_json(records / "scans.json", results)
             if not args.system_baseline:
-                validate(label, validate_product_scan, entry, results[0] if label != "baseline" else None)
+                classification = validate(label, validate_product_scan, entry)
+                if classification is not None:
+                    entry.update(classification)
+                    write_json(records / "scans.json", results)
 
         try:
             host = subprocess.Popen([str(executable), str(state), *host_arguments], env=environment, stdout=host_log, stderr=host_log)
@@ -278,8 +320,8 @@ def main():
                 if observed["buttons"] != 10 or observed["registrations"] != expected_registrations:
                     raise RuntimeError(f"AX registrations incomplete: {observed}")
                 if not args.system_baseline and cycle == 1:
-                    # Locate setup growth without replacing the empty baseline
-                    # or destroying any target button before the first scan.
+                    # Preserve a checkpoint before any target destruction, so
+                    # system setup and product destruction remain distinguishable.
                     scan("registered-10", command("checkpoint"))
                 elif args.startup_trace and cycle == 1:
                     scan("observed-10", command("checkpoint"))
@@ -344,14 +386,17 @@ def main():
                            "baseline_leak_nodes": results[0]["leak_nodes"],
                            "baseline_leak_bytes": results[0]["leak_bytes"],
                            "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
+                           "system_leak_nodes": results[-1].get("system_leak_nodes"),
+                           "system_leak_bytes": results[-1].get("system_leak_bytes"),
+                           "unattributed_leak_nodes": results[-1].get("unattributed_leak_nodes"),
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
-                           "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX groups and no increase over the non-AX startup baseline; not an installed-app or VoiceOver test"}
+                           "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX leakage and complete per-allocation attribution of known AppIntents system residuals; whole-heap totals include those residuals; not an installed-app or VoiceOver test"}
             if validation_errors:
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors
                 write_json(records / "validation-errors.json", validation_errors)
             write_json(records / "result.json", summary)
-            print(json.dumps(summary))
+            print(json.dumps(summary, indent=2))
         finally:
             if reader and reader.poll() is None:
                 (state / "stop-reader").touch()

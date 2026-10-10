@@ -111,10 +111,14 @@ jobs:
           --records-directory .build/Temporary/ax-system-probe/records-balance
       - name: Verify production compensation against real destroyed notifications
         if: ${{ !inputs.ax_startup_probe && matrix.appkit_uuid != '' }}
-        run: >-
-          python3 Scripts/Investigations/verify-ax-compatibility.py
-          --work-directory .build/Temporary/ax-system-probe/product
-          --records-directory .build/Temporary/ax-system-probe/records-product
+        run: |
+          status=0
+          for trial in 1 2 3; do
+            python3 Scripts/Investigations/verify-ax-compatibility.py \
+              --work-directory ".build/Temporary/ax-system-probe/product-$trial" \
+              --records-directory ".build/Temporary/ax-system-probe/records-product-$trial" || status=1
+          done
+          exit "$status"
       - name: Trace startup without product compensation or AX subscriptions
         if: ${{ inputs.ax_startup_probe }}
         run: >-

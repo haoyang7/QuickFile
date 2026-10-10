@@ -49,44 +49,147 @@ class AXCompatibilityPreflightTests(unittest.TestCase):
 
 class AXCompatibilityHeapValidationTests(unittest.TestCase):
     @staticmethod
-    def scan(nodes=0, byte_count=0, root_type="NSXPCConnection", ax=False):
-        return {"leak_nodes": nodes, "leak_bytes": byte_count,
-                "destroyed_notification_stack_present": ax, "unclassified_nodes": 0,
-                "groups": [{"root_type": root_type, "root_instances": 1, "tree_nodes": nodes}] if nodes else []}
+    def frame(image, symbol, offset):
+        return {"image": image, "symbol": symbol, "offset": offset}
 
-    def test_zero_heap_and_stable_xpc_baseline_are_reported_separately(self):
-        empty = self.scan()
-        PROBE.validate_product_scan(empty)
-        PROBE.validate_product_scan(empty, empty)
-        baseline = self.scan(288, 18_816)
-        PROBE.validate_product_scan(baseline)
-        PROBE.validate_product_scan(self.scan(288, 18_816), baseline)
-        self.assertEqual(baseline["leak_nodes"], 288)
+    @classmethod
+    def stack(cls, make_offset=68, route_image="com.apple.LinkServices",
+              route_symbol="+[NSXPCConnection(ApplicationService) ln_applicationServiceWithError:]",
+              route_offset=84):
+        return [cls.frame(route_image, route_symbol, route_offset),
+                cls.frame("com.apple.AppIntents", "-[LNProcessInstanceRegistryClient makeXPCConnection]", make_offset),
+                cls.frame("com.apple.AppIntents", "__52-[LNProcessInstanceRegistryClient makeXPCConnection]_block_invoke.16", 52)]
+
+    @classmethod
+    def scan(cls, *, root_instances=3):
+        allocations = [
+            {"type": "NSXPCConnection", "allocation_bytes": 128, "count": root_instances,
+             "allocation_stack": cls.stack()},
+            {"type": "NSMutableDictionary", "allocation_bytes": 64, "count": 2,
+             "allocation_stack": cls.stack(route_offset=148)},
+            {"type": "NSXPCInterface", "allocation_bytes": 48, "count": 1,
+             "allocation_stack": cls.stack(240, "com.apple.LinkServices", "LNDaemonApplicationXPCInterface", 16)},
+            {"type": "OS_dispatch_queue_serial", "allocation_bytes": 80, "count": 1,
+             "allocation_stack": cls.stack(204, "libdispatch.dylib", "_dispatch_lane_create_with_target", 24)},
+            {"type": "__NSMallocBlock__", "allocation_bytes": 32, "count": 1,
+             "allocation_stack": cls.stack(364, "com.apple.Foundation", "-[NSXPCConnection setInterruptionHandler:]", 20)},
+        ]
+        nodes = sum(item["count"] for item in allocations)
+        byte_count = sum(item["count"] * item["allocation_bytes"] for item in allocations)
+        return {"leak_nodes": nodes, "leak_bytes": byte_count,
+                "destroyed_notification_stack_present": False, "unclassified_nodes": 0,
+                "groups": [{"root_kind": "CYCLE", "root_type": "NSXPCConnection",
+                            "root_instances": root_instances, "tree_nodes": nodes,
+                            "allocation_stack": cls.stack()}], "allocations": allocations}
+
+    def assert_classified(self, entry):
+        classification = PROBE.validate_product_scan(entry)
+        self.assertEqual(classification, {"system_leak_nodes": entry["leak_nodes"],
+                                          "system_leak_bytes": entry["leak_bytes"],
+                                          "unattributed_leak_nodes": 0})
+
+    def test_empty_heap_and_complete_known_system_routes_are_classified(self):
+        self.assert_classified({"leak_nodes": 0, "leak_bytes": 0, "groups": [], "allocations": [],
+                                "destroyed_notification_stack_present": False, "unclassified_nodes": 0})
+        self.assert_classified(self.scan())
+
+    def test_known_system_quantity_changes_need_no_startup_threshold(self):
+        for roots in (1, 3, 8):
+            with self.subTest(roots=roots):
+                self.assert_classified(self.scan(root_instances=roots))
+
+    def test_reversed_stack_order_preserves_the_known_route(self):
+        entry = self.scan()
+        entry["groups"][0]["allocation_stack"].reverse()
+        for allocation in entry["allocations"]:
+            allocation["allocation_stack"].reverse()
+        self.assert_classified(entry)
 
     def test_target_ax_and_unclassified_or_unexpected_roots_fail(self):
-        for value in (self.scan(1, 32, ax=True), self.scan(1, 32, root_type="__NSArrayM"),
-                      self.scan() | {"unclassified_nodes": 1}):
-            with self.subTest(value=value), self.assertRaises(RuntimeError):
-                PROBE.validate_product_scan(value)
+        for field, value in (("destroyed_notification_stack_present", True), ("unclassified_nodes", 1)):
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                PROBE.validate_product_scan(self.scan() | {field: value})
+        for field, value in (("root_type", "__NSArrayM"), ("root_kind", "LEAK")):
+            entry = self.scan()
+            entry["groups"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                PROBE.validate_product_scan(entry)
 
-    def test_non_ax_growth_cannot_be_hidden_as_a_startup_baseline(self):
-        baseline = self.scan(288, 18_816)
-        for value in (self.scan(289, 18_816), self.scan(288, 18_832),
-                      self.scan(288, 18_816) | {"groups": [{"root_type": "NSXPCConnection", "root_instances": 2}]}):
-            with self.subTest(value=value), self.assertRaises(RuntimeError) as failure:
-                PROBE.validate_product_scan(value, baseline)
-            self.assertIn(f"baseline={baseline}", str(failure.exception))
-            self.assertIn(f"current={value}", str(failure.exception))
+    def test_unknown_child_fails_even_when_heap_totals_and_xpc_root_are_unchanged(self):
+        entry = self.scan()
+        entry["allocations"][-1]["allocation_stack"] = [self.frame("QuickFile", "-[UnexpectedOwner allocate]", 8)]
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_product_scan(entry)
+
+    def test_other_xpc_connection_cannot_borrow_a_known_root_class(self):
+        entry = self.scan()
+        entry["groups"][0]["allocation_stack"] = [self.frame("com.apple.Foundation", "-[NSXPCConnection initWithServiceName:]", 8)]
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_product_scan(entry)
+
+    def test_root_cannot_borrow_a_route_allowed_only_for_descendants(self):
+        for allocation in self.scan()["allocations"][1:]:
+            entry = self.scan()
+            entry["groups"][0]["allocation_stack"] = allocation["allocation_stack"]
+            with self.subTest(route=allocation["type"]), self.assertRaises(RuntimeError):
+                PROBE.validate_product_scan(entry)
+
+    def test_missing_root_or_child_allocation_stacks_fail(self):
+        for location in ("groups", "allocations"):
+            for missing in (False, True):
+                entry = self.scan()
+                if missing:
+                    del entry[location][0]["allocation_stack"]
+                else:
+                    entry[location][0]["allocation_stack"] = []
+                with self.subTest(location=location, missing=missing), self.assertRaises(RuntimeError):
+                    PROBE.validate_product_scan(entry)
+
+    def test_all_nodes_and_bytes_must_close_against_complete_allocations(self):
+        changes = [("leak_nodes", 1), ("leak_bytes", 1)]
+        for field, change in changes:
+            entry = self.scan()
+            entry[field] += change
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                PROBE.validate_product_scan(entry)
+        for location, field in (("groups", "tree_nodes"), ("allocations", "count"),
+                                ("allocations", "allocation_bytes")):
+            entry = self.scan()
+            entry[location][0][field] += 1
+            with self.subTest(location=location, field=field), self.assertRaises(RuntimeError):
+                PROBE.validate_product_scan(entry)
+
+    def test_ax_stack_cannot_hide_under_a_system_root_without_the_report_flag(self):
+        entry = self.scan()
+        entry["allocations"][-1]["allocation_stack"].append(self.frame(
+            "com.apple.AppKit", "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification", 128))
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_product_scan(entry)
+
+    def test_route_requires_adjacent_frames_and_exact_known_image_and_offsets(self):
+        for mutation in ("separated-route", "wrong-image", "wrong-make-offset", "wrong-route-offset", "wrong-block-offset"):
+            entry = self.scan()
+            stack = entry["allocations"][0]["allocation_stack"]
+            if mutation == "separated-route":
+                stack.insert(1, self.frame("QuickFile", "-[UnexpectedOwner forward]", 8))
+            elif mutation == "wrong-image":
+                stack[1]["image"] = "QuickFile"
+            elif mutation == "wrong-make-offset":
+                stack[1]["offset"] = 72
+            elif mutation == "wrong-route-offset":
+                stack[0]["offset"] = 88
+            else:
+                stack[2]["offset"] = 56
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                PROBE.validate_product_scan(entry)
 
     def test_real_leaks_cycle_label_is_parsed_as_its_class(self):
         text = "STACK OF 3 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n  288 (18.4K) ROOT CYCLE: <NSXPCConnection>\n"
         groups = PROBE.leak_groups(text)
         self.assertEqual(groups[0]["root_type"], "NSXPCConnection")
         self.assertEqual(groups[0]["root_kind"], "CYCLE")
-        entry = self.scan(288, 18_816) | {"groups": groups}
-        PROBE.validate_product_scan(entry, entry)
-        with self.assertRaises(RuntimeError):
-            PROBE.validate_product_scan(entry | {"groups": PROBE.leak_groups(text.replace("NSXPCConnection", "UnexpectedConnection"))})
+        self.assertEqual(groups[0]["root_instances"], 3)
+        self.assertEqual(groups[0]["tree_nodes"], 288)
 
     def test_allocation_symbols_survive_without_addresses_or_binary_paths(self):
         report = ("STACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
@@ -138,8 +241,11 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
     """Inject process/scan results while exercising the real runner protocol."""
 
     def exercise_runner(self, *, failed_scan=None, invalid_notifications=False,
-                        system_baseline=False, insufficient_compensation=False):
-        with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
+                        system_baseline=False, insufficient_compensation=False,
+                        system_growth=False, scan_fault=None):
+        temporary_root = ROOT / ".build/Temporary"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ax-protocol-", dir=temporary_root) as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
             records = temporary / "records"
@@ -155,7 +261,23 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             scan_labels = (["baseline", "removed-10", "removed-30", "observer-exited"] if system_baseline else
                            ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
             scanned = []
+            captures = []
+            allocation_scans = []
             processes = []
+
+            def scan_entry(label):
+                roots = 3 + scan_labels.index(label) if system_growth else 3
+                entry = AXCompatibilityHeapValidationTests.scan(root_instances=roots)
+                if label == failed_scan:
+                    # Replace provenance without changing root, node or byte
+                    # totals: a startup threshold cannot detect this child.
+                    entry["allocations"][-1]["allocation_stack"] = [
+                        AXCompatibilityHeapValidationTests.frame("QuickFile", "-[UnexpectedOwner allocate]", 8)]
+                return entry
+
+            def stack_report(stack):
+                return "".join(f"{index}   {frame['image']}  0xabc {frame['symbol']} + {frame['offset']}\n"
+                               for index, frame in enumerate(stack))
 
             class FixtureProcess:
                 returncode = None
@@ -182,13 +304,55 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         "images": {"AppKit": "synthetic", "CoreFoundation": "synthetic"}}
                     output = json.dumps(capability)
                 elif command[0] == "leaks":
-                    label = scan_labels[len(scanned)]
-                    scanned.append(label)
-                    nodes, size = (287, 18_768) if label == failed_scan else (280, 18_416)
-                    output = (f"Process 1234: {nodes} leaks for {size} total leaked bytes.\n"
-                              "STACK OF 3 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
-                              f"  {nodes} ({size} bytes) ROOT CYCLE: NSXPCConnection\n")
-                return subprocess.CompletedProcess(command, 1 if command[0] == "leaks" else 0, output, "")
+                    graph_output = next((str(part).split("=", 1)[1] for part in command
+                                         if str(part).startswith("--outputGraph=")), None)
+                    if graph_output:
+                        graph = pathlib.Path(graph_output)
+                        self.assertEqual(command[-1], "1234")
+                        self.assertEqual(graph.stem, scan_labels[len(scanned)])
+                        if scan_fault != "missing-graph":
+                            graph.write_text("synthetic complete heap snapshot\n")
+                        captures.append(graph)
+                        return subprocess.CompletedProcess(command, 1 if scan_fault == "capture-exit" else 0,
+                                                           "Snapshot captured\n", "")
+                    if "--groupByType" in command:
+                        label = scan_labels[len(scanned)]
+                        scanned.append(label)
+                        if not system_baseline:
+                            self.assertEqual(pathlib.Path(command[-1]), work / f"{label}.memgraph")
+                            self.assertTrue(pathlib.Path(command[-1]).is_file())
+                        else:
+                            self.assertEqual(command[-1], "1234")
+                    else:
+                        self.assertIn("--list", command)
+                        label = pathlib.Path(command[-1]).stem
+                        self.assertEqual(label, scanned[-1])
+                        self.assertEqual(pathlib.Path(command[-1]), captures[-1])
+                        self.assertFalse(any(str(part).startswith("--diffFrom=") for part in command))
+                        allocation_scans.append(label)
+                    entry = scan_entry(label)
+                    nodes, size = entry["leak_nodes"], entry["leak_bytes"]
+                    if "--list" in command:
+                        nodes += 1 if scan_fault == "list-count" else 0
+                        size += 1 if scan_fault == "list-bytes" else 0
+                    output = f"Process 1234: {nodes} leaks for {size} total leaked bytes.\n"
+                    if "--groupByType" in command:
+                        root = entry["groups"][0]
+                        output += (f"STACK OF {root['root_instances']} INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
+                                   + stack_report(root["allocation_stack"])
+                                   + f"====\n  {nodes} ({size} bytes) ROOT CYCLE: NSXPCConnection\n")
+                    else:
+                        address = 0x1000
+                        for allocation in entry["allocations"]:
+                            for _ in range(allocation["count"]):
+                                output += (f"Leak: 0x{address:x} size={allocation['allocation_bytes']} "
+                                           f"zone: DefaultMallocZone_0x111 {allocation['type']}\n"
+                                           "\tCall stack:\n" + stack_report(allocation["allocation_stack"]))
+                                address += 0x100
+                exit_code = 1 if command[0] == "leaks" else 0
+                if command[0] == "leaks" and "--list" in command and scan_fault == "list-exit":
+                    exit_code = 2
+                return subprocess.CompletedProcess(command, exit_code, output, "")
 
             def wait_json(path, predicate, _processes):
                 if path.name == "reader-ready.json":
@@ -235,6 +399,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 exit_code = PROBE.main()
             summary = json.loads((records / "result.json").read_text())
             self.assertEqual(scanned, scan_labels)
+            self.assertEqual([graph.stem for graph in captures], [] if system_baseline else scan_labels)
+            self.assertEqual(allocation_scans, [] if system_baseline else scan_labels)
             self.assertEqual(json.loads((records / "notifications.json").read_text()), notifications)
             self.assertTrue((state / "stop-reader").exists())
             self.assertTrue((state / "quit").exists())
@@ -246,6 +412,16 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             if not system_baseline:
                 self.assertEqual(scans[1]["host"]["allocatedButtons"], 10)
                 self.assertEqual(scans[1]["host"]["destroyedButtons"], 0)
+                for scan in scans:
+                    self.assertEqual(scan["allocations"], scan_entry(scan["label"])["allocations"])
+                    if scan["label"] != failed_scan:
+                        self.assertEqual(scan["system_leak_nodes"], scan["leak_nodes"])
+                        self.assertEqual(scan["system_leak_bytes"], scan["leak_bytes"])
+                        self.assertEqual(scan["unattributed_leak_nodes"], 0)
+                    else:
+                        self.assertNotIn("system_leak_nodes", scan)
+                        self.assertNotIn("system_leak_bytes", scan)
+                        self.assertNotIn("unattributed_leak_nodes", scan)
             if exit_code:
                 self.assertEqual(json.loads((records / "validation-errors.json").read_text()), summary["validation_errors"])
             return exit_code, summary
@@ -257,8 +433,25 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["ax_leak_nodes"], 0)
         self.assertNotIn("validation_errors", summary)
 
-    def test_intermediate_growth_still_fails_after_heap_returns_to_baseline(self):
-        for label in ("registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"):
+    def test_known_system_growth_completes_every_checkpoint(self):
+        exit_code, summary = self.exercise_runner(system_growth=True)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["coverage"], "passed")
+        self.assertGreater(summary["leak_nodes"], summary["baseline_leak_nodes"])
+        self.assertGreater(summary["leak_bytes"], summary["baseline_leak_bytes"])
+
+    def test_snapshot_requires_successful_capture_and_a_graph_file(self):
+        for fault in ("capture-exit", "missing-graph"):
+            with self.subTest(fault=fault), self.assertRaisesRegex(RuntimeError, "snapshot capture"):
+                self.exercise_runner(scan_fault=fault)
+
+    def test_raw_allocation_list_requires_matching_node_and_byte_accounting(self):
+        for fault in ("list-count", "list-bytes", "list-exit"):
+            with self.subTest(fault=fault), self.assertRaisesRegex(RuntimeError, "Allocation provenance"):
+                self.exercise_runner(scan_fault=fault)
+
+    def test_unknown_same_root_child_fails_even_after_provenance_recovers(self):
+        for label in ("baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"):
             with self.subTest(label=label):
                 exit_code, summary = self.exercise_runner(failed_scan=label)
                 self.assertEqual(exit_code, 1)
@@ -281,10 +474,11 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["notifications"])
 
     def test_system_baseline_still_measures_growth_without_claiming_product_coverage(self):
-        exit_code, summary = self.exercise_runner(failed_scan="removed-30", system_baseline=True)
+        exit_code, summary = self.exercise_runner(system_growth=True, system_baseline=True)
         self.assertEqual(exit_code, 0)
         self.assertEqual(summary["coverage"], "measured")
         self.assertFalse(summary["product_compensation_enabled"])
+        self.assertGreater(summary["scans"][-1]["leak_nodes"], summary["scans"][0]["leak_nodes"])
 
     def test_insufficient_compensation_preserves_evidence_and_fails(self):
         exit_code, summary = self.exercise_runner(insufficient_compensation=True)
@@ -297,7 +491,9 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "darwin" and shutil.which("xcrun"), "requires macOS SDK")
 class AXCompatibilityCopyTests(unittest.TestCase):
     def run_fixture(self, reject_image=False, disable_environment=False, disable_argument=False):
-        with tempfile.TemporaryDirectory(prefix="ax-copy-") as directory:
+        temporary_root = ROOT / ".build/Temporary"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ax-copy-", dir=temporary_root) as directory:
             work = pathlib.Path(directory)
             source = ROOT / "QuickFileApp/AXCompatibility.m"
             if reject_image:
@@ -357,11 +553,14 @@ class AXCompatibilityCopyTests(unittest.TestCase):
             receipt = json.loads((records / "result.json").read_text())
             self.assertEqual(receipt["coverage"], "passed")
             self.assertEqual(receipt["notifications"], 60)
-            self.assertGreaterEqual(receipt["ordinary_compensations"], 30)
-            self.assertGreaterEqual(receipt["mutable_compensations"], 30)
+            self.assertEqual(receipt["ordinary_compensations"], 30)
+            self.assertEqual(receipt["mutable_compensations"], 30)
+            self.assertEqual(receipt["notification_receipt"]["target_notification_counts"], [[1, 1] for _ in range(30)])
             self.assertEqual(receipt["ax_leak_nodes"], 0)
-            self.assertLessEqual(receipt["leak_nodes"], receipt["baseline_leak_nodes"])
-            self.assertLessEqual(receipt["leak_bytes"], receipt["baseline_leak_bytes"])
+            for scan in receipt["scans"]:
+                self.assertEqual(scan["system_leak_nodes"], scan["leak_nodes"])
+                self.assertEqual(scan["system_leak_bytes"], scan["leak_bytes"])
+                self.assertEqual(scan["unattributed_leak_nodes"], 0)
 
     def test_unrelated_copy_ownership_and_concurrency(self):
         self.run_fixture()
