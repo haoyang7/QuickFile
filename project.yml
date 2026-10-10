@@ -13,7 +13,7 @@ settings:
     ARCHS: "arm64 x86_64"
     ONLY_ACTIVE_ARCH: "NO"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "68"
+    CURRENT_PROJECT_VERSION: "69"
 
 packages:
   Sparkle:
@@ -27,6 +27,8 @@ targets:
     deploymentTarget: "13.0"
     sources:
       - path: Shared/FileTemplate.swift
+      - path: Shared/OfficeDocumentFormat.swift
+      - path: Shared/OfficeDocumentData.swift
       - path: Shared/TemplateDraft.swift
       - path: Shared/TemplateByteOperations.swift
       - path: Shared/TemplateTransfer.swift

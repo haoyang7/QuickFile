@@ -47,12 +47,14 @@ struct TemplateEditorView: View {
                     }
                     templateFields
 
-                    DisclosureGroup("可用变量", isExpanded: $showsVariableHelp) {
-                        Text("{{date}}、{{time}}、{{year}}、{{folderName}}、{{clipboard}}、{{sequence}}")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, 4)
+                    if editor.draft.officeFormat == nil {
+                        DisclosureGroup("可用变量", isExpanded: $showsVariableHelp) {
+                            Text("{{date}}、{{time}}、{{year}}、{{folderName}}、{{clipboard}}、{{sequence}}")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 4)
+                        }
                     }
 
                     if let message = editor.errorMessage {
@@ -114,9 +116,14 @@ struct TemplateEditorView: View {
                 TextField("模板名称", text: draftBinding.name)
                 capacityHint(TemplateEditorCapacityGuidance.name)
             }
-            VStack(alignment: .leading, spacing: 4) {
-                TextField("文件扩展名（可选）", text: draftBinding.fileExtension)
-                capacityHint("留空时不追加扩展名。" + TemplateEditorCapacityGuidance.fileExtension)
+            if let format = editor.draft.officeFormat {
+                Text("文件扩展名：.\(format.rawValue)")
+                capacityHint("创建\(format.blankDocumentDescription)。创建后可在对应的 Office 应用中编辑内容。")
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("文件扩展名（可选）", text: draftBinding.fileExtension)
+                    capacityHint("留空时不追加扩展名。" + TemplateEditorCapacityGuidance.fileExtension)
+                }
             }
             Toggle("在创建菜单中启用", isOn: draftBinding.isEnabled)
             VStack(alignment: .leading, spacing: 4) {
@@ -124,16 +131,18 @@ struct TemplateEditorView: View {
                 capacityHint("未输入本次名称时使用；留空则使用“未命名”。按原文使用，不展开变量。")
                 capacityHint(TemplateEditorCapacityGuidance.defaultFilename)
             }
-            VStack(alignment: .leading, spacing: 8) {
-                Text("初始内容（可留空）")
-                TextEditor(text: draftBinding.content)
-                    .accessibilityLabel("初始内容（可留空）")
-                    .font(.system(.body, design: .monospaced))
-                    .frame(minHeight: 180)
-                    .border(Color.secondary.opacity(0.3))
-                capacityHint(TemplateEditorCapacityGuidance.content)
+            if editor.draft.officeFormat == nil {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("初始内容（可留空）")
+                    TextEditor(text: draftBinding.content)
+                        .accessibilityLabel("初始内容（可留空）")
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minHeight: 180)
+                        .border(Color.secondary.opacity(0.3))
+                    capacityHint(TemplateEditorCapacityGuidance.content)
+                }
+                previewSection
             }
-            previewSection
             capacityHint(TemplateEditorCapacityGuidance.collection)
         }
     }

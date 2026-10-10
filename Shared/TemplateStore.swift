@@ -362,16 +362,37 @@ public final class TemplateStore: @unchecked Sendable {
     // a library after silently dropping fields they do not understand.
     private enum StorageKeys: String, CodingKey { case format, version, templates }
 
-    private static func templateContainer(from decoder: Decoder) throws -> UnkeyedDecodingContainer {
-        if let array = try? decoder.unkeyedContainer() { return array }
+    private struct TemplateContainer {
+        var values: UnkeyedDecodingContainer
+        let supportsOfficeDocuments: Bool
+
+        var isAtEnd: Bool { values.isAtEnd }
+
+        mutating func decodeTemplate() throws -> FileTemplate {
+            let template = try values.decode(FileTemplate.self)
+            guard supportsOfficeDocuments || template.officeFormat == nil else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: values.codingPath, debugDescription: "Office templates require library version 4."
+                ))
+            }
+            return template
+        }
+    }
+
+    private static func templateContainer(from decoder: Decoder) throws -> TemplateContainer {
+        if let array = try? decoder.unkeyedContainer() {
+            return TemplateContainer(values: array, supportsOfficeDocuments: false)
+        }
         let envelope = try decoder.container(keyedBy: StorageKeys.self)
+        let version = try envelope.decode(Int.self, forKey: .version)
         guard try envelope.decode(String.self, forKey: .format) == "quickfile.template-library",
-              try envelope.decode(Int.self, forKey: .version) == 3 else {
+              version == 3 || version == 4 else {
             throw DecodingError.dataCorrupted(.init(
                 codingPath: decoder.codingPath, debugDescription: "Unsupported template library format."
             ))
         }
-        return try envelope.nestedUnkeyedContainer(forKey: .templates)
+        return TemplateContainer(values: try envelope.nestedUnkeyedContainer(forKey: .templates),
+                                 supportsOfficeDocuments: version == 4)
     }
 
     private struct StoredTemplates: Codable {
@@ -382,15 +403,16 @@ public final class TemplateStore: @unchecked Sendable {
         init(from decoder: Decoder) throws {
             var values = try TemplateStore.templateContainer(from: decoder)
             var templates: [FileTemplate] = []
-            while !values.isAtEnd { templates.append(try values.decode(FileTemplate.self)) }
+            while !values.isAtEnd { templates.append(try values.decodeTemplate()) }
             self.templates = templates
         }
 
         func encode(to encoder: Encoder) throws {
-            if templates.contains(where: { !$0.defaultFilename.isEmpty }) {
+            let hasOfficeDocuments = templates.contains { $0.officeFormat != nil }
+            if hasOfficeDocuments || templates.contains(where: { !$0.defaultFilename.isEmpty }) {
                 var values = encoder.container(keyedBy: StorageKeys.self)
                 try values.encode("quickfile.template-library", forKey: .format)
-                try values.encode(3, forKey: .version)
+                try values.encode(hasOfficeDocuments ? 4 : 3, forKey: .version)
                 try values.encode(templates, forKey: .templates)
             } else {
                 var values = encoder.unkeyedContainer()
@@ -410,7 +432,7 @@ public final class TemplateStore: @unchecked Sendable {
             var entries: [FinderTemplateMenuEntry] = []
             var selected: FileTemplate?
             while !container.isAtEnd {
-                let template = try container.decode(FileTemplate.self)
+                let template = try container.decodeTemplate()
                 if template.isEnabled {
                     entries.append(FinderTemplateMenuEntry(template: template))
                     if selected == nil, template.id == selectedID { selected = template }
@@ -534,7 +556,8 @@ public final class TemplateStore: @unchecked Sendable {
     }
 
     private static func fieldsMatchExactly(_ lhs: FileTemplate, _ rhs: FileTemplate) -> Bool {
-        TemplateByteOperations.areEqual(lhs.name.utf8, rhs.name.utf8)
+        lhs.officeFormat == rhs.officeFormat
+            && TemplateByteOperations.areEqual(lhs.name.utf8, rhs.name.utf8)
             && TemplateByteOperations.areEqual(lhs.fileExtension.utf8, rhs.fileExtension.utf8)
             && TemplateByteOperations.areEqual(lhs.content.utf8, rhs.content.utf8)
             && TemplateByteOperations.areEqual(lhs.defaultFilename.utf8, rhs.defaultFilename.utf8)

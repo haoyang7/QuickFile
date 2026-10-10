@@ -59,6 +59,7 @@ struct TemplateEditorState {
 
     private var differsFromBaseline: Bool {
         draft.id != baseline.id || draft.isEnabled != baseline.isEnabled
+            || draft.officeFormat != baseline.officeFormat
             || !TemplateByteOperations.areEqual(draft.name.utf8, baseline.name.utf8)
             || !TemplateByteOperations.areEqual(draft.fileExtension.utf8, baseline.fileExtension.utf8)
             || !TemplateByteOperations.areEqual(draft.defaultFilename.utf8, baseline.defaultFilename.utf8)
@@ -98,7 +99,8 @@ struct TemplateEditorState {
 
     /// Copies literal draft values; this never evaluates variables or reads the pasteboard.
     var copyText: String {
-        "模板名称：\(draft.name)\n文件扩展名：\(draft.fileExtension)\n默认文件名：\(draft.defaultFilename)\n启用：\(draft.isEnabled ? "是" : "否")\n\n\(draft.content)"
+        let documentDescription = draft.officeFormat.map { "\n文档类型：\($0.blankDocumentDescription)" } ?? ""
+        return "模板名称：\(draft.name)\n文件扩展名：\(draft.fileExtension)\n默认文件名：\(draft.defaultFilename)\n启用：\(draft.isEnabled ? "是" : "否")\(documentDescription)\n\n\(draft.content)"
     }
 
     mutating func copyDraft(using copy: (String) -> Void) {
