@@ -86,12 +86,28 @@ def validate_notifications(receipt, expected_buttons, read_only=False):
         raise RuntimeError(f"Invalid destroyed notification accounting: {receipt}")
 
 
+def validate_control_host(receipt):
+    keys = ("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")
+    if any(type(receipt.get(key)) is not int or receipt[key] != 0 for key in keys):
+        raise RuntimeError(f"Heap control created targets or applied compensation: {receipt}")
+
+
+def validate_control_reader(receipt, completed=False):
+    keys = ("notifications", "all_notifications", "unmatched_notifications", "tracked_buttons")
+    if not completed:
+        keys += ("buttons", "registrations")
+    if (any(type(receipt.get(key)) is not int or receipt[key] != 0 for key in keys)
+            or receipt.get("target_notification_counts") != []):
+        raise RuntimeError(f"Heap control read targets, registered targets or received notifications: {receipt}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-directory", required=True, type=Path)
     parser.add_argument("--records-directory", required=True, type=Path)
     parser.add_argument("--system-baseline", action="store_true")
-    parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; product mode only")
+    parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; compensation-enabled modes only")
+    parser.add_argument("--heap-control", action="store_true", help="Match all diagnostic checkpoints with an empty window and no target buttons; requires --heap-diagnostics")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
     parser.add_argument("--balance-copies", action="store_true", help="Causal experiment: add one autorelease at the traced call sites; requires --ownership-trace")
@@ -100,6 +116,8 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.heap_control and (not args.heap_diagnostics or args.system_baseline):
+        parser.error("--heap-control requires --heap-diagnostics and cannot use --system-baseline")
     if args.heap_diagnostics and args.system_baseline:
         parser.error("--heap-diagnostics requires product mode")
     if args.read_only and not args.system_baseline:
@@ -175,8 +193,11 @@ def main():
         "sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources}})
     reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline)
     if reason:
-        print(json.dumps({"coverage": "not-covered", "reason": reason,
-                          "host": capabilities, "reader": reader_capabilities}))
+        receipt = {"coverage": "not-covered", "reason": reason,
+                   "host": capabilities, "reader": reader_capabilities}
+        if args.heap_diagnostics:
+            receipt["mode"] = "heap-control" if args.heap_control else "product"
+        print(json.dumps(receipt))
         return 77
     environment.update(MallocStackLogging="1", MallocStackLoggingNoCompact="1")
     if args.heap_diagnostics:
@@ -204,13 +225,19 @@ def main():
             nonlocal sequence
             sequence += 1
             write_json(state / "command.json", {"sequence": sequence, "action": action, "count": 10})
-            return wait_json(state / "ready.json", lambda value: value["sequence"] == sequence, [host])
+            receipt = wait_json(state / "ready.json", lambda value: value["sequence"] == sequence, [host])
+            if args.heap_control:
+                validate(f"control-host-{sequence}", validate_control_host, receipt)
+            return receipt
 
         def observe():
             nonlocal reader_sequence
             reader_sequence += 1
             write_json(state / "reader-command.json", {"sequence": reader_sequence})
-            return wait_json(state / "reader-ready.json", lambda value: value["sequence"] == reader_sequence, [host, reader])
+            receipt = wait_json(state / "reader-ready.json", lambda value: value["sequence"] == reader_sequence, [host, reader])
+            if args.heap_control:
+                validate(f"control-reader-{reader_sequence}", validate_control_reader, receipt)
+            return receipt
 
         def scan(label, host_state):
             started = time.monotonic()
@@ -246,6 +273,8 @@ def main():
         try:
             host = subprocess.Popen([str(executable), str(state), *host_arguments], env=environment, stdout=host_log, stderr=host_log)
             initial = wait_json(state / "ready.json", lambda value: value["sequence"] == 0, [host])
+            if args.heap_control:
+                validate("control-host-0", validate_control_host, initial)
             if args.system_baseline:
                 scan("baseline", initial)
             reader_arguments = ["--read-only"] if args.read_only else []
@@ -255,27 +284,29 @@ def main():
                 # Establish AX/XPC setup before the baseline, with no owned test
                 # buttons yet. All target destruction remains after this scan.
                 warmed = observe()
-                if warmed["buttons"] or warmed["registrations"] or warmed["notifications"]:
+                if not args.heap_control and (warmed["buttons"] or warmed["registrations"] or warmed["notifications"]):
                     raise RuntimeError(f"AX baseline warm-up was not empty: {warmed}")
                 scan("baseline", command("checkpoint"))
             for cycle in range(1, args.cycles + 1):
-                added = command("add")
+                added = command("checkpoint" if args.heap_control else "add")
                 if args.heap_diagnostics and cycle == 1:
                     # Split button construction from the first AX subscription;
                     # this remains subject to the original empty-window baseline.
                     scan("added-10", added)
                 observed = observe()
-                if observed["buttons"] != 10 or observed["registrations"] != expected_registrations:
+                if not args.heap_control and (observed["buttons"] != 10 or observed["registrations"] != expected_registrations):
                     raise RuntimeError(f"AX registrations incomplete: {observed}")
                 if not args.system_baseline and cycle == 1:
                     # Locate setup growth without replacing the empty baseline
                     # or destroying any target button before the first scan.
                     scan("registered-10", command("checkpoint"))
-                removed = command("remove")
+                removed = command("checkpoint" if args.heap_control else "remove")
                 observe()
-                if removed["destroyedButtons"] != cycle * 10:
+                if not args.heap_control and removed["destroyedButtons"] != cycle * 10:
                     raise RuntimeError(f"Buttons did not deallocate: {removed}")
-                checkpoints.append({key: removed[key] for key in ("allocatedButtons", "destroyedButtons", "ownership") if key in removed})
+                checkpoint_keys = (("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")
+                                   if args.heap_control else ("allocatedButtons", "destroyedButtons", "ownership"))
+                checkpoints.append({key: removed[key] for key in checkpoint_keys if key in removed})
                 if not args.system_baseline or cycle in {1, 3, args.cycles}:
                     scan(f"removed-{cycle * 10}", removed)
             (state / "stop-reader").touch()
@@ -284,7 +315,10 @@ def main():
                 raise RuntimeError("AX observer did not exit successfully")
             notification_receipt = json.loads((state / "reader-completed.json").read_text())
             write_json(records / "notifications.json", notification_receipt)
-            validate("notifications", validate_notifications, notification_receipt, args.cycles * 10, args.read_only)
+            if args.heap_control:
+                validate("notifications", validate_control_reader, notification_receipt, True)
+            else:
+                validate("notifications", validate_notifications, notification_receipt, args.cycles * 10, args.read_only)
             notification_count = notification_receipt.get("notifications")
             observer_exited = time.monotonic()
             if args.idle_seconds > 10:
@@ -324,6 +358,20 @@ def main():
                     if args.balance_copies and (ownership["live"] or any(
                             group["destroyed_return_offsets"] for entry in results for group in entry.get("groups", []))):
                         raise RuntimeError(f"Diagnostic balance left live target arrays or AX leak groups: {ownership}")
+            elif args.heap_control:
+                summary = {"coverage": "measured", "mode": "heap-control", "reader_mode": "subscribed",
+                           "destroyed_buttons": final["destroyedButtons"],
+                           "allocated_buttons": final["allocatedButtons"], "buttons": final["buttons"],
+                           "notifications": notification_count, "notification_receipt": notification_receipt,
+                           "ordinary_compensations": ordinary, "mutable_compensations": final["mutableCompensations"],
+                           "ax_leak_nodes": None if validation_errors else 0,
+                           "baseline_leak_nodes": results[0]["leak_nodes"],
+                           "baseline_leak_bytes": results[0]["leak_bytes"],
+                           "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
+                           "images": capabilities["images"], "checkpoints": checkpoints,
+                           "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
+                           "scope": "empty-window control with the diagnostic product checkpoint sequence and strict heap guard; "
+                                    "application AX reads and observers active; zero target buttons; no product destruction coverage"}
             else:
                 if ordinary < 30 or final["mutableCompensations"] < 30:
                     validation_errors.append({"stage": "compensation-branches",
@@ -342,6 +390,8 @@ def main():
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors
                 write_json(records / "validation-errors.json", validation_errors)
+            if args.heap_diagnostics:
+                summary["mode"] = "heap-control" if args.heap_control else "product"
             write_json(records / "result.json", summary)
             print(json.dumps(summary))
         finally:

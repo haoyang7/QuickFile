@@ -9,7 +9,7 @@ on:
         required: false
         default: false
       heap_diagnostics:
-        description: 'Investigate macOS 26 heap growth with five independent product fixtures and bounded summaries'
+        description: 'Compare macOS 26 heap growth in five matched empty-target/product pairs with bounded summaries'
         type: boolean
         required: false
         default: false
@@ -130,7 +130,7 @@ jobs:
     if: ${{ inputs.heap_diagnostics }}
     name: macOS 26 heap diagnostics (arm64)
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       CAUSAL_PROBE: ${{ inputs.ax_causal_probe }}
@@ -157,7 +157,7 @@ jobs:
               'checkout_sha':output('git', 'rev-parse', 'HEAD'), 'macos':version,
               'os_build':output('sw_vers', '-buildVersion'), 'architecture':architecture, 'xcode':xcode}))
           PY
-      - name: Measure five independent product fixtures
+      - name: Measure five matched control and product pairs
         run: |
           python3 - <<'PY'
           import json, os, pathlib, signal, subprocess, sys
@@ -167,69 +167,77 @@ jobs:
           root.mkdir(parents=True, exist_ok=False)
           failed = False
           for trial in range(1, 6):
-              directory = root / f'trial-{trial}'
-              directory.mkdir()
-              records = directory / 'records'
-              with (directory / 'runner.log').open('w') as log:
-                  try:
-                      process = subprocess.Popen([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
-                          '--work-directory', str(directory / 'fixture'),
-                          '--records-directory', str(records), '--heap-diagnostics'],
-                          stdout=log, stderr=log, start_new_session=True)
-                      return_code = process.wait(timeout=180)
-                  except subprocess.TimeoutExpired:
-                      # Reap this trial's complete private process group, including
-                      # the synthetic host and reader if the runner cannot clean up.
+              for mode in (('control', 'product') if trial % 2 else ('product', 'control')):
+                  directory = root / f'pair-{trial}-{mode}'
+                  directory.mkdir()
+                  records = directory / 'records'
+                  with (directory / 'runner.log').open('w') as log:
                       try:
-                          os.killpg(process.pid, signal.SIGTERM)
-                      except ProcessLookupError:
-                          pass
-                      try:
-                          process.wait(timeout=5)
+                          process = subprocess.Popen([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
+                              '--work-directory', str(directory / 'fixture'),
+                              '--records-directory', str(records), '--heap-diagnostics',
+                              *(['--heap-control'] if mode == 'control' else [])],
+                              stdout=log, stderr=log, start_new_session=True)
+                          return_code = process.wait(timeout=180)
                       except subprocess.TimeoutExpired:
-                          pass
+                          # Reap this trial's complete private process group, including
+                          # the synthetic host and reader if the runner cannot clean up.
+                          try:
+                              os.killpg(process.pid, signal.SIGTERM)
+                          except ProcessLookupError:
+                              pass
+                          try:
+                              process.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              pass
+                          try:
+                              os.killpg(process.pid, signal.SIGKILL)
+                          except ProcessLookupError:
+                              pass
+                          process.wait(timeout=5)
+                          return_code = 124
+                  failed |= return_code != 0
+                  receipt = {'trial': trial, 'mode': mode, 'return_code': return_code, 'diagnostics_available': False}
+                  summary = records / 'heap-diagnostics.json'
+                  if summary.is_file() and not summary.is_symlink() and summary.stat().st_size <= 16384:
                       try:
-                          os.killpg(process.pid, signal.SIGKILL)
-                      except ProcessLookupError:
-                          pass
-                      process.wait(timeout=5)
-                      return_code = 124
-              failed |= return_code != 0
-              receipt = {'trial': trial, 'return_code': return_code, 'diagnostics_available': False}
-              summary = records / 'heap-diagnostics.json'
-              if summary.is_file() and not summary.is_symlink() and summary.stat().st_size <= 16384:
-                  try:
-                      data = json.loads(summary.read_text())
-                      validate_heap_diagnostics_summary(data)
-                  except (ValueError, TypeError, KeyError):
+                          data = json.loads(summary.read_text())
+                          validate_heap_diagnostics_summary(data)
+                      except (ValueError, TypeError, KeyError):
+                          failed = True
+                      else:
+                          receipt.update(diagnostics_available=True, diagnostics=data)
+                          failed |= data['status'] != 'complete' or data['cohorts_status'] != 'complete'
+                  if not receipt['diagnostics_available']:
                       failed = True
-                  else:
-                      receipt.update(diagnostics_available=True, diagnostics=data)
-                      failed |= data['status'] != 'complete' or data['cohorts_status'] != 'complete'
-              if not receipt['diagnostics_available']:
-                  failed = True
-              # Include only bounded original scan totals so a zero allocation
-              # diff cannot be mistaken for a passing heap-baseline assertion.
-              scan_file = records / 'scans.json'
-              receipt['scan_totals'] = []
-              if scan_file.is_file() and not scan_file.is_symlink() and scan_file.stat().st_size <= 16384:
-                  try:
-                      scans = json.loads(scan_file.read_text())
-                      labels = ['baseline', 'added-10', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited']
-                      if type(scans) is not list or [item['label'] for item in scans] != labels:
-                          raise ValueError('Incomplete scan totals')
-                      totals = []
-                      for item in scans:
-                          fields = {name: item[name] for name in ['leak_nodes', 'leak_bytes', 'unclassified_nodes']}
-                          if any(type(value) is not int or not 0 <= value <= 1_000_000_000 for value in fields.values()):
-                              raise ValueError('Invalid scan totals')
-                          totals.append(dict(label=item['label'], **fields))
-                      receipt['scan_totals'] = totals
-                  except (ValueError, TypeError, KeyError):
+                  # Include only bounded original scan totals so a zero allocation
+                  # diff cannot be mistaken for a passing heap-baseline assertion.
+                  scan_file = records / 'scans.json'
+                  receipt['scan_totals'] = []
+                  if scan_file.is_file() and not scan_file.is_symlink() and scan_file.stat().st_size <= 16384:
+                      try:
+                          scans = json.loads(scan_file.read_text())
+                          labels = ['baseline', 'added-10', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited']
+                          if type(scans) is not list or [item['label'] for item in scans] != labels:
+                              raise ValueError('Incomplete scan totals')
+                          totals = []
+                          for item in scans:
+                              fields = {name: item[name] for name in ['leak_nodes', 'leak_bytes', 'unclassified_nodes']}
+                              if any(type(value) is not int or not 0 <= value <= 1_000_000_000 for value in fields.values()):
+                                  raise ValueError('Invalid scan totals')
+                              totals.append(dict(label=item['label'], **fields))
+                          if mode == 'control':
+                              zero_fields = ['buttons', 'allocatedButtons', 'destroyedButtons', 'compensations', 'mutableCompensations']
+                              if any(type(item['host'][key]) is not int or item['host'][key] != 0
+                                     for item in scans for key in zero_fields):
+                                  raise ValueError('Control had target activity')
+                              receipt['control_zero_targets'] = True
+                          receipt['scan_totals'] = totals
+                      except (ValueError, TypeError, KeyError):
+                          failed = True
+                  if not receipt['scan_totals']:
                       failed = True
-              if not receipt['scan_totals']:
-                  failed = True
-              print(json.dumps(receipt, separators=(',', ':')), flush=True)
+                  print(json.dumps(receipt, separators=(',', ':')), flush=True)
           raise SystemExit(1 if failed else 0)
           PY
       - name: Remove synthetic memory graphs and raw logs

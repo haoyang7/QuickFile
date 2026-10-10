@@ -317,6 +317,19 @@ class AXAllocationCohortTests(unittest.TestCase):
 
 
 class AXCompatibilityPreflightTests(unittest.TestCase):
+    def test_heap_control_requires_diagnostics_and_the_original_product_window(self):
+        for options in (("--heap-control",), ("--heap-control", "--heap-diagnostics", "--system-baseline"),
+                        ("--heap-control", "--heap-diagnostics", "--read-only"),
+                        ("--heap-control", "--heap-diagnostics", "--cycles", "2")):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                work = pathlib.Path(directory) / "unused"
+                arguments = ["probe", "--work-directory", str(work), "--records-directory", str(work), *options]
+                with mock.patch.object(sys, "argv", arguments), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as failure:
+                        PROBE.main()
+                self.assertEqual(failure.exception.code, 2)
+                self.assertFalse(work.exists())
+
     def test_only_the_actual_reader_controls_accessibility_preflight(self):
         for host_trusted in (False, True):
             for reader_trusted in (False, True):
@@ -385,6 +398,24 @@ class AXCompatibilityHeapValidationTests(unittest.TestCase):
 
 
 class AXCompatibilityNotificationTests(unittest.TestCase):
+    def test_heap_control_requires_strict_zero_host_and_reader_counts(self):
+        host = dict.fromkeys(("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations"), 0)
+        reader = dict.fromkeys(("buttons", "registrations", "notifications", "all_notifications",
+                                "unmatched_notifications", "tracked_buttons"), 0) | {"target_notification_counts": []}
+        PROBE.validate_control_host(host)
+        PROBE.validate_control_reader(reader)
+        PROBE.validate_control_reader({key: value for key, value in reader.items()
+                                      if key not in ("buttons", "registrations")}, completed=True)
+        for validator, receipt in ((PROBE.validate_control_host, host), (PROBE.validate_control_reader, reader)):
+            for key in receipt:
+                for value in (None, True, 1, -1):
+                    with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
+                        validator(receipt | {key: value})
+                invalid = receipt.copy()
+                del invalid[key]
+                with self.subTest(missing=key), self.assertRaises(RuntimeError):
+                    validator(invalid)
+
     def test_extra_application_notifications_do_not_hide_per_button_coverage(self):
         receipt = {"notifications": 200, "all_notifications": 204, "unmatched_notifications": 4,
                    "tracked_buttons": 100, "target_notification_counts": [[1, 1] for _ in range(100)]}
@@ -409,7 +440,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
 
     def exercise_runner(self, *, failed_scan=None, invalid_notifications=False,
                         system_baseline=False, insufficient_compensation=False, ownership_trace=False,
-                        heap_diagnostics=False, unavailable_cohorts=False):
+                        heap_diagnostics=False, unavailable_cohorts=False, heap_control=False,
+                        invalid_control_host=None, invalid_control_reader=None):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -421,10 +453,16 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 host_state["ownership"] = {"duplicateLiveAddresses": 0, "offMainHits": 0, "created": 1, "live": 1}
             notifications = {"notifications": 60, "all_notifications": 60, "unmatched_notifications": 0,
                              "tracked_buttons": 30, "target_notification_counts": [[1, 1] for _ in range(30)]}
+            if heap_control:
+                notifications = {"notifications": 0, "all_notifications": 0, "unmatched_notifications": 0,
+                                 "tracked_buttons": 0, "target_notification_counts": []}
             if invalid_notifications == "missing-count":
                 del notifications["notifications"]
             elif invalid_notifications:
-                notifications["target_notification_counts"][0] = [0, 2]
+                if heap_control:
+                    notifications["all_notifications"] = notifications["unmatched_notifications"] = 1
+                else:
+                    notifications["target_notification_counts"][0] = [0, 2]
             scan_labels = (["baseline", "removed-10", "removed-30", "observer-exited"] if system_baseline else
                            ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
             if heap_diagnostics:
@@ -432,6 +470,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             scanned = []
             commands = []
             processes = []
+            protocol = []
 
             class FixtureProcess:
                 returncode = None
@@ -477,6 +516,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         return subprocess.CompletedProcess(command, 0, "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
                     label = scan_labels[len(scanned)]
                     scanned.append(label)
+                    protocol.append(("scan", label))
                     if label in ("added-10", "registered-10"):
                         reader_command = json.loads((state / "reader-command.json").read_text())
                         self.assertEqual(reader_command["sequence"], 2 if label == "registered-10" else 1)
@@ -492,11 +532,19 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     command = json.loads((state / "reader-command.json").read_text())
                     receipt = {"sequence": command["sequence"], "buttons": host_state["buttons"],
                                "registrations": host_state["buttons"] * 2,
-                               "notifications": host_state["destroyedButtons"] * 2}
+                               "notifications": host_state["destroyedButtons"] * 2,
+                               "all_notifications": host_state["destroyedButtons"] * 2,
+                               "unmatched_notifications": 0,
+                               "tracked_buttons": host_state["allocatedButtons"],
+                               "target_notification_counts": [] if heap_control else [[1, 1]] * host_state["allocatedButtons"]}
+                    protocol.append(("observe", command["sequence"]))
+                    if invalid_control_reader and command["sequence"] == invalid_control_reader[0]:
+                        receipt[invalid_control_reader[1]] = 1
                 else:
                     command_path = state / "command.json"
                     if command_path.exists():
                         command = json.loads(command_path.read_text())
+                        protocol.append(("command", command["action"]))
                         host_state.update(sequence=command["sequence"], action=command["action"])
                         if command["action"] == "add":
                             host_state["buttons"] = 10
@@ -510,6 +558,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                                 if insufficient_compensation and host_state["destroyedButtons"] == 30:
                                     host_state["compensations"] -= 1
                     receipt = dict(host_state)
+                    if invalid_control_host and receipt["sequence"] == invalid_control_host[0]:
+                        receipt[invalid_control_host[1]] = 1
                 self.assertTrue(predicate(receipt))
                 return receipt
 
@@ -526,6 +576,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.append("--ownership-trace")
             if heap_diagnostics:
                 arguments.append("--heap-diagnostics")
+            if heap_control:
+                arguments.append("--heap-control")
             with mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
                     mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
                     mock.patch.object(PROBE.subprocess, "Popen", side_effect=FixtureProcess), \
@@ -554,7 +606,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertTrue(all(any(value.startswith("--outputGraph=") for value in command) for command in live_scans))
                 self.assertEqual([point["label"] for point in diagnostic["checkpoints"]], list(REPORT.HEAP_LABELS[1:]))
             self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
-            self.assertEqual(scans[-1]["host"]["destroyedButtons"], 30)
+            self.assertEqual(scans[-1]["host"]["destroyedButtons"], 0 if heap_control else 30)
             if system_baseline:
                 self.assertEqual(summary["instrumented"], ownership_trace)
                 host_build = next(command for command in commands if "-fobjc-arc" in command)
@@ -567,11 +619,56 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     disassembled.assert_not_called()
             if not system_baseline:
                 registered = next(scan for scan in scans if scan["label"] == "registered-10")
-                self.assertEqual(registered["host"]["allocatedButtons"], 10)
+                self.assertEqual(registered["host"]["allocatedButtons"], 0 if heap_control else 10)
                 self.assertEqual(registered["host"]["destroyedButtons"], 0)
+            if heap_diagnostics:
+                add, remove = ("checkpoint", "checkpoint") if heap_control else ("add", "remove")
+                self.assertEqual(protocol, [
+                    ("observe", 1), ("command", "checkpoint"), ("scan", "baseline"),
+                    ("command", add), ("scan", "added-10"), ("observe", 2),
+                    ("command", "checkpoint"), ("scan", "registered-10"),
+                    ("command", remove), ("observe", 3), ("scan", "removed-10"),
+                    ("command", add), ("observe", 4), ("command", remove), ("observe", 5), ("scan", "removed-20"),
+                    ("command", add), ("observe", 6), ("command", remove), ("observe", 7), ("scan", "removed-30"),
+                    ("command", "checkpoint"), ("scan", "observer-exited")])
+                self.assertEqual(summary["mode"], "heap-control" if heap_control else "product")
+            if heap_control:
+                for scan in scans:
+                    PROBE.validate_control_host(scan["host"])
+                self.assertEqual(summary["ordinary_compensations"], 0)
+                self.assertEqual(summary["mutable_compensations"], 0)
+                self.assertEqual(summary["notifications"], notifications.get("notifications"))
             if exit_code:
                 self.assertEqual(json.loads((records / "validation-errors.json").read_text()), summary["validation_errors"])
             return exit_code, summary
+
+    def test_heap_control_measures_seven_empty_scans_without_product_coverage(self):
+        exit_code, summary = self.exercise_runner(heap_diagnostics=True, heap_control=True)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["coverage"], "measured")
+        self.assertEqual(summary["destroyed_buttons"], 0)
+        self.assertEqual(summary["notification_receipt"]["tracked_buttons"], 0)
+        self.assertEqual([scan["label"] for scan in summary["scans"]], list(REPORT.HEAP_LABELS))
+        self.assertIn("no product destruction coverage", summary["scope"])
+
+    def test_heap_control_preserves_every_strict_growth_failure_after_recovery(self):
+        for stage in REPORT.HEAP_LABELS[1:]:
+            with self.subTest(stage=stage):
+                exit_code, summary = self.exercise_runner(heap_diagnostics=True, heap_control=True, failed_scan=stage)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(summary["coverage"], "failed")
+                self.assertEqual([error["stage"] for error in summary["validation_errors"]], [stage])
+
+    def test_heap_control_rejects_transient_targets_and_any_reader_notifications(self):
+        for options, stage in (({"invalid_control_host": (5, "allocatedButtons")}, "control-host-5"),
+                               ({"invalid_control_reader": (3, "registrations")}, "control-reader-3"),
+                               ({"invalid_control_reader": (4, "all_notifications")}, "control-reader-4"),
+                               ({"invalid_notifications": True}, "notifications")):
+            with self.subTest(options=options):
+                exit_code, summary = self.exercise_runner(heap_diagnostics=True, heap_control=True, **options)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(summary["coverage"], "failed")
+                self.assertEqual([error["stage"] for error in summary["validation_errors"]], [stage])
 
     def test_stable_heap_completes_every_lifecycle_checkpoint(self):
         exit_code, summary = self.exercise_runner()
