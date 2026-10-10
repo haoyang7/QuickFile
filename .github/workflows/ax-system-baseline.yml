@@ -34,6 +34,11 @@ on:
         options:
           - internal
           - external-startup
+      terminal_origin:
+        description: 'One off/control + off/product pair, six live scans then one later graph each; requires live + external-startup + malloc_scribble'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -48,7 +53,7 @@ defaults:
 
 jobs:
   ax-system-probe:
-    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' }}
+    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin }}
     name: macOS ${{ matrix.expected_os }} (arm64)
     strategy:
       fail-fast: false
@@ -148,7 +153,7 @@ jobs:
           PY
 
   ax-heap-diagnostics:
-    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' }}
+    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin }}
     name: macOS 26 ${{ inputs.scan_mode }} heap comparison (arm64)
     runs-on: macos-26
     timeout-minutes: ${{ inputs.malloc_scribble && 70 || 35 }}
@@ -159,6 +164,7 @@ jobs:
       AX_SCAN_MODE: ${{ inputs.scan_mode }}
       AX_RECEIPT_MODE: ${{ inputs.receipt_mode }}
       AX_HEAP_DIAGNOSTICS: ${{ inputs.heap_diagnostics }}
+      AX_TERMINAL_ORIGIN: ${{ inputs.terminal_origin }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -175,11 +181,13 @@ jobs:
           assert os.environ['CAUSAL_PROBE'] == 'false', 'Choose one investigation mode'
           scan_mode = os.environ['AX_SCAN_MODE']
           receipt_mode = os.environ['AX_RECEIPT_MODE']
+          terminal_origin = os.environ.get('AX_TERMINAL_ORIGIN', 'false') == 'true'
           assert receipt_mode in ('internal', 'external-startup'), 'Unknown receipt mode'
           assert receipt_mode != 'external-startup' or (scan_mode == 'live' and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'), 'External startup receipts require live MallocScribble'
           assert receipt_mode != 'external-startup' or os.environ['AX_HEAP_DIAGNOSTICS'] == 'false', 'External startup receipts cannot request frozen diagnostics'
           assert scan_mode in ('diagnostic', 'live'), 'Unknown heap scan mode'
           assert scan_mode != 'live' or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires malloc_scribble'
+          assert not terminal_origin or (scan_mode == 'live' and receipt_mode == 'external-startup'), 'Terminal origin requires external live comparison'
           version = output('sw_vers', '-productVersion')
           architecture = output('uname', '-m')
           xcode = output('xcodebuild', '-version')
@@ -195,6 +203,7 @@ jobs:
               value = os.environ.get(name)
               allocator_environment[name] = 'unset' if value is None else value if value in ('0', '1') else 'other'
           identity = {'scope':'synthetic-AX-heap-investigation', 'scan_mode':scan_mode, 'receipt_mode':receipt_mode,
+              'terminal_origin':terminal_origin,
               'checkout_sha':output('git', 'rev-parse', 'HEAD'), 'macos':version,
               'os_build':output('sw_vers', '-buildVersion'), 'architecture':architecture, 'xcode':xcode,
               'runner_image':{'os':image_field('ImageOS'), 'version':image_field('ImageVersion')},
@@ -204,15 +213,15 @@ jobs:
           root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
           root.mkdir(parents=True, exist_ok=False)
           (root / 'summary.json').write_text(json.dumps({'identity':identity, 'trials':[], 'completed':False,
-              'expected_trials':20 if identity['malloc_scribble_experiment'] else 10}, indent=2) + '\n')
+              'expected_trials':2 if terminal_origin else 20 if identity['malloc_scribble_experiment'] else 10}, indent=2) + '\n')
           print(json.dumps(identity))
           PY
-      - name: Measure five matched groups with strict heap checks
+      - name: Measure matched cases with strict heap checks
         run: |
           python3 - <<'PY'
           import json, os, pathlib, re, signal, subprocess, sys
           sys.path.insert(0, 'Scripts/Investigations')
-          from ax_probe_report import validate_heap_diagnostics_summary, validation_failure_counts
+          from ax_probe_report import validate_heap_diagnostics_summary, validate_terminal_snapshot, validation_failure_counts
           from ax_external_receipt import load_prepared_fixture, validate_external_receipt
           import hashlib
           from importlib import import_module
@@ -223,6 +232,7 @@ jobs:
           scan_mode = public_summary['identity']['scan_mode']
           diagnostics_expected = scan_mode == 'diagnostic'
           external_receipt = public_summary['identity']['receipt_mode'] == 'external-startup'
+          terminal_origin = public_summary['identity'].get('terminal_origin', False)
           scribble_experiment = os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'
           def run_owned(command, log_path, environment):
               with log_path.open('w') as log:
@@ -264,10 +274,11 @@ jobs:
               public_summary['fixture_sources'] = source_hashes
               summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
           failed = False
-          for trial in range(1, 6):
+          terminal_failed = False
+          for trial in range(1, 2 if terminal_origin else 6):
               # Reverse both factors between groups to expose order effects.
               modes = ('control', 'product') if trial % 2 else ('product', 'control')
-              settings = (('off', 'on') if trial % 2 else ('on', 'off')) if scribble_experiment else (None,)
+              settings = ('off',) if terminal_origin else (('off', 'on') if trial % 2 else ('on', 'off')) if scribble_experiment else (None,)
               for scribble, mode in ((setting, mode) for setting in settings for mode in modes):
                   directory = root / (f'pair-{trial}-{scribble}-{mode}' if scribble else f'pair-{trial}-{mode}')
                   directory.mkdir()
@@ -282,6 +293,7 @@ jobs:
                       *(['--heap-diagnostics'] if diagnostics_expected else []),
                       *(['--malloc-scribble', scribble] if scribble else []),
                       *(['--external-startup-receipt', '--prepared-fixture-directory', str(prepared)] if external_receipt else []),
+                      *(['--terminal-origin'] if terminal_origin else []),
                       *(['--heap-control'] if mode == 'control' else [])], directory / 'runner.log', environment)
                   failed |= return_code != 0
                   receipt = {'trial': trial, 'mode': mode, 'scan_mode': scan_mode, 'return_code': return_code,
@@ -393,13 +405,36 @@ jobs:
                           failed = True
                   if not receipt['scan_totals']:
                       failed = True
+                  if terminal_origin:
+                      receipt.update(terminal_snapshot_available=False, terminal_snapshot_checks_passed=False)
+                      terminal_file = records / 'terminal-snapshot.json'
+                      if terminal_file.is_file() and not terminal_file.is_symlink() and terminal_file.stat().st_size <= 65536:
+                          try:
+                              terminal = json.loads(terminal_file.read_text())
+                              validate_terminal_snapshot(terminal)
+                          except (ValueError, TypeError, KeyError):
+                              pass
+                          else:
+                              # Filtered/unverified frames remain explicitly partial.
+                              # Successful bounded extraction does not require a full
+                              # public stack and does not alter the six-scan verdict.
+                              rows = terminal['root_groups'] + terminal['allocation_groups']
+                              usable = (terminal['parsing_status'] == 'complete'
+                                  and not terminal['omitted_root_groups'] and not terminal['omitted_allocation_groups']
+                                  and all(row['stack']['reported_frames'] and not row['stack']['missing_frames']
+                                          and not row['stack']['unparsed_lines'] for row in rows))
+                              receipt.update(terminal_snapshot_available=True, terminal_snapshot=terminal,
+                                             terminal_snapshot_checks_passed=usable)
+                      terminal_failed |= not receipt['terminal_snapshot_checks_passed']
                   print(json.dumps(receipt, separators=(',', ':')), flush=True)
                   public_summary['trials'].append(receipt)
                   summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
           public_summary['completed'] = True
           public_summary['strict_checks_passed'] = not failed
+          if terminal_origin:
+              public_summary['terminal_snapshot_checks_passed'] = not terminal_failed
           summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
-          raise SystemExit(1 if failed else 0)
+          raise SystemExit(1 if failed or terminal_failed else 0)
           PY
       - name: Upload bounded diagnostic summary
         if: always()

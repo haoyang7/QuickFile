@@ -17,7 +17,8 @@ import re
 import shutil
 import subprocess
 import time
-from ax_probe_report import collect_heap_diagnostics, disassemble_symbols, leak_groups
+from ax_probe_report import (capture_terminal_snapshot, collect_heap_diagnostics, collect_terminal_snapshot,
+                             disassemble_symbols, empty_terminal_snapshot, leak_groups)
 from ax_external_receipt import (fixture_hashes, load_prepared_fixture, owned_child_receipt,
                                  require_fixture_hashes, validate_external_receipt)
 
@@ -141,6 +142,7 @@ def main():
     parser.add_argument("--prepare-external-fixture", action="store_true", help="Build ordinary host/reader once, without running them, for external startup receipts")
     parser.add_argument("--external-startup-receipt", action="store_true", help="Read owned child startup metadata outside the ordinary fixture; requires live MallocScribble and a prepared fixture")
     parser.add_argument("--prepared-fixture-directory", type=Path)
+    parser.add_argument("--terminal-origin", action="store_true", help="Capture one later heap graph after all six live scans; requires external startup receipts and MallocScribble off")
     parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
@@ -153,7 +155,7 @@ def main():
     if args.prepare_external_fixture and any((args.malloc_scribble, args.external_startup_receipt,
             args.prepared_fixture_directory, args.system_baseline, args.heap_diagnostics, args.heap_control,
             args.copy_lifetime, args.read_only, args.ownership_trace, args.balance_copies,
-            args.expected_appkit_uuid, args.expected_corefoundation_uuid)):
+            args.expected_appkit_uuid, args.expected_corefoundation_uuid, args.terminal_origin)):
         parser.error("--prepare-external-fixture requires an independent ordinary build")
     if args.external_startup_receipt and (not args.malloc_scribble or not args.prepared_fixture_directory
             or any((args.system_baseline, args.heap_diagnostics, args.copy_lifetime, args.read_only,
@@ -161,6 +163,8 @@ def main():
         parser.error("external startup receipts require live MallocScribble and a prepared ordinary fixture")
     if args.prepared_fixture_directory and not args.external_startup_receipt:
         parser.error("--prepared-fixture-directory requires --external-startup-receipt")
+    if args.terminal_origin and (not args.external_startup_receipt or args.malloc_scribble != "off"):
+        parser.error("--terminal-origin requires external startup receipts with --malloc-scribble off")
     if args.malloc_scribble and args.system_baseline:
         parser.error("--malloc-scribble requires product mode")
     if args.copy_lifetime and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
@@ -191,7 +195,7 @@ def main():
     state = work / "state"
     state.mkdir()
     graphs = work / "heap"
-    if args.heap_diagnostics:
+    if args.heap_diagnostics or args.terminal_origin:
         graphs.mkdir()
     app = work / "AXCompatibilityFixture.app"
     executable = app / "Contents/MacOS/AXCompatibilityFixture"
@@ -308,6 +312,7 @@ def main():
     host = reader = None
     observer_exited = None
     sequence = reader_sequence = 0
+    terminal_snapshot = empty_terminal_snapshot() if args.terminal_origin else None
     with (records / "host.log").open("w") as host_log, (records / "reader.log").open("w") as reader_log:
         def validate(stage, validator, *values):
             # Assertion failures must not discard later lifecycle evidence. They
@@ -471,6 +476,10 @@ def main():
                 time.sleep(min(1, remaining))
             final = command("checkpoint", 30 if args.copy_lifetime else None)
             scan("observer-exited", final)
+            if args.terminal_origin:
+                # The ordinary six scans are finished. This later capture never
+                # changes their totals or strict validation results.
+                terminal_snapshot = capture_terminal_snapshot(host.pid, graphs / "terminal.memgraph")
             ordinary = final["compensations"] - final["mutableCompensations"]
             if args.system_baseline:
                 if final["compensations"] != 0 or final["mutableCompensations"] != 0:
@@ -584,6 +593,10 @@ def main():
                     write_json(records / "result.json", summary)
             if args.heap_diagnostics:
                 collect_heap_diagnostics(graphs, records)
+            if args.terminal_origin:
+                # Symbol verification and both offline text views run only once
+                # both owned processes have stopped, including on strict failure.
+                collect_terminal_snapshot(graphs / "terminal.memgraph", records, terminal_snapshot)
     return 1 if validation_errors else 0
 
 

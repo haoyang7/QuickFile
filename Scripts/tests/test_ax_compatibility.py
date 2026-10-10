@@ -551,6 +551,195 @@ class AXCompatibilityCopyLifetimeTests(unittest.TestCase):
                     PROBE.validate_copy_lifetime_host(receipt)
 
 
+class AXTerminalSnapshotTests(unittest.TestCase):
+    def test_terminal_cli_rejects_incompatible_modes_before_building(self):
+        invalid = [[], ["--prepare-external-fixture"], ["--malloc-scribble", "off"],
+                   ["--malloc-scribble", "on", "--external-startup-receipt", "--prepared-fixture-directory", "prepared"],
+                   ["--malloc-scribble", "off", "--external-startup-receipt", "--prepared-fixture-directory", "prepared", "--heap-diagnostics"],
+                   ["--malloc-scribble", "off", "--external-startup-receipt", "--prepared-fixture-directory", "prepared", "--copy-lifetime"]]
+        for extra in invalid:
+            arguments = ["probe", "--terminal-origin", "--work-directory", "unused", "--records-directory", "unused", *extra]
+            with mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE.subprocess, "run") as run, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                PROBE.main()
+            self.assertEqual(error.exception.code, 2)
+            run.assert_not_called()
+
+    @staticmethod
+    def reports():
+        # Generic grouped/list syntax observed in a non-AX root/child fixture.
+        # NSXPC symbol text is synthetic; no macOS 26 raw format is assumed.
+        frames = ["0 com.apple.Foundation 0x9999 -[NSXPCConnection initWithMachServiceName:options:] + 8",
+                  "1 com.apple.Foundation 0x9999 -[NSXPCConnection initWithMachServiceName:options:] + 8",
+                  "2 private-fixture 0x1000 secret_caller + 4"]
+        totals = "Process 123: 2 leaks for 144 total leaked bytes.\n"
+        grouped = (totals + "\nSTACK OF 1 INSTANCE OF 'ROOT LEAK: NSMutableArray':\n"
+            + "\n".join(reversed(frames)) + "\n====\n    2 (144 bytes) ROOT LEAK: NSMutableArray\n"
+              "       1 (96 bytes) private-child\n\nBinary Images:\nprivate-data\n")
+        listed = (totals + "\nLeak: 0x1000  size=48  zone: PrivateZone_0x4321   NSMutableArray  ObjC  Foundation\n"
+            "\tCall stack: \n" + "\n".join(frames) + "\n\n"
+            "Leak: 0x2000  size=96  zone: PrivateZone_0x4321   private-child  C  private-image\n"
+            "\tCall stack: \n0 com.apple.CoreFoundation 0x8888 CFDataCreate + 8\n\nBinary Images:\nprivate-data\n")
+        return grouped, listed
+
+    @staticmethod
+    def resolver():
+        resolver = mock.Mock()
+        resolver.verified.side_effect = lambda image, symbol, *_: REPORT.public_system_symbol(image, symbol)
+        resolver.lookup.return_value = 0x1000
+        return resolver
+
+    @classmethod
+    def summary(cls, reports=None, resolver=None):
+        value = REPORT.terminal_snapshot_summary(*(reports or cls.reports()), resolver or cls.resolver())
+        value.update(capture_status="complete", capture_exit_code=0, analysis_status="complete",
+                     tool_exit_codes={"grouped": 1, "list": 1})
+        value["status"] = value["stacks_status"] if value["parsing_status"] == "complete" else "unavailable"
+        return value
+
+    def test_root_stack_order_repeats_and_list_counts_are_independent(self):
+        resolver = self.resolver()
+        value = self.summary(resolver=resolver)
+        with mock.patch.object(REPORT, "SystemSymbols", return_value=resolver):
+            REPORT.validate_terminal_snapshot(value)
+        self.assertEqual((value["leak_nodes"], value["leak_bytes"], value["root_instances"]), (2, 144, 1))
+        self.assertEqual(value["parsing_status"], "complete")
+        self.assertEqual(value["stacks_status"], "partial")
+        root = value["root_groups"][0]
+        self.assertEqual(root["type"], "NSMutableArray")
+        self.assertEqual([frame["index"] for frame in root["stack"]["frames"]], [0, 1])
+        self.assertEqual(root["stack"]["frames"][0]["symbol"], root["stack"]["frames"][1]["symbol"])
+        self.assertEqual(root["stack"]["filtered_frames"], 1)
+        self.assertEqual([(row["type"], row["size"], row["count"]) for row in value["allocation_groups"]],
+                         [("NSMutableArray", 48, 1), ("unknown", 96, 1)])
+        text = json.dumps(value)
+        for private in ("0x", "private", "secret", "zone", "address", "preexisting", "new_allocation"):
+            self.assertNotIn(private, text)
+        self.assertEqual(resolver.verified.call_count, 5)
+
+    def test_duplicate_missing_and_disagreeing_reports_fail_closed(self):
+        grouped, listed = self.reports()
+        variants = [
+            (grouped.replace("144 total", "145 total"), listed),
+            (grouped.replace("ROOT LEAK: NSMutableArray\n", "ROOT LEAK: NSData\n"), listed),
+            (grouped.replace("STACK OF 1 INSTANCE", "STACK OF 3 INSTANCES"), listed),
+            (grouped.replace("    2 (144 bytes)", "    1 (144 bytes)"), listed),
+            (grouped, listed.replace("Leak: 0x2000", "Leak: 0x1000")),
+            (grouped, listed.replace("size=96", "size=95")),
+            (grouped, listed.replace("Leak: 0x2000", "Unsupported: 0x2000")),
+            (grouped.replace("1 com.apple.Foundation", "0 com.apple.Foundation"), listed),
+            (grouped + grouped, listed),
+        ]
+        for reports in variants:
+            with self.subTest(reports=variants.index(reports)):
+                value = self.summary(reports)
+                self.assertEqual(value["parsing_status"], "unavailable")
+                self.assertEqual(value["root_groups"], [])
+
+    def test_multiple_root_headers_keep_their_own_stacks(self):
+        grouped, listed = self.reports()
+        grouped = grouped.replace("    2 (144 bytes)", "    1 (48 bytes)").replace(
+            "       1 (96 bytes) private-child\n", "\nSTACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
+            "0 com.apple.CoreFoundation 0x8888 CFDataCreate + 8\n====\n"
+            "    1 (96 bytes) ROOT CYCLE: NSXPCConnection\n")
+        value = self.summary((grouped, listed))
+        self.assertEqual(value["root_instances"], 2)
+        self.assertEqual([row["type"] for row in value["root_groups"]], ["NSMutableArray", "NSXPCConnection"])
+        self.assertEqual(value["root_groups"][1]["stack"]["frames"],
+                         [{"index": 0, "image": "CoreFoundation", "symbol": "CFDataCreate"}])
+        self.assertNotEqual(value["root_groups"][0]["stack"]["frames"], value["root_groups"][1]["stack"]["frames"])
+
+    def test_stack_gaps_unknown_lines_and_missing_stack_do_not_claim_coverage(self):
+        grouped, listed = self.reports()
+        for changed in (grouped.replace("1 com.apple.Foundation 0x9999 -[NSXPCConnection initWithMachServiceName:options:] + 8\n", ""),
+                        grouped.replace("2 private-fixture 0x1000 secret_caller + 4", "truncated stack")):
+            value = self.summary((changed, listed))
+            stack = value["root_groups"][0]["stack"]
+            self.assertEqual(value["status"], "partial")
+            self.assertTrue(stack["missing_frames"] or stack["unparsed_lines"])
+        frames, unparsed = REPORT.terminal_frames("stack unavailable")
+        self.assertEqual(REPORT.terminal_stack(frames, unparsed, self.resolver(), [96])["status"], "missing")
+
+    def test_each_frame_requires_independent_verification_and_shared_budget(self):
+        resolver = self.resolver()
+        resolver.verified.side_effect = lambda image, *_: image == "CoreFoundation"
+        value = self.summary(resolver=resolver)
+        self.assertEqual(value["root_groups"][0]["stack"]["unverified_frames"], 2)
+        self.assertEqual(value["root_groups"][0]["stack"]["frames"], [])
+        with mock.patch.object(REPORT, "TERMINAL_FRAME_LIMIT", 1):
+            value = self.summary()
+        rows = value["root_groups"] + value["allocation_groups"]
+        self.assertEqual(sum(len(row["stack"]["frames"]) for row in rows), 1)
+        self.assertEqual(sum(row["stack"]["budget_omitted_frames"] for row in rows), 4)
+        self.assertEqual(value["status"], "partial")
+        resolver = self.resolver()
+        resolver.verified.side_effect = None
+        resolver.verified.return_value = False
+        with mock.patch.object(REPORT, "TERMINAL_FRAME_LIMIT", 1):
+            value = self.summary(resolver=resolver)
+        self.assertEqual(resolver.verified.call_count, 1)
+        self.assertEqual(sum(row["stack"]["unverified_frames"] for row in value["root_groups"] + value["allocation_groups"]), 1)
+
+    def test_group_and_input_budgets_are_explicit(self):
+        with mock.patch.object(REPORT, "TERMINAL_GROUP_LIMIT", 1):
+            value = self.summary()
+        self.assertEqual(value["omitted_allocation_groups"], 1)
+        self.assertEqual(value["status"], "partial")
+        with mock.patch.object(REPORT, "REPORT_BYTE_LIMIT", 1):
+            self.assertEqual(self.summary()["status"], "unavailable")
+
+    def test_public_gate_rechecks_symbols_and_counts_without_raw_output(self):
+        valid = self.summary()
+        mutations = [lambda v: v.update(private="secret"), lambda v: v.update(status="complete"),
+                     lambda v: v.update(root_instances=2), lambda v: v.update(leak_bytes=145),
+                     lambda v: v["root_groups"][0].update(type="secret"),
+                     lambda v: v["root_groups"][0]["stack"].update(omitted_frames=0),
+                     lambda v: v["root_groups"][0]["stack"]["frames"][0].update(symbol="/private/secret"),
+                     lambda v: v["root_groups"][0]["stack"]["frames"][0].update(index=True),
+                     lambda v: v["tool_exit_codes"].update(grouped=2)]
+        for mutate in mutations:
+            value = json.loads(json.dumps(valid))
+            mutate(value)
+            with mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), self.assertRaises(ValueError):
+                REPORT.validate_terminal_snapshot(value)
+        resolver = self.resolver()
+        resolver.lookup.return_value = None
+        with mock.patch.object(REPORT, "SystemSymbols", return_value=resolver), self.assertRaises(ValueError):
+            REPORT.validate_terminal_snapshot(valid)
+
+    def test_capture_timeout_and_offline_tool_failures_are_bounded_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            graph = root / "terminal.memgraph"
+            with mock.patch.object(REPORT.subprocess, "run", side_effect=subprocess.TimeoutExpired("leaks", 60)):
+                capture = REPORT.capture_terminal_snapshot(123, graph)
+            self.assertEqual(capture["capture_status"], "timeout")
+            with mock.patch.object(REPORT.subprocess, "run") as run:
+                value = REPORT.collect_terminal_snapshot(graph, root, capture)
+            run.assert_not_called()
+            self.assertEqual(value["status"], "unavailable")
+            capture.update(capture_status="complete", capture_exit_code=0)
+            grouped, listed = self.reports()
+            for fail in ("timeout", "code"):
+                returns = [subprocess.CompletedProcess([], 1, grouped, "")]
+                returns.append(subprocess.TimeoutExpired("leaks", 1) if fail == "timeout" else
+                               subprocess.CompletedProcess([], 2, "private-error", "secret"))
+                with mock.patch.object(REPORT.subprocess, "run", side_effect=returns) as run:
+                    value = REPORT.collect_terminal_snapshot(graph, root, capture)
+                self.assertEqual(value["tool_exit_codes"]["grouped"], 1)
+                self.assertEqual(value["analysis_status"], "timeout" if fail == "timeout" else "failed")
+                self.assertEqual(value["status"], "unavailable")
+                self.assertEqual(run.call_count, 2)
+                self.assertLessEqual(run.call_args.kwargs["timeout"], REPORT.TERMINAL_SECONDS)
+                self.assertNotIn("secret", (root / "terminal-snapshot.json").read_text())
+            with mock.patch.object(REPORT.time, "monotonic", side_effect=[0, 0, REPORT.TERMINAL_SECONDS + 1]), \
+                    mock.patch.object(REPORT.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, grouped, "")) as run:
+                value = REPORT.collect_terminal_snapshot(graph, root, capture)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(value["analysis_status"], "timeout")
+            self.assertEqual(value["tool_exit_codes"], {"grouped": 1, "list": None})
+
+
 class AXCompatibilityLifecycleTests(unittest.TestCase):
     """Inject process/scan results while exercising the real runner protocol."""
 
@@ -559,7 +748,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         heap_diagnostics=False, unavailable_cohorts=False, heap_control=False,
                         invalid_control_host=None, invalid_control_reader=None,
                         copy_lifetime=False, invalid_copy_lifetime=None,
-                        malloc_scribble=None, invalid_allocator=None, external_receipt=False, binary_drift=False):
+                        malloc_scribble=None, invalid_allocator=None, external_receipt=False, binary_drift=False,
+                        terminal_origin=False, terminal_timeout=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -641,9 +831,18 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 elif command[0] == "leaks":
                     capture = next((value for value in command if value.startswith("--outputGraph=")), None)
                     if capture:
-                        self.assertIn("--fullStackHistory", command)
+                        self.assertEqual("--fullStackHistory" in command, heap_diagnostics)
+                        if terminal_origin:
+                            self.assertEqual(scanned, scan_labels)
+                            self.assertEqual(processes[0].poll(), None)
+                            self.assertEqual(processes[1].poll(), 0)
+                            if terminal_timeout:
+                                raise subprocess.TimeoutExpired("terminal capture", 60)
                         pathlib.Path(capture.split("=", 1)[1]).touch()
                         return subprocess.CompletedProcess(command, 0, "", "")
+                    if terminal_origin and command[-1].endswith("terminal.memgraph"):
+                        self.assertTrue(all(process.returncode == 0 for process in processes))
+                        return subprocess.CompletedProcess(command, 0, "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
                     if "--list" in command:
                         self.assertTrue(all(process.returncode == 0 for process in processes))
                         if unavailable_cohorts:
@@ -737,6 +936,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.append("--copy-lifetime")
             if malloc_scribble:
                 arguments.extend(["--malloc-scribble", malloc_scribble])
+            if terminal_origin:
+                arguments.append("--terminal-origin")
             def startup_metadata(pid):
                 process = next(process for process in processes if process.pid == pid)
                 role = "reader" if process.is_reader else "host"
@@ -810,6 +1011,18 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertEqual(len(live_scans), len(scan_labels))
                 self.assertTrue(all(any(value.startswith("--outputGraph=") for value in command) for command in live_scans))
                 self.assertEqual([point["label"] for point in diagnostic["checkpoints"]], list(REPORT.HEAP_LABELS[1:]))
+            elif terminal_origin:
+                terminal = json.loads((records / "terminal-snapshot.json").read_text())
+                REPORT.validate_terminal_snapshot(terminal)
+                self.assertEqual(terminal["capture_status"], "timeout" if terminal_timeout else "complete")
+                self.assertEqual(terminal["status"], "unavailable" if terminal_timeout else "complete")
+                self.assertFalse((records / "heap-diagnostics.json").exists())
+                live_scans = [command for command in commands if command[0] == "leaks" and command[-1] == "1234"]
+                self.assertEqual(len(live_scans), 7)
+                self.assertTrue(all(command == ["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", "1234"]
+                                    for command in live_scans[:6]))
+                self.assertEqual(sum(command[0] == "leaks" and command[-1].endswith("terminal.memgraph") for command in commands),
+                                 0 if terminal_timeout else 2)
             else:
                 self.assertFalse((records / "heap-diagnostics.json").exists())
                 self.assertFalse((work / "heap").exists())
@@ -1019,6 +1232,15 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertIsNone(summary["ax_leak_nodes"])
                 self.assertEqual([error["stage"] for error in summary["validation_errors"]], [stage])
 
+    def test_terminal_origin_follows_six_live_scans_and_preserves_strict_failures(self):
+        for failed in (None, "registered-10"):
+            for timeout in (False, True):
+                with self.subTest(failed=failed, timeout=timeout):
+                    code, summary = self.exercise_runner(failed_scan=failed, terminal_origin=True, terminal_timeout=timeout,
+                                                        external_receipt=True, malloc_scribble="off")
+                    self.assertEqual(code, int(failed is not None))
+                    self.assertEqual(summary["coverage"], "failed" if failed else "passed")
+
     def test_allocation_tool_failure_does_not_replace_product_exit_code(self):
         for stage in (None, "registered-10"):
             with self.subTest(stage=stage):
@@ -1106,6 +1328,25 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     self.assertTrue(receipt["external_startup_verified"])
                     self.assertEqual(receipt["startup_environment"]["executables"], summary["fixture_executables"])
 
+    def test_terminal_workflow_runs_only_off_pair_and_retains_independent_verdicts(self):
+        for failure in (None, "strict", "terminal", "terminal-private", "terminal-missing", "timeout"):
+            with self.subTest(failure=failure):
+                invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                                                          terminal_origin=True, first_failure=failure)
+                self.assertEqual(invocations, [("off", "control"), ("off", "product")])
+                self.assertTrue(summary["trials"][1]["terminal_snapshot_checks_passed"])
+                self.assertEqual(summary["terminal_snapshot_checks_passed"], failure not in ("terminal", "terminal-private", "terminal-missing", "timeout"))
+
+    def test_terminal_workflow_rejects_internal_or_diagnostic_before_querying_host(self):
+        script = self.workflow_script("Verify investigation identity")
+        for mode, receipt in (("live", "internal"), ("diagnostic", "external-startup"), ("diagnostic", "internal")):
+            with mock.patch.dict(os.environ, {"CAUSAL_PROBE": "false", "AX_SCAN_MODE": mode,
+                    "MALLOC_SCRIBBLE_EXPERIMENT": "true", "AX_RECEIPT_MODE": receipt,
+                    "AX_HEAP_DIAGNOSTICS": "false", "AX_TERMINAL_ORIGIN": "true"}), \
+                    mock.patch.object(subprocess, "check_output") as query, self.assertRaises(AssertionError):
+                exec(compile(script, "ax-system-baseline.yml", "exec"), {})
+            query.assert_not_called()
+
     def test_scan_tool_status_and_independent_assertion_categories_are_preserved(self):
         _, summary = self.run_measurement(scan_mode="live", first_failure="strict")
         first = summary["trials"][0]
@@ -1143,13 +1384,13 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         self.assertFalse(root.exists())
 
     def run_measurement(self, *, enabled=True, first_failure=None, scan_mode="diagnostic", unexpected_diagnostics=False,
-                        first_scan_change=None, receipt_mode="internal"):
-        script = self.workflow_script("Measure five matched groups with strict heap checks")
+                        first_scan_change=None, receipt_mode="internal", terminal_origin=False):
+        script = self.workflow_script("Measure matched cases with strict heap checks")
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
             summary_file = root / "summary.json"
-            PROBE.write_json(summary_file, {"identity": {"scan_mode": scan_mode, "receipt_mode": receipt_mode}, "trials": [], "completed": False,
-                                           "expected_trials": 20 if enabled else 10})
+            PROBE.write_json(summary_file, {"identity": {"scan_mode": scan_mode, "receipt_mode": receipt_mode, "terminal_origin": terminal_origin}, "trials": [], "completed": False,
+                                           "expected_trials": 2 if terminal_origin else 20 if enabled else 10})
             script = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
             invocations = []
             builds = []
@@ -1176,6 +1417,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                             "executables": EXTERNAL.fixture_hashes(prepared)})
                         return
                     test.assertEqual("--external-startup-receipt" in command, receipt_mode == "external-startup")
+                    test.assertEqual("--terminal-origin" in command, terminal_origin)
                     setting = command[command.index("--malloc-scribble") + 1] if "--malloc-scribble" in command else None
                     mode = "control" if "--heap-control" in command else "product"
                     invocations.append((setting, mode))
@@ -1220,6 +1462,13 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         PROBE.write_json(records / "heap-diagnostics.json", diagnostic)
                     if scan_mode == "live" and unexpected_diagnostics:
                         PROBE.write_json(records / "heap-diagnostics.json", diagnostic | {"private": "secret"})
+                    if terminal_origin and not (self.first and first_failure == "terminal-missing"):
+                        terminal = AXTerminalSnapshotTests.summary()
+                        if self.first and first_failure == "terminal":
+                            terminal = REPORT.empty_terminal_snapshot()
+                        elif self.first and first_failure == "terminal-private":
+                            terminal["private"] = "secret"
+                        PROBE.write_json(records / "terminal-snapshot.json", terminal)
                     labels = [label for label in REPORT.HEAP_LABELS if scan_mode == "diagnostic" or label != "added-10"]
                     if self.first and first_failure == "scans":
                         labels.remove("registered-10")
@@ -1256,6 +1505,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     mock.patch.dict(sys.modules, {"verify-ax-compatibility": PROBE}), \
                     mock.patch.object(sys, "path", list(sys.path)), \
                     mock.patch.object(subprocess, "Popen", side_effect=Process), \
+                    mock.patch.object(REPORT, "SystemSymbols", return_value=AXTerminalSnapshotTests.resolver()), \
                     mock.patch.object(os, "killpg", create=True) as killpg, \
                     contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit) as result:
                 exec(compile(script, "ax-system-baseline.yml", "exec"), {})
@@ -1270,9 +1520,9 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 self.assertEqual(killpg.call_count, 2 if first_failure == "build-timeout" else 0)
                 return invocations, summary
             self.assertEqual(result.exception.code, int(first_failure is not None))
-            self.assertEqual(summary["strict_checks_passed"], first_failure is None)
+            self.assertEqual(summary["strict_checks_passed"], first_failure is None or first_failure.startswith("terminal"))
             self.assertTrue(summary["completed"])
-            self.assertEqual(len(summary["trials"]), 20 if enabled else 10)
+            self.assertEqual(len(summary["trials"]), 2 if terminal_origin else 20 if enabled else 10)
             for trial_index, receipt in enumerate(summary["trials"]):
                 self.assertEqual(receipt["scan_mode"], scan_mode)
                 self.assertEqual(receipt["diagnostics_expected"], scan_mode == "diagnostic")

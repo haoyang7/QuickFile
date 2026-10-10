@@ -532,6 +532,276 @@ def leak_groups(report):
     return groups
 
 
+# The terminal report is independent of allocation cohorts. Its two text views
+# describe one later snapshot; neither counts nor stack equality bind it to a
+# node from the preceding live scans. Bounds also apply at the public gate.
+TERMINAL_ROOT_LIMIT = 16
+TERMINAL_GROUP_LIMIT = 32
+TERMINAL_FRAME_LIMIT = 96
+TERMINAL_NODE_LIMIT = 4096
+TERMINAL_SECONDS = 45
+TERMINAL_FRAME = re.compile(r"(\d{1,3})\s+(\S+)\s+(0x[0-9a-fA-F]{1,16})\s+(.+?)\s+\+ (\d{1,10})\s*")
+
+
+def empty_terminal_snapshot():
+    return {"schema": 1, "status": "unavailable", "capture_status": "not-run", "capture_exit_code": None,
+            "analysis_status": "not-run", "tool_exit_codes": {"grouped": None, "list": None},
+            "parsing_status": "unavailable", "stacks_status": "unavailable",
+            "frame_order": "allocation-first", "leak_nodes": None, "leak_bytes": None,
+            "root_instances": 0, "root_groups": [], "allocation_groups": [],
+            "omitted_root_groups": 0, "omitted_allocation_groups": 0}
+
+
+def terminal_frames(text):
+    """Private frame tokens; retain repeated symbols and reject ambiguous indices."""
+    frames, unparsed = [], 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = TERMINAL_FRAME.fullmatch(line)
+        if match:
+            frames.append((int(match[1]), match[2], int(match[3], 16), match[4], int(match[5])))
+        else:
+            unparsed += 1
+    indices = [frame[0] for frame in frames]
+    if len(indices) != len(set(indices)) or len(indices) > 512 or any(index > 511 for index in indices):
+        raise ValueError("Ambiguous terminal frames")
+    if indices not in (sorted(indices), sorted(indices, reverse=True)):
+        raise ValueError("Unordered terminal frames")
+    return tuple(sorted(frames)), unparsed
+
+
+def terminal_stack(frames, unparsed, resolver, budget):
+    public = []
+    filtered = unverified = limited = 0
+    for index, raw_image, address, symbol, offset in frames:
+        image = next((name for name, (reported, _) in HEAP_IMAGES.items() if raw_image in (name, reported)), None)
+        if image not in HEAP_SYMBOL_IMAGES:
+            filtered += 1
+        elif not budget[0]:
+            limited += 1
+        else:
+            # Bound independent lookups, including failures, not just output.
+            budget[0] -= 1
+            if resolver.verified(image, symbol, address, offset):
+                public.append({"index": index, "image": image, "symbol": symbol})
+            else:
+                unverified += 1
+    missing = frames[-1][0] + 1 - len(frames) if frames else None
+    omitted = len(frames) - len(public)
+    status = "missing" if not frames else "partial" if omitted or missing or unparsed else "complete"
+    return {"status": status, "reported_frames": len(frames), "missing_frames": missing,
+            "unparsed_lines": unparsed, "omitted_frames": omitted, "filtered_frames": filtered,
+            "unverified_frames": unverified, "budget_omitted_frames": limited, "frames": public}
+
+
+def terminal_snapshot_summary(grouped, listed, resolver):
+    """Parse observed leaks v4 grouped/v3 list syntax, without a node-to-root join.
+
+    A grouped header owns the stack immediately before its tree. The list view
+    contributes whole-snapshot type/size/stack counts only, not descendant links.
+    Unknown formatting fails closed instead of guessing NSXPC-specific syntax.
+    """
+    result = empty_terminal_snapshot()
+    try:
+        reports = []
+        for text in (grouped, listed):
+            if len(text.encode()) > REPORT_BYTE_LIMIT:
+                raise ValueError("Terminal report budget")
+            body = text.split("\nBinary Images:", 1)[0]
+            totals = re.findall(r"^Process \d+: (\d+) leaks? for (\d+) total leaked bytes\.\s*$", text, re.MULTILINE)
+            if len(totals) != 1:
+                raise ValueError("Terminal totals unavailable")
+            nodes, size = map(int, totals[0])
+            if nodes > TERMINAL_NODE_LIMIT or size > 1_000_000_000:
+                raise ValueError("Terminal node budget")
+            reports.append((body, nodes, size))
+        if reports[0][1:] != reports[1][1:]:
+            raise ValueError("Terminal views disagree")
+        result.update(leak_nodes=reports[0][1], leak_bytes=reports[0][2])
+        allocation_counts, addresses = Counter(), set()
+        blocks = reports[1][0].split("\nLeak: ")[1:]
+        if len(blocks) != result["leak_nodes"]:
+            raise ValueError("Incomplete terminal list")
+        byte_count = 0
+        for block in blocks:
+            header, separator, stack = block.partition("\n\tCall stack:")
+            match = re.fullmatch(r"(0x[0-9a-fA-F]{1,16})\s+size=(\d+)\s+zone:\s*\S+\s{2,}([^\n]+)", header)
+            if not match or int(match[1], 16) in addresses:
+                raise ValueError("Invalid terminal list row")
+            addresses.add(int(match[1], 16))
+            size = int(match[2])
+            byte_count += size
+            kind = re.split(r"\s{2,}", match[3])[0]
+            frames, unparsed = terminal_frames(stack if separator else "")
+            allocation_counts[(kind if kind in HEAP_TYPES else "unknown", size, frames, unparsed)] += 1
+        if byte_count != result["leak_bytes"]:
+            raise ValueError("Terminal list bytes disagree")
+        roots, root_keys = [], set()
+        blocks = re.split(r"(?=^STACK OF )", reports[0][0], flags=re.MULTILINE)[1:]
+        for block in blocks:
+            header, _, remainder = block.partition("\n")
+            match = re.fullmatch(r"STACK OF (\d+) INSTANCES? OF 'ROOT (LEAK|CYCLE): ([^\n]+)':", header)
+            stack, separator, tree = remainder.partition("\n====\n")
+            tree_lines = [line for line in tree.splitlines() if line.strip()]
+            first = re.fullmatch(r"\s+(\d+) \([^)]+\) ROOT (LEAK|CYCLE): (.+)", tree_lines[0]) if tree_lines else None
+            if (not match or not separator or not first or (match[2], match[3]) != (first[2], first[3])
+                    or not 1 <= int(match[1]) <= int(first[1]) <= TERMINAL_NODE_LIMIT):
+                raise ValueError("Invalid terminal root group")
+            frames, unparsed = terminal_frames(stack)
+            key = (match[2], match[3], frames)
+            if key in root_keys:
+                raise ValueError("Duplicate terminal root group")
+            root_keys.add(key)
+            roots.append({"type": match[3] if match[3] in HEAP_TYPES else "unknown", "kind": match[2],
+                          "instances": int(match[1]), "tree_nodes": int(first[1]), "private_stack": (frames, unparsed)})
+        if sum(root["tree_nodes"] for root in roots) != result["leak_nodes"]:
+            raise ValueError("Incomplete terminal root groups")
+        result["root_instances"] = sum(root["instances"] for root in roots)
+        budget = [TERMINAL_FRAME_LIMIT]
+        for root in roots[:TERMINAL_ROOT_LIMIT]:
+            frames, unparsed = root.pop("private_stack")
+            root["stack"] = terminal_stack(frames, unparsed, resolver, budget)
+            result["root_groups"].append(root)
+        result["omitted_root_groups"] = max(0, len(roots) - TERMINAL_ROOT_LIMIT)
+        for (kind, size, frames, unparsed), count in list(sorted(allocation_counts.items()))[:TERMINAL_GROUP_LIMIT]:
+            result["allocation_groups"].append({"type": kind, "size": size, "count": count,
+                                               "stack": terminal_stack(frames, unparsed, resolver, budget)})
+        result["omitted_allocation_groups"] = max(0, len(allocation_counts) - TERMINAL_GROUP_LIMIT)
+        result["parsing_status"] = "complete"
+        rows = result["root_groups"] + result["allocation_groups"]
+        result["stacks_status"] = ("partial" if result["omitted_root_groups"] or result["omitted_allocation_groups"]
+            or any(row["stack"]["status"] != "complete" for row in rows) else "complete")
+    except (ValueError, TypeError):
+        # No partially interpreted raw text or unsafely associated frames escape.
+        result = empty_terminal_snapshot()
+    return result
+
+
+def capture_terminal_snapshot(pid, graph):
+    result = empty_terminal_snapshot()
+    try:
+        captured = subprocess.run(["leaks", "--noContent", "--fullStacks", f"--outputGraph={graph}", str(pid)],
+                                  capture_output=True, text=True, timeout=60)
+        graph.with_suffix(".capture.txt").write_text(captured.stdout + captured.stderr)
+        result["capture_exit_code"] = captured.returncode
+        result["capture_status"] = "complete" if captured.returncode in (0, 1) and graph.is_file() else "failed"
+    except subprocess.TimeoutExpired:
+        result["capture_status"] = "timeout"
+    except OSError:
+        result["capture_status"] = "failed"
+    return result
+
+
+def collect_terminal_snapshot(graph, records, capture):
+    """Called only after the host exits; bounded tools consume the single graph."""
+    result = dict(capture)
+    if result["capture_status"] == "complete":
+        deadline = time.monotonic() + TERMINAL_SECONDS
+        codes, reports = dict(result["tool_exit_codes"]), {}
+        analysis_status = "complete"
+        try:
+            for name, flag in (("grouped", "--groupByType"), ("list", "--list")):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired("terminal analysis", TERMINAL_SECONDS)
+                output = subprocess.run(["leaks", "--noContent", flag, "--nosources", "--fullStacks", str(graph)],
+                                        capture_output=True, text=True, timeout=remaining)
+                (records / f"terminal-{name}.txt").write_text(output.stdout + output.stderr)
+                codes[name] = output.returncode
+                if output.returncode not in (0, 1) or len(output.stdout.encode()) > REPORT_BYTE_LIMIT:
+                    analysis_status = "failed"
+                reports[name] = output.stdout
+            if analysis_status == "complete":
+                result.update(terminal_snapshot_summary(reports["grouped"], reports["list"], SystemSymbols()))
+        except subprocess.TimeoutExpired:
+            analysis_status = "timeout"
+        except OSError:
+            analysis_status = "failed"
+        result.update(capture_status=capture["capture_status"], capture_exit_code=capture["capture_exit_code"],
+                      analysis_status=analysis_status, tool_exit_codes=codes)
+    result["status"] = ("unavailable" if result["parsing_status"] != "complete" else
+                        "complete" if result["stacks_status"] == "complete" else "partial")
+    validate_terminal_snapshot(result)
+    (records / "terminal-snapshot.json").write_text(json.dumps(result, indent=2) + "\n")
+    return result
+
+
+def validate_terminal_snapshot(value):
+    """Exact allowlist plus a second independent system-symbol output gate."""
+    def require(condition):
+        if not condition:
+            raise ValueError("Invalid bounded terminal snapshot")
+
+    integer = lambda item: type(item) is int and 0 <= item <= 1_000_000_000
+    require(type(value) is dict and set(value) == set(empty_terminal_snapshot()))
+    require(type(value["schema"]) is int and value["schema"] == 1 and value["frame_order"] == "allocation-first")
+    require(value["capture_status"] in ("not-run", "complete", "timeout", "failed"))
+    require(value["analysis_status"] in ("not-run", "complete", "timeout", "failed"))
+    require(value["parsing_status"] in ("unavailable", "complete") and value["stacks_status"] in ("unavailable", "complete", "partial"))
+    require(type(value["tool_exit_codes"]) is dict and set(value["tool_exit_codes"]) == {"grouped", "list"})
+    for code in [value["capture_exit_code"], *value["tool_exit_codes"].values()]:
+        require(code is None or type(code) is int and -128 <= code <= 255)
+    require(type(value["root_groups"]) is list and len(value["root_groups"]) <= TERMINAL_ROOT_LIMIT)
+    require(type(value["allocation_groups"]) is list and len(value["allocation_groups"]) <= TERMINAL_GROUP_LIMIT)
+    for key in ("root_instances", "omitted_root_groups", "omitted_allocation_groups"):
+        require(integer(value[key]) and value[key] <= TERMINAL_NODE_LIMIT)
+    for key in ("leak_nodes", "leak_bytes"):
+        require(value[key] is None or integer(value[key]))
+    resolver, frame_count = SystemSymbols(), 0
+    rows = value["root_groups"] + value["allocation_groups"]
+    for root, entries in ((True, value["root_groups"]), (False, value["allocation_groups"])):
+        for row in entries:
+            fields = {"type", "kind", "instances", "tree_nodes", "stack"} if root else {"type", "size", "count", "stack"}
+            require(type(row) is dict and set(row) == fields and row["type"] in (*HEAP_TYPES, "unknown"))
+            if root:
+                require(row["kind"] in ("LEAK", "CYCLE") and integer(row["instances"]) and integer(row["tree_nodes"])
+                        and 1 <= row["instances"] <= row["tree_nodes"] <= TERMINAL_NODE_LIMIT)
+            else:
+                require(integer(row["size"]) and integer(row["count"]) and 1 <= row["count"] <= TERMINAL_NODE_LIMIT)
+            stack = row["stack"]
+            require(type(stack) is dict and set(stack) == {"status", "reported_frames", "missing_frames", "unparsed_lines", "omitted_frames",
+                                                          "filtered_frames", "unverified_frames", "budget_omitted_frames", "frames"})
+            require(all(integer(stack[key]) for key in ("reported_frames", "unparsed_lines", "omitted_frames",
+                                                        "filtered_frames", "unverified_frames", "budget_omitted_frames")))
+            require(stack["omitted_frames"] == stack["filtered_frames"] + stack["unverified_frames"] + stack["budget_omitted_frames"])
+            require(stack["reported_frames"] <= 512 and stack["unparsed_lines"] <= REPORT_BYTE_LIMIT)
+            require(stack["missing_frames"] is None if not stack["reported_frames"] else
+                    integer(stack["missing_frames"]) and stack["missing_frames"] + stack["reported_frames"] <= 512)
+            require(type(stack["frames"]) is list and len(stack["frames"]) + stack["omitted_frames"] == stack["reported_frames"])
+            indices = []
+            for frame in stack["frames"]:
+                require(type(frame) is dict and set(frame) == {"index", "image", "symbol"})
+                require(integer(frame["index"]) and frame["index"] < stack["reported_frames"] + stack["missing_frames"])
+                require(public_system_symbol(frame["image"], frame["symbol"]) and resolver.lookup(frame["image"], frame["symbol"]) is not None)
+                indices.append(frame["index"])
+            require(indices == sorted(set(indices)))
+            frame_count += len(indices)
+            expected = ("missing" if not stack["reported_frames"] else "partial" if
+                        stack["missing_frames"] or stack["omitted_frames"] or stack["unparsed_lines"] else "complete")
+            require(stack["status"] == expected)
+    require(frame_count + sum(row["stack"]["unverified_frames"] for row in rows) <= TERMINAL_FRAME_LIMIT)
+    if value["parsing_status"] == "complete":
+        require(value["capture_status"] == value["analysis_status"] == "complete" and value["capture_exit_code"] in (0, 1)
+                and all(code in (0, 1) for code in value["tool_exit_codes"].values()))
+        require(integer(value["leak_nodes"]) and value["leak_nodes"] <= TERMINAL_NODE_LIMIT and integer(value["leak_bytes"]))
+        roots = sum(row["instances"] for row in value["root_groups"])
+        nodes = sum(row["count"] for row in value["allocation_groups"])
+        size = sum(row["count"] * row["size"] for row in value["allocation_groups"])
+        tree_nodes = sum(row["tree_nodes"] for row in value["root_groups"])
+        require(roots <= value["root_instances"] <= value["leak_nodes"] and tree_nodes <= value["leak_nodes"])
+        require(nodes <= value["leak_nodes"] and size <= value["leak_bytes"])
+        require(value["omitted_root_groups"] or roots == value["root_instances"] and tree_nodes == value["leak_nodes"])
+        require(value["omitted_allocation_groups"] or nodes == value["leak_nodes"] and size == value["leak_bytes"])
+        expected = "partial" if value["omitted_root_groups"] or value["omitted_allocation_groups"] or any(row["stack"]["status"] != "complete" for row in rows) else "complete"
+        require(value["stacks_status"] == value["status"] == expected)
+    else:
+        require(not rows and value["leak_nodes"] is None and value["leak_bytes"] is None
+                and value["root_instances"] == value["omitted_root_groups"] == value["omitted_allocation_groups"] == 0
+                and value["stacks_status"] == value["status"] == "unavailable")
+    require(len(json.dumps(value).encode()) <= 65536)
+
+
 def disassemble_symbols(state, work, records):
     raw = json.loads((state / "symbol-code.json").read_text())
     summaries = []
