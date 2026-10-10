@@ -3,6 +3,11 @@ name: AX system baseline
 on:
   workflow_dispatch:
     inputs:
+      ax_startup_probe:
+        description: 'Trace idle AppKit startup and allocation stacks before AX activity'
+        type: boolean
+        required: false
+        default: false
       ax_causal_probe:
         description: 'Run traced control and isolated balance experiment after reviewing system ownership evidence'
         type: boolean
@@ -75,27 +80,28 @@ jobs:
               'os_build':output('sw_vers', '-buildVersion'), 'architecture':architecture, 'xcode':xcode}))
           PY
       - name: Measure AX reads without subscriptions
-        if: ${{ !inputs.ax_causal_probe }}
+        if: ${{ !inputs.ax_causal_probe && !inputs.ax_startup_probe }}
         run: >-
           python3 Scripts/Investigations/verify-ax-compatibility.py
           --system-baseline --read-only --cycles 10 --idle-seconds 60
           --work-directory .build/Temporary/ax-system-probe/read-only
           --records-directory .build/Temporary/ax-system-probe/records-read-only
       - name: Measure AX destroyed notifications without compensation
-        if: ${{ !inputs.ax_causal_probe }}
+        if: ${{ !inputs.ax_causal_probe && !inputs.ax_startup_probe }}
         run: >-
           python3 Scripts/Investigations/verify-ax-compatibility.py
           --system-baseline --cycles 10 --idle-seconds 60
           --work-directory .build/Temporary/ax-system-probe/subscribed
           --records-directory .build/Temporary/ax-system-probe/records-subscribed
       - name: Trace owned array generations and system call sites
+        if: ${{ !inputs.ax_startup_probe }}
         run: >-
           python3 Scripts/Investigations/verify-ax-compatibility.py
           --system-baseline --ownership-trace --cycles 10 --idle-seconds 60
           --work-directory .build/Temporary/ax-system-probe/ownership
           --records-directory .build/Temporary/ax-system-probe/records-ownership
       - name: Balance one owned copy in the isolated fixture
-        if: ${{ inputs.ax_causal_probe && matrix.appkit_uuid != '' }}
+        if: ${{ inputs.ax_causal_probe && !inputs.ax_startup_probe && matrix.appkit_uuid != '' }}
         run: >-
           python3 Scripts/Investigations/verify-ax-compatibility.py
           --system-baseline --ownership-trace --balance-copies --cycles 10 --idle-seconds 60
@@ -104,11 +110,18 @@ jobs:
           --work-directory .build/Temporary/ax-system-probe/balance
           --records-directory .build/Temporary/ax-system-probe/records-balance
       - name: Verify production compensation against real destroyed notifications
-        if: ${{ matrix.appkit_uuid != '' }}
+        if: ${{ !inputs.ax_startup_probe && matrix.appkit_uuid != '' }}
         run: >-
           python3 Scripts/Investigations/verify-ax-compatibility.py
           --work-directory .build/Temporary/ax-system-probe/product
           --records-directory .build/Temporary/ax-system-probe/records-product
+      - name: Trace startup without product compensation or AX subscriptions
+        if: ${{ inputs.ax_startup_probe }}
+        run: >-
+          python3 Scripts/Investigations/verify-ax-compatibility.py
+          --system-baseline --startup-trace --read-only --cycles 10 --idle-seconds 60
+          --work-directory .build/Temporary/ax-system-probe/startup
+          --records-directory .build/Temporary/ax-system-probe/records-startup
       - name: Remove investigation products and raw logs
         if: always()
         run: |

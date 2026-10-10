@@ -16,7 +16,7 @@ import plistlib
 import re
 import subprocess
 import time
-from ax_probe_report import disassemble_symbols, leak_groups
+from ax_probe_report import allocation_groups, disassemble_symbols, leak_groups
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -91,6 +91,7 @@ def main():
     parser.add_argument("--work-directory", required=True, type=Path)
     parser.add_argument("--records-directory", required=True, type=Path)
     parser.add_argument("--system-baseline", action="store_true")
+    parser.add_argument("--startup-trace", action="store_true", help="Separate idle startup and button creation from AX reads; requires --system-baseline")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
     parser.add_argument("--balance-copies", action="store_true", help="Causal experiment: add one autorelease at the traced call sites; requires --ownership-trace")
@@ -99,6 +100,8 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.startup_trace and not args.system_baseline:
+        parser.error("--startup-trace requires --system-baseline")
     if args.read_only and not args.system_baseline:
         parser.error("--read-only requires --system-baseline")
     if args.ownership_trace and (not args.system_baseline or args.read_only):
@@ -204,10 +207,17 @@ def main():
 
         def scan(label, host_state):
             started = time.monotonic()
-            result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(host.pid)],
+            graph = work / f"{label}.memgraph"
+            if args.startup_trace:
+                capture = subprocess.run(["leaks", "--noContent", f"--outputGraph={graph}", str(host.pid)],
+                                         capture_output=True, text=True, timeout=60)
+                (records / f"{label}-capture.txt").write_text(capture.stdout + capture.stderr)
+                if capture.returncode != 0 or not graph.is_file():
+                    raise RuntimeError("Heap snapshot capture was unavailable")
+            result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(graph if args.startup_trace else host.pid)],
                                     capture_output=True, text=True, timeout=60)
             (records / f"{label}-leaks.txt").write_text(result.stdout + result.stderr)
-            match = re.search(r"(\d+) leaks for (\d+) total leaked bytes", result.stdout)
+            match = re.search(r"(\d+) leaks? for (\d+) total leaked bytes", result.stdout)
             entry = {"label": label, "host": host_state, "exit_code": result.returncode,
                      "leak_nodes": int(match[1]) if match else None, "leak_bytes": int(match[2]) if match else None,
                      "destroyed_notification_stack_present": "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification" in result.stdout}
@@ -219,6 +229,22 @@ def main():
             write_json(records / "scans.json", results)
             if not match or result.returncode not in (0, 1):
                 raise RuntimeError(f"Full-heap scan was unavailable: {entry}")
+            if args.startup_trace:
+                # Decode the same snapshot, not a second live-process scan. The
+                # differential includes children added under an existing root.
+                differences = [] if label == "baseline" else [f"--diffFrom={work / 'baseline.memgraph'}"]
+                detail = subprocess.run(["leaks", "--list", "--noContent", "--nosources", "--fullStacks",
+                                         *differences, str(graph)], capture_output=True, text=True, timeout=60)
+                (records / f"{label}-allocations.txt").write_text(detail.stdout + detail.stderr)
+                total = re.search(r"(\d+) leaks? for (\d+) total leaked bytes", detail.stdout)
+                allocations = allocation_groups(detail.stdout)
+                if (detail.returncode not in (0, 1) or not total
+                        or sum(item["count"] for item in allocations) != int(total[1])
+                        or sum(item["count"] * item["allocation_bytes"] for item in allocations) != int(total[2])):
+                    raise RuntimeError("Allocation provenance was unavailable or incomplete")
+                entry["allocation_delta_from"] = None if label == "baseline" else "baseline"
+                entry["allocations"] = allocations
+                write_json(records / "scans.json", results)
             if not args.system_baseline:
                 validate(label, validate_product_scan, entry, results[0] if label != "baseline" else None)
 
@@ -227,6 +253,13 @@ def main():
             initial = wait_json(state / "ready.json", lambda value: value["sequence"] == 0, [host])
             if args.system_baseline:
                 scan("baseline", initial)
+            if args.startup_trace:
+                # No reader, owned buttons or product compensation exists yet.
+                # Fixed checkpoints reveal asynchronous AppKit startup without
+                # choosing a passing baseline or hiding an earlier failure.
+                for delay in (1, 3, 10):
+                    time.sleep(delay)
+                    scan(f"startup-idle-{delay}", command("checkpoint"))
             reader_arguments = ["--read-only"] if args.read_only else []
             reader = subprocess.Popen([str(reader_executable), str(host.pid), str(executable), str(state), *reader_arguments],
                                       stdout=reader_log, stderr=reader_log)
@@ -238,7 +271,9 @@ def main():
                     raise RuntimeError(f"AX baseline warm-up was not empty: {warmed}")
                 scan("baseline", command("checkpoint"))
             for cycle in range(1, args.cycles + 1):
-                command("add")
+                added = command("add")
+                if args.startup_trace and cycle == 1:
+                    scan("created-before-observe-10", added)
                 observed = observe()
                 if observed["buttons"] != 10 or observed["registrations"] != expected_registrations:
                     raise RuntimeError(f"AX registrations incomplete: {observed}")
@@ -246,6 +281,8 @@ def main():
                     # Locate setup growth without replacing the empty baseline
                     # or destroying any target button before the first scan.
                     scan("registered-10", command("checkpoint"))
+                elif args.startup_trace and cycle == 1:
+                    scan("observed-10", command("checkpoint"))
                 removed = command("remove")
                 observe()
                 if removed["destroyedButtons"] != cycle * 10:

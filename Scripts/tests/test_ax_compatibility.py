@@ -88,6 +88,31 @@ class AXCompatibilityHeapValidationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             PROBE.validate_product_scan(entry | {"groups": PROBE.leak_groups(text.replace("NSXPCConnection", "UnexpectedConnection"))})
 
+    def test_allocation_symbols_survive_without_addresses_or_binary_paths(self):
+        report = ("STACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
+                  "2   AppKit  0x123456 -[Example start] + 24\n"
+                  "1   Foundation  0xabcdef -[NSXPCConnection initWithServiceName:] + 8\n"
+                  "====\n  96 (6.12K) ROOT CYCLE: NSXPCConnection\n"
+                  "Binary Images:\n/Users/private/test.app\n")
+        groups = PROBE.leak_groups(report)
+        self.assertEqual(groups[0]["allocation_stack"], [
+            {"image": "AppKit", "symbol": "-[Example start]", "offset": 24},
+            {"image": "Foundation", "symbol": "-[NSXPCConnection initWithServiceName:]", "offset": 8}])
+        self.assertNotIn("0x", json.dumps(groups))
+        self.assertNotIn("/Users/", json.dumps(groups))
+
+    def test_allocation_provenance_counts_children_by_size_and_stack(self):
+        report = ""
+        for address, size in (("abc", 32), ("def", 32), ("123", 48)):
+            report += (f"Leak: 0x{address}  size={size}  zone: DefaultMallocZone_0x111   NSArray\n"
+                       "\tCall stack:\n0   Foundation  0xabc -[Example initialize] + 16\n")
+        groups = PROBE.allocation_groups(report + "Binary Images:\n/private/source\n")
+        self.assertEqual([(group["count"], group["allocation_bytes"]) for group in groups], [(2, 32), (1, 48)])
+        self.assertEqual(groups[0]["type"], "NSArray")
+        self.assertNotIn("0x", json.dumps(groups))
+        with self.assertRaisesRegex(RuntimeError, "no allocation stack"):
+            PROBE.allocation_groups("Leak: 0xabc size=32 zone: DefaultMallocZone_0x111 NSArray\n")
+
 
 class AXCompatibilityNotificationTests(unittest.TestCase):
     def test_extra_application_notifications_do_not_hide_per_button_coverage(self):

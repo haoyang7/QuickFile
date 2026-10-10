@@ -13,6 +13,31 @@ import subprocess
 DESTROYED = "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification"
 
 
+def allocation_stack(report):
+    return [{"image": image, "symbol": symbol, "offset": int(offset)}
+            for image, symbol, offset in re.findall(
+                r"^\s*\d+\s+(\S+)\s+0x[0-9a-fA-F]+\s+(.+?)\s+\+\s+(\d+)\s*$",
+                report, re.MULTILINE)]
+
+
+def allocation_groups(report):
+    """Aggregate individual leaked allocations without exporting addresses."""
+    groups = {}
+    for block in re.split(r"(?=^Leak: )", report, flags=re.MULTILINE):
+        header = re.match(r"Leak: 0x[0-9a-fA-F]+\s+size=(\d+)\s+zone: \S+([^\n]*)", block)
+        if not header:
+            continue
+        stack = allocation_stack(block.split("Binary Images:", 1)[0])
+        if not stack:
+            raise RuntimeError("Leaked allocation has no allocation stack")
+        kind = header[2].strip()
+        key = (kind, int(header[1]), json.dumps(stack, sort_keys=True))
+        group = groups.setdefault(key, {"type": kind, "allocation_bytes": int(header[1]),
+                                       "count": 0, "allocation_stack": stack})
+        group["count"] += 1
+    return list(groups.values())
+
+
 def leak_groups(report):
     groups = []
     for block in re.split(r"(?=STACK OF \d+ INSTANCES? OF )", report):
@@ -24,8 +49,12 @@ def leak_groups(report):
         # leaks includes the root classification inside the quoted type label.
         # Keep it separately so callers compare the actual class, not decoration.
         root = re.fullmatch(r"ROOT (LEAK|CYCLE): (.+)", header[2])
+        # Keep allocation provenance, not just the root class. Strip runtime
+        # addresses and retain only symbols from the no-content/no-sources scan.
+        stack = allocation_stack(block.split("====", 1)[0])
         groups.append({"root_instances": int(header[1]), "root_type": root[2] if root else header[2],
                        "root_kind": root[1] if root else None,
+                       "allocation_stack": stack,
                        "tree_nodes": int(tree[1]) if tree else None,
                        "display_size": tree[2] if tree else None,
                        "destroyed_return_offsets": sorted(set(map(int, re.findall(re.escape(DESTROYED) + r" \+ (\d+)", block))))})
