@@ -119,6 +119,46 @@ final class FileCreationServiceTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: result.fileURL, encoding: .utf8), "sequence=2")
     }
 
+    func testOneThroughNinetyNineConsecutiveConflictsPreserveEveryCompleteFileAndCleanStaging() throws {
+        let folder = temporaryDirectory.appendingPathComponent("destination", isDirectory: true)
+        let parent = temporaryDirectory.appendingPathComponent("private", isDirectory: true)
+        let stage = parent.appendingPathComponent("stage", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let original = folder.appendingPathComponent("报告.md")
+        let originalData = Data("原内容\n不可覆盖\n".utf8)
+        try originalData.write(to: original, options: .withoutOverwriting)
+        let body = String(repeating: "完整内容 🧪\n", count: 128)
+        let request = FileCreationRequest(
+            template: FileTemplate(name: "Markdown", fileExtension: "md", content: body + "sequence={{sequence}}\n"),
+            destinationFolder: folder,
+            requestedFilename: "报告.md"
+        )
+        let manager = ReplacementDirectoryFileManager(directory: stage)
+        let service = FileCreationService(fileManager: manager)
+        var expectedFiles = ["报告.md": originalData]
+
+        for conflictCount in 1...99 {
+            try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let result = try service.createFile(for: request)
+            let expectedName = "报告 \(conflictCount + 1).md"
+            let expectedData = Data((body + "sequence=\(conflictCount + 1)\n").utf8)
+
+            XCTAssertEqual(result.fileURL.lastPathComponent, expectedName, "Conflict count: \(conflictCount)")
+            XCTAssertTrue(result.didRenameForConflict)
+            XCTAssertEqual(try Data(contentsOf: result.fileURL), expectedData)
+            XCTAssertEqual(try Data(contentsOf: original), originalData)
+            expectedFiles[expectedName] = expectedData
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(), expectedFiles.keys.sorted())
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: parent.path), [], "Staging leaked after conflict count \(conflictCount)")
+        }
+
+        XCTAssertEqual(manager.requestCount, 99)
+        for (name, expectedData) in expectedFiles {
+            XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent(name)), expectedData, name)
+        }
+    }
+
     func testCreatesUnicodeAndEmojiFilename() throws {
         let template = FileTemplate(name: "文本", fileExtension: "txt", content: "")
 
