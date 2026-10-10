@@ -544,11 +544,11 @@ TERMINAL_FRAME = re.compile(r"(\d{1,3})\s+(\S+)\s+(0x[0-9a-fA-F]{1,16})\s+(.+?)\
 
 
 def empty_terminal_snapshot():
-    return {"schema": 1, "status": "unavailable", "capture_status": "not-run", "capture_exit_code": None,
+    return {"schema": 2, "status": "unavailable", "capture_status": "not-run", "capture_exit_code": None,
             "analysis_status": "not-run", "tool_exit_codes": {"grouped": None, "list": None},
             "parsing_status": "unavailable", "stacks_status": "unavailable",
             "frame_order": "allocation-first", "leak_nodes": None, "leak_bytes": None,
-            "root_instances": 0, "root_groups": [], "allocation_groups": [],
+            "root_instances": 0, "root_groups": [], "allocation_groups": [], "allocation_type_totals": None,
             "omitted_root_groups": 0, "omitted_allocation_groups": 0}
 
 
@@ -571,11 +571,16 @@ def terminal_frames(text):
     return tuple(sorted(frames)), unparsed
 
 
+def terminal_reported_image(raw_image):
+    """Classify report labels only; this does not verify a loaded image."""
+    return next((name for name, (reported, _) in HEAP_IMAGES.items() if raw_image in (name, reported)), "other")
+
+
 def terminal_stack(frames, unparsed, resolver, budget):
     public = []
     filtered = unverified = limited = 0
     for index, raw_image, address, symbol, offset in frames:
-        image = next((name for name, (reported, _) in HEAP_IMAGES.items() if raw_image in (name, reported)), None)
+        image = terminal_reported_image(raw_image)
         if image not in HEAP_SYMBOL_IMAGES:
             filtered += 1
         elif not budget[0]:
@@ -620,6 +625,8 @@ def terminal_snapshot_summary(grouped, listed, resolver):
             raise ValueError("Terminal views disagree")
         result.update(leak_nodes=reports[0][1], leak_bytes=reports[0][2])
         allocation_counts, addresses = Counter(), set()
+        type_totals = {kind: dict.fromkeys(("nodes", "bytes", "retained_nodes", "retained_bytes", "omitted_nodes", "omitted_bytes"), 0)
+                       for kind in (*HEAP_TYPES, "unknown")}
         blocks = reports[1][0].split("\nLeak: ")[1:]
         if len(blocks) != result["leak_nodes"]:
             raise ValueError("Incomplete terminal list")
@@ -633,8 +640,11 @@ def terminal_snapshot_summary(grouped, listed, resolver):
             size = int(match[2])
             byte_count += size
             kind = re.split(r"\s{2,}", match[3])[0]
+            kind = kind if kind in HEAP_TYPES else "unknown"
+            type_totals[kind]["nodes"] += 1
+            type_totals[kind]["bytes"] += size
             frames, unparsed = terminal_frames(stack if separator else "")
-            allocation_counts[(kind if kind in HEAP_TYPES else "unknown", size, frames, unparsed)] += 1
+            allocation_counts[(kind, size, frames, unparsed)] += 1
         if byte_count != result["leak_bytes"]:
             raise ValueError("Terminal list bytes disagree")
         roots, root_keys = [], set()
@@ -661,12 +671,27 @@ def terminal_snapshot_summary(grouped, listed, resolver):
         budget = [TERMINAL_FRAME_LIMIT]
         for root in roots[:TERMINAL_ROOT_LIMIT]:
             frames, unparsed = root.pop("private_stack")
+            # Fixed report-label buckets explain the image prefilter, without
+            # publishing unknown labels or claiming independent verification.
+            images = dict.fromkeys((*HEAP_IMAGES, "other"), 0)
+            for _, raw_image, *_ in frames:
+                images[terminal_reported_image(raw_image)] += 1
+            root["reported_image_counts"] = images
+            root["reported_filtered_reason_counts"] = {
+                "known_image_excluded": sum(images[name] for name in HEAP_IMAGES if name not in HEAP_SYMBOL_IMAGES),
+                "unrecognized_image": images["other"]}
             root["stack"] = terminal_stack(frames, unparsed, resolver, budget)
             result["root_groups"].append(root)
         result["omitted_root_groups"] = max(0, len(roots) - TERMINAL_ROOT_LIMIT)
         for (kind, size, frames, unparsed), count in list(sorted(allocation_counts.items()))[:TERMINAL_GROUP_LIMIT]:
             result["allocation_groups"].append({"type": kind, "size": size, "count": count,
                                                "stack": terminal_stack(frames, unparsed, resolver, budget)})
+            type_totals[kind]["retained_nodes"] += count
+            type_totals[kind]["retained_bytes"] += count * size
+        for counts in type_totals.values():
+            counts["omitted_nodes"] = counts["nodes"] - counts["retained_nodes"]
+            counts["omitted_bytes"] = counts["bytes"] - counts["retained_bytes"]
+        result["allocation_type_totals"] = type_totals
         result["omitted_allocation_groups"] = max(0, len(allocation_counts) - TERMINAL_GROUP_LIMIT)
         result["parsing_status"] = "complete"
         rows = result["root_groups"] + result["allocation_groups"]
@@ -735,7 +760,7 @@ def validate_terminal_snapshot(value):
 
     integer = lambda item: type(item) is int and 0 <= item <= 1_000_000_000
     require(type(value) is dict and set(value) == set(empty_terminal_snapshot()))
-    require(type(value["schema"]) is int and value["schema"] == 1 and value["frame_order"] == "allocation-first")
+    require(type(value["schema"]) is int and value["schema"] == 2 and value["frame_order"] == "allocation-first")
     require(value["capture_status"] in ("not-run", "complete", "timeout", "failed"))
     require(value["analysis_status"] in ("not-run", "complete", "timeout", "failed"))
     require(value["parsing_status"] in ("unavailable", "complete") and value["stacks_status"] in ("unavailable", "complete", "partial"))
@@ -752,7 +777,8 @@ def validate_terminal_snapshot(value):
     rows = value["root_groups"] + value["allocation_groups"]
     for root, entries in ((True, value["root_groups"]), (False, value["allocation_groups"])):
         for row in entries:
-            fields = {"type", "kind", "instances", "tree_nodes", "stack"} if root else {"type", "size", "count", "stack"}
+            fields = ({"type", "kind", "instances", "tree_nodes", "stack", "reported_image_counts", "reported_filtered_reason_counts"}
+                      if root else {"type", "size", "count", "stack"})
             require(type(row) is dict and set(row) == fields and row["type"] in (*HEAP_TYPES, "unknown"))
             if root:
                 require(row["kind"] in ("LEAK", "CYCLE") and integer(row["instances"]) and integer(row["tree_nodes"])
@@ -776,6 +802,18 @@ def validate_terminal_snapshot(value):
                 require(public_system_symbol(frame["image"], frame["symbol"]) and resolver.lookup(frame["image"], frame["symbol"]) is not None)
                 indices.append(frame["index"])
             require(indices == sorted(set(indices)))
+            if root:
+                images, reasons = row["reported_image_counts"], row["reported_filtered_reason_counts"]
+                require(type(images) is dict and set(images) == {*HEAP_IMAGES, "other"}
+                        and all(integer(count) for count in images.values())
+                        and sum(images.values()) == stack["reported_frames"])
+                require(type(reasons) is dict and set(reasons) == {"known_image_excluded", "unrecognized_image"}
+                        and all(integer(count) for count in reasons.values())
+                        and reasons["unrecognized_image"] == images["other"]
+                        and reasons["known_image_excluded"] == sum(images[name] for name in HEAP_IMAGES if name not in HEAP_SYMBOL_IMAGES)
+                        and sum(reasons.values()) == stack["filtered_frames"])
+                retained_images = Counter(frame["image"] for frame in stack["frames"])
+                require(all(retained_images[image] <= images[image] for image in HEAP_SYMBOL_IMAGES))
             frame_count += len(indices)
             expected = ("missing" if not stack["reported_frames"] else "partial" if
                         stack["missing_frames"] or stack["omitted_frames"] or stack["unparsed_lines"] else "complete")
@@ -793,10 +831,29 @@ def validate_terminal_snapshot(value):
         require(nodes <= value["leak_nodes"] and size <= value["leak_bytes"])
         require(value["omitted_root_groups"] or roots == value["root_instances"] and tree_nodes == value["leak_nodes"])
         require(value["omitted_allocation_groups"] or nodes == value["leak_nodes"] and size == value["leak_bytes"])
+        totals = value["allocation_type_totals"]
+        require(type(totals) is dict and set(totals) == {*HEAP_TYPES, "unknown"})
+        for kind, counts in totals.items():
+            require(type(counts) is dict and set(counts) == {"nodes", "bytes", "retained_nodes", "retained_bytes", "omitted_nodes", "omitted_bytes"}
+                    and all(integer(count) for count in counts.values()))
+            entries = [row for row in value["allocation_groups"] if row["type"] == kind]
+            require(counts["retained_nodes"] == sum(row["count"] for row in entries)
+                    and counts["retained_bytes"] == sum(row["count"] * row["size"] for row in entries))
+            for metric in ("nodes", "bytes"):
+                require(counts[metric] == counts["retained_" + metric] + counts["omitted_" + metric])
+            for prefix in ("", "retained_", "omitted_"):
+                require(counts[prefix + "nodes"] or not counts[prefix + "bytes"])
+        require(sum(counts["nodes"] for counts in totals.values()) == value["leak_nodes"]
+                and sum(counts["bytes"] for counts in totals.values()) == value["leak_bytes"])
+        omitted_nodes = sum(counts["omitted_nodes"] for counts in totals.values())
+        omitted_types = sum(counts["omitted_nodes"] > 0 for counts in totals.values())
+        require(omitted_types <= value["omitted_allocation_groups"] <= omitted_nodes)
+        require(value["omitted_allocation_groups"] or not omitted_nodes)
         expected = "partial" if value["omitted_root_groups"] or value["omitted_allocation_groups"] or any(row["stack"]["status"] != "complete" for row in rows) else "complete"
         require(value["stacks_status"] == value["status"] == expected)
     else:
         require(not rows and value["leak_nodes"] is None and value["leak_bytes"] is None
+                and value["allocation_type_totals"] is None
                 and value["root_instances"] == value["omitted_root_groups"] == value["omitted_allocation_groups"] == 0
                 and value["stacks_status"] == value["status"] == "unavailable")
     require(len(json.dumps(value).encode()) <= 65536)
