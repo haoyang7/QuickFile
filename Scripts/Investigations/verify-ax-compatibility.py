@@ -101,6 +101,15 @@ def validate_control_reader(receipt, completed=False):
         raise RuntimeError(f"Heap control read targets, registered targets or received notifications: {receipt}")
 
 
+def validate_malloc_scribble_receipt(receipt, requested):
+    expected = "1" if requested == "on" else "unset"
+    if (requested not in ("off", "on") or type(receipt) is not dict
+            or set(receipt) != {"requested", "host", "reader"}
+            or receipt["requested"] != requested
+            or receipt["host"] != expected or receipt["reader"] != expected):
+        raise RuntimeError("Actual host/reader MallocScribble environment was not confirmed")
+
+
 def validate_copy_lifetime_host(receipt, expected_copies=None):
     lifetime = receipt.get("copyLifetime")
     keys = ("ordinary", "mutable", "liveOrdinary", "liveMutable", "invalid")
@@ -125,6 +134,7 @@ def main():
     parser.add_argument("--system-baseline", action="store_true")
     parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; compensation-enabled modes only")
     parser.add_argument("--heap-control", action="store_true", help="Match all diagnostic checkpoints with an empty window and no target buttons; requires --heap-diagnostics")
+    parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; requires --heap-diagnostics")
     parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
@@ -134,6 +144,8 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.malloc_scribble and not args.heap_diagnostics:
+        parser.error("--malloc-scribble requires --heap-diagnostics")
     if args.copy_lifetime and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
                                    args.ownership_trace, args.read_only)):
         parser.error("--copy-lifetime requires independent product mode without other probes")
@@ -181,6 +193,8 @@ def main():
         return result
 
     common = ["xcrun", "clang", "-O2", "-I", str(ROOT / "QuickFileApp")]
+    if args.malloc_scribble:
+        common.append("-DQUICKFILE_AX_MALLOC_RECEIPT")
     if args.copy_lifetime:
         common.append("-DQUICKFILE_AX_COPY_LIFETIME")
     run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[0]), "-o", str(work / "AXCompatibility.o")])
@@ -191,7 +205,9 @@ def main():
         probe_arguments = [f"-DQUICKFILE_AX_OWNERSHIP_PROBE={2 if args.balance_copies else 1}", str(work / "AXOwnershipProbe.o")]
     run(common + ["-fobjc-arc", "-framework", "AppKit", "-framework", "ApplicationServices",
                   str(ROOT / sources[2]), str(work / "AXCompatibility.o"), *probe_arguments, "-o", str(executable)])
-    run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-parse-as-library", str(ROOT / sources[3]),
+    run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-parse-as-library",
+         *(["-DQUICKFILE_AX_MALLOC_RECEIPT", "-module-cache-path", str(work / "swift-module-cache")]
+           if args.malloc_scribble else []), str(ROOT / sources[3]),
          "-o", str(reader_executable)])
     (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
         "CFBundleIdentifier": "local.quickfile.tests.ax-compatibility", "CFBundleName": "AXCompatibilityFixture",
@@ -201,11 +217,22 @@ def main():
     run(["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(app)])
     environment = dict(os.environ)
     environment.pop("QUICKFILE_DISABLE_AX_COMPATIBILITY", None)
+    # Preserve the reader's existing inherited environment by default. The paired
+    # experiment changes only MallocScribble, not its stack-logging behavior.
+    reader_environment = dict(os.environ) if args.malloc_scribble else None
+    allocator_receipt = {"requested": args.malloc_scribble, "host": "missing", "reader": "missing"}
+    if args.malloc_scribble:
+        for target_environment in (environment, reader_environment):
+            target_environment.pop("MallocScribble", None)
+            if args.malloc_scribble == "on":
+                target_environment["MallocScribble"] = "1"
+        write_json(records / "malloc-scribble.json", allocator_receipt)
     host_arguments = ["--system-baseline"] if args.system_baseline else []
     capability = subprocess.run([str(executable), "--capabilities", *host_arguments], env=environment,
                                 capture_output=True, text=True, check=True, timeout=15)
     capabilities = json.loads(capability.stdout)
-    reader_capability = subprocess.run([str(reader_executable), "--capabilities"], env=environment,
+    reader_capability = subprocess.run([str(reader_executable), "--capabilities"],
+                                       env=reader_environment if args.malloc_scribble else environment,
                                        capture_output=True, text=True, check=True, timeout=15)
     reader_capabilities = json.loads(reader_capability.stdout)
     if args.balance_copies and capabilities["images"] != {
@@ -268,9 +295,17 @@ def main():
             reader_sequence += 1
             write_json(state / "reader-command.json", {"sequence": reader_sequence})
             receipt = wait_json(state / "reader-ready.json", lambda value: value["sequence"] == reader_sequence, [host, reader])
+            if args.malloc_scribble and reader_sequence == 1:
+                record_allocator_environment("reader", receipt)
+                validate("malloc-scribble", validate_malloc_scribble_receipt, allocator_receipt, args.malloc_scribble)
             if args.heap_control:
                 validate(f"control-reader-{reader_sequence}", validate_control_reader, receipt)
             return receipt
+
+        def record_allocator_environment(role, receipt):
+            value = receipt.get("malloc_scribble", "missing")
+            allocator_receipt[role] = value if value in ("unset", "1", "other", "missing") else "other"
+            write_json(records / "malloc-scribble.json", allocator_receipt)
 
         def scan(label, host_state):
             if args.copy_lifetime:
@@ -310,6 +345,8 @@ def main():
         try:
             host = subprocess.Popen([str(executable), str(state), *host_arguments], env=environment, stdout=host_log, stderr=host_log)
             initial = wait_json(state / "ready.json", lambda value: value["sequence"] == 0, [host])
+            if args.malloc_scribble:
+                record_allocator_environment("host", initial)
             if args.heap_control:
                 validate("control-host-0", validate_control_host, initial)
             if args.copy_lifetime:
@@ -318,7 +355,7 @@ def main():
                 scan("baseline", initial)
             reader_arguments = ["--read-only"] if args.read_only else []
             reader = subprocess.Popen([str(reader_executable), str(host.pid), str(executable), str(state), *reader_arguments],
-                                      stdout=reader_log, stderr=reader_log)
+                                      env=reader_environment, stdout=reader_log, stderr=reader_log)
             if not args.system_baseline:
                 # Establish AX/XPC setup before the baseline, with no owned test
                 # buttons yet. All target destruction remains after this scan.
@@ -445,6 +482,9 @@ def main():
                 write_json(records / "validation-errors.json", validation_errors)
             if args.heap_diagnostics:
                 summary["mode"] = "heap-control" if args.heap_control else "product"
+            if args.malloc_scribble:
+                summary["malloc_scribble"] = allocator_receipt
+                summary["scope"] += "; MallocScribble environment experiment only; not an ownership fix or proof of completed free"
             write_json(records / "result.json", summary)
             print(json.dumps(summary))
         finally:

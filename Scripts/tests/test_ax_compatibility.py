@@ -344,6 +344,29 @@ class AXAllocationCohortTests(unittest.TestCase):
 
 
 class AXCompatibilityPreflightTests(unittest.TestCase):
+    def test_malloc_scribble_is_only_an_explicit_heap_diagnostic(self):
+        for options in (("--malloc-scribble", "off"), ("--malloc-scribble", "on", "--copy-lifetime"),
+                        ("--malloc-scribble", "on", "--heap-diagnostics", "--system-baseline"),
+                        ("--malloc-scribble", "on", "--heap-diagnostics", "--copy-lifetime")):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                work = pathlib.Path(directory) / "unused"
+                arguments = ["probe", "--work-directory", str(work), "--records-directory", str(work), *options]
+                with mock.patch.object(sys, "argv", arguments), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as failure:
+                        PROBE.main()
+                self.assertEqual(failure.exception.code, 2)
+                self.assertFalse(work.exists())
+
+    def test_malloc_scribble_public_receipt_rejects_extra_data_and_unconfirmed_processes(self):
+        for setting, expected in (("off", "unset"), ("on", "1")):
+            valid = {"requested": setting, "host": expected, "reader": expected}
+            PROBE.validate_malloc_scribble_receipt(valid, setting)
+            for invalid in (valid | {"host": "other"}, valid | {"reader": "missing"},
+                            valid | {"host": None}, valid | {"reader": True},
+                            valid | {"path": "/private/secret"}, valid | {"requested": "other"}):
+                with self.subTest(setting=setting, invalid=invalid), self.assertRaises(RuntimeError):
+                    PROBE.validate_malloc_scribble_receipt(invalid, setting)
+
     def test_copy_lifetime_is_an_independent_product_probe(self):
         for option in ("--system-baseline", "--heap-diagnostics", "--heap-control", "--ownership-trace", "--read-only",
                        "--balance-copies"):
@@ -528,7 +551,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         system_baseline=False, insufficient_compensation=False, ownership_trace=False,
                         heap_diagnostics=False, unavailable_cohorts=False, heap_control=False,
                         invalid_control_host=None, invalid_control_reader=None,
-                        copy_lifetime=False, invalid_copy_lifetime=None):
+                        copy_lifetime=False, invalid_copy_lifetime=None,
+                        malloc_scribble=None, invalid_allocator=None):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -566,6 +590,16 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
 
                 def __init__(self, command, **_kwargs):
                     self.is_reader = pathlib.Path(command[0]).name == "ax-reader"
+                    self.environment = _kwargs.get("env")
+                    if malloc_scribble:
+                        assert ("MallocScribble" in self.environment) == (malloc_scribble == "on")
+                        if malloc_scribble == "on":
+                            assert self.environment["MallocScribble"] == "1"
+                        if self.is_reader:
+                            for key in ("MallocStackLogging", "MallocStackLoggingNoCompact"):
+                                assert self.environment.get(key) == os.environ.get(key)
+                    elif self.is_reader:
+                        assert self.environment is None
                     if not self.is_reader:
                         environment = _kwargs["env"]
                         assert environment["MallocStackLoggingNoCompact"] == "1"
@@ -659,6 +693,16 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                                 receipt["copyLifetime"][key] = value
                     if invalid_control_host and receipt["sequence"] == invalid_control_host[0]:
                         receipt[invalid_control_host[1]] = 1
+                if malloc_scribble:
+                    process = next(process for process in processes
+                                   if process.is_reader == (path.name == "reader-ready.json"))
+                    value = process.environment.get("MallocScribble")
+                    receipt["malloc_scribble"] = "unset" if value is None else "1" if value == "1" else "other"
+                    if invalid_allocator and invalid_allocator[0] == ("reader" if process.is_reader else "host"):
+                        if invalid_allocator[1] is None:
+                            del receipt["malloc_scribble"]
+                        else:
+                            receipt["malloc_scribble"] = invalid_allocator[1]
                 self.assertTrue(predicate(receipt))
                 return receipt
 
@@ -679,6 +723,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.append("--heap-control")
             if copy_lifetime:
                 arguments.append("--copy-lifetime")
+            if malloc_scribble:
+                arguments.extend(["--malloc-scribble", malloc_scribble])
             with mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
                     mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
                     mock.patch.object(PROBE.subprocess, "Popen", side_effect=FixtureProcess), \
@@ -700,6 +746,16 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             scans = [] if copy_lifetime else json.loads((records / "scans.json").read_text())
             product_build = next(command for command in commands if "-fno-objc-arc" in command)
             host_build = next(command for command in commands if "-fobjc-arc" in command)
+            reader_build = next(command for command in commands if "swiftc" in command)
+            for build in (host_build, reader_build):
+                self.assertEqual("-DQUICKFILE_AX_MALLOC_RECEIPT" in build, malloc_scribble is not None)
+            if malloc_scribble:
+                self.assertEqual(summary["malloc_scribble"], json.loads((records / "malloc-scribble.json").read_text()))
+                if not invalid_allocator:
+                    PROBE.validate_malloc_scribble_receipt(summary["malloc_scribble"], malloc_scribble)
+            else:
+                self.assertNotIn("malloc_scribble", summary)
+                self.assertFalse((records / "malloc-scribble.json").exists())
             for build in (product_build, host_build):
                 self.assertEqual("-DQUICKFILE_AX_COPY_LIFETIME" in build, copy_lifetime)
             if heap_diagnostics:
@@ -779,6 +835,31 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             if exit_code:
                 self.assertEqual(json.loads((records / "validation-errors.json").read_text()), summary["validation_errors"])
             return exit_code, summary
+
+    def test_malloc_scribble_overrides_inherited_state_in_both_actual_processes(self):
+        for setting, control in itertools.product(("off", "on"), (False, True)):
+            with self.subTest(setting=setting, control=control), mock.patch.dict(os.environ, {"MallocScribble": "inherited"}):
+                exit_code, summary = self.exercise_runner(heap_diagnostics=True, heap_control=control, malloc_scribble=setting)
+                self.assertEqual(exit_code, 0)
+                expected = "unset" if setting == "off" else "1"
+                self.assertEqual(summary["malloc_scribble"], {"requested": setting, "host": expected, "reader": expected})
+
+    def test_malloc_scribble_keeps_strict_heap_failures_and_all_later_checkpoints(self):
+        for setting, control in itertools.product(("off", "on"), (False, True)):
+            with self.subTest(setting=setting, control=control):
+                exit_code, summary = self.exercise_runner(heap_diagnostics=True, heap_control=control,
+                    malloc_scribble=setting, failed_scan="registered-10")
+                self.assertEqual(exit_code, 1)
+                self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["registered-10"])
+
+    def test_missing_or_mismatched_actual_allocator_receipts_fail_without_losing_later_evidence(self):
+        for role, value in itertools.product(("host", "reader"), (None, "1", "/private/secret", True)):
+            with self.subTest(role=role, value=value):
+                exit_code, summary = self.exercise_runner(heap_diagnostics=True, malloc_scribble="off",
+                                                         invalid_allocator=(role, value))
+                self.assertEqual(exit_code, 1)
+                self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["malloc-scribble"])
+                self.assertNotIn("/private/secret", json.dumps(summary["malloc_scribble"]))
 
     def test_copy_lifetime_covers_thirty_copies_per_branch_without_heap_sampling(self):
         exit_code, summary = self.exercise_runner(copy_lifetime=True)
@@ -915,6 +996,133 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["coverage"], "failed")
         self.assertEqual(summary["ordinary_compensations"], 29)
         self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["compensation-branches"])
+
+
+class AXMallocScribbleWorkflowTests(unittest.TestCase):
+    def run_measurement(self, *, enabled=True, first_failure=None):
+        workflow = (ROOT / ".github/workflows/ax-system-baseline.yml").read_text()
+        block = workflow.split("      - name: Measure five matched groups with strict heap checks\n", 1)[1]
+        script = block.split("          python3 - <<'PY'\n", 1)[1].split("          PY\n", 1)[0]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
+            root = pathlib.Path(directory)
+            summary_file = root / "summary.json"
+            PROBE.write_json(summary_file, {"identity": {}, "trials": [], "completed": False,
+                                           "expected_trials": 20 if enabled else 10})
+            script = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
+            invocations = []
+            test = self
+
+            class Process:
+                pid = 12345
+
+                def __init__(self, command, **kwargs):
+                    setting = command[command.index("--malloc-scribble") + 1] if "--malloc-scribble" in command else None
+                    mode = "control" if "--heap-control" in command else "product"
+                    invocations.append((setting, mode))
+                    self.first = len(invocations) == 1
+                    test.assertTrue(kwargs["start_new_session"])
+                    if setting:
+                        test.assertEqual(kwargs["env"].get("MallocScribble"), "1" if setting == "on" else None)
+                    else:
+                        test.assertEqual(kwargs["env"]["MallocScribble"], "inherited-secret")
+                    records = pathlib.Path(command[command.index("--records-directory") + 1])
+                    records.mkdir()
+                    if self.first and first_failure == "timeout":
+                        return
+                    expected = "1" if setting == "on" else "unset"
+                    receipt = {"requested": setting, "host": expected, "reader": expected}
+                    if self.first and first_failure == "receipt":
+                        receipt["reader"] = "/private/secret"
+                    PROBE.write_json(records / "malloc-scribble.json", receipt)
+                    PROBE.write_json(records / "inputs.json", {"capabilities": {"images": {
+                        "AppKit": "B6B4BDAD-6428-3E64-8747-275700109B46",
+                        "CoreFoundation": "9B672762-7B1F-30BC-96DE-F176B372D66D"}}})
+                    point = REPORT.heap_diff_summary("Process 123: 0 leaks for 0 total leaked bytes.\n")
+                    diagnostic = {"schema": 4, "status": "complete", "symbols": [], "omitted_symbols": 0,
+                                  "symbols_status": "complete", "cohorts_status": "complete",
+                                  "checkpoints": [point | {"label": label} for label in REPORT.HEAP_LABELS[1:]]}
+                    PROBE.write_json(records / "heap-diagnostics.json", diagnostic)
+                    PROBE.write_json(records / "scans.json", [{"label": label, "leak_nodes": 0, "leak_bytes": 0,
+                        "unclassified_nodes": 0, "host": dict.fromkeys(("buttons", "allocatedButtons", "destroyedButtons",
+                        "compensations", "mutableCompensations"), 0)} for label in REPORT.HEAP_LABELS])
+                    # Raw records and arbitrary fields must never enter the public artifact.
+                    (records / "host.log").write_text("private-raw-host-data")
+
+                def wait(self, timeout):
+                    if self.first and first_failure == "timeout" and timeout == 180:
+                        raise subprocess.TimeoutExpired("probe", timeout)
+                    return 1 if self.first and first_failure == "strict" else 0
+
+            with mock.patch.dict(os.environ, {"MALLOC_SCRIBBLE_EXPERIMENT": "true" if enabled else "false",
+                                              "MallocScribble": "inherited-secret"}), \
+                    mock.patch.dict(sys.modules, {"verify-ax-compatibility": PROBE}), \
+                    mock.patch.object(sys, "path", list(sys.path)), \
+                    mock.patch.object(subprocess, "Popen", side_effect=Process), \
+                    mock.patch.object(os, "killpg", create=True) as killpg, \
+                    contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit) as result:
+                exec(compile(script, "ax-system-baseline.yml", "exec"), {})
+            summary = json.loads(summary_file.read_text())
+            self.assertEqual(result.exception.code, int(first_failure is not None))
+            self.assertEqual(summary["strict_checks_passed"], first_failure is None)
+            self.assertTrue(summary["completed"])
+            self.assertEqual(len(summary["trials"]), 20 if enabled else 10)
+            self.assertNotIn("secret", output.getvalue() + summary_file.read_text())
+            self.assertNotIn("private-raw-host-data", output.getvalue() + summary_file.read_text())
+            if first_failure == "timeout":
+                self.assertEqual(killpg.call_count, 2)
+                self.assertEqual(summary["trials"][0]["return_code"], 124)
+            return invocations
+
+    def test_paired_experiment_alternates_all_four_conditions_and_keeps_failures(self):
+        for failure in (None, "strict", "receipt", "timeout"):
+            with self.subTest(failure=failure):
+                invocations = self.run_measurement(first_failure=failure)
+                odd = [("off", "control"), ("off", "product"), ("on", "control"), ("on", "product")]
+                self.assertEqual(invocations, odd + list(reversed(odd)) + odd + list(reversed(odd)) + odd)
+
+    def test_original_diagnostics_still_have_ten_trials_without_allocator_override(self):
+        self.assertEqual(self.run_measurement(enabled=False),
+                         [(None, mode) for pair in range(5) for mode in
+                          (("control", "product") if pair % 2 == 0 else ("product", "control"))])
+
+
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("xcrun"), "requires macOS SDK")
+class AXMallocScribbleFixtureTests(unittest.TestCase):
+    def test_native_environment_receipts_are_bounded_and_opt_in_without_launching_apps(self):
+        temporary_root = ROOT / ".build/Temporary"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        parent = pathlib.Path(tempfile.gettempdir()).resolve()
+        if not parent.is_relative_to(temporary_root):
+            parent = temporary_root
+        with tempfile.TemporaryDirectory(prefix="ax-allocator-", dir=parent) as directory:
+            work = pathlib.Path(directory)
+            common = ["xcrun", "clang", "-O2", "-I", str(ROOT / "QuickFileApp")]
+            subprocess.run(common + ["-fno-objc-arc", "-c", str(ROOT / "QuickFileApp/AXCompatibility.m"),
+                "-o", str(work / "compatibility.o")], check=True, capture_output=True, timeout=60)
+            for instrumented in (False, True):
+                flags = ["-DQUICKFILE_AX_MALLOC_RECEIPT"] if instrumented else []
+                host, reader = work / "host", work / "reader"
+                subprocess.run(common + flags + ["-fobjc-arc", "-framework", "AppKit", "-framework", "ApplicationServices",
+                    str(ROOT / "Scripts/tests/fixtures/AXCompatibilityNotifications.m"), str(work / "compatibility.o"),
+                    "-o", str(host)], check=True, capture_output=True, timeout=60)
+                subprocess.run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-parse-as-library",
+                    "-module-cache-path", str(work / "swift-module-cache"), *flags,
+                    str(ROOT / "Scripts/tests/fixtures/AXCompatibilityReader.swift"), "-o", str(reader)],
+                    check=True, capture_output=True, timeout=60)
+                for value, expected in ((None, "unset"), ("1", "1"), ("0", "other"), ("private-secret", "other")):
+                    environment = dict(os.environ)
+                    environment.pop("MallocScribble", None)
+                    if value is not None:
+                        environment["MallocScribble"] = value
+                    for arguments in ([str(host), "--capabilities", "--system-baseline"], [str(reader), "--capabilities"]):
+                        result = subprocess.run(arguments, env=environment, check=True, capture_output=True, text=True, timeout=15)
+                        receipt = json.loads(result.stdout)
+                        self.assertNotIn("private-secret", result.stdout)
+                        if instrumented:
+                            self.assertEqual(receipt["malloc_scribble"], expected)
+                        else:
+                            self.assertNotIn("malloc_scribble", receipt)
 
 
 @unittest.skipUnless(sys.platform == "darwin" and shutil.which("xcrun"), "requires macOS SDK")

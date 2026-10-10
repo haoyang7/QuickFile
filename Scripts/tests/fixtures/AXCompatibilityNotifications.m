@@ -3,6 +3,12 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <mach-o/dyld.h>
 #import "AXCompatibility.h"
+#ifdef QUICKFILE_AX_MALLOC_RECEIPT
+static NSString *mallocScribbleEnvironment(void) {
+    const char *value = getenv("MallocScribble");
+    return value == NULL ? @"unset" : (!strcmp(value, "1") ? @"1" : @"other");
+}
+#endif
 #ifdef QUICKFILE_AX_OWNERSHIP_PROBE
 extern void AXOwnershipProbeInstall(NSString *directory, BOOL balance);
 extern NSDictionary *AXOwnershipProbeSnapshot(void);
@@ -97,6 +103,9 @@ static NSUInteger allocatedButtons = 0, destroyedButtons = 0;
 #ifdef QUICKFILE_AX_COPY_LIFETIME
     record[@"copyLifetime"] = copyLifetimeSnapshot();
 #endif
+#ifdef QUICKFILE_AX_MALLOC_RECEIPT
+    record[@"malloc_scribble"] = mallocScribbleEnvironment();
+#endif
     NSData *data = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:NULL];
     [data writeToFile:[self.directory stringByAppendingPathComponent:@"ready.json"] atomically:YES];
 }
@@ -137,8 +146,11 @@ int main(int argc, const char **argv) {
     // A system baseline never installs or attempts the product compensation.
     BOOL enabled = systemBaseline ? NO : QuickFileInstallAXCompatibility();
     if (!strcmp(argv[1], "--capabilities")) {
-        NSDictionary *capabilities = @{@"enabled":@(enabled),
-            @"status":systemBaseline ? @"system-baseline" : @(QuickFileAXCompatibilityStatus()), @"images":systemImages()};
+        NSMutableDictionary *capabilities = [@{@"enabled":@(enabled),
+            @"status":systemBaseline ? @"system-baseline" : @(QuickFileAXCompatibilityStatus()), @"images":systemImages()} mutableCopy];
+#ifdef QUICKFILE_AX_MALLOC_RECEIPT
+        capabilities[@"malloc_scribble"] = mallocScribbleEnvironment();
+#endif
         NSData *json = [NSJSONSerialization dataWithJSONObject:capabilities options:NSJSONWritingSortedKeys error:NULL];
         puts([[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
         return 0;
