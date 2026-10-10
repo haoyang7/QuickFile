@@ -197,11 +197,9 @@ def parse_procargs(raw):
         offset += 1
     arguments = [take() for _ in range(argc)]
     environment = {}
-    terminated = False
     while offset < len(raw):
         entry = take()
         if not entry:
-            terminated = True
             # Darwin copies a saved stack region, not a serialized env dictionary.
             # Bytes beyond envp's empty terminator are not environment entries.
             break
@@ -209,7 +207,8 @@ def parse_procargs(raw):
         if not separator or not key or key in environment:
             raise StartupReceiptError("parse_environment", "Invalid startup environment entry")
         environment[key] = value
-    if not terminated or not environment:
+    # Every entry needs its own NUL; kernel tail alignment can add no extra NUL.
+    if not environment:
         raise StartupReceiptError("environment_not_visible", "Startup environment is not visible")
     return executable, arguments, environment
 
@@ -236,7 +235,8 @@ def read_procargs(pid):
     ctypes.set_errno(0)
     if library.sysctl((ctypes.c_int * 3)(1, 49, pid), 3, buffer, ctypes.byref(size), None, 0):
         raise StartupReceiptError("sysctl_procargs", "Owned child startup environment unavailable", ctypes.get_errno())
-    if not 5 <= size.value <= len(buffer):
+    # XNU's compatibility copyout can succeed with a truncated, full buffer.
+    if not 5 <= size.value < len(buffer):
         raise StartupReceiptError("result_size", "Invalid startup metadata result size")
     return parse_procargs(buffer.raw[:size.value])
 

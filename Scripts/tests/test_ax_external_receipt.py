@@ -215,9 +215,79 @@ class AXExternalStartupTests(unittest.TestCase):
         self.assertEqual(arguments, [b"/synthetic/host", b"", b"last"])
         self.assertEqual(environment, {b"PATH": b"/synthetic/bin", b"MallocScribble": b"1", b"OTHER": b"a=b"})
 
+    def test_complete_environment_accepts_final_entry_nul_at_eof(self):
+        raw = procargs([b"PATH=/synthetic/bin", b"EMPTY=", b"OTHER=a=b"],
+                       (b"/synthetic/host", b"", b"last"))
+        expected = (b"/synthetic/host", [b"/synthetic/host", b"", b"last"],
+                    {b"PATH": b"/synthetic/bin", b"EMPTY": b"", b"OTHER": b"a=b"})
+        for data in (raw, raw[:-1]):
+            with self.subTest(extra_empty_entry=data == raw):
+                self.assertEqual(EXTERNAL.parse_procargs(data), expected)
+
+    def test_zero_padding_apple_tail_keeps_strict_entry_and_empty_entry_rules(self):
+        environment = procargs([b"PATH=/synthetic/bin"])[:-1]
+        apple = b"executable_path=/synthetic/host\0"
+        for padding in (b"", b"\0"):
+            with self.subTest(padding=bool(padding)):
+                self.assertEqual(EXTERNAL.parse_procargs(environment + apple + padding)[2],
+                    {b"PATH": b"/synthetic/bin", b"executable_path": b"/synthetic/host"})
+        for tail in (b"unterminated-secret", b"secret-without-equals\0", b"=secret\0", b"PATH=secret\0"):
+            with self.subTest(tail=tail):
+                with self.assertRaises(EXTERNAL.StartupReceiptError) as caught:
+                    EXTERNAL.parse_procargs(environment + tail)
+                self.assertEqual(caught.exception.reason, "parse_terminator" if not tail.endswith(b"\0") else "parse_environment")
+                self.assertNotIn("secret", str(caught.exception))
+                # An extra empty entry still ends parsing before arbitrary tail bytes.
+                self.assertEqual(EXTERNAL.parse_procargs(environment + b"\0" + tail)[2],
+                    {b"PATH": b"/synthetic/bin"})
+
+    def test_capacity_filling_sysctl_data_cannot_form_an_off_receipt(self):
+        with tempfile.TemporaryDirectory(prefix="ax-procargs-") as directory:
+            executable = Path(directory).resolve() / "synthetic-host"
+            executable.write_bytes(b"synthetic fixture identity")
+            executable.chmod(0o700)
+            digest = EXTERNAL.executable_hash(executable)
+            path = os.fsencode(executable)
+            complete = struct.pack("=i", 1) + path + b"\0\0" + path + b"\0PATH=/synthetic/bin\0"
+            for extra_empty_entry in (False, True):
+                data = complete + (b"\0" if extra_empty_entry else b"")
+                for spare_capacity in (0, 1):
+                    capacity = len(data) + spare_capacity
+                    calls = []
+                    def sysctl(mib, count, output, size, *_):
+                        calls.append((tuple(mib), size._obj.value))
+                        if count == 2:
+                            output._obj.value = capacity
+                            size._obj.value = 4
+                        else:
+                            self.assertEqual(size._obj.value, capacity)
+                            output.raw = data
+                            size._obj.value = len(data)
+                        return 0
+                    library = mock.Mock(); library.sysctl.side_effect = sysctl
+                    process = mock.Mock(pid=123, args=[str(executable)])
+                    process.poll.return_value = None
+                    with self.subTest(extra_empty_entry=extra_empty_entry, spare_capacity=spare_capacity), \
+                            mock.patch.object(EXTERNAL.sys, "platform", "darwin"), \
+                            mock.patch.object(EXTERNAL.ctypes, "CDLL", return_value=library), \
+                            mock.patch.object(EXTERNAL, "parse_procargs", wraps=EXTERNAL.parse_procargs) as parse:
+                        if not spare_capacity:
+                            with self.assertRaises(EXTERNAL.StartupReceiptError) as caught:
+                                EXTERNAL.owned_child_receipt(process, executable, {"PATH": "/synthetic/bin"}, "off", digest)
+                            self.assertEqual(EXTERNAL.startup_failure("external-startup-reader", caught.exception),
+                                {"stage": "external-startup-reader", "reason": "result_size", "errno": None})
+                            parse.assert_not_called()
+                        else:
+                            receipt = EXTERNAL.owned_child_receipt(process, executable, {"PATH": "/synthetic/bin"}, "off", digest)
+                            self.assertEqual(receipt, {"malloc_scribble": "unset", "path_matches": True,
+                                "startup_executable_matches": True, "alive_during_check": True, "executable_sha256": digest})
+                            parse.assert_called_once_with(data)
+                    self.assertEqual(calls, [((1, 8), 4), ((1, 49, 123), capacity)])
+
     def test_malformed_or_invisible_environment_is_never_unset(self):
+        argv_only = struct.pack("=i", 1) + b"/synthetic/host\0\0/synthetic/host\0"
         bad = [b"", struct.pack("=i", 0) + b"path\0", struct.pack("=i", 4097) + b"path\0",
-               struct.pack("=i", 1) + b"\0", procargs([]), procargs([b"PATH=x", b"PATH=y"]),
+               struct.pack("=i", 1) + b"\0", argv_only, argv_only + b"\0", procargs([]), procargs([b"PATH=x", b"PATH=y"]),
                procargs([b"secret-entry-without-equals"]), procargs([b"=secret"]),
                procargs([b"PATH=x"])[:-2], procargs([b"PATH=x"])[:-3],
                struct.pack("=i", 1) + b"unterminated-secret"]
