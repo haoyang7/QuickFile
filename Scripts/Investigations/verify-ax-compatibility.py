@@ -21,7 +21,8 @@ import time
 from ax_process import reap_owned
 from ax_probe_report import (capture_terminal_snapshot, collect_heap_diagnostics, collect_terminal_snapshot,
                              disassemble_symbols, empty_terminal_snapshot, leak_groups)
-from ax_external_receipt import (EXECUTABLES, FIXTURE_SOURCES, INSTALL_ENV, INSTALL_MODES, fixture_hashes, fixture_sources, load_prepared_fixture,
+from ax_external_receipt import (EXECUTABLES, FIXTURE_SOURCES, INSTALL_ENV, INSTALL_MODES, STARTUP_STAGES, StartupReceiptError,
+                                 fixture_hashes, fixture_sources, load_prepared_fixture, startup_failure,
                                  owned_child_receipt, require_fixture_hashes, validate_empty_control_build,
                                  validate_external_receipt, validate_install_gate_build, validate_install_gate_state)
 
@@ -336,6 +337,7 @@ def main():
         print(json.dumps(manifest))
         return 0
     external_receipt = None
+    startup_failures = []
     if args.external_startup_receipt:
         external_receipt = {"receipt_mode": "external-startup", "requested": args.malloc_scribble,
                             "host": None, "reader": None, "executables": expected_hashes,
@@ -343,6 +345,7 @@ def main():
         if args.install_gate:
             external_receipt["install_gate"] = args.install_gate
         write_json(records / "external-startup.json", external_receipt)
+        write_json(records / "startup-failures.json", startup_failures)
     environment = dict(os.environ)
     environment.pop("QUICKFILE_DISABLE_AX_COMPATIBILITY", None)
     # Preserve the reader's existing inherited environment by default. The paired
@@ -405,8 +408,14 @@ def main():
             # remain fatal even if a subsequent scan returns to the baseline.
             try:
                 validator(*values)
-            except RuntimeError as error:
-                validation_errors.append({"stage": stage, "message": str(error)})
+            except Exception as error:
+                if isinstance(error, RuntimeError):
+                    validation_errors.append({"stage": stage, "message": str(error)})
+                if stage in STARTUP_STAGES:
+                    startup_failures.append(startup_failure(stage, error))
+                    write_json(records / "startup-failures.json", startup_failures)
+                if not isinstance(error, RuntimeError):
+                    raise
                 write_json(records / "validation-errors.json", validation_errors)
 
         def record_copy_lifetime_host(receipt, expected_copies=None):
@@ -452,11 +461,22 @@ def main():
             write_json(records / "malloc-scribble.json", allocator_receipt)
 
         def finish_external_receipt():
-            require_fixture_hashes(prepared, expected_hashes)
-            require_fixture_hashes(work, expected_hashes)
+            for directory, reason in ((prepared, "prepared_hash"), (work, "working_hash")):
+                try:
+                    require_fixture_hashes(directory, expected_hashes)
+                except OSError as error:
+                    # Preserve the original I/O exception and execution/cleanup
+                    # path; only attach an allowlisted diagnostic reason.
+                    error._startup_hash_reason = reason
+                    raise
+                except RuntimeError as error:
+                    raise StartupReceiptError(reason, str(error)) from None
             external_receipt["binary_reuse_verified"] = True
             write_json(records / "external-startup.json", external_receipt)
-            validate_external_receipt(external_receipt, args.malloc_scribble, expected_hashes, args.install_gate)
+            try:
+                validate_external_receipt(external_receipt, args.malloc_scribble, expected_hashes, args.install_gate)
+            except RuntimeError as error:
+                raise StartupReceiptError("receipt_incomplete", str(error)) from None
 
         def scan(label, host_state):
             if args.copy_lifetime:

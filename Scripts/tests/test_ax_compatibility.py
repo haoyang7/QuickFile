@@ -1080,7 +1080,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         copy_lifetime=False, invalid_copy_lifetime=None,
                         malloc_scribble=None, invalid_allocator=None, external_receipt=False, binary_drift=False,
                         terminal_origin=False, terminal_timeout=False, empty_control_mode=None,
-                        cleanup_failure=None, ls_failure=False, install_gate=None, invalid_install_gate=None):
+                        cleanup_failure=None, ls_failure=False, install_gate=None, invalid_install_gate=None,
+                        startup_error=None, hash_io_failure=None):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -1152,7 +1153,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         raise subprocess.TimeoutExpired("original-reader-wait" if self.is_reader else "host-wait", timeout)
                     self.returncode = 0
                     if external_receipt and binary_drift and not self.is_reader:
-                        pathlib.Path(self.args[0]).write_bytes(b"changed after measurement")
+                        target = prepared / EXTERNAL.EXECUTABLES["host"] if binary_drift == "prepared" else pathlib.Path(self.args[0])
+                        target.write_bytes(b"changed after measurement")
                     if self.is_reader:
                         PROBE.write_json(state / "reader-completed.json", notifications)
                     return 0
@@ -1300,9 +1302,23 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 process = next(process for process in processes if process.pid == pid)
                 role = "reader" if process.is_reader else "host"
                 if invalid_allocator and invalid_allocator[0] == role:
+                    if startup_error is not None:
+                        raise startup_error
                     raise RuntimeError("Owned child startup environment unavailable")
                 return (os.fsencode(process.args[0]), [os.fsencode(process.args[0])],
                         {os.fsencode(key): os.fsencode(value) for key, value in process.environment.items()})
+
+            hash_io_error = PermissionError(13, "private-hash-error", "/private/secret")
+            propagated_hash_error = None
+            require_hashes = PROBE.require_fixture_hashes
+
+            def require_fixture_hashes(directory, expected):
+                if hash_io_failure and scanned == scan_labels:
+                    phase = "complete" if processes[0].returncode is None else "final"
+                    target = "prepared" if directory == prepared else "working"
+                    if hash_io_failure == (phase, target):
+                        raise hash_io_error
+                return require_hashes(directory, expected)
 
             if external_receipt:
                 prepared = temporary / "prepared"
@@ -1321,7 +1337,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 if install_gate:
                     PROBE.write_json(prepared / "fixture-build.json", AXInstallGateTests.manifest(EXTERNAL.fixture_hashes(prepared)))
                 arguments.extend(["--external-startup-receipt", "--prepared-fixture-directory", str(prepared)])
-            with mock.patch.object(EXTERNAL, "read_procargs", side_effect=startup_metadata), \
+            with mock.patch.object(EXTERNAL, "read_procargs", side_effect=startup_metadata) as startup_reads, \
+                    mock.patch.object(PROBE, "require_fixture_hashes", side_effect=require_fixture_hashes), \
                     mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
                     mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
                     mock.patch.object(PROBE.subprocess, "Popen", side_effect=FixtureProcess), \
@@ -1338,7 +1355,31 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         raise
                     self.assertEqual(error.cmd, "original-reader-wait")
                     exit_code = 1
+                except ValueError as error:
+                    if error is not startup_error:
+                        raise
+                    exit_code = 1
+                except PermissionError as error:
+                    if error is not hash_io_error or not hash_io_failure:
+                        raise
+                    propagated_hash_error = error
+                    exit_code = 1
             summary = json.loads((records / "result.json").read_text())
+            self.assertEqual([call.args[0] for call in startup_reads.call_args_list],
+                             [process.pid for process in processes] if external_receipt else [])
+            if isinstance(startup_error, ValueError):
+                failures = json.loads((records / "startup-failures.json").read_text())
+                EXTERNAL.validate_startup_failures(failures)
+                self.assertEqual(failures, [
+                    {"stage": "external-startup-" + invalid_allocator[0], "reason": "unclassified", "errno": None},
+                    {"stage": "external-startup-final", "reason": "receipt_incomplete", "errno": None}])
+                self.assertNotIn("private", json.dumps(failures))
+                self.assertEqual(scanned, [])
+                self.assertTrue(summary["cleanup"]["processes_exited"])
+                self.assertTrue(summary["cleanup"]["primary_exception"])
+                self.assertTrue(all(process.returncode == 0 for process in processes))
+                self.assertTrue(any(command[0].endswith("/lsregister") for command in commands))
+                return exit_code, summary
             if cleanup_failure:
                 cleanup = json.loads((records / "process-cleanup.json").read_text())
                 self.assertEqual(summary["cleanup"], cleanup)
@@ -1369,11 +1410,47 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             if not copy_lifetime:
                 self.assertEqual(summary["scans"][0]["label"], "baseline")
             scans = [] if copy_lifetime else json.loads((records / "scans.json").read_text())
+            if hash_io_failure:
+                phase, target = hash_io_failure
+                self.assertEqual(type(hash_io_error), PermissionError)
+                self.assertEqual(hash_io_error.errno, 13)
+                self.assertIs(propagated_hash_error, hash_io_error if phase == "complete" else None)
+                failures = json.loads((records / "startup-failures.json").read_text())
+                EXTERNAL.validate_startup_failures(failures)
+                self.assertEqual(failures, [{"stage": "external-startup-" + phase,
+                    "reason": target + "_hash", "errno": 13}])
+                self.assertNotIn("private", json.dumps(failures))
+                self.assertEqual(summary["cleanup"]["primary_exception"], phase == "complete")
+                self.assertEqual(summary["cleanup"]["errors"], [] if phase == "complete" else ["external_receipt"])
+                self.assertTrue(summary["cleanup"]["processes_exited"])
+                self.assertTrue(any(command[0].endswith("/lsregister") for command in commands))
+                self.assertEqual([row["stage"] for row in summary["validation_errors"]],
+                    ([failed_scan] if failed_scan else []) + ["execution" if phase == "complete" else "cleanup"])
+                counts = REPORT.validation_failure_counts(summary)
+                self.assertEqual(counts["allocator_environment"], 0)
+                self.assertEqual(counts["other"], 1)
+                self.assertEqual(counts["heap_baseline"], int(failed_scan is not None))
+                self.assertEqual(len(scans), 6)
+                return exit_code, summary
             if external_receipt:
                 self.assertFalse(any("clang" in command or "swiftc" in command or "codesign" in command for command in commands))
                 if not binary_drift:
                     self.assertEqual(EXTERNAL.fixture_hashes(work), EXTERNAL.fixture_hashes(prepared))
                 receipt = json.loads((records / "external-startup.json").read_text())
+                failures = json.loads((records / "startup-failures.json").read_text())
+                EXTERNAL.validate_startup_failures(failures)
+                self.assertEqual(len(failures), 3 if invalid_allocator else 1 if binary_drift else 0)
+                if invalid_allocator:
+                    self.assertEqual(failures[0], EXTERNAL.startup_failure("external-startup-" + invalid_allocator[0],
+                        startup_error if startup_error is not None else RuntimeError("unknown")))
+                    self.assertEqual([row["reason"] for row in failures[1:]], ["receipt_incomplete"] * 2)
+                    self.assertEqual([row["stage"] for row in failures[1:]], list(EXTERNAL.STARTUP_STAGES[2:]))
+                    self.assertEqual(REPORT.validation_failure_counts(summary)["allocator_environment"], 3)
+                    self.assertTrue(any(row["message"] == str(startup_error or RuntimeError("Owned child startup environment unavailable"))
+                        for row in summary["validation_errors"]))
+                elif binary_drift:
+                    self.assertEqual(failures, [{"stage": "external-startup-final",
+                        "reason": "prepared_hash" if binary_drift == "prepared" else "working_hash", "errno": None}])
                 if not invalid_allocator and not binary_drift:
                     EXTERNAL.validate_external_receipt(receipt, malloc_scribble, EXTERNAL.fixture_hashes(prepared), install_gate)
             else:
@@ -1531,6 +1608,25 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             self.assertEqual(len(summary["scans"]), 6)
             self.assertIn("install-gate-host-" + str(sequence), [row["stage"] for row in summary["validation_errors"]])
 
+    def test_initial_startup_failure_keeps_role_errno_all_scans_and_heap_failure(self):
+        for role, error in itertools.product(("host", "reader"), (
+                EXTERNAL.StartupReceiptError("sysctl_procargs", "private original failure", 13),
+                EXTERNAL.StartupReceiptError("parse_environment", "private malformed environment"),
+                RuntimeError("private unclassified failure"))):
+            code, result = self.exercise_runner(external_receipt=True, malloc_scribble="off", heap_control=True,
+                install_gate="installed", invalid_allocator=(role, "missing"), startup_error=error, failed_scan="registered-10")
+            self.assertEqual(code, 1)
+            self.assertEqual(len(result["scans"]), 6)
+            self.assertEqual(REPORT.validation_failure_counts(result)["heap_baseline"], 1)
+
+    def test_unknown_non_runtime_startup_failure_keeps_original_abort_and_cleanup(self):
+        for role in ("host", "reader"):
+            code, result = self.exercise_runner(external_receipt=True, malloc_scribble="off", heap_control=True,
+                invalid_allocator=(role, "missing"), startup_error=ValueError("private unexpected exception"))
+            self.assertEqual(code, 1)
+            self.assertEqual(result["coverage"], "failed")
+            self.assertEqual(REPORT.validation_failure_counts(result)["other"], 1)
+
     def test_pure_and_patched_empty_controls_keep_six_scans_and_transient_strict_failures(self):
         for mode, failure in itertools.product(("patched", "pure-appkit"), (None, "registered-10", "removed-20")):
             with self.subTest(mode=mode, failure=failure):
@@ -1551,10 +1647,20 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             self.assertEqual(len(summary["scans"]), 6)
 
     def test_external_executable_drift_after_measurement_remains_fatal(self):
-        code, summary = self.exercise_runner(external_receipt=True, malloc_scribble="off", binary_drift=True)
-        self.assertEqual(code, 1)
-        self.assertEqual(summary["coverage"], "failed")
-        self.assertIn("external-startup-final", [error["stage"] for error in summary["validation_errors"]])
+        for target in (True, "prepared"):
+            code, summary = self.exercise_runner(external_receipt=True, malloc_scribble="off", binary_drift=target)
+            self.assertEqual(code, 1)
+            self.assertEqual(summary["coverage"], "failed")
+            self.assertIn("external-startup-final", [error["stage"] for error in summary["validation_errors"]])
+
+    def test_external_hash_io_failure_keeps_original_exception_and_failure_category(self):
+        for phase, target in itertools.product(("complete", "final"), ("prepared", "working")):
+            with self.subTest(phase=phase, target=target):
+                code, summary = self.exercise_runner(external_receipt=True, malloc_scribble="off",
+                    hash_io_failure=(phase, target), failed_scan="registered-10")
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["coverage"], "failed")
+                self.assertEqual(len(summary["scans"]), 6)
 
     def test_unreadable_external_environment_fails_and_retains_all_later_scans(self):
         for role in ("host", "reader"):
@@ -1830,6 +1936,22 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
         for failure in ("build", "build-timeout", "cleanup"):
             self.run_measurement(enabled=False, scan_mode="live", receipt_mode="external-startup", install_control=True, first_failure=failure)
 
+    def test_startup_failure_summary_is_bounded_and_never_weakens_the_verdict(self):
+        valid = [{"stage": "external-startup-reader", "reason": "sysctl_procargs", "errno": 13},
+                 {"stage": "external-startup-complete", "reason": "receipt_incomplete", "errno": None},
+                 {"stage": "external-startup-final", "reason": "receipt_incomplete", "errno": None}]
+        for evidence in (valid, None, [{"stage": "external-startup-host", "reason": "secret", "errno": None}],
+                         [dict(valid[0], errno=True)], [valid[0]] * 5, [dict(valid[0], private="secret")]):
+            _, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                first_failure="startup-failures", first_startup_failures=evidence)
+            first = summary["trials"][0]
+            self.assertEqual(first["startup_failures_available"], evidence == valid)
+            if evidence == valid:
+                self.assertEqual(first["startup_failures"], valid)
+            else:
+                self.assertNotIn("startup_failures", first)
+            self.assertTrue(all(row["startup_failures_available"] and row["startup_failures"] == [] for row in summary["trials"][1:]))
+
     def test_pure_control_workflow_reuses_each_build_and_keeps_all_ten_cases_after_failure(self):
         for failure in (None, "strict", "timeout", "control-mode", "cross-mode-receipt", "external-receipt", "external-private", "external-missing", "scan-fields"):
             with self.subTest(failure=failure):
@@ -1951,7 +2073,8 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         self.assertFalse(root.exists())
 
     def run_measurement(self, *, enabled=True, first_failure=None, scan_mode="diagnostic", unexpected_diagnostics=False,
-                        first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False, install_control=False):
+                        first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False, install_control=False,
+                        first_startup_failures=None):
         script = self.workflow_script("Measure matched cases with strict heap checks")
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
@@ -2024,6 +2147,9 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if self.first and first_failure == "receipt":
                         receipt["reader"] = "/private/secret"
                     if receipt_mode == "external-startup":
+                        failures = first_startup_failures if self.first and first_failure == "startup-failures" else []
+                        if failures is not None:
+                            PROBE.write_json(records / "startup-failures.json", failures)
                         hashes = EXTERNAL.fixture_hashes(root / (("install-gate" if install_control else mode if pure_control else "ordinary") + "-fixture"))
                         if self.first and first_failure == "cross-mode-receipt":
                             hashes = EXTERNAL.fixture_hashes(root / "pure-appkit-fixture")

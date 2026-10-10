@@ -1,4 +1,5 @@
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -19,6 +20,130 @@ def procargs(environment, arguments=(b"/synthetic/host",), suffix=b""):
 
 
 class AXExternalStartupTests(unittest.TestCase):
+    def test_invalid_owned_pid_and_unavailable_library_are_distinct(self):
+        for pid in (True, 0, -1, "123"):
+            with mock.patch.object(EXTERNAL.sys, "platform", "darwin"), mock.patch.object(EXTERNAL.ctypes, "CDLL") as load:
+                with self.assertRaises(EXTERNAL.StartupReceiptError) as caught:
+                    EXTERNAL.read_procargs(pid)
+                load.assert_not_called()
+            self.assertEqual(EXTERNAL.startup_failure("external-startup-reader", caught.exception)["reason"], "owned_pid")
+        with mock.patch.object(EXTERNAL.sys, "platform", "darwin"), \
+                mock.patch.object(EXTERNAL.ctypes, "CDLL", side_effect=OSError(2, "/private/secret")):
+            with self.assertRaises(EXTERNAL.StartupReceiptError) as caught:
+                EXTERNAL.read_procargs(123)
+        self.assertEqual(EXTERNAL.startup_failure("external-startup-reader", caught.exception),
+            {"stage": "external-startup-reader", "reason": "sysctl_library", "errno": 2})
+
+    def test_syscall_failures_keep_immediate_errno_and_call_site(self):
+        for failed_call, number in ((2, 13), (3, 22), (3, 0)):
+            calls = []
+            def sysctl(mib, count, output, size, *_):
+                calls.append(count)
+                self.assertEqual(ctypes.get_errno(), 0)
+                if count == failed_call:
+                    ctypes.set_errno(number)
+                    return -1
+                output._obj.value = 4096
+                size._obj.value = 4
+                ctypes.set_errno(91)
+                return 0
+            library = mock.Mock(); library.sysctl.side_effect = sysctl
+            ctypes.set_errno(99)
+            with mock.patch.object(EXTERNAL.sys, "platform", "darwin"), mock.patch.object(EXTERNAL.ctypes, "CDLL", return_value=library):
+                with self.assertRaises(EXTERNAL.StartupReceiptError) as caught:
+                    EXTERNAL.read_procargs(123)
+            self.assertEqual(calls, [2] if failed_call == 2 else [2, 3])
+            ctypes.set_errno(77)
+            self.assertEqual(EXTERNAL.startup_failure("external-startup-reader", caught.exception), {
+                "stage": "external-startup-reader", "reason": "sysctl_capacity" if failed_call == 2 else "sysctl_procargs", "errno": number})
+
+    def test_failure_projection_never_uses_exception_text_and_rejects_bad_fields(self):
+        for error in (RuntimeError("/private/secret"), ValueError("PATH=secret"), OSError(13, "secret"),
+                      EXTERNAL.StartupReceiptError("/private/secret", "secret", 13)):
+            self.assertEqual(EXTERNAL.startup_failure("external-startup-host", error),
+                {"stage": "external-startup-host", "reason": "unclassified", "errno": None})
+        initial = {"stage": "external-startup-reader", "reason": "sysctl_procargs", "errno": 22}
+        complete = {"stage": "external-startup-complete", "reason": "receipt_incomplete", "errno": None}
+        final = dict(complete, stage="external-startup-final")
+        EXTERNAL.validate_startup_failures([initial, complete, final])
+        EXTERNAL.validate_startup_failures([])
+        bad = [None, {}, [initial] * 5, [initial, initial], [final, initial],
+            [dict(initial, extra="secret")], [dict(initial, stage="secret")],
+            [dict(initial, reason="secret")], [dict(initial, reason=[])], [dict(initial, errno=True)],
+            [dict(initial, errno=-1)], [dict(initial, errno=4096)], [dict(initial, errno="22")],
+            [dict(initial, errno=None)], [dict(initial, reason="parse_argc")],
+            [dict(complete, errno=22)], [dict(initial, reason="receipt_incomplete", errno=None)],
+            [dict(complete, reason="parse_argc")], [dict(initial, stage=True)]]
+        for value in bad:
+            with self.subTest(value=value), self.assertRaises(ValueError) as caught:
+                EXTERNAL.validate_startup_failures(value)
+            self.assertNotIn("secret", str(caught.exception))
+
+    def test_hash_io_failure_projection_requires_fixed_reason_stage_and_errno(self):
+        for stage, reason in (("external-startup-complete", "prepared_hash"),
+                              ("external-startup-final", "working_hash")):
+            error = PermissionError(13, "private-secret", "/private/secret")
+            error._startup_hash_reason = reason
+            self.assertEqual(EXTERNAL.startup_failure(stage, error),
+                {"stage": stage, "reason": reason, "errno": 13})
+            self.assertEqual(type(error), PermissionError)
+            self.assertEqual(str(error), "[Errno 13] private-secret: '/private/secret'")
+        for stage, reason, number in (("external-startup-host", "prepared_hash", 13),
+                ("external-startup-final", "sysctl_procargs", 13),
+                ("external-startup-final", "/private/secret", 13),
+                ("external-startup-final", ["working_hash"], 13),
+                ("external-startup-final", "working_hash", True),
+                ("external-startup-final", "working_hash", -1),
+                ("external-startup-final", "working_hash", 4096)):
+            error = PermissionError(13, "private-secret")
+            error._startup_hash_reason, error.errno = reason, number
+            self.assertEqual(EXTERNAL.startup_failure(stage, error),
+                {"stage": stage, "reason": "unclassified", "errno": None})
+
+    def test_parse_failures_identify_shape_without_exporting_contents(self):
+        for raw, reason in ((b"", "parse_size"), (struct.pack("=i", 0) + b"path\0", "parse_argc"),
+                (struct.pack("=i", 1) + b"\0", "parse_executable"),
+                (struct.pack("=i", 1) + b"private-secret", "parse_terminator"),
+                (procargs([b"PATH=x", b"PATH=secret"]), "parse_environment"),
+                (procargs([]), "environment_not_visible")):
+            with self.assertRaises(EXTERNAL.StartupReceiptError) as caught:
+                EXTERNAL.parse_procargs(raw)
+            evidence = EXTERNAL.startup_failure("external-startup-host", caught.exception)
+            self.assertEqual(evidence["reason"], reason)
+            self.assertIsNone(evidence["errno"])
+            self.assertNotIn("secret", json.dumps(evidence))
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin owned-child startup metadata")
+    def test_native_owned_child_success_and_injected_syscall_failure(self):
+        executable = Path(sys.executable).resolve()
+        environment = dict(os.environ, QUICKFILE_AX_INSTALL_PROBE_MODE="installed")
+        environment.pop("MallocScribble", None)
+        child = subprocess.Popen([str(executable), "-B", "-c", "import sys; sys.stdin.buffer.read()"],
+                                 stdin=subprocess.PIPE, env=environment)
+        try:
+            digest = EXTERNAL.executable_hash(executable)
+            receipt = EXTERNAL.owned_child_receipt(child, executable, environment, "off", digest, "installed")
+            self.assertEqual(receipt["malloc_scribble"], "unset")
+            self.assertEqual(receipt["install_gate"], "installed")
+            def sysctl(mib, count, output, size, *_):
+                if count == 2:
+                    output._obj.value = 4096; size._obj.value = 4
+                    return 0
+                ctypes.set_errno(13)
+                return -1
+            library = mock.Mock(); library.sysctl.side_effect = sysctl
+            with mock.patch.object(EXTERNAL.ctypes, "CDLL", return_value=library), self.assertRaises(EXTERNAL.StartupReceiptError) as caught:
+                EXTERNAL.owned_child_receipt(child, executable, environment, "off", digest, "installed")
+            self.assertEqual(EXTERNAL.startup_failure("external-startup-host", caught.exception),
+                {"stage": "external-startup-host", "reason": "sysctl_procargs", "errno": 13})
+            self.assertIsNone(child.poll())
+        finally:
+            try:
+                child.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill(); child.communicate(timeout=5)
+        self.assertEqual(child.returncode, 0)
+
     def test_install_gate_startup_requires_exact_setting_and_public_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "host"
@@ -37,6 +162,7 @@ class AXExternalStartupTests(unittest.TestCase):
                             with self.assertRaises(RuntimeError) as error:
                                 EXTERNAL.owned_child_receipt(process, path, environment, "off", digest, mode)
                             self.assertNotIn("secret", str(error.exception))
+                            self.assertEqual(EXTERNAL.startup_failure("external-startup-host", error.exception)["reason"], "install_setting")
                         else:
                             entry = EXTERNAL.owned_child_receipt(process, path, environment, "off", digest, mode)
                             self.assertEqual(entry["install_gate"], mode)
@@ -73,8 +199,11 @@ class AXExternalStartupTests(unittest.TestCase):
             with self.subTest(failure=failure), mock.patch.object(EXTERNAL.sys, "platform", "darwin"), \
                     mock.patch.object(EXTERNAL.ctypes, "CDLL", return_value=library):
                 if failure:
-                    with self.assertRaises(RuntimeError):
+                    with self.assertRaises(RuntimeError) as caught:
                         EXTERNAL.read_procargs(123)
+                    self.assertEqual(EXTERNAL.startup_failure("external-startup-host", caught.exception)["reason"], {
+                        "capacity-error": "sysctl_capacity", "capacity-size": "capacity_shape", "capacity-bound": "capacity_shape",
+                        "read-error": "sysctl_procargs", "result-size": "result_size", "malformed": "result_size"}[failure])
                 else:
                     self.assertEqual(EXTERNAL.read_procargs(123)[2], {b"PATH": b"/synthetic/bin"})
 
@@ -105,9 +234,11 @@ class AXExternalStartupTests(unittest.TestCase):
             alias = Path(directory) / "alias"
             alias.symlink_to(path)
             digest = EXTERNAL.executable_hash(path)
-            for failure in (None, "before-exit", "after-exit", "launch", "startup", "argv", "path", "empty-path", "setting", "hash", "read"):
+            for failure in (None, "before-exit", "after-exit", "launch", "startup", "argv", "path", "empty-path", "setting", "hash", "read", "poll-error"):
                 process = mock.Mock(args=[str(alias)], pid=123)
                 process.poll.side_effect = [1] if failure == "before-exit" else [None, 1 if failure == "after-exit" else None]
+                if failure == "poll-error":
+                    process.poll.side_effect = OSError(13, "/private/secret")
                 environment = {"PATH": "/synthetic/bin"}
                 actual = {b"PATH": b"/synthetic/bin"}
                 executable, arguments = os.fsencode(alias), [os.fsencode(alias)]
@@ -130,6 +261,13 @@ class AXExternalStartupTests(unittest.TestCase):
                         with self.assertRaises(RuntimeError) as error:
                             EXTERNAL.owned_child_receipt(process, path, environment, "off", "0" * 64 if failure == "hash" else digest)
                         self.assertNotIn("private", str(error.exception))
+                        reason = {"before-exit": "child_not_alive", "after-exit": "child_exited", "launch": "launch_path",
+                            "startup": "startup_path", "argv": "startup_argv", "path": "path_visibility",
+                            "empty-path": "path_visibility", "setting": "allocator_setting", "hash": "executable_hash",
+                            "read": "unclassified", "poll-error": "unclassified"}[failure]
+                        evidence = EXTERNAL.startup_failure("external-startup-host", error.exception)
+                        self.assertEqual(evidence["reason"], reason)
+                        self.assertEqual(evidence["errno"], 2 if failure in ("launch", "startup", "argv") else None)
                     else:
                         value = EXTERNAL.owned_child_receipt(process, path, environment, "off", digest)
                         self.assertEqual(value["malloc_scribble"], "unset")

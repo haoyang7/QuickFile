@@ -245,7 +245,7 @@ jobs:
           import json, os, pathlib, re, sys
           sys.path.insert(0, 'Scripts/Investigations')
           from ax_probe_report import validate_heap_diagnostics_summary, validate_terminal_snapshot, validation_failure_counts
-          from ax_external_receipt import fixture_sources, load_prepared_build, validate_external_receipt, validate_install_gate_state
+          from ax_external_receipt import fixture_sources, load_prepared_build, validate_external_receipt, validate_install_gate_state, validate_startup_failures
           from ax_process import run_owned
           import hashlib
           from importlib import import_module
@@ -385,6 +385,18 @@ jobs:
                           else:
                               receipt.update(external_startup_verified=True, startup_environment=startup)
                       failed |= not receipt['external_startup_verified']
+                      receipt['startup_failures_available'] = False
+                      failures_file = records / 'startup-failures.json'
+                      if failures_file.is_file() and not failures_file.is_symlink() and failures_file.stat().st_size <= 2048:
+                          try:
+                              startup_failures = json.loads(failures_file.read_text())
+                              validate_startup_failures(startup_failures)
+                          except (ValueError, TypeError):
+                              pass
+                          else:
+                              receipt.update(startup_failures_available=True, startup_failures=startup_failures)
+                              failed |= bool(startup_failures)
+                      failed |= not receipt['startup_failures_available']
                   if install_control:
                       receipt['initial_install_gate_verified'] = False
                       initial_file = records / 'install-gate-initial.json'

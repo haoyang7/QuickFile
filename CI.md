@@ -41,6 +41,8 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 该入口的构建清单 schema 3 绑定 `install-gate` 模式、源文件哈希、生产对象/宿主的唯一调查宏、reader 无宏及链接输入，不能借用 ordinary 或 pure AppKit 构建。外部启动回执在两个实际 owned PID 上核验 `QUICKFILE_AX_INSTALL_PROBE_MODE` 的固定值；它仍只证明启动元数据。capability 子进程与实际测量宿主分别验收：实际初始 ready 和后续每次 ready 均须显示前置检查已完成、gate 恰好调用一次，以及两个当前 IMP 分别匹配保存值或替换值；公开摘要保留初始和六个扫描点的固定状态，不公开地址。前置检查不支持时两模式都失败，off 不能只凭模式名称通过。严格堆断言及清理失败保留，失败后按既有安全边界收集后续对照。该链接宿主仍包含测试代码和调查回执；结果可比较最后的 IMP 替换路径，不能独自证明泄漏所有权、基线漏报或补丁因果缺陷，也不能与先前不同二进制的 pure 对照直接等同。
 
+所有 external-startup case 另验收 `startup-failures.json`，公开最多四条按 host、reader、complete、final 排序且阶段唯一的失败记录，仅含固定 `stage`、`reason` 和 `errno`（null 或 0…4095 整数）。原因区分启动身份、sysctl 容量/读取、解析、PATH 可见性、开关值、字节哈希及回执完整性；失败 syscall 的 errno 在返回时立即保存，未知异常仅公开 `unclassified`。摘要缺失、字段/枚举/阶段组合或 errno 类型越界都使工作流失败。原私有错误和固定 category 计数继续保留；一次角色失败可进一步导致 complete/final 两次完整性失败，不能将这些计数视为独立环境读取。成功回执、读取时点和次数、宿主/reader 字节及六点严格扫描不变，不增加重试；回执失败削弱验证范围，不豁免同时观察到的堆增长。
+
 `terminal_origin=true` 是另一个有界入口，要求同时传入 `malloc_scribble=true`、`scan_mode=live`、`receipt_mode=external-startup`、`heap_diagnostics=false`、`ax_causal_probe=false`。它将上述 20 case 改为按顺序执行一次 off/control 和一次 off/product；同一构建的两个可执行文件继续逐次核对 SHA-256。每例先完成普通 CI 的全部六个实时扫描点，然后在 `observer-exited` 扫描之后、宿主停止之前仅捕获一份后续堆图；合计 12 个原扫描点和 2 次终点捕获。host/reader 均退出后，才用该图生成 grouped/list 两份离线文本，不增加基线前采样、不启用 NoCompact 优先模式、不记录分配年龄或代次。
 
 `terminal_snapshot` 将每个 grouped 根组与其自身分配栈关联，list 仅汇总全图的固定类型、大小与分配栈计数，不将 list 子节点归属到某个 NSXPC 根。公开帧按原帧号规范为 `allocation-first`（从分配端向调用者），保留重复帧及 index；这不是调用时序。每一保留帧必须通过本机 `SystemSymbols` 的系统映像、地址/偏移与符号核验，上传前再次独立查找符号。地址、路径、任意类型和未经核验的符号均不公开；非白名单类型仅记 `unknown`。摘要最多保留 16 个根组、32 个分配组和总计 96 帧，另记缺帧、不可解析行、过滤帧、未验证帧及预算省略数；原始栈和堆图不上传。
