@@ -1,6 +1,8 @@
 import Combine
 import Foundation
+#if !QUICKFILE_COMMUNITY
 import Sparkle
+#endif
 
 struct UpdateConfiguration {
     init?(info: [String: Any]) {
@@ -16,7 +18,7 @@ struct UpdateConfiguration {
 }
 
 @MainActor
-final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate {
+final class UpdateController: NSObject, ObservableObject {
     @Published private(set) var canCheckForUpdates = false
     @Published private(set) var automaticallyChecksForUpdates = false
     @Published private(set) var receivesBetaUpdates: Bool
@@ -24,14 +26,16 @@ final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate {
 
     private static let betaPreference = "QuickFileReceivesBetaUpdates"
     private let defaults: UserDefaults
+    #if !QUICKFILE_COMMUNITY
     private var updaterController: SPUStandardUpdaterController?
+    #endif
 
     init(bundle: Bundle = .main, defaults: UserDefaults = .standard, isTesting: Bool = ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil) {
         self.defaults = defaults
         receivesBetaUpdates = defaults.bool(forKey: Self.betaPreference)
         super.init()
 
-        #if !DEBUG
+        #if !DEBUG && !QUICKFILE_COMMUNITY
         guard !isTesting, UpdateConfiguration(info: bundle.infoDictionary ?? [:]) != nil else { return }
         let controller = SPUStandardUpdaterController(
             startingUpdater: false, updaterDelegate: self, userDriverDelegate: nil
@@ -50,23 +54,32 @@ final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate {
     }
 
     func checkForUpdates() {
+        #if !QUICKFILE_COMMUNITY
         guard canCheckForUpdates else { return }
         updaterController?.checkForUpdates(nil)
+        #endif
     }
 
     func setAutomaticallyChecksForUpdates(_ enabled: Bool) {
+        #if !QUICKFILE_COMMUNITY
         updaterController?.updater.automaticallyChecksForUpdates = enabled
+        #endif
     }
 
     func setReceivesBetaUpdates(_ enabled: Bool) {
         receivesBetaUpdates = enabled
         defaults.set(enabled, forKey: Self.betaPreference)
+        #if !QUICKFILE_COMMUNITY
         // Changing channel must not cause a network check when automatic checks are off.
         if automaticallyChecksForUpdates {
             updaterController?.updater.resetUpdateCycleAfterShortDelay()
         }
+        #endif
     }
+}
 
+#if !QUICKFILE_COMMUNITY
+extension UpdateController: SPUUpdaterDelegate {
     func allowedChannels(for updater: SPUUpdater) -> Set<String> {
         receivesBetaUpdates ? ["beta"] : []
     }
@@ -83,3 +96,4 @@ final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate {
         []
     }
 }
+#endif
