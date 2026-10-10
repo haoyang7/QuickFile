@@ -22,6 +22,33 @@ with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
 REPORT = sys.modules["ax_probe_report"]
 
 
+def notification_records(work, copy_lifetime=False):
+    configured = os.environ.get("QUICKFILE_AX_TEST_RECORDS")
+    if configured is None:
+        return work / "records"
+    records = pathlib.Path(configured)
+    return records.with_name(records.name + "-copy-lifetime") if copy_lifetime else records
+
+
+class AXCompatibilityRecordDirectoryTests(unittest.TestCase):
+    def test_configured_modes_have_independent_directories_in_either_order(self):
+        for order in ((False, True), (True, False)):
+            with self.subTest(order=order), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                configured = root / "records"
+                with mock.patch.dict(os.environ, {"QUICKFILE_AX_TEST_RECORDS": str(configured)}):
+                    paths = [notification_records(root / "fixture", copy_lifetime=mode) for mode in order]
+                for path in paths:
+                    path.mkdir(parents=True, exist_ok=False)
+                self.assertEqual(set(paths), {configured, root / "records-copy-lifetime"})
+
+    def test_default_records_remain_inside_each_independent_fixture_directory(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for mode in (False, True):
+                work = pathlib.Path("fixture-lifetime" if mode else "fixture-product")
+                self.assertEqual(notification_records(work, copy_lifetime=mode), work / "records")
+
+
 class AXHeapDiagnosticTests(unittest.TestCase):
     @staticmethod
     def report(count=1, size=48, kind="NSMutableArray", stack="-[NSXPCConnection initWithMachServiceName:options:]"):
@@ -317,6 +344,19 @@ class AXAllocationCohortTests(unittest.TestCase):
 
 
 class AXCompatibilityPreflightTests(unittest.TestCase):
+    def test_copy_lifetime_is_an_independent_product_probe(self):
+        for option in ("--system-baseline", "--heap-diagnostics", "--heap-control", "--ownership-trace", "--read-only",
+                       "--balance-copies"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as directory:
+                work = pathlib.Path(directory) / "unused"
+                arguments = ["probe", "--work-directory", str(work), "--records-directory", str(work),
+                             "--copy-lifetime", option]
+                with mock.patch.object(sys, "argv", arguments), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as failure:
+                        PROBE.main()
+                self.assertEqual(failure.exception.code, 2)
+                self.assertFalse(work.exists())
+
     def test_heap_control_requires_diagnostics_and_the_original_product_window(self):
         for options in (("--heap-control",), ("--heap-control", "--heap-diagnostics", "--system-baseline"),
                         ("--heap-control", "--heap-diagnostics", "--read-only"),
@@ -435,13 +475,60 @@ class AXCompatibilityNotificationTests(unittest.TestCase):
         PROBE.validate_notifications(receipt, 100, read_only=True)
 
 
+class AXCompatibilityCopyLifetimeTests(unittest.TestCase):
+    @staticmethod
+    def receipt(count=10):
+        return {"destroyedButtons": count, "compensations": count * 2, "mutableCompensations": count,
+                "copyLifetime": {"ordinary": count, "mutable": count, "liveOrdinary": 0, "liveMutable": 0, "invalid": 0}}
+
+    def test_both_branches_match_destruction_and_compensation_at_every_checkpoint(self):
+        for count in (0, 10, 20, 30):
+            PROBE.validate_copy_lifetime_host(self.receipt(count))
+        PROBE.validate_copy_lifetime_host(self.receipt(30), 30)
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_copy_lifetime_host(self.receipt(20), 30)
+        for key, value in (("destroyedButtons", 9), ("compensations", 19), ("mutableCompensations", 9)):
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                PROBE.validate_copy_lifetime_host(self.receipt() | {key: value})
+        for key in ("ordinary", "mutable", "liveOrdinary", "liveMutable", "invalid"):
+            receipt = self.receipt()
+            receipt["copyLifetime"][key] += 1
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                PROBE.validate_copy_lifetime_host(receipt)
+
+    def test_missing_and_noninteger_counts_are_rejected(self):
+        for lifetime in (None, [], 0):
+            with self.subTest(lifetime=lifetime), self.assertRaises(RuntimeError):
+                PROBE.validate_copy_lifetime_host(self.receipt() | {"copyLifetime": lifetime})
+        missing = self.receipt()
+        del missing["copyLifetime"]
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_copy_lifetime_host(missing)
+        for container in ("host", "copyLifetime"):
+            keys = self.receipt()["copyLifetime"].keys() if container == "copyLifetime" else (
+                "destroyedButtons", "compensations", "mutableCompensations")
+            for key in keys:
+                for value in (None, True, 1.0, -1, "0"):
+                    receipt = self.receipt()
+                    target = receipt["copyLifetime"] if container == "copyLifetime" else receipt
+                    target[key] = value
+                    with self.subTest(container=container, key=key, value=value), self.assertRaises(RuntimeError):
+                        PROBE.validate_copy_lifetime_host(receipt)
+                receipt = self.receipt()
+                target = receipt["copyLifetime"] if container == "copyLifetime" else receipt
+                del target[key]
+                with self.subTest(container=container, missing=key), self.assertRaises(RuntimeError):
+                    PROBE.validate_copy_lifetime_host(receipt)
+
+
 class AXCompatibilityLifecycleTests(unittest.TestCase):
     """Inject process/scan results while exercising the real runner protocol."""
 
     def exercise_runner(self, *, failed_scan=None, invalid_notifications=False,
                         system_baseline=False, insufficient_compensation=False, ownership_trace=False,
                         heap_diagnostics=False, unavailable_cohorts=False, heap_control=False,
-                        invalid_control_host=None, invalid_control_reader=None):
+                        invalid_control_host=None, invalid_control_reader=None,
+                        copy_lifetime=False, invalid_copy_lifetime=None):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -558,6 +645,16 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                                 if insufficient_compensation and host_state["destroyedButtons"] == 30:
                                     host_state["compensations"] -= 1
                     receipt = dict(host_state)
+                    if copy_lifetime:
+                        count = host_state["destroyedButtons"]
+                        receipt["copyLifetime"] = {"ordinary": count, "mutable": count, "liveOrdinary": 0,
+                                                   "liveMutable": 0, "invalid": 0}
+                        if invalid_copy_lifetime and receipt["sequence"] == invalid_copy_lifetime[0]:
+                            key, value = invalid_copy_lifetime[1:]
+                            if key is None:
+                                del receipt["copyLifetime"]
+                            else:
+                                receipt["copyLifetime"][key] = value
                     if invalid_control_host and receipt["sequence"] == invalid_control_host[0]:
                         receipt[invalid_control_host[1]] = 1
                 self.assertTrue(predicate(receipt))
@@ -578,6 +675,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.append("--heap-diagnostics")
             if heap_control:
                 arguments.append("--heap-control")
+            if copy_lifetime:
+                arguments.append("--copy-lifetime")
             with mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
                     mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
                     mock.patch.object(PROBE.subprocess, "Popen", side_effect=FixtureProcess), \
@@ -596,6 +695,10 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             self.assertTrue(all(process.returncode == 0 for process in processes))
             self.assertEqual(summary["scans"][0]["label"], "baseline")
             scans = json.loads((records / "scans.json").read_text())
+            product_build = next(command for command in commands if "-fno-objc-arc" in command)
+            host_build = next(command for command in commands if "-fobjc-arc" in command)
+            for build in (product_build, host_build):
+                self.assertEqual("-DQUICKFILE_AX_COPY_LIFETIME" in build, copy_lifetime)
             if heap_diagnostics:
                 diagnostic = json.loads((records / "heap-diagnostics.json").read_text())
                 REPORT.validate_heap_diagnostics_summary(diagnostic)
@@ -638,9 +741,44 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertEqual(summary["ordinary_compensations"], 0)
                 self.assertEqual(summary["mutable_compensations"], 0)
                 self.assertEqual(summary["notifications"], notifications.get("notifications"))
+            if copy_lifetime:
+                self.assertEqual(summary["mode"], "copy-lifetime")
+                self.assertIs(summary["instrumented"], True)
+                self.assertEqual(summary["copy_lifetime"], scans[-1]["host"].get("copyLifetime"))
+                self.assertTrue(all("copyLifetime" in checkpoint for checkpoint in summary["checkpoints"]))
             if exit_code:
                 self.assertEqual(json.loads((records / "validation-errors.json").read_text()), summary["validation_errors"])
             return exit_code, summary
+
+    def test_copy_lifetime_covers_thirty_copies_per_branch_with_the_original_heap_guard(self):
+        exit_code, summary = self.exercise_runner(copy_lifetime=True)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["coverage"], "passed")
+        self.assertEqual(summary["copy_lifetime"], AXCompatibilityCopyLifetimeTests.receipt(30)["copyLifetime"])
+        self.assertIn("weak targets cannot be acquired", summary["scope"])
+        self.assertIn("does not establish completed object destruction", summary["scope"])
+        self.assertEqual([scan["label"] for scan in summary["scans"]],
+                         ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
+        exit_code, summary = self.exercise_runner(copy_lifetime=True, failed_scan="removed-10")
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["coverage"], "failed")
+        self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["removed-10"])
+
+    def test_copy_lifetime_early_failures_survive_later_nil_and_complete_all_evidence(self):
+        for sequence, key, value in ((0, None, None), (4, "liveOrdinary", 1), (4, "liveMutable", 1),
+                                     (4, "invalid", 1), (5, "ordinary", 9), (5, "mutable", True),
+                                     (9, "ordinary", 29)):
+            with self.subTest(sequence=sequence, key=key):
+                exit_code, summary = self.exercise_runner(copy_lifetime=True,
+                                                         invalid_copy_lifetime=(sequence, key, value))
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(summary["coverage"], "failed")
+                self.assertEqual([error["stage"] for error in summary["validation_errors"]],
+                                 [f"copy-lifetime-host-{sequence}"])
+                self.assertIsNone(summary["ax_leak_nodes"])
+                self.assertEqual(summary["scans"][-1]["label"], "observer-exited")
+                if sequence != 9:
+                    self.assertEqual(summary["copy_lifetime"], AXCompatibilityCopyLifetimeTests.receipt(30)["copyLifetime"])
 
     def test_heap_control_measures_seven_empty_scans_without_product_coverage(self):
         exit_code, summary = self.exercise_runner(heap_diagnostics=True, heap_control=True)
@@ -676,6 +814,9 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["coverage"], "passed")
         self.assertEqual(summary["ax_leak_nodes"], 0)
         self.assertNotIn("validation_errors", summary)
+        self.assertNotIn("mode", summary)
+        self.assertNotIn("instrumented", summary)
+        self.assertNotIn("copy_lifetime", summary)
 
     def test_diagnostics_capture_once_per_stage_and_preserve_heap_failure(self):
         for stage in ("added-10", "registered-10"):
@@ -784,7 +925,7 @@ class AXCompatibilityCopyTests(unittest.TestCase):
     def test_startup_argument_can_disable_compensation(self):
         self.run_fixture(disable_argument=True)
 
-    def test_real_destroyed_notifications_cover_both_compensation_branches(self):
+    def run_notifications_fixture(self, copy_lifetime=False):
         temporary_root = ROOT / ".build/Temporary"
         temporary_root.mkdir(parents=True, exist_ok=True)
         parent = pathlib.Path(tempfile.gettempdir()).resolve()
@@ -792,11 +933,14 @@ class AXCompatibilityCopyTests(unittest.TestCase):
             parent = temporary_root
         with tempfile.TemporaryDirectory(prefix="ax-notifications-", dir=parent) as directory:
             work = pathlib.Path(directory)
-            records = pathlib.Path(os.environ.get("QUICKFILE_AX_TEST_RECORDS", work / "records"))
-            result = subprocess.run([
+            records = notification_records(work, copy_lifetime=copy_lifetime)
+            arguments = [
                 sys.executable, str(ROOT / "Scripts/Investigations/verify-ax-compatibility.py"),
                 "--work-directory", str(work / "fixture"), "--records-directory", str(records)
-            ], capture_output=True, text=True, timeout=300)
+            ]
+            if copy_lifetime:
+                arguments.append("--copy-lifetime")
+            result = subprocess.run(arguments, capture_output=True, text=True, timeout=300)
             if result.returncode == 77:
                 self.skipTest("AX notification coverage unavailable: " + result.stdout.strip())
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -808,6 +952,20 @@ class AXCompatibilityCopyTests(unittest.TestCase):
             self.assertEqual(receipt["ax_leak_nodes"], 0)
             self.assertLessEqual(receipt["leak_nodes"], receipt["baseline_leak_nodes"])
             self.assertLessEqual(receipt["leak_bytes"], receipt["baseline_leak_bytes"])
+            if copy_lifetime:
+                self.assertEqual(receipt["mode"], "copy-lifetime")
+                self.assertIs(receipt["instrumented"], True)
+                self.assertEqual(receipt["copy_lifetime"], AXCompatibilityCopyLifetimeTests.receipt(30)["copyLifetime"])
+                scans = json.loads((records / "scans.json").read_text())
+                for scan in scans:
+                    PROBE.validate_copy_lifetime_host(scan["host"])
+                PROBE.validate_copy_lifetime_host(scans[-1]["host"], 30)
+
+    def test_real_destroyed_notifications_cover_both_compensation_branches(self):
+        self.run_notifications_fixture()
+
+    def test_real_destroyed_notifications_verify_copy_lifetime(self):
+        self.run_notifications_fixture(copy_lifetime=True)
 
     def test_unrelated_copy_ownership_and_concurrency(self):
         self.run_fixture()

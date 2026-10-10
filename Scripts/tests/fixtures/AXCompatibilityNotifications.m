@@ -7,6 +7,51 @@
 extern void AXOwnershipProbeInstall(NSString *directory, BOOL balance);
 extern NSDictionary *AXOwnershipProbeSnapshot(void);
 #endif
+#ifdef QUICKFILE_AX_COPY_LIFETIME
+#import <stdatomic.h>
+// Each slot observes one actual return value for the lifetime of this host.
+// Zeroing weak references establish loss of weak access, not completion of free.
+static __weak id copyLifetimeResults[60];
+static BOOL copyLifetimeMutable[60], observingCopyLifetime;
+static unsigned copyLifetimeCount;
+static atomic_ulong copyLifetimeInvalid;
+
+void QuickFileAXObserveCopyLifetime(__unsafe_unretained id result, BOOL mutableCopy) {
+    if (![NSThread isMainThread]) {
+        atomic_fetch_add_explicit(&copyLifetimeInvalid, 1, memory_order_relaxed);
+        return;
+    }
+    if (observingCopyLifetime) {
+        atomic_fetch_add_explicit(&copyLifetimeInvalid, 1, memory_order_relaxed);
+        return;
+    }
+    observingCopyLifetime = YES;
+    BOOL valid = result != nil && copyLifetimeCount < 60;
+    for (unsigned i = 0; valid && i < copyLifetimeCount; i++) {
+        if (copyLifetimeResults[i] == result) valid = NO;
+    }
+    if (valid) {
+        unsigned index = copyLifetimeCount++;
+        copyLifetimeMutable[index] = mutableCopy;
+        copyLifetimeResults[index] = result;
+        valid = copyLifetimeResults[index] == result;
+    }
+    if (!valid) atomic_fetch_add_explicit(&copyLifetimeInvalid, 1, memory_order_relaxed);
+    observingCopyLifetime = NO;
+}
+
+static NSDictionary *copyLifetimeSnapshot(void) {
+    unsigned observed[2] = {0}, live[2] = {0};
+    for (unsigned i = 0; i < copyLifetimeCount; i++) {
+        unsigned kind = copyLifetimeMutable[i] ? 1 : 0;
+        observed[kind]++;
+        if (copyLifetimeResults[i] != nil) live[kind]++;
+    }
+    return @{@"ordinary":@(observed[0]), @"mutable":@(observed[1]),
+        @"liveOrdinary":@(live[0]), @"liveMutable":@(live[1]),
+        @"invalid":@(atomic_load_explicit(&copyLifetimeInvalid, memory_order_relaxed))};
+}
+#endif
 static NSDictionary *systemImages(void) {
     NSMutableDictionary *images = [NSMutableDictionary new];
     NSDictionary *wanted = @{
@@ -48,6 +93,9 @@ static NSUInteger allocatedButtons = 0, destroyedButtons = 0;
        @"buttons":@(self.buttons.count), @"allocatedButtons":@(allocatedButtons), @"destroyedButtons":@(destroyedButtons)} mutableCopy];
 #ifdef QUICKFILE_AX_OWNERSHIP_PROBE
     record[@"ownership"] = AXOwnershipProbeSnapshot();
+#endif
+#ifdef QUICKFILE_AX_COPY_LIFETIME
+    record[@"copyLifetime"] = copyLifetimeSnapshot();
 #endif
     NSData *data = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:NULL];
     [data writeToFile:[self.directory stringByAppendingPathComponent:@"ready.json"] atomically:YES];

@@ -101,6 +101,23 @@ def validate_control_reader(receipt, completed=False):
         raise RuntimeError(f"Heap control read targets, registered targets or received notifications: {receipt}")
 
 
+def validate_copy_lifetime_host(receipt, expected_copies=None):
+    lifetime = receipt.get("copyLifetime")
+    keys = ("ordinary", "mutable", "liveOrdinary", "liveMutable", "invalid")
+    host_keys = ("destroyedButtons", "compensations", "mutableCompensations")
+    if (not isinstance(lifetime, dict)
+            or any(type(lifetime.get(key)) is not int or lifetime[key] < 0 for key in keys)
+            or any(type(receipt.get(key)) is not int or receipt[key] < 0 for key in host_keys)):
+        raise RuntimeError(f"Invalid copy lifetime accounting: {receipt}")
+    destroyed = receipt["destroyedButtons"]
+    if (lifetime["ordinary"] != destroyed or lifetime["mutable"] != destroyed
+            or receipt["compensations"] != lifetime["ordinary"] + lifetime["mutable"]
+            or receipt["mutableCompensations"] != lifetime["mutable"]
+            or any(lifetime[key] != 0 for key in ("liveOrdinary", "liveMutable", "invalid"))
+            or (expected_copies is not None and destroyed != expected_copies)):
+        raise RuntimeError(f"Copy lifetime coverage or weak unavailability failed: {receipt}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-directory", required=True, type=Path)
@@ -108,6 +125,7 @@ def main():
     parser.add_argument("--system-baseline", action="store_true")
     parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; compensation-enabled modes only")
     parser.add_argument("--heap-control", action="store_true", help="Match all diagnostic checkpoints with an empty window and no target buttons; requires --heap-diagnostics")
+    parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
     parser.add_argument("--balance-copies", action="store_true", help="Causal experiment: add one autorelease at the traced call sites; requires --ownership-trace")
@@ -116,6 +134,9 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.copy_lifetime and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
+                                   args.ownership_trace, args.read_only)):
+        parser.error("--copy-lifetime requires independent product mode without other probes")
     if args.heap_control and (not args.heap_diagnostics or args.system_baseline):
         parser.error("--heap-control requires --heap-diagnostics and cannot use --system-baseline")
     if args.heap_diagnostics and args.system_baseline:
@@ -160,6 +181,8 @@ def main():
         return result
 
     common = ["xcrun", "clang", "-O2", "-I", str(ROOT / "QuickFileApp")]
+    if args.copy_lifetime:
+        common.append("-DQUICKFILE_AX_COPY_LIFETIME")
     run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[0]), "-o", str(work / "AXCompatibility.o")])
     probe_arguments = []
     if args.ownership_trace:
@@ -197,6 +220,8 @@ def main():
                    "host": capabilities, "reader": reader_capabilities}
         if args.heap_diagnostics:
             receipt["mode"] = "heap-control" if args.heap_control else "product"
+        if args.copy_lifetime:
+            receipt.update(mode="copy-lifetime", instrumented=True)
         print(json.dumps(receipt))
         return 77
     environment.update(MallocStackLogging="1", MallocStackLoggingNoCompact="1")
@@ -221,13 +246,15 @@ def main():
                 validation_errors.append({"stage": stage, "message": str(error)})
                 write_json(records / "validation-errors.json", validation_errors)
 
-        def command(action):
+        def command(action, expected_copies=None):
             nonlocal sequence
             sequence += 1
             write_json(state / "command.json", {"sequence": sequence, "action": action, "count": 10})
             receipt = wait_json(state / "ready.json", lambda value: value["sequence"] == sequence, [host])
             if args.heap_control:
                 validate(f"control-host-{sequence}", validate_control_host, receipt)
+            if args.copy_lifetime:
+                validate(f"copy-lifetime-host-{sequence}", validate_copy_lifetime_host, receipt, expected_copies)
             return receipt
 
         def observe():
@@ -275,6 +302,8 @@ def main():
             initial = wait_json(state / "ready.json", lambda value: value["sequence"] == 0, [host])
             if args.heap_control:
                 validate("control-host-0", validate_control_host, initial)
+            if args.copy_lifetime:
+                validate("copy-lifetime-host-0", validate_copy_lifetime_host, initial)
             if args.system_baseline:
                 scan("baseline", initial)
             reader_arguments = ["--read-only"] if args.read_only else []
@@ -306,6 +335,8 @@ def main():
                     raise RuntimeError(f"Buttons did not deallocate: {removed}")
                 checkpoint_keys = (("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")
                                    if args.heap_control else ("allocatedButtons", "destroyedButtons", "ownership"))
+                if args.copy_lifetime:
+                    checkpoint_keys += ("copyLifetime",)
                 checkpoints.append({key: removed[key] for key in checkpoint_keys if key in removed})
                 if not args.system_baseline or cycle in {1, 3, args.cycles}:
                     scan(f"removed-{cycle * 10}", removed)
@@ -329,7 +360,7 @@ def main():
                 if remaining <= 0:
                     break
                 time.sleep(min(1, remaining))
-            final = command("checkpoint")
+            final = command("checkpoint", 30 if args.copy_lifetime else None)
             scan("observer-exited", final)
             ordinary = final["compensations"] - final["mutableCompensations"]
             if args.system_baseline:
@@ -392,6 +423,14 @@ def main():
                 write_json(records / "validation-errors.json", validation_errors)
             if args.heap_diagnostics:
                 summary["mode"] = "heap-control" if args.heap_control else "product"
+            if args.copy_lifetime:
+                summary.update(mode="copy-lifetime", instrumented=True, copy_lifetime=final.get("copyLifetime"),
+                               checkpoints=checkpoints,
+                               scope="optimized production implementation with diagnostic weak copy tracking, synthetic AppKit fixture; "
+                                     "weak targets cannot be acquired after the existing autorelease pool drains; "
+                                     "this does not establish completed object destruction; "
+                                     "requires absent target AX groups and no increase over the non-AX startup baseline; "
+                                     "not an installed-app or VoiceOver test")
             write_json(records / "result.json", summary)
             print(json.dumps(summary))
         finally:
