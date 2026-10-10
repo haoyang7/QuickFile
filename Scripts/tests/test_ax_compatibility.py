@@ -554,6 +554,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                            ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
             if heap_diagnostics:
                 scan_labels.insert(1, "added-10")
+            if copy_lifetime:
+                scan_labels = []
             scanned = []
             commands = []
             processes = []
@@ -693,8 +695,9 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             self.assertTrue((state / "stop-reader").exists())
             self.assertTrue((state / "quit").exists())
             self.assertTrue(all(process.returncode == 0 for process in processes))
-            self.assertEqual(summary["scans"][0]["label"], "baseline")
-            scans = json.loads((records / "scans.json").read_text())
+            if not copy_lifetime:
+                self.assertEqual(summary["scans"][0]["label"], "baseline")
+            scans = [] if copy_lifetime else json.loads((records / "scans.json").read_text())
             product_build = next(command for command in commands if "-fno-objc-arc" in command)
             host_build = next(command for command in commands if "-fobjc-arc" in command)
             for build in (product_build, host_build):
@@ -708,8 +711,9 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertEqual(len(live_scans), len(scan_labels))
                 self.assertTrue(all(any(value.startswith("--outputGraph=") for value in command) for command in live_scans))
                 self.assertEqual([point["label"] for point in diagnostic["checkpoints"]], list(REPORT.HEAP_LABELS[1:]))
-            self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
-            self.assertEqual(scans[-1]["host"]["destroyedButtons"], 0 if heap_control else 30)
+            if not copy_lifetime:
+                self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
+                self.assertEqual(scans[-1]["host"]["destroyedButtons"], 0 if heap_control else 30)
             if system_baseline:
                 self.assertEqual(summary["instrumented"], ownership_trace)
                 host_build = next(command for command in commands if "-fobjc-arc" in command)
@@ -720,7 +724,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     self.assertEqual(summary["ownership"], host_state["ownership"])
                 else:
                     disassembled.assert_not_called()
-            if not system_baseline:
+            if not system_baseline and not copy_lifetime:
                 registered = next(scan for scan in scans if scan["label"] == "registered-10")
                 self.assertEqual(registered["host"]["allocatedButtons"], 0 if heap_control else 10)
                 self.assertEqual(registered["host"]["destroyedButtons"], 0)
@@ -742,24 +746,48 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertEqual(summary["mutable_compensations"], 0)
                 self.assertEqual(summary["notifications"], notifications.get("notifications"))
             if copy_lifetime:
+                self.assertFalse(any(command[0] == "leaks" for command in commands))
+                self.assertFalse((records / "scans.json").exists())
+                self.assertFalse(list(records.glob("*-leaks.txt")))
+                self.assertEqual(protocol, [
+                    ("observe", 1), ("command", "checkpoint"), ("command", "add"), ("observe", 2),
+                    ("command", "checkpoint"), ("command", "remove"), ("observe", 3),
+                    ("command", "add"), ("observe", 4), ("command", "remove"), ("observe", 5),
+                    ("command", "add"), ("observe", 6), ("command", "remove"), ("observe", 7),
+                    ("command", "checkpoint")])
+                hosts = json.loads((records / "copy-lifetime-hosts.json").read_text())
+                self.assertEqual([host["sequence"] for host in hosts], list(range(10)))
+                self.assertEqual([host.get("action") for host in hosts],
+                                 [None, "checkpoint", "add", "checkpoint", "remove", "add", "remove", "add", "remove", "checkpoint"])
+                self.assertEqual(hosts[0]["allocatedButtons"], 0)
+                self.assertEqual(hosts[-1]["destroyedButtons"], 30)
                 self.assertEqual(summary["mode"], "copy-lifetime")
                 self.assertIs(summary["instrumented"], True)
-                self.assertEqual(summary["copy_lifetime"], scans[-1]["host"].get("copyLifetime"))
+                self.assertEqual(summary["copy_lifetime"], hosts[-1].get("copyLifetime"))
                 self.assertTrue(all("copyLifetime" in checkpoint for checkpoint in summary["checkpoints"]))
+                self.assertEqual(summary["idle_seconds"], 2)
+                for key in ("ax_leak_nodes", "baseline_leak_nodes", "baseline_leak_bytes", "leak_nodes", "leak_bytes", "scans"):
+                    self.assertNotIn(key, summary)
+                if invalid_copy_lifetime:
+                    sequence, key, value = invalid_copy_lifetime
+                    if key is None:
+                        self.assertNotIn("copyLifetime", hosts[sequence])
+                    else:
+                        self.assertEqual(hosts[sequence]["copyLifetime"][key], value)
+            else:
+                self.assertFalse((records / "copy-lifetime-hosts.json").exists())
             if exit_code:
                 self.assertEqual(json.loads((records / "validation-errors.json").read_text()), summary["validation_errors"])
             return exit_code, summary
 
-    def test_copy_lifetime_covers_thirty_copies_per_branch_with_the_original_heap_guard(self):
+    def test_copy_lifetime_covers_thirty_copies_per_branch_without_heap_sampling(self):
         exit_code, summary = self.exercise_runner(copy_lifetime=True)
         self.assertEqual(exit_code, 0)
         self.assertEqual(summary["coverage"], "passed")
         self.assertEqual(summary["copy_lifetime"], AXCompatibilityCopyLifetimeTests.receipt(30)["copyLifetime"])
         self.assertIn("weak targets cannot be acquired", summary["scope"])
         self.assertIn("does not establish completed object destruction", summary["scope"])
-        self.assertEqual([scan["label"] for scan in summary["scans"]],
-                         ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
-        exit_code, summary = self.exercise_runner(copy_lifetime=True, failed_scan="removed-10")
+        exit_code, summary = self.exercise_runner(failed_scan="removed-10")
         self.assertEqual(exit_code, 1)
         self.assertEqual(summary["coverage"], "failed")
         self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["removed-10"])
@@ -775,10 +803,18 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertEqual(summary["coverage"], "failed")
                 self.assertEqual([error["stage"] for error in summary["validation_errors"]],
                                  [f"copy-lifetime-host-{sequence}"])
-                self.assertIsNone(summary["ax_leak_nodes"])
-                self.assertEqual(summary["scans"][-1]["label"], "observer-exited")
+                self.assertNotIn("ax_leak_nodes", summary)
                 if sequence != 9:
                     self.assertEqual(summary["copy_lifetime"], AXCompatibilityCopyLifetimeTests.receipt(30)["copyLifetime"])
+
+    def test_copy_lifetime_notification_failures_preserve_final_host_evidence(self):
+        for invalid in (True, "missing-count"):
+            with self.subTest(invalid=invalid):
+                exit_code, summary = self.exercise_runner(copy_lifetime=True, invalid_notifications=invalid)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(summary["coverage"], "failed")
+                self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["notifications"])
+                self.assertEqual(summary["copy_lifetime"], AXCompatibilityCopyLifetimeTests.receipt(30)["copyLifetime"])
 
     def test_heap_control_measures_seven_empty_scans_without_product_coverage(self):
         exit_code, summary = self.exercise_runner(heap_diagnostics=True, heap_control=True)
@@ -949,17 +985,20 @@ class AXCompatibilityCopyTests(unittest.TestCase):
             self.assertEqual(receipt["notifications"], 60)
             self.assertGreaterEqual(receipt["ordinary_compensations"], 30)
             self.assertGreaterEqual(receipt["mutable_compensations"], 30)
-            self.assertEqual(receipt["ax_leak_nodes"], 0)
-            self.assertLessEqual(receipt["leak_nodes"], receipt["baseline_leak_nodes"])
-            self.assertLessEqual(receipt["leak_bytes"], receipt["baseline_leak_bytes"])
             if copy_lifetime:
                 self.assertEqual(receipt["mode"], "copy-lifetime")
                 self.assertIs(receipt["instrumented"], True)
                 self.assertEqual(receipt["copy_lifetime"], AXCompatibilityCopyLifetimeTests.receipt(30)["copyLifetime"])
-                scans = json.loads((records / "scans.json").read_text())
-                for scan in scans:
-                    PROBE.validate_copy_lifetime_host(scan["host"])
-                PROBE.validate_copy_lifetime_host(scans[-1]["host"], 30)
+                hosts = json.loads((records / "copy-lifetime-hosts.json").read_text())
+                self.assertEqual([host["sequence"] for host in hosts], list(range(10)))
+                for host in hosts:
+                    PROBE.validate_copy_lifetime_host(host)
+                PROBE.validate_copy_lifetime_host(hosts[-1], 30)
+                self.assertFalse((records / "scans.json").exists())
+            else:
+                self.assertEqual(receipt["ax_leak_nodes"], 0)
+                self.assertLessEqual(receipt["leak_nodes"], receipt["baseline_leak_nodes"])
+                self.assertLessEqual(receipt["leak_bytes"], receipt["baseline_leak_bytes"])
 
     def test_real_destroyed_notifications_cover_both_compensation_branches(self):
         self.run_notifications_fixture()
