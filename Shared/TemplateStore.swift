@@ -875,7 +875,13 @@ public final class TemplateStore: @unchecked Sendable {
 
             if let storageURL {
                 try writeTemplatesData(data, storageURL)
-                invalidateDecodedFileCache()
+                // Reuse the saved values so an unchanged reload shares their bodies.
+                // Keys retain the same bounded bytes/digest as authoritative reads.
+                let key = cachesReads ? Self.decodedFileCacheKey(for: data) : nil
+                cacheLock.lock()
+                fileReadGeneration &+= 1
+                decodedFileCache = key.map { (key: $0, templates: templates) }
+                cacheLock.unlock()
                 defaults.set(revision, forKey: revisionKey)
                 defaults.removeObject(forKey: legacyTemplatesKey)
             } else {

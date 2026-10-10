@@ -442,6 +442,175 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertEqual(probe.counts().decodes, 2)
     }
 
+    func testSuccessfulSaveReloadReusesSavedTemplatesWithoutDecodingAgain() throws {
+        for bodySize in [8, 2 * 1024 * 1024] {
+            let url = temporaryDirectory.appendingPathComponent("saved-cache-\(bodySize).json")
+            var templates = [FileTemplate(name: "Original", fileExtension: "txt",
+                                          content: String(repeating: "a", count: bodySize))]
+            try JSONEncoder().encode(templates).write(to: url)
+            let probe = TemplateStoreIOProbe()
+            let store = TemplateStore(defaults: defaults, storageURL: url,
+                readTemplatesData: { try probe.read($0) }, decodeTemplatesData: { try probe.decode($0) })
+            XCTAssertEqual(try store.reloadTemplates(), templates)
+            XCTAssertEqual(probe.counts().decodes, 1)
+
+            for changesBody in [false, true] {
+                templates[0].name = "Saved"
+                if changesBody { templates[0].content = String(repeating: "b", count: bodySize) }
+                try store.saveTemplates(templates)
+                let countsAfterSave = probe.counts()
+                for _ in 0..<2 { XCTAssertEqual(try store.reloadTemplates(), templates) }
+                XCTAssertEqual(probe.counts().reads, countsAfterSave.reads + 2,
+                               "Reload must still read the authoritative file after saving")
+                XCTAssertEqual(probe.counts().decodes, countsAfterSave.decodes,
+                               "The saved value must be reused for both exact-byte and fingerprint keys")
+                XCTAssertEqual(store.decodedFileCacheRetainedRawByteCount,
+                               bodySize < TemplateStore.maximumDecodedFileCacheBytes ? try Data(contentsOf: url).count : 0)
+            }
+        }
+    }
+
+    func testLegacyMigrationReloadUsesSavedSnapshotOnlyWhenCachingIsEnabled() throws {
+        for cachesReads in [true, false] {
+            for bodySize in [8, 2 * 1024 * 1024] {
+                let url = temporaryDirectory.appendingPathComponent("migrated-cache-\(cachesReads)-\(bodySize).json")
+                let templates = [FileTemplate(name: "Legacy", fileExtension: "txt",
+                                              content: String(repeating: "x", count: bodySize))]
+                defaults.removeObject(forKey: "templates.revision.v2")
+                defaults.set(try JSONEncoder().encode(templates), forKey: "templates.v1")
+                let probe = TemplateStoreIOProbe()
+                let store = TemplateStore(defaults: defaults, storageURL: url, cachesReads: cachesReads,
+                    readTemplatesData: { try probe.read($0) }, decodeTemplatesData: { try probe.decode($0) })
+                XCTAssertEqual(try store.loadTemplates(), templates)
+                for _ in 0..<2 { XCTAssertEqual(try store.reloadTemplates(), templates) }
+                XCTAssertEqual(probe.counts().reads, 2)
+                XCTAssertEqual(probe.counts().decodes, cachesReads ? 0 : 2)
+                XCTAssertNil(defaults.object(forKey: "templates.v1"))
+            }
+        }
+    }
+
+    func testRecoveryReloadUsesSavedSnapshotOnlyWhenCachingIsEnabled() throws {
+        for cachesReads in [true, false] {
+            for bodySize in [8, 2 * 1024 * 1024] {
+                let url = temporaryDirectory.appendingPathComponent("recovered-cache-\(cachesReads)-\(bodySize).json")
+                try Data("corrupt".utf8).write(to: url)
+                let templates = [FileTemplate(name: "Recovered", fileExtension: "txt",
+                                              content: String(repeating: "x", count: bodySize))]
+                let probe = TemplateStoreIOProbe()
+                let store = TemplateStore(defaults: defaults, storageURL: url, cachesReads: cachesReads,
+                    readTemplatesData: { try probe.read($0) }, decodeTemplatesData: { try probe.decode($0) })
+                let snapshot = try store.prepareRecovery()
+                XCTAssertEqual(try store.recoverTemplates(templates, expectedRecoveryState: snapshot).templates, templates)
+                for _ in 0..<2 { XCTAssertEqual(try store.reloadTemplates(), templates) }
+                XCTAssertEqual(probe.counts().reads, 2)
+                XCTAssertEqual(probe.counts().decodes, cachesReads ? 0 : 2)
+            }
+        }
+    }
+
+    func testHistoricalSaveBeyondFingerprintBudgetDoesNotCacheDecodedSnapshot() throws {
+        let url = temporaryDirectory.appendingPathComponent("historical-save-cache.json")
+        let templates = [FileTemplate(name: "Historical", fileExtension: "txt",
+                                      content: String(repeating: "x", count: TemplateStore.maximumFingerprintedFileCacheBytes))]
+        let data = try JSONEncoder().encode(templates)
+        XCTAssertGreaterThan(data.count, TemplateStore.maximumFingerprintedFileCacheBytes)
+        try data.write(to: url)
+        let probe = TemplateStoreIOProbe()
+        let store = TemplateStore(defaults: defaults, storageURL: url,
+            readTemplatesData: { try probe.read($0) }, decodeTemplatesData: { try probe.decode($0) })
+        // An unchanged historical oversized library remains saveable.
+        try store.saveTemplates(templates, expectedTemplates: templates)
+        for _ in 0..<2 { XCTAssertEqual(try store.reloadTemplates(), templates) }
+        XCTAssertEqual(probe.counts().reads, 3)
+        XCTAssertEqual(probe.counts().decodes, 3)
+        XCTAssertEqual(store.decodedFileCacheRetainedRawByteCount, 0)
+    }
+
+    func testUncachedSaveReloadStillDecodesEveryAuthoritativeRead() throws {
+        let url = temporaryDirectory.appendingPathComponent("uncached-save.json")
+        let original = [FileTemplate(name: "Original", fileExtension: "txt", content: "old")]
+        let saved = [FileTemplate(name: "Saved", fileExtension: "txt", content: "new")]
+        try JSONEncoder().encode(original).write(to: url)
+        let probe = TemplateStoreIOProbe()
+        let store = TemplateStore(defaults: defaults, storageURL: url, cachesReads: false,
+            readTemplatesData: { try probe.read($0) }, decodeTemplatesData: { try probe.decode($0) })
+        try store.saveTemplates(saved)
+        for _ in 0..<2 { XCTAssertEqual(try store.reloadTemplates(), saved) }
+        XCTAssertEqual(probe.counts().reads, 3)
+        XCTAssertEqual(probe.counts().decodes, 3)
+        XCTAssertEqual(store.decodedFileCacheRetainedRawByteCount, 0)
+    }
+
+    func testFailedSaveCannotCacheUnsavedTemplates() throws {
+        let url = temporaryDirectory.appendingPathComponent("failed-save-cache.json")
+        let original = [FileTemplate(name: "Original", fileExtension: "txt", content: "old")]
+        let unsaved = [FileTemplate(name: "Unsaved", fileExtension: "txt", content: "new")]
+        let originalData = try JSONEncoder().encode(original)
+        try originalData.write(to: url)
+        defaults.set("original", forKey: "templates.revision.v2")
+        let probe = TemplateStoreIOProbe()
+        let store = TemplateStore(defaults: defaults, storageURL: url,
+            writeTemplatesData: { _, _ in throw NSError(domain: "TemplateStoreTests", code: 1) },
+            readTemplatesData: { try probe.read($0) }, decodeTemplatesData: { try probe.decode($0) })
+        XCTAssertEqual(try store.reloadTemplates(), original)
+        XCTAssertThrowsError(try store.saveTemplates(unsaved, expectedTemplates: original))
+        XCTAssertEqual(try Data(contentsOf: url), originalData)
+        XCTAssertEqual(defaults.string(forKey: "templates.revision.v2"), "original")
+        XCTAssertEqual(try store.loadTemplates(), original)
+        XCTAssertEqual(try store.reloadTemplates(), original)
+        XCTAssertEqual(probe.counts().decodes, 1)
+    }
+
+    func testReadStartedDuringSaveCannotReplaceSavedDecodedFileCache() throws {
+        for bodySize in [8, 2 * 1024 * 1024] {
+            let url = temporaryDirectory.appendingPathComponent("save-interleaving-\(bodySize).json")
+            let original = [FileTemplate(name: "Original", fileExtension: "txt",
+                                         content: String(repeating: "a", count: bodySize))]
+            let saved = [FileTemplate(name: "Saved", fileExtension: "txt",
+                                      content: String(repeating: "b", count: bodySize))]
+            try JSONEncoder().encode(original).write(to: url)
+            let didEnterWrite = DispatchSemaphore(value: 0)
+            let resumeWrite = DispatchSemaphore(value: 0)
+            let probe = TemplateStoreIOProbe(pauseReadNumber: 2)
+            let store = TemplateStore(defaults: defaults, storageURL: url,
+                writeTemplatesData: { data, url in
+                    didEnterWrite.signal()
+                    guard resumeWrite.wait(timeout: .now() + 5) == .success else {
+                        throw NSError(domain: "TemplateStoreTests", code: 1)
+                    }
+                    try data.write(to: url, options: .atomic)
+                },
+                readTemplatesData: { try probe.read($0) }, decodeTemplatesData: { try probe.decode($0) })
+            defer { resumeWrite.signal(); probe.resumeRead.signal() }
+            let saveResult = LockedTemplateLoadResult()
+            let saveFinished = expectation(description: "Save finished")
+            DispatchQueue.global().async {
+                saveResult.set(Result { try store.saveTemplates(saved); return saved })
+                saveFinished.fulfill()
+            }
+            XCTAssertEqual(didEnterWrite.wait(timeout: .now() + 5), .success)
+            let readResult = LockedTemplateLoadResult()
+            let readFinished = expectation(description: "Old read finished")
+            DispatchQueue.global().async {
+                readResult.set(Result { try store.reloadTemplates() })
+                readFinished.fulfill()
+            }
+            XCTAssertEqual(probe.didRead.wait(timeout: .now() + 5), .success)
+            resumeWrite.signal()
+            wait(for: [saveFinished], timeout: 5)
+            XCTAssertEqual(try saveResult.get().get(), saved)
+            probe.resumeRead.signal()
+            wait(for: [readFinished], timeout: 5)
+            XCTAssertEqual(try readResult.get().get(), original)
+            XCTAssertEqual(try store.loadTemplates(), saved)
+            XCTAssertEqual(try store.reloadTemplates(), saved)
+            XCTAssertEqual(probe.counts().reads, 3)
+            XCTAssertEqual(probe.counts().decodes, 2,
+                           "A read begun after save preflight must not evict the successfully saved value")
+        }
+    }
+
     func testUncachedReadsRetainNoDecodeSnapshotAndStillSeeEditsAndCorruption() throws {
         let url = temporaryDirectory.appendingPathComponent("uncached.json")
         let probe = TemplateStoreIOProbe()
@@ -1323,17 +1492,19 @@ private final class TemplateStoreIOProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var readCount = 0
     private var decodeCount = 0
-    private let pauseFirstRead: Bool
+    private let pauseReadNumber: Int?
     let didRead = DispatchSemaphore(value: 0)
     let resumeRead = DispatchSemaphore(value: 0)
 
-    init(pauseFirstRead: Bool = false) { self.pauseFirstRead = pauseFirstRead }
+    init(pauseFirstRead: Bool = false, pauseReadNumber: Int? = nil) {
+        self.pauseReadNumber = pauseReadNumber ?? (pauseFirstRead ? 1 : nil)
+    }
 
     func read(_ url: URL) throws -> Data {
         let data = try Data(contentsOf: url)
         lock.lock()
         readCount += 1
-        let pause = pauseFirstRead && readCount == 1
+        let pause = readCount == pauseReadNumber
         lock.unlock()
         if pause {
             didRead.signal()
