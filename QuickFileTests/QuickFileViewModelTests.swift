@@ -1480,8 +1480,11 @@ final class QuickFileViewModelTests: XCTestCase {
         let original = FileTemplate(name: "Original", fileExtension: "txt", content: "{{clipboard}}")
         try store.saveTemplates([original])
         var clipboardReads = 0
+        // Seed the initial snapshot so the one-shot loader gate belongs to creation,
+        // not the initial load, which now shares the authoritative loader.
         let model = QuickFileViewModel(
             templateStore: store,
+            templates: [original],
             authorizedDirectoryStore: makeAuthorizationStore(defaults: defaults),
             clipboardProvider: { clipboardReads += 1; return "private" },
             authoritativeTemplateLoader: {
@@ -1490,7 +1493,6 @@ final class QuickFileViewModelTests: XCTestCase {
                 return snapshot
             }
         )
-        await model.loadTemplatesIfNeeded()
         model.destinationFolder = temporaryDirectory
         var edited = original
         edited.content = "saved while reload was suspended"
@@ -1498,9 +1500,11 @@ final class QuickFileViewModelTests: XCTestCase {
         let creation = Task { await model.createFile() }
         let started = await BackgroundWork.run { gate.started.wait(timeout: .now() + 5) == .success }
         XCTAssertTrue(started)
+        XCTAssertTrue(model.isCreatingFile, "Creation must own the blocked preflight before the template mutation")
         try await model.saveTemplate(edited, replacing: original)
         gate.release.signal()
         await creation.value
+        XCTAssertTrue(gate.wasReleasedBeforeTimeout, "The preflight must be released by the test, not the gate timeout")
 
         XCTAssertNil(model.createdFileURL)
         XCTAssertEqual(clipboardReads, 0)
@@ -1519,8 +1523,11 @@ final class QuickFileViewModelTests: XCTestCase {
         let original = FileTemplate(name: "Original", fileExtension: "txt", content: "{{clipboard}}")
         try store.saveTemplates([original])
         var clipboardReads = 0
+        // Seed the initial snapshot so the one-shot loader gate belongs to creation,
+        // not the initial load, which now shares the authoritative loader.
         let model = QuickFileViewModel(
             templateStore: store,
+            templates: [original],
             authorizedDirectoryStore: makeAuthorizationStore(defaults: defaults),
             clipboardProvider: { clipboardReads += 1; return "private" },
             authoritativeTemplateLoader: {
@@ -1529,15 +1536,16 @@ final class QuickFileViewModelTests: XCTestCase {
                 return snapshot
             }
         )
-        await model.loadTemplatesIfNeeded()
         model.destinationFolder = temporaryDirectory
 
         let creation = Task { await model.createFile() }
         let started = await BackgroundWork.run { gate.started.wait(timeout: .now() + 5) == .success }
         XCTAssertTrue(started)
+        XCTAssertTrue(model.isCreatingFile, "Creation must own the blocked preflight before the template mutation")
         await model.setTemplateEnabled(false, id: original.id)
         gate.release.signal()
         await creation.value
+        XCTAssertTrue(gate.wasReleasedBeforeTimeout, "The preflight must be released by the test, not the gate timeout")
 
         XCTAssertNil(model.createdFileURL)
         XCTAssertEqual(clipboardReads, 0)
