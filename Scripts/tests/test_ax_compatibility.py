@@ -1,5 +1,8 @@
 import pathlib
+import contextlib
 import importlib.util
+import io
+import itertools
 import os
 import json
 import shutil
@@ -104,6 +107,166 @@ class AXCompatibilityNotificationTests(unittest.TestCase):
         receipt = {"notifications": 0, "all_notifications": 0, "unmatched_notifications": 0,
                    "tracked_buttons": 100, "target_notification_counts": [[] for _ in range(100)]}
         PROBE.validate_notifications(receipt, 100, read_only=True)
+
+
+class AXCompatibilityLifecycleTests(unittest.TestCase):
+    """Inject process/scan results while exercising the real runner protocol."""
+
+    def exercise_runner(self, *, failed_scan=None, invalid_notifications=False,
+                        system_baseline=False, insufficient_compensation=False):
+        with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
+            temporary = pathlib.Path(directory).resolve()
+            work = temporary / "fixture"
+            records = temporary / "records"
+            state = work / "state"
+            host_state = {"pid": 1234, "sequence": 0, "buttons": 0, "allocatedButtons": 0,
+                          "destroyedButtons": 0, "compensations": 0, "mutableCompensations": 0}
+            notifications = {"notifications": 60, "all_notifications": 60, "unmatched_notifications": 0,
+                             "tracked_buttons": 30, "target_notification_counts": [[1, 1] for _ in range(30)]}
+            if invalid_notifications == "missing-count":
+                del notifications["notifications"]
+            elif invalid_notifications:
+                notifications["target_notification_counts"][0] = [0, 2]
+            scan_labels = (["baseline", "removed-10", "removed-30", "observer-exited"] if system_baseline else
+                           ["baseline", "registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"])
+            scanned = []
+            processes = []
+
+            class FixtureProcess:
+                returncode = None
+
+                def __init__(self, command, **_kwargs):
+                    self.is_reader = pathlib.Path(command[0]).name == "ax-reader"
+                    self.pid = 1235 if self.is_reader else 1234
+                    processes.append(self)
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout):
+                    self.returncode = 0
+                    if self.is_reader:
+                        PROBE.write_json(state / "reader-completed.json", notifications)
+                    return 0
+
+            def run(command, **_kwargs):
+                output = ""
+                if "--capabilities" in command:
+                    capability = {"trusted": True} if pathlib.Path(command[0]).name == "ax-reader" else {
+                        "enabled": not system_baseline, "status": "system-baseline" if system_baseline else "enabled",
+                        "images": {"AppKit": "synthetic", "CoreFoundation": "synthetic"}}
+                    output = json.dumps(capability)
+                elif command[0] == "leaks":
+                    label = scan_labels[len(scanned)]
+                    scanned.append(label)
+                    nodes, size = (287, 18_768) if label == failed_scan else (280, 18_416)
+                    output = (f"Process 1234: {nodes} leaks for {size} total leaked bytes.\n"
+                              "STACK OF 3 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
+                              f"  {nodes} ({size} bytes) ROOT CYCLE: NSXPCConnection\n")
+                return subprocess.CompletedProcess(command, 1 if command[0] == "leaks" else 0, output, "")
+
+            def wait_json(path, predicate, _processes):
+                if path.name == "reader-ready.json":
+                    command = json.loads((state / "reader-command.json").read_text())
+                    receipt = {"sequence": command["sequence"], "buttons": host_state["buttons"],
+                               "registrations": host_state["buttons"] * 2,
+                               "notifications": host_state["destroyedButtons"] * 2}
+                else:
+                    command_path = state / "command.json"
+                    if command_path.exists():
+                        command = json.loads(command_path.read_text())
+                        host_state.update(sequence=command["sequence"], action=command["action"])
+                        if command["action"] == "add":
+                            host_state["buttons"] = 10
+                            host_state["allocatedButtons"] += 10
+                        elif command["action"] == "remove":
+                            host_state["buttons"] = 0
+                            host_state["destroyedButtons"] += 10
+                            if not system_baseline:
+                                host_state["compensations"] += 20
+                                host_state["mutableCompensations"] += 10
+                                if insufficient_compensation and host_state["destroyedButtons"] == 30:
+                                    host_state["compensations"] -= 1
+                    receipt = dict(host_state)
+                self.assertTrue(predicate(receipt))
+                return receipt
+
+            # The real source hashes are retained; only the allowed work root and
+            # external processes/time are substituted. No GUI or AX is invoked.
+            class ProbeRoot:
+                def __truediv__(self, child):
+                    return temporary if child == ".build/Temporary" else ROOT / child
+
+            arguments = ["verify-ax-compatibility.py", "--work-directory", str(work), "--records-directory", str(records)]
+            if system_baseline:
+                arguments.append("--system-baseline")
+            with mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
+                    mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
+                    mock.patch.object(PROBE.subprocess, "Popen", side_effect=FixtureProcess), \
+                    mock.patch.object(PROBE, "wait_json", side_effect=wait_json), \
+                    mock.patch.object(PROBE.time, "sleep"), \
+                    mock.patch.object(PROBE.time, "monotonic", side_effect=itertools.count(step=0.25)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                exit_code = PROBE.main()
+            summary = json.loads((records / "result.json").read_text())
+            self.assertEqual(scanned, scan_labels)
+            self.assertEqual(json.loads((records / "notifications.json").read_text()), notifications)
+            self.assertTrue((state / "stop-reader").exists())
+            self.assertTrue((state / "quit").exists())
+            self.assertTrue(all(process.returncode == 0 for process in processes))
+            self.assertEqual(summary["scans"][0]["label"], "baseline")
+            scans = json.loads((records / "scans.json").read_text())
+            self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
+            self.assertEqual(scans[-1]["host"]["destroyedButtons"], 30)
+            if not system_baseline:
+                self.assertEqual(scans[1]["host"]["allocatedButtons"], 10)
+                self.assertEqual(scans[1]["host"]["destroyedButtons"], 0)
+            if exit_code:
+                self.assertEqual(json.loads((records / "validation-errors.json").read_text()), summary["validation_errors"])
+            return exit_code, summary
+
+    def test_stable_heap_completes_every_lifecycle_checkpoint(self):
+        exit_code, summary = self.exercise_runner()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["coverage"], "passed")
+        self.assertEqual(summary["ax_leak_nodes"], 0)
+        self.assertNotIn("validation_errors", summary)
+
+    def test_intermediate_growth_still_fails_after_heap_returns_to_baseline(self):
+        for label in ("registered-10", "removed-10", "removed-20", "removed-30", "observer-exited"):
+            with self.subTest(label=label):
+                exit_code, summary = self.exercise_runner(failed_scan=label)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(summary["coverage"], "failed")
+                self.assertIsNone(summary["ax_leak_nodes"])
+                self.assertEqual([error["stage"] for error in summary["validation_errors"]], [label])
+
+    def test_heap_failure_does_not_skip_per_button_notification_validation(self):
+        exit_code, summary = self.exercise_runner(failed_scan="removed-30", invalid_notifications=True)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["removed-30", "notifications"])
+
+    def test_invalid_notifications_preserve_the_exit_scan_and_fail_both_modes(self):
+        for baseline in (False, True):
+            for invalid in (True, "missing-count"):
+                with self.subTest(system_baseline=baseline, invalid=invalid):
+                    exit_code, summary = self.exercise_runner(invalid_notifications=invalid, system_baseline=baseline)
+                    self.assertEqual(exit_code, 1)
+                    self.assertEqual(summary["coverage"], "failed")
+                    self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["notifications"])
+
+    def test_system_baseline_still_measures_growth_without_claiming_product_coverage(self):
+        exit_code, summary = self.exercise_runner(failed_scan="removed-30", system_baseline=True)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["coverage"], "measured")
+        self.assertFalse(summary["product_compensation_enabled"])
+
+    def test_insufficient_compensation_preserves_evidence_and_fails(self):
+        exit_code, summary = self.exercise_runner(insufficient_compensation=True)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["coverage"], "failed")
+        self.assertEqual(summary["ordinary_compensations"], 29)
+        self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["compensation-branches"])
 
 
 @unittest.skipUnless(sys.platform == "darwin" and shutil.which("xcrun"), "requires macOS SDK")
