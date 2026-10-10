@@ -201,7 +201,7 @@ struct TemplateManagerView: View {
                     }, secondaryButton: .cancel())
             case .restoreDefaults:
                 return Alert(title: Text("恢复默认模板？"),
-                    message: Text("当前自定义模板和排序会被 6 个内置模板替换。"),
+                    message: Text("当前自定义模板和排序会被 \(BuiltInTemplates.all.count) 个内置模板替换。"),
                     primaryButton: .destructive(Text("恢复")) {
                         let selection = selectedTemplateID
                         Task {
@@ -263,6 +263,8 @@ struct TemplateManagerView: View {
 
     private var templateActionsMenu: some View {
         Menu("更多") {
+            Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
+            Divider()
             Button("导入模板…", action: chooseImport)
             Button("导出全部模板…") { confirmation = .exportAll }
             Divider()

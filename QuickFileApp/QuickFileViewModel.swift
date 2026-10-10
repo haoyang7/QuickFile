@@ -262,20 +262,26 @@ final class QuickFileViewModel: ObservableObject {
     // Compatibility projection; there is no second mutable error state.
     var templateLoadError: String? { templateLoadFailure?.message }
     @Published private(set) var recoveryBackupURL: URL?
-    @Published private(set) var isLoadingTemplates = false
-    @Published private(set) var isSavingTemplates = false
+    @Published private(set) var isLoadingTemplates = false {
+        didSet { if !isLoadingTemplates { drainTemplateRefresh() } }
+    }
+    @Published private(set) var isSavingTemplates = false {
+        didSet { if !isSavingTemplates { drainTemplateRefresh() } }
+    }
     private var hasLoadedTemplates: Bool
     private var didAttemptInitialTemplateLoad = false
     @Published private(set) var isCreatingFile = false {
-        didSet { resumeFinderPresentationIfReady() }
+        didSet { resumeFinderPresentationIfReady(); drainTemplateRefresh() }
     }
     @Published private(set) var isAuthorizingDirectory = false {
-        didSet { resumeFinderPresentationIfReady() }
+        didSet { resumeFinderPresentationIfReady(); drainTemplateRefresh() }
     }
     // True for the entire drain, including actual queue I/O and a claimed request
     // waiting for a direct operation. Cancellation never releases this ownership.
     @Published private(set) var isProcessingFinderAuthorizationRequests = false
-    @Published private(set) var finderAuthorizationRequestPhase: FinderAuthorizationRequestPhase = .idle
+    @Published private(set) var finderAuthorizationRequestPhase: FinderAuthorizationRequestPhase = .idle {
+        didSet { drainTemplateRefresh() }
+    }
     // Session-wide, independent of any window's lifetime, route or ordinary result.
     // Notifications, window appearance and other completed operations cannot clear it.
     @Published private(set) var finderAuthorizationQueuePause: FinderAuthorizationQueuePause?
@@ -298,6 +304,15 @@ final class QuickFileViewModel: ObservableObject {
     private let finderAuthorizationCoordinator: FinderAuthorizationCoordinator
     private let clipboardProvider: (@MainActor () -> String?)?
     private let revealCreatedFile: @MainActor (URL) -> Void
+    private var templateRefreshObserver: TemplateRefreshObserver?
+    private var templateRefreshTask: Task<Void, Never>?
+    private var templateRefreshPending = false
+    private var templateRefreshForced = false
+    private var templateRefreshNeedsAuthority = false
+    private var templateRefreshStatusGeneration: UInt64?
+    private var templateRefreshWaiters: [CheckedContinuation<Void, Never>] = []
+    private var templateRefreshToken: TemplateStore.ChangeToken?
+    private var templateRefreshTokenGeneration: UInt64?
     private var didRefreshAuthorizationBookmarks = false
     private let finderAuthorizationRequestPump = FinderAuthorizationRequestPump()
 
@@ -712,29 +727,111 @@ final class QuickFileViewModel: ObservableObject {
         await reloadTemplates()
     }
 
-    func reloadTemplates() async {
-        guard !isLoadingTemplates, !isSavingTemplates else { return }
-        isLoadingTemplates = true
-        templateStateGeneration &+= 1
-        defer { isLoadingTemplates = false }
-        let store = templateStore
-        let result = await BackgroundWork.result { try store.reloadTemplates() }
-        switch result {
-        case let .success(loaded):
-            templates = loaded
-            persistedTemplates = loaded
-            hasLoadedTemplates = true
-            templateLoadFailure = nil
-            templateStateGeneration &+= 1
-            ensureSelectedTemplateIsAvailable()
-            status = .success("模板已重新加载。")
-        case let .failure(error):
-            // Preserve the last successful list, but require a successful reload before editing.
-            let failure = TemplateLoadFailure(error)
-            templateLoadFailure = failure
-            templateStateGeneration &+= 1
-            status = .failure(failure.message)
+    /// Called once by the app-owned model; windows share this observer and read slot.
+    func startTemplateSynchronization() {
+        guard templateRefreshObserver == nil else { return }
+        templateRefreshObserver = TemplateRefreshObserver(name: templateStore.changeNotificationName) { [weak self] changed in
+            Task { @MainActor [weak self] in self?.requestTemplateRefresh(force: changed) }
         }
+        // Initial loading owns the first read. An already loaded model only
+        // needs a metadata check when observation starts after that read.
+        if hasLoadedTemplates { requestTemplateRefresh() }
+    }
+
+    func requestTemplateRefresh(force: Bool = false) {
+        templateRefreshNeedsAuthority = templateRefreshNeedsAuthority || force
+        templateRefreshPending = true
+        drainTemplateRefresh()
+    }
+
+    func reloadTemplates() async {
+        templateRefreshStatusGeneration = statusGeneration
+        templateRefreshForced = true
+        if isSavingTemplates || isBusy || (isLoadingTemplates && templateRefreshTask == nil) {
+            requestTemplateRefresh()
+            return
+        }
+        await withCheckedContinuation { continuation in
+            templateRefreshWaiters.append(continuation)
+            templateRefreshForced = true
+            requestTemplateRefresh()
+        }
+    }
+
+    private func drainTemplateRefresh() {
+        guard templateRefreshPending, templateRefreshTask == nil,
+              !isLoadingTemplates, !isSavingTemplates, !isBusy else { return }
+        templateRefreshPending = false
+        let forced = templateRefreshForced
+        let needsAuthority = forced || templateRefreshNeedsAuthority
+        templateRefreshNeedsAuthority = false
+        templateRefreshForced = false
+        let waiters = templateRefreshWaiters
+        templateRefreshWaiters.removeAll()
+        let generation = templateStateGeneration
+        let statusVersion = templateRefreshStatusGeneration
+        templateRefreshStatusGeneration = nil
+        let baseline = persistedTemplates
+        let token = templateRefreshTokenGeneration == generation ? templateRefreshToken : nil
+        let store = templateStore
+        let load = authoritativeTemplateLoader
+        // Keep the lease until synchronous I/O actually returns. The task captures
+        // values, not the model, so closing the application can release observers.
+        isLoadingTemplates = true
+        templateRefreshTask = Task { @MainActor [weak self] in
+            let result = await BackgroundWork.result {
+                let before = try store.changeToken()
+                if !needsAuthority, let token, before == token {
+                    return (templates: Optional<[FileTemplate]>.none, changed: false, token: Optional(before))
+                }
+                let loaded = try load()
+                let after = try store.changeToken()
+                let changed = loaded.count != baseline.count || !zip(loaded, baseline).allSatisfy {
+                    $0.id == $1.id && TransferTemplate($0) == TransferTemplate($1)
+                }
+                return (templates: Optional(loaded), changed: changed, token: before == after ? after : nil)
+            }
+            if let self {
+                if self.templateStateGeneration == generation {
+                    switch result {
+                    case let .success(snapshot):
+                        self.templateRefreshToken = snapshot.token
+                        if let loaded = snapshot.templates {
+                            if snapshot.changed || !self.hasLoadedTemplates || self.templateLoadFailure != nil {
+                                self.templates = loaded
+                                self.persistedTemplates = loaded
+                                self.templateStateGeneration &+= 1
+                            }
+                            self.hasLoadedTemplates = true
+                            self.templateLoadFailure = nil
+                            self.ensureSelectedTemplateIsAvailable()
+                        }
+                        self.templateRefreshTokenGeneration = self.templateStateGeneration
+                        if snapshot.token == nil { self.templateRefreshPending = true }
+                        if forced, self.statusGeneration == statusVersion {
+                            self.status = .success("模板已重新加载。")
+                        }
+                    case let .failure(error):
+                        self.templateRefreshToken = nil
+                        self.templateLoadFailure = TemplateLoadFailure(error)
+                        self.templateStateGeneration &+= 1
+                        if forced, self.statusGeneration == statusVersion {
+                            self.status = .failure(TemplateLoadFailure(error).message)
+                        }
+                    }
+                } else {
+                    self.templateRefreshPending = true
+                }
+                self.templateRefreshTask = nil
+                self.isLoadingTemplates = false
+            }
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    deinit {
+        templateRefreshTask?.cancel()
+        templateRefreshWaiters.forEach { $0.resume() }
     }
 
     func deleteTemplate(withID id: FileTemplate.ID) async -> Bool {

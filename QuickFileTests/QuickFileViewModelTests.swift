@@ -1837,7 +1837,7 @@ final class QuickFileViewModelTests: XCTestCase {
         XCTAssertEqual(try store.reloadTemplates(), [edited])
     }
 
-    func testFinderContinuationDoesNotOverwriteTemplatesReloadedDuringWrite() async throws {
+    func testFinderContinuationCompletesWriteThenAppliesQueuedTemplateReload() async throws {
         let gate = CreationGate()
         defer { gate.release.signal() }
         let original = FileTemplate(name: "Original", fileExtension: "txt", content: "{{clipboard}}")
@@ -1863,6 +1863,14 @@ final class QuickFileViewModelTests: XCTestCase {
         gate.release.signal()
         let completed = await creation.value
         XCTAssertTrue(completed)
+        // Reload waits for the active creation lease, then reconciles the library.
+        // Creation still uses its captured body; its completion must not lose the queued reload.
+        for _ in 0..<300 {
+            if !model.isLoadingTemplates { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(model.isLoadingTemplates, "Queued template reload must settle")
+        XCTAssertNil(model.templateLoadFailure)
         XCTAssertEqual(model.templates, [restored])
         XCTAssertEqual(model.selectedTemplateID, restored.id)
         XCTAssertEqual(try String(contentsOf: XCTUnwrap(model.createdFileURL), encoding: .utf8), "captured")
