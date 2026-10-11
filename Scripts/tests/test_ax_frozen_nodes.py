@@ -486,6 +486,18 @@ class ReferenceTests(unittest.TestCase):
         return (prefix + f"    1 <private-type {target:#x}> [48]\n"
                 f"      1 <{description}> +{offset}: __strong {slot:#x}\n")
 
+    def test_private_heap_slot_keeps_direction_and_checked_offset(self):
+        text = trace(0x1000, 48, 1).split("    1 <", 1)[0]
+        text += ("    1 <private-type 0x1000> [48]\n"
+                 "      1 <private allocator 0x2000> [64] +40:  0x2028\n"
+                 "        1 Region Stack private 0x90000\n")
+        graph = NODES.parse_trace_graph(text, 0x1000, 48)
+        self.assertEqual(graph["slots"], [{"source": 0x2000, "target": 0x1000, "offset": 40}])
+        with self.assertRaises(ValueError):
+            NODES.parse_trace_graph(text.replace("0x2028", "0x2029"), 0x1000, 48)
+        # Addressless roots do not invent a heap base for bridge selection.
+        self.assertEqual(NODES.parse_trace_graph(self.slot_trace(), 0x1000, 48)["slots"], [])
+
     def test_addressless_root_uses_private_slot_identity_and_public_unknown_bucket(self):
         for description in ("Swift Metadata", "Swift metadata", "Swift HeapGenericLocalVariable", "Unlisted Private Type"):
             graph = NODES.parse_trace_graph(self.slot_trace(description=description), 0x1000, 48)
@@ -940,6 +952,32 @@ class FrozenPublicGateTests(unittest.TestCase):
             self.assertEqual(value["status"], "partial")
             self.assertIn("summary_budget", value["reasons"])
             self.assertEqual(len(value["nodes"]) + value["omitted_candidates"], 16)
+
+    def test_bridge_cli_binds_final_summary_and_preserves_original_failure(self):
+        with mock.patch.object(sys, "path", [str(SOURCE.parent), *sys.path]):
+            import ax_bridge_evidence as bridge
+        for changed_graph in (False, True):
+            with self.subTest(changed_graph=changed_graph), tempfile.TemporaryDirectory() as directory:
+                case = Case(Path(directory))
+                original = NODES.write_bridge_evidence
+                def supplement(frozen, context, records):
+                    if changed_graph:
+                        context['after_graph'].write_bytes(b'changed private graph')
+                    return original(frozen, context, records)
+                with mock.patch.object(NODES.Tools, 'run', autospec=True, side_effect=case.run), \
+                        mock.patch.object(NODES, 'write_bridge_evidence', side_effect=supplement), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = NODES.main(['--graph-directory', str(case.graphs), '--records-directory', str(case.records), '--bridge-evidence'])
+                frozen_bytes = (case.records / 'frozen-nodes.json').read_bytes()
+                frozen = json.loads(frozen_bytes)
+                evidence = json.loads((case.records / 'bridge-evidence.json').read_bytes())
+                bridge.validate_summary(evidence, frozen)
+                self.assertEqual(evidence['frozen_sha256'], hashlib.sha256(frozen_bytes).hexdigest())
+                self.assertEqual(code, 0)  # The independent bridge gate consumes its partial status.
+                self.assertEqual(evidence['status'], 'partial' if changed_graph else 'not_needed')
+                self.assertEqual(frozen['status'], 'complete')
+                self.assertEqual(json.loads((case.records / 'result.json').read_bytes())['coverage'], 'failed')
+                self.assertNotIn('private', output.getvalue())
 
 
 if __name__ == "__main__":

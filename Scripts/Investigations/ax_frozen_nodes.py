@@ -14,6 +14,7 @@ import subprocess
 import time
 
 from ax_parser_evidence import Collector, encode_evidence, validate_evidence
+from ax_evidence_errors import EvidenceError, ExitUnconfirmed
 from ax_probe_report import HEAP_LABELS, HEAP_TYPES, allocation_generation, allocation_history, heap_allocations
 
 SECONDS = 90
@@ -69,17 +70,6 @@ def object_description(text):
         else:
             raise ValueError("Unsupported object suffix")
     return {"address": address, "size": size, "kind": kind or "unknown", "protocol": protocol, "region": "none"}
-
-
-class EvidenceError(Exception):
-    def __init__(self, reason):
-        self.reason = reason
-        super().__init__(reason)
-
-
-class ExitUnconfirmed(EvidenceError):
-    def __init__(self):
-        super().__init__("process_exit_unconfirmed")
 
 
 def integer(value):
@@ -308,7 +298,7 @@ def parse_trace_graph(report, address, size):
         if report.count(marker) != 1 or not body.startswith(marker):
             raise ValueError("Unsupported trace preamble")
         body = body[len(marker):]
-    members, edges, stack = {}, [], []
+    members, edges, stack, slots = {}, [], [], []
     top = None
 
     def close():
@@ -332,7 +322,7 @@ def parse_trace_graph(report, address, size):
             close()
         if stack and stack[-1]["leaf_only"]:
             raise ValueError("Invalid reverse nesting")
-        label, leaf_only = "unlabeled", False
+        label, leaf_only, heap_offset = "unlabeled", False, None
         slot_root = re.fullmatch(r"<([^<>\r\n\t]{1,1024})> +\+(\d{1,10}): +__strong +(" + ADDRESS + r")", text)
         if slot_root:
             description, offset, slot = slot_root[1], int(slot_root[2]), int(slot_root[3], 16)
@@ -369,6 +359,7 @@ def parse_trace_graph(report, address, size):
                 offset = int(match[2][1:])
                 if offset >= obj["size"] or int(match[4], 16) != key + offset:
                     raise ValueError("Unbound reference slot")
+                heap_offset = offset
                 raw_label = match[3].strip()
                 if raw_label and not re.fullmatch(EDGE_NAME + r"(?: \+ \d+)?", raw_label):
                     raise ValueError("Unsupported reference label")
@@ -390,6 +381,10 @@ def parse_trace_graph(report, address, size):
             edge = {"source": key, "target": stack[-1]["address"], "label": label, "relation": "reverse_reference"}
             if edge not in edges:
                 edges.append(edge)
+            if heap_offset is not None:
+                slot = {"source": key, "target": stack[-1]["address"], "offset": heap_offset}
+                if slot not in slots:
+                    slots.append(slot)
         stack.append({"address": key, "indent": indent, "paths": paths, "children": 0, "terminal": terminal, "leaf_only": leaf_only})
     while stack:
         close()
@@ -397,7 +392,7 @@ def parse_trace_graph(report, address, size):
         raise ValueError("Missing trace tree")
     if not roots:
         members[address] = object_description(re.search(r"^Tracing: (.+)$", report, re.M)[1])
-    return {"members": members, "edges": edges, "root": address, "target": address, "roots": roots}
+    return {"members": members, "edges": edges, "slots": slots, "root": address, "target": address, "roots": roots}
 
 
 def tree_reference_graph(graph, address):
@@ -821,9 +816,11 @@ class Tools:
         return report
 
 
-def compare(graph_directory, records, first_strict_growth=False, collector=None):
+def compare(graph_directory, records, first_strict_growth=False, collector=None, bridge_context=None):
     result = initial_summary()
     deadline = time.monotonic() + SECONDS
+    if bridge_context is not None:
+        bridge_context.update(deadline=deadline, traces={}, baseline_heap=None, reference_ids={})
     def reason(name):
         if name not in result["reasons"]:
             result["reasons"].append(name)
@@ -956,6 +953,9 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None)
                 raise ValueError("Incomplete heap inventory")
             return parsed
         baseline_heap = attempt("heap_unavailable", lambda: heap("baseline", before_graph))
+        if bridge_context is not None:
+            bridge_context.update(baseline_heap=baseline_heap, before_graph=before_graph,
+                                  after_graph=after_graph, reference_ids=references.ids)
         changed_heap = attempt("heap_unavailable", lambda: heap(label, after_graph, True))
         address_args = [hex(address) for address in candidates]
         def history(name, graph):
@@ -995,7 +995,12 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None)
                     if report is not None:
                         row[field] = attempt("trace_unavailable", lambda: trace_roots(report, address, size))
                         view = references.view(index, "baseline" if name == "baseline" else "selected", "trace")
-                        attempt("references_invalid", lambda: references.add(parse_report("trace", name, report, target=(address, size)), view))
+                        def add_trace():
+                            parsed = parse_report("trace", name, report, target=(address, size))
+                            references.add(parsed, view)
+                            if bridge_context is not None and name == "baseline":
+                                bridge_context["traces"][index] = parsed
+                        attempt("references_invalid", add_trace)
                 elif name == "baseline" and row["baseline_presence"] == "absent":
                     references.view(index, "baseline", "trace")["status"] = "not_present"
         if snapshot(0) != result["baseline"] or snapshot(selected) != result["selected"]:
@@ -1074,9 +1079,12 @@ def main(argv=None):
     parser.add_argument("--graph-directory", type=Path, required=True)
     parser.add_argument("--records-directory", type=Path, required=True)
     parser.add_argument("--first-strict-growth", action="store_true")
+    parser.add_argument("--bridge-evidence", action="store_true")
     args = parser.parse_args(argv)
     collector = Collector()
-    result = compare(args.graph_directory, args.records_directory, first_strict_growth=args.first_strict_growth, collector=collector)
+    bridge_context = {} if args.bridge_evidence else None
+    result = compare(args.graph_directory, args.records_directory, first_strict_growth=args.first_strict_growth,
+                     collector=collector, bridge_context=bridge_context)
     bound_summary(result)
     try:
         validate_summary(result)
@@ -1097,8 +1105,44 @@ def main(argv=None):
     except (OSError, ValueError, TypeError, RecursionError):
         print("Parser evidence unavailable")
         return 1
+    bridge_written = True
+    if args.bridge_evidence:
+        bridge_written = write_bridge_evidence(result, bridge_context, args.records_directory)
     print("Frozen-node summary " + result["status"])
-    return 0 if result["status"] == "complete" else 1
+    return 0 if result["status"] == "complete" and bridge_written else 1
+
+
+def write_bridge_evidence(frozen, context, records):
+    """Supplement the final frozen summary without replacing its evidence."""
+    import ax_bridge_evidence as bridge
+    result = bridge.initial_summary(frozen)
+    try:
+        tools = Tools(records / "bridge-private", {"tools": [], "process_cleanup_confirmed": True}, context["deadline"])
+        graphs = [(context.get("before_graph"), frozen["baseline"]),
+                  (context.get("after_graph"), frozen["selected"])]
+        def unchanged():
+            return all(path is None or point is not None and graph_hash(path) == point["graph_sha256"]
+                       for path, point in graphs)
+        if not unchanged():
+            bridge.fail_closed(result, "graph_changed")
+        else:
+            result = bridge.collect(frozen=frozen, traces=context["traces"], baseline_heap=context["baseline_heap"],
+                before_graph=context.get("before_graph"), after_graph=context.get("after_graph"),
+                tools=tools, reference_ids=context["reference_ids"])
+            if not unchanged():
+                bridge.fail_closed(result, "graph_changed")
+        payload = bridge.encode_summary(result, frozen)
+        target = records / "bridge-evidence.json"
+        if target.is_symlink():
+            raise ValueError("Invalid output file")
+        target.write_bytes(payload)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        print("Bridge evidence unavailable")
+        return False
+    print("Bridge evidence " + result["status"])
+    # The workflow validates and gates the bridge verdict independently. Its
+    # partial result must not change the successfully collected frozen verdict.
+    return True
 
 
 if __name__ == "__main__":

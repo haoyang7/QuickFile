@@ -2427,6 +2427,25 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
         self.assertFalse(summary["frozen_node_checks_passed"])
         self.assertFalse(summary["trials"][0]["frozen_nodes_available"])
 
+    def test_bridge_sidecar_is_independently_gated_without_rewriting_strict_results(self):
+        for failure in (None, 'private', 'hash', 'partial', 'missing', 'oversized', 'symlink', 'encoding', 'cleanup'):
+            with self.subTest(failure=failure):
+                value = self.frozen_summary(first_strict_growth=True, selected_label='added-10')
+                def match_scans(scans):
+                    for index, scan in enumerate(scans):
+                        point = value['baseline'] if index == 0 else value['selected']
+                        scan.update({key: point[key] for key in ('leak_nodes', 'leak_bytes')})
+                _, summary = self.run_measurement(enabled=False, first_strict_growth=True,
+                    frozen_summary=value, first_failure='strict', first_scans_change=match_scans, bridge_failure=failure)
+                first = summary['trials'][0]
+                self.assertFalse(summary['strict_checks_passed'])
+                self.assertTrue(first['frozen_node_checks_passed'])
+                self.assertEqual(first['bridge_checks_passed'], failure is None)
+                self.assertEqual(summary['bridge_checks_passed'], failure is None)
+                self.assertEqual(first['bridge_evidence_available'], failure in (None, 'partial', 'cleanup'))
+                self.assertEqual(len(summary['trials']), 1 if failure == 'cleanup' else 10)
+                self.assertNotIn('/private/secret', json.dumps(summary))
+
     def test_first_strict_growth_identity_requires_heap_diagnostics_without_scribble(self):
         script = self.workflow_script("Verify investigation identity")
         outputs = {('sw_vers', '-productVersion'): '26.6.2', ('sw_vers', '-buildVersion'): '25G83',
@@ -3211,7 +3230,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False, install_control=False,
                         first_startup_failures=None, image_cleanup_failure=None, first_records_change=None,
                         frozen_control=False, frozen_summary=None, frozen_failure=None, first_strict_growth=False,
-                        first_scans_change=None, parser_evidence=None, parser_failure=None):
+                        first_scans_change=None, parser_evidence=None, parser_failure=None, bridge_failure=None):
         script = self.workflow_script("Measure matched cases with strict heap checks")
         frozen_analysis = frozen_control or first_strict_growth
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
@@ -3412,6 +3431,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     test.assertTrue(frozen_analysis)
                     test.assertEqual(timeout, 120)
                     test.assertEqual("--first-strict-growth" in command, first_strict_growth)
+                    test.assertIn("--bridge-evidence", command)
                     test.assertNotIn("MallocScribble", environment)
                     frozen_invocations.append(invocations[-1])
                     if frozen_control:
@@ -3430,9 +3450,35 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     test.assertTrue(saved["trials"][-1]["process_run"]["cleanup"]["complete"])
                     test.assertEqual(pathlib.Path(command[command.index("--graph-directory") + 1]), records.parent / "fixture/heap")
                     failure = frozen_failure if len(invocations) == 1 else None
+                    value = frozen_summary if len(invocations) == 1 and frozen_summary is not None else test.frozen_summary(first_strict_growth=first_strict_growth)
                     if failure != "missing":
-                        value = frozen_summary if len(invocations) == 1 and frozen_summary is not None else test.frozen_summary(first_strict_growth=first_strict_growth)
                         PROBE.write_json(records / "frozen-nodes.json", value)
+                    from ax_bridge_evidence import initial_summary as bridge_summary, fail_closed as bridge_failed
+                    bridges = bridge_summary(value)
+                    # These synthetic frozen traces contain no 64B +40 -> 48B path.
+                    if value['status'] == 'complete':
+                        bridges['status'] = 'not_needed'
+                    else:
+                        bridge_failed(bridges, 'not_ready')
+                    bridge_error = bridge_failure if len(invocations) == 1 else None
+                    bridge_path = records / 'bridge-evidence.json'
+                    if bridge_error == 'private':
+                        bridges['raw'] = '/private/secret'
+                    if bridge_error == 'hash':
+                        bridges['frozen_sha256'] = '9' * 64
+                    if bridge_error in ('partial', 'cleanup'):
+                        bridge_failed(bridges, 'tool_budget' if bridge_error == 'partial' else 'process_exit_unconfirmed')
+                    if bridge_error == 'cleanup':
+                        bridges.update(process_cleanup_confirmed=False, heap_tool_index=0,
+                            tools=[{'tool':'heap', 'label':'selected', 'status':'timeout', 'return_code':None, 'cleanup_confirmed':False}])
+                    if bridge_error == 'oversized':
+                        bridge_path.write_bytes(b' ' * (32768 + 1))
+                    elif bridge_error == 'symlink':
+                        private_bridge = records / 'private-bridge.json'
+                        PROBE.write_json(private_bridge, bridges)
+                        bridge_path.symlink_to(private_bridge)
+                    elif bridge_error != 'missing':
+                        bridge_path.write_text(json.dumps(bridges, separators=(',', ':')) + ('\n ' if bridge_error == 'encoding' else '\n'))
                     evidence = copy.deepcopy(parser_evidence) if len(invocations) == 1 and parser_evidence is not None else {
                         "schema": 1, "status": "complete", "documents": [], "omitted_documents": 0}
                     evidence_path = records / "parser-evidence.json"
@@ -3494,7 +3540,12 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 self.assertEqual(invocations, [])
                 return invocations, summary
             self.assertEqual(result.exception.code, int(first_failure is not None or image_cleanup_failure is not None
-                or frozen_failure is not None or parser_failure is not None))
+                or frozen_failure is not None or parser_failure is not None or bridge_failure is not None))
+            if bridge_failure == 'cleanup':
+                self.assertFalse(summary['completed'])
+                self.assertFalse(summary['bridge_checks_passed'])
+                self.assertEqual(len(invocations), 1)
+                return invocations, summary
             if frozen_failure == "cleanup":
                 self.assertFalse(summary["completed"])
                 self.assertFalse(summary["frozen_node_checks_passed"])
