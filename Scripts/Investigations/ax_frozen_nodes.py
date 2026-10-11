@@ -1,7 +1,7 @@
-"""Bounded, private-address comparison of an existing frozen AX control.
+"""Bounded, private-address comparison of existing frozen AX checkpoints.
 
 This runs after the fixture exits. Default leak trees describe the tool's chosen
-tree, and traceTree counts external roots; neither is a complete ownership graph.
+tree, and traceTree describes reverse paths; neither is a complete ownership graph.
 """
 import argparse
 import hashlib
@@ -19,13 +19,55 @@ SECONDS = 90
 TOOL_SECONDS = 15
 CANDIDATES = 16
 RAW_LIMIT = 16 * 1024 * 1024
-PUBLIC_LIMIT = 16384
+PUBLIC_LIMIT = 131072
 INTEGER_LIMIT = 1_000_000_000
 REASONS = ("input_invalid", "graph_changed", "list_invalid", "tree_invalid",
            "heap_unavailable", "history_unavailable", "allocation_unknown", "trace_unavailable",
-           "candidate_limit", "tool_failed", "deadline", "process_exit_unconfirmed", "artifact_failed", "summary_budget")
+           "candidate_limit", "tool_failed", "deadline", "process_exit_unconfirmed", "artifact_failed", "summary_budget",
+           "references_invalid", "references_budget")
 TOOL_KINDS = ("list", "tree", "heap", "heap_diff", "history", "trace")
 TOOL_STATES = ("complete", "spawn_failed", "timeout", "exit_failed", "output_invalid", "output_limit")
+REFERENCE_NODES = 512
+REFERENCE_EDGES = 1024
+REFERENCE_TYPES = (*HEAP_TYPES, "NSXPCInterface", "xpc_connection_t", "dispatch_mach_t", "__NSMallocBlock__",
+                   "CFDictionary", "CFDictionary (Value Storage)", "CFDictionary (Key Storage)", "NSSet",
+                   "dispatch_queue_t (serial)", "dispatch_group_t", "unknown")
+REFERENCE_LABELS = ("unlabeled", "unknown", "_connection", "_remoteObjectInterface", "_methodInfo", "list",
+                    "__strong [capture]", "[capture]", "[__block capture]", "__strong", "__strong _object",
+                    "__strong storage", "__strong _values", "_userQueue", "_exportInfo", "_replyGroup",
+                    "_importInfo", "_interruptionHandler", "_repliesRequested", "_dCache", "_eCache", "_repliesExpected")
+REFERENCE_PROTOCOLS = ("none", "unknown", "NSAccessibilityRemoteUIElement", "NSAccessibilityRemoteUIElementProtocol",
+                       "LNDaemonApplicationInterface")
+REFERENCE_REGIONS = ("none", "stack", "data", "kernel", "other")
+ADDRESS = r"0x[0-9a-fA-F]{1,16}"
+EDGE_NAME = r"(?:(?:__strong|__weak) ?)?(?:\[(?:__block )?capture\]|[A-Za-z_][A-Za-z0-9_.]*)?"
+
+
+def reference_label(raw):
+    return raw if raw in REFERENCE_LABELS else "unknown" if raw else "unlabeled"
+
+
+def object_description(text):
+    """Parse tool syntax privately; publish only literal type/protocol buckets."""
+    match = re.fullmatch(r"(?:<(.+) (" + ADDRESS + r")>|(" + ADDRESS + r")) \[(\d{1,10})\](.*)", text)
+    if not match:
+        raise ValueError("Unsupported object description")
+    kind, address, bare, size, suffix = match.groups()
+    address, size = int(address or bare, 16), int(size)
+    if not address or not 0 < size <= INTEGER_LIMIT:
+        raise ValueError("Invalid object")
+    protocol = "none"
+    if suffix:
+        protocol_match = re.fullmatch(r"  Protocol: ([A-Za-z_][A-Za-z0-9_]*)(?:  Connection: <[^\n>]+> \[[^\n\]]+\])?", suffix)
+        if protocol_match:
+            protocol = protocol_match[1] if protocol_match[1] in REFERENCE_PROTOCOLS else "unknown"
+        elif re.fullmatch(r"  <[^\n>]+> \[[^\n\]]+\]", suffix):
+            pass
+        elif kind == "__NSMallocBlock__" and re.fullmatch(r"  \S+  [^\n]+  " + ADDRESS, suffix):
+            pass
+        else:
+            raise ValueError("Unsupported object suffix")
+    return {"address": address, "size": size, "kind": kind or "unknown", "protocol": protocol, "region": "none"}
 
 
 class EvidenceError(Exception):
@@ -96,29 +138,45 @@ def parse_list(report):
     return nodes, kinds
 
 
-def parse_tree(report, nodes):
-    """Accept only the observed default-tree grammar and validated back edges.
+def parse_tree_graph(report, nodes):
+    """Validate the complete reported tree, retaining private address relations.
 
-    A nested ROOT CYCLE label is a node, not another top-level cycle instance.
-    Unsupported tree forms remain unknown instead of inventing an ownership map.
+    These are leaks' selected relationships, not a complete ARC ownership graph.
+    Both allocation-stack groups and the ungrouped TOTAL form are observed forms.
     """
     if totals(report) != (len(nodes), sum(nodes.values())):
         raise ValueError("Tree/list totals differ")
     body = report.split("Binary Images:", 1)[0]
+    total_line = re.search(r"^Process \d+: \d+ leaks? for \d+ total leaked bytes\.$", body, re.M)
+    body = body[total_line.end():]
     headers = list(re.finditer(r"^STACK OF (\d+) INSTANCES? OF '(ROOT CYCLE|ROOT LEAK): ([^\n]+)':$", body, re.M))
-    if len(headers) != len(re.findall(r"^STACK OF ", body, re.M)) or (bool(nodes) != bool(headers)):
+    if len(headers) != len(re.findall(r"^STACK OF ", body, re.M)):
         raise ValueError("Unsupported tree header")
-    mapping, seen = {}, set()
-    for index, header in enumerate(headers):
-        header_kind = header[3]
-        # Actual default reports wrap allocation-site descriptions in <...>.
-        if header_kind.startswith("<") and header_kind.endswith(">"):
-            header_kind = header_kind[1:-1]
-        block = body[header.end():headers[index + 1].start() if index + 1 < len(headers) else len(body)]
-        if block.count("\n====\n") != 1:
-            raise ValueError("Missing tree boundary")
-        tree = block.split("\n====\n", 1)[1]
-        stack, ancestors, roots = [], set(), []
+    blocks = []
+    if headers:
+        if body[:headers[0].start()].strip():
+            raise ValueError("Unparsed tree prefix")
+        for index, header in enumerate(headers):
+            block = body[header.end():headers[index + 1].start() if index + 1 < len(headers) else len(body)]
+            if block.count("\n====\n") != 1:
+                raise ValueError("Missing tree boundary")
+            kind = header[3]
+            if kind.startswith("<") and kind.endswith(">"):
+                kind = kind[1:-1]
+            blocks.append((block.split("\n====\n", 1)[1], int(header[1]), header[2], kind))
+    else:
+        lines = [line for line in body.splitlines() if line.strip()]
+        if lines:
+            marker = re.fullmatch(r" *(\d+) \([^\n)]+\) << TOTAL >>", lines.pop(0))
+            if not marker or int(marker[1]) != len(nodes):
+                raise ValueError("Unsupported ungrouped tree")
+        elif nodes:
+            raise ValueError("Missing tree")
+        blocks.append(("\n".join(lines), None, None, None))
+    graph = {"members": {}, "roots": [], "back_edges": []}
+    seen = set()
+    for tree, instances, header_marker, header_kind in blocks:
+        stack, ancestors, root_count = [], set(), 0
 
         def close_node():
             entry = stack.pop()
@@ -129,63 +187,274 @@ def parse_tree(report, nodes):
         for line in tree.splitlines():
             if not line.strip():
                 continue
-            back = re.fullmatch(r"( +)CYCLE BACK TO <[^\n]+ (0x[0-9a-fA-F]{1,16})> \[(\d{1,10})\]", line)
-            if back:
-                address, size = int(back[2], 16), int(back[3])
-                if not stack or len(back[1]) <= stack[-1]["indent"] or address not in ancestors or nodes.get(address) != size:
-                    raise ValueError("Unbound cycle back edge")
-                roots[-1]["cycle_back_edges"] += 1
-                continue
-            row = re.fullmatch(r"( +)(\d{1,6}) \([^\n)]+\) (?:(ROOT CYCLE|ROOT LEAK): )?<([^\n]+) (0x[0-9a-fA-F]{1,16})> \[(\d{1,10})\]", line)
+            row = re.fullmatch(r"( +)(?:(\d{1,6}) \([^\n)]+\) )?(.*)", line)
             if not row:
                 raise ValueError("Unsupported tree row")
-            indent, count, marker, kind, address, size = row.groups()
-            indent, count, address, size = len(indent), int(count), int(address, 16), int(size)
-            if address in seen or nodes.get(address) != size:
-                raise ValueError("Duplicate or unlisted tree node")
+            indent, count, text = len(row[1]), row[2], row[3]
             while stack and indent <= stack[-1]["indent"]:
                 close_node()
+            edge = None
+            if " --> " in text:
+                edge, text = text.split(" --> ", 1)
+                if not edge or not re.fullmatch(EDGE_NAME, edge):
+                    raise ValueError("Unsupported edge syntax")
+            if text.startswith("CYCLE BACK TO "):
+                if count is not None:
+                    raise ValueError("Counted back edge")
+                obj = object_description(text[len("CYCLE BACK TO "):])
+                address = obj["address"]
+                if not stack or address not in ancestors or nodes.get(address) != obj["size"]:
+                    raise ValueError("Unbound cycle back edge")
+                target = graph["members"][address]
+                if obj["kind"] != target["kind"] or obj["protocol"] not in ("none", target["protocol"]):
+                    raise ValueError("Contradictory back edge")
+                graph["back_edges"].append({"source": stack[-1]["address"], "target": address,
+                                            "label": reference_label(edge), "root": target["root"]})
+                graph["roots"][target["root"]]["summary"]["cycle_back_edges"] += 1
+                continue
+            if count is None:
+                raise ValueError("Uncounted tree node")
+            marker = None
+            for prefix in ("ROOT CYCLE", "ROOT LEAK"):
+                if text.startswith(prefix + ": "):
+                    marker, text = prefix, text[len(prefix) + 2:]
+                    break
+            obj = object_description(text)
+            address, size, kind = obj["address"], obj["size"], obj["kind"]
+            if address in seen or nodes.get(address) != size:
+                raise ValueError("Duplicate or unlisted tree node")
             if not stack:
-                if marker != header[2] or kind != header_kind:
+                if edge is not None or marker is None or (header_marker is not None and (marker, kind) != (header_marker, header_kind)):
                     raise ValueError("Root/header mismatch")
-                roots.append({"status": "mapped", "root_kind": "cycle" if marker == "ROOT CYCLE" else "leak",
-                              "root_type": kind if kind in HEAP_TYPES else "unknown", "nodes": 0,
-                              "bytes": 0, "cycle_back_edges": 0})
-            stack.append({"address": address, "indent": indent, "reported": count, "start": len(seen)})
+                root_count += 1
+                graph["roots"].append({"address": address, "protocol": obj["protocol"], "summary": {
+                    "status": "mapped", "root_kind": "cycle" if marker == "ROOT CYCLE" else "leak",
+                    "root_type": kind if kind in HEAP_TYPES else "unknown", "nodes": 0, "bytes": 0, "cycle_back_edges": 0}})
+            root = len(graph["roots"]) - 1
+            obj.update(parent=stack[-1]["address"] if stack else None, edge=reference_label(edge), root=root)
+            graph["members"][address] = obj
+            graph["roots"][root]["summary"]["nodes"] += 1
+            graph["roots"][root]["summary"]["bytes"] += size
+            stack.append({"address": address, "indent": indent, "reported": int(count), "start": len(seen)})
             ancestors.add(address)
-            roots[-1]["nodes"] += 1
-            roots[-1]["bytes"] += size
-            mapping[address] = roots[-1]
             seen.add(address)
         while stack:
             close_node()
-        if len(roots) != int(header[1]):
+        if instances is not None and root_count != instances:
             raise ValueError("Root instance count mismatch")
     if seen != set(nodes):
         raise ValueError("Incomplete tree membership")
-    return mapping
+    for root in graph["roots"]:
+        graph["members"][root["address"]]["tree"] = dict(root["summary"])
+    return graph
+
+
+def parse_tree(report, nodes):
+    graph = parse_tree_graph(report, nodes)
+    return {address: graph["roots"][node["root"]]["summary"] for address, node in graph["members"].items()}
 
 
 def trace_roots(report, address, size):
-    prefix = r"<[^\n]+ (0x[0-9a-fA-F]{1,16})> \[(\d{1,10})\]"
-    target = re.findall(r"^Tracing: " + prefix + r"$", report, re.M)
-    roots = re.findall(r"^Found (\d{1,10}) roots? referencing: " + prefix + r"$", report, re.M)
-    if (len(target) != 1 or len(roots) != 1
-            or (int(target[0][0], 16), int(target[0][1])) != (address, size)
-            or (int(roots[0][1], 16), int(roots[0][2])) != (address, size)
-            or not integer(int(roots[0][0]))
-            or "This is a reverse reference tree showing how the specified block is referenced.\n" not in report):
+    target = re.findall(r"^Tracing: (.+)$", report, re.M)
+    roots = re.findall(r"^Found (\d{1,10}) roots? referencing: (.+)$", report, re.M)
+    if len(target) != 1 or len(roots) != 1 or not integer(int(roots[0][0])):
+        raise ValueError("Unbound trace result")
+    for text in (target[0], roots[0][1]):
+        obj = object_description(text)
+        if (obj["address"], obj["size"]) != (address, size):
+            raise ValueError("Unbound trace result")
+    if "This is a reverse reference tree showing how the specified block is referenced.\n" not in report:
         raise ValueError("Unbound trace result")
     # Region lines include intermediate nodes and are not a root counter.
     return int(roots[0][0])
 
+
+def parse_trace_graph(report, address, size):
+    """Validate all reverse paths; edge direction is referrer -> referenced."""
+    roots = trace_roots(report, address, size)
+    marker = "This reverse reference tree can be imported into Instruments using Import Sample Data to allow data mining."
+    if report.count(marker) != 1:
+        raise ValueError("Unsupported trace preamble")
+    body = report.split(marker, 1)[1]
+    members, edges, stack = {}, [], []
+    top = None
+
+    def close():
+        entry = stack.pop()
+        if entry["children"]:
+            if entry["children"] != entry["paths"]:
+                raise ValueError("Trace path count mismatch")
+        elif not entry["terminal"] or entry["paths"] != 1:
+            raise ValueError("Incomplete trace root")
+
+    for line in body.splitlines():
+        if not line.strip():
+            continue
+        row = re.fullmatch(r"([ +!:|]+)(\d{1,10}) (.+?) *", line)
+        if not row:
+            raise ValueError("Unsupported trace row")
+        indent, paths, text = len(row[1]), int(row[2]), row[3]
+        if not 0 < paths <= INTEGER_LIMIT:
+            raise ValueError("Invalid trace paths")
+        while stack and indent <= stack[-1]["indent"]:
+            close()
+        label = "unlabeled"
+        if text.startswith("Region "):
+            region = re.fullmatch(r"Region ([^\n]+) (" + ADDRESS + r")(?: --> offset \d+)?", text)
+            if not region:
+                raise ValueError("Unsupported region")
+            name = region[1]
+            category = "stack" if name.startswith("Stack ") else "data" if "__DATA" in name else "other"
+            key = ("region", int(region[2], 16))
+            obj = {"address": key, "kind": "unknown", "protocol": "none", "size": 0, "region": category}
+            terminal = True
+        elif text == "Kernel Pointers Into User Space":
+            key = ("kernel",)
+            obj = {"address": key, "kind": "unknown", "protocol": "none", "size": 0, "region": "kernel"}
+            terminal = True
+        else:
+            # Offset and pointer are checked privately and never become node IDs.
+            match = re.fullmatch(r"(.*? \[\d{1,10}\])(?: +(\+\d+): *(.*?) (" + ADDRESS + r")(?: --> offset \d+)?)?", text)
+            if not match:
+                raise ValueError("Unsupported reverse object")
+            obj = object_description(match[1])
+            key, terminal = obj["address"], False
+            if match[2]:
+                offset = int(match[2][1:])
+                if offset >= obj["size"] or int(match[4], 16) != key + offset:
+                    raise ValueError("Unbound reference slot")
+                raw_label = match[3].strip()
+                if raw_label and not re.fullmatch(EDGE_NAME + r"(?: \+ \d+)?", raw_label):
+                    raise ValueError("Unsupported reference label")
+                label = reference_label(raw_label)
+            elif stack:
+                raise ValueError("Missing reverse reference slot")
+        existing = members.get(key)
+        if existing is not None and existing != obj:
+            raise ValueError("Conflicting trace object")
+        members[key] = obj
+        if not stack:
+            if top is not None or key != address or obj["size"] != size or paths != roots:
+                raise ValueError("Unbound trace tree")
+            top = key
+        else:
+            if indent != stack[-1]["indent"] + 2:
+                raise ValueError("Invalid reverse nesting")
+            stack[-1]["children"] += paths
+            edge = {"source": key, "target": stack[-1]["address"], "label": label, "relation": "reverse_reference"}
+            if edge not in edges:
+                edges.append(edge)
+        stack.append({"address": key, "indent": indent, "paths": paths, "children": 0, "terminal": terminal})
+    while stack:
+        close()
+    if bool(roots) != (top is not None):
+        raise ValueError("Missing trace tree")
+    if not roots:
+        members[address] = object_description(re.search(r"^Tracing: (.+)$", report, re.M)[1])
+    return {"members": members, "edges": edges, "root": address, "target": address, "roots": roots}
+
+
+def tree_reference_graph(graph, address):
+    member = graph["members"][address]
+    root = member["root"]
+    backs = [edge for edge in graph["back_edges"] if edge["root"] == root]
+    selected = set()
+    for endpoint in [address, *(edge["source"] for edge in backs), *(edge["target"] for edge in backs)]:
+        while endpoint is not None and endpoint not in selected:
+            selected.add(endpoint)
+            endpoint = graph["members"][endpoint]["parent"]
+    edges = []
+    for key in sorted(selected):
+        obj = graph["members"][key]
+        if obj["parent"] is not None:
+            edges.append({"source": obj["parent"], "target": key, "label": obj["edge"], "relation": "tree_child"})
+    edges.extend({"source": edge["source"], "target": edge["target"], "label": edge["label"], "relation": "cycle_back"} for edge in backs)
+    return {"members": {key: graph["members"][key] for key in sorted(selected)}, "edges": edges,
+            "root": graph["roots"][root]["address"], "target": address}
+
+
+def empty_references():
+    return {"status": "not_needed", "semantics": "tool-reported", "nodes": [], "edges": [], "views": []}
+
+
+def reference_view(candidate, checkpoint, kind, status="unavailable"):
+    return {"candidate": candidate, "checkpoint": checkpoint, "kind": kind, "status": status,
+            "root": None, "target": None, "nodes": [], "edges": []}
+
+
+class References:
+    """Atomically publish bounded views with shared same-run address IDs."""
+    def __init__(self, summary, addresses):
+        self.summary = summary
+        self.value = summary["references"]
+        self.ids = {address: index for index, address in enumerate(sorted(addresses))}
+
+    def view(self, candidate, checkpoint, kind):
+        return next(view for view in self.value["views"] if
+                    (view["candidate"], view["checkpoint"], view["kind"]) == (candidate, checkpoint, kind))
+
+    def add(self, graph, view):
+        checkpoint = view["checkpoint"]
+        for address in graph["members"]:
+            if address not in self.ids:
+                self.ids[address] = len(self.ids)
+        nodes = [{"id": self.ids[key], "checkpoint": checkpoint,
+                  "type": obj["kind"] if obj["kind"] in REFERENCE_TYPES else "unknown",
+                  "protocol": obj["protocol"], "size": obj["size"], "region": obj["region"], "tree": obj.get("tree")}
+                 for key, obj in graph["members"].items()]
+        edges = [{"checkpoint": checkpoint, "source": self.ids[edge["source"]], "target": self.ids[edge["target"]],
+                  "relation": edge["relation"], "label": edge["label"], "count": 1} for edge in graph["edges"]]
+        unique_edges = []
+        for edge in edges:
+            previous = next((item for item in unique_edges if all(item[key] == edge[key] for key in edge if key != "count")), None)
+            if previous is None: unique_edges.append(edge)
+            else: previous["count"] += 1
+        edges = unique_edges
+        new_nodes = [node for node in nodes if node not in self.value["nodes"]]
+        added_identities = {(node["id"], checkpoint) for node in new_nodes} - {(node["id"], node["checkpoint"]) for node in self.value["nodes"]}
+        new_edges = [edge for edge in edges if edge not in self.value["edges"]]
+        if len(self.value["nodes"]) + len(added_identities) > REFERENCE_NODES or len(self.value["edges"]) + len(new_edges) > REFERENCE_EDGES:
+            view["status"] = "budget_exceeded"
+            raise EvidenceError("references_budget")
+        # Unknown type information in one tool is not a conflicting identity.
+        for node in new_nodes:
+            previous = next((item for item in self.value["nodes"] if (item["id"], item["checkpoint"]) == (node["id"], checkpoint)), None)
+            if previous is not None:
+                if previous["size"] != node["size"] or previous["region"] != node["region"]:
+                    raise ValueError("Conflicting reference identity")
+                if node["type"] != "unknown" and previous["type"] not in ("unknown", node["type"]):
+                    raise ValueError("Conflicting reference type")
+                if node["protocol"] != "none" and previous["protocol"] not in ("none", node["protocol"]):
+                    raise ValueError("Conflicting reference protocol")
+                if node["tree"] is not None and previous["tree"] not in (None, node["tree"]):
+                    raise ValueError("Conflicting root metadata")
+        for node in new_nodes:
+            previous = next((item for item in self.value["nodes"] if (item["id"], item["checkpoint"]) == (node["id"], checkpoint)), None)
+            if previous is None:
+                self.value["nodes"].append(node)
+            else:
+                if previous["type"] == "unknown": previous["type"] = node["type"]
+                if previous["protocol"] == "none": previous["protocol"] = node["protocol"]
+                if previous["tree"] is None: previous["tree"] = node["tree"]
+        self.value["edges"].extend(new_edges)
+        view.update(status="complete", root=self.ids[graph["root"]], target=self.ids[graph["target"]],
+                    nodes=[node["id"] for node in nodes], edges=[self.value["edges"].index(edge) for edge in edges])
+
+
+def roots_overview(graph):
+    roots = [{**{key: value for key, value in root["summary"].items() if key != "status"}, "protocol": root["protocol"]}
+             for root in graph["roots"]]
+    if len(roots) > REFERENCE_NODES:
+        return {"status": "budget_exceeded", "roots": []}
+    return {"status": "complete", "roots": roots}
 
 def empty_tree(status="unavailable"):
     return {"status": status, "root_kind": None, "root_type": None, "nodes": None, "bytes": None, "cycle_back_edges": None}
 
 
 def initial_summary():
-    return {"schema": 1, "status": "unavailable", "selection": None, "selected_label": None,
+    return {"schema": 2, "status": "unavailable", "selection": None, "selected_label": None,
+            "checked_points": [], "baseline_roots": {"status": "not_requested", "roots": []}, "references": empty_references(),
             "baseline": None, "selected": None, "comparison": None, "candidate_count": 0,
             "omitted_candidates": 0, "nodes": [], "tools": [], "reasons": [], "process_cleanup_confirmed": True}
 
@@ -196,9 +465,9 @@ def validate_summary(value):
         if not condition:
             raise ValueError("Invalid bounded frozen-node summary")
     require(type(value) is dict and set(value) == set(initial_summary()))
-    require(type(value["schema"]) is int and value["schema"] == 1)
+    require(type(value["schema"]) is int and value["schema"] == 2)
     require(value["status"] in ("complete", "partial", "unavailable"))
-    require(value["selection"] in (None, "first-new-leak", "no-new-leak"))
+    require(value["selection"] in (None, "first-new-leak", "no-new-leak", "first-strict-growth", "no-strict-growth"))
     require(value["selected_label"] is None or value["selected_label"] in HEAP_LABELS[1:])
     require(type(value["process_cleanup_confirmed"]) is bool)
     for key in ("baseline", "selected"):
@@ -258,7 +527,7 @@ def validate_summary(value):
     require(type(value["reasons"]) is list and all(type(reason) is str and reason in REASONS for reason in value["reasons"]))
     require(len(set(value["reasons"])) == len(value["reasons"]))
     require(value["process_cleanup_confirmed"] or "process_exit_unconfirmed" in value["reasons"])
-    if value["selection"] == "first-new-leak":
+    if value["selection"] in ("first-new-leak", "first-strict-growth"):
         require(value["selected_label"] is not None and value["baseline"] is not None and value["selected"] is not None)
     else:
         require(value["selected_label"] is None and value["selected"] is None and comparison is None and not value["nodes"] and value["candidate_count"] == 0)
@@ -266,7 +535,7 @@ def validate_summary(value):
         require(value["selection"] is not None and value["baseline"] is not None and not value["reasons"] and value["process_cleanup_confirmed"])
         require(all(tool["status"] == "complete" and tool["cleanup_confirmed"] for tool in value["tools"]))
         labels = HEAP_LABELS
-        if value["selection"] == "first-new-leak":
+        if value["selection"] in ("first-new-leak", "first-strict-growth"):
             labels = HEAP_LABELS[:HEAP_LABELS.index(value["selected_label"]) + 1]
             require(comparison is not None and bool(value["nodes"]) and value["omitted_candidates"] == 0)
             require(all(node["selected_tree"]["status"] == "mapped" and node["baseline_tree"]["status"] != "unavailable"
@@ -274,7 +543,7 @@ def validate_summary(value):
                         and node["baseline_presence"] in ("present", "absent")
                         and (node["baseline_presence"] != "present" or node["baseline_external_roots"] is not None) for node in value["nodes"]))
         expected_tools = [("list", label) for label in labels]
-        if value["selection"] == "first-new-leak":
+        if value["selection"] in ("first-new-leak", "first-strict-growth"):
             selected = value["selected_label"]
             expected_tools += [("tree", "baseline"), ("tree", selected), ("heap", "baseline"),
                                ("heap_diff", selected), ("history", "baseline"), ("history", selected)]
@@ -282,11 +551,158 @@ def validate_summary(value):
                 if node["baseline_presence"] == "present":
                     expected_tools.append(("trace", "baseline"))
                 expected_tools.append(("trace", selected))
+        if value["selection"] == "no-strict-growth":
+            expected_tools.append(("tree", "baseline"))
         require([(tool["tool"], tool["label"]) for tool in value["tools"]] == expected_tools)
     else:
         require(bool(value["reasons"]))
+    validate_references(value)
     require(len(encode_summary(value)) <= PUBLIC_LIMIT)
 
+
+
+def validate_references(value):
+    """Public references have no free text or address-derived strings."""
+    def require(condition):
+        if not condition:
+            raise ValueError("Invalid public reference evidence")
+    points = value["checked_points"]
+    require(type(points) is list and len(points) <= len(HEAP_LABELS))
+    for index, point in enumerate(points):
+        require(type(point) is dict and set(point) == {"label", "leak_nodes", "leak_bytes"})
+        require(point["label"] == HEAP_LABELS[index] and integer(point["leak_nodes"]) and integer(point["leak_bytes"]))
+    if points:
+        require(value["baseline"] is not None and all(points[0][key] == value["baseline"][key] for key in ("leak_nodes", "leak_bytes")))
+    selection = value["selection"]
+    if selection in ("first-strict-growth", "no-strict-growth"):
+        require(bool(points))
+        growth = [index for index, point in enumerate(points) if
+                  point["leak_nodes"] > points[0]["leak_nodes"] or point["leak_bytes"] > points[0]["leak_bytes"]]
+        if selection == "no-strict-growth":
+            require(len(points) == len(HEAP_LABELS) and not growth)
+        else:
+            require(growth == [len(points) - 1] and points[-1]["label"] == value["selected_label"])
+    if value["selected"] is not None:
+        require(bool(points) and points[-1]["label"] == value["selected_label"])
+        require(all(points[-1][key] == value["selected"][key] for key in ("leak_nodes", "leak_bytes")))
+    if value["status"] == "complete":
+        labels = HEAP_LABELS[:HEAP_LABELS.index(value["selected_label"]) + 1] if value["selected_label"] else HEAP_LABELS
+        require([point["label"] for point in points] == list(labels))
+        if value["selected"] is not None:
+            require(all(points[-1][key] == value["selected"][key] for key in ("leak_nodes", "leak_bytes")))
+    overview = value["baseline_roots"]
+    require(type(overview) is dict and set(overview) == {"status", "roots"})
+    require(overview["status"] in ("not_requested", "complete", "unavailable", "budget_exceeded"))
+    require(type(overview["roots"]) is list and len(overview["roots"]) <= REFERENCE_NODES)
+    for root in overview["roots"]:
+        require(type(root) is dict and set(root) == {"root_kind", "root_type", "protocol", "nodes", "bytes", "cycle_back_edges"})
+        require(root["root_kind"] in ("cycle", "leak") and root["root_type"] in REFERENCE_TYPES and root["protocol"] in REFERENCE_PROTOCOLS)
+        require(all(integer(root[key]) for key in ("nodes", "bytes", "cycle_back_edges")) and root["nodes"] > 0 and root["bytes"] > 0)
+    if overview["status"] == "complete":
+        require(value["baseline"] is not None)
+        require(sum(root["nodes"] for root in overview["roots"]) == value["baseline"]["leak_nodes"])
+        require(sum(root["bytes"] for root in overview["roots"]) == value["baseline"]["leak_bytes"])
+    else:
+        require(not overview["roots"])
+    if value["status"] == "complete" and selection != "no-new-leak":
+        require(overview["status"] == "complete")
+    refs = value["references"]
+    require(type(refs) is dict and set(refs) == set(empty_references()))
+    require(refs["status"] in ("not_needed", "complete", "partial", "unavailable") and refs["semantics"] == "tool-reported")
+    require(type(refs["nodes"]) is list and len(refs["nodes"]) <= REFERENCE_NODES)
+    require(type(refs["edges"]) is list and len(refs["edges"]) <= REFERENCE_EDGES)
+    require(type(refs["views"]) is list and len(refs["views"]) <= CANDIDATES * 4)
+    identities = set()
+    for node in refs["nodes"]:
+        require(type(node) is dict and set(node) == {"id", "checkpoint", "type", "protocol", "size", "region", "tree"})
+        require(integer(node["id"]) and node["checkpoint"] in ("baseline", "selected"))
+        require(node["type"] in REFERENCE_TYPES and node["protocol"] in REFERENCE_PROTOCOLS and node["region"] in REFERENCE_REGIONS)
+        require(integer(node["size"]) and ((node["region"] == "none") == (node["size"] > 0)))
+        if node["tree"] is not None:
+            tree = node["tree"]
+            require(type(tree) is dict and set(tree) == set(empty_tree()) and tree["status"] == "mapped")
+            require(tree["root_kind"] in ("cycle", "leak") and tree["root_type"] == (node["type"] if node["type"] in HEAP_TYPES else "unknown"))
+            require(all(integer(tree[key]) for key in ("nodes", "bytes", "cycle_back_edges")) and tree["nodes"] > 0 and tree["bytes"] >= node["size"])
+        identity = (node["checkpoint"], node["id"])
+        require(identity not in identities)
+        identities.add(identity)
+    edge_keys = set()
+    for edge in refs["edges"]:
+        require(type(edge) is dict and set(edge) == {"checkpoint", "source", "target", "relation", "label", "count"})
+        require(edge["checkpoint"] in ("baseline", "selected") and integer(edge["source"]) and integer(edge["target"]))
+        require((edge["checkpoint"], edge["source"]) in identities and (edge["checkpoint"], edge["target"]) in identities)
+        require(edge["relation"] in ("tree_child", "cycle_back", "reverse_reference") and edge["label"] in REFERENCE_LABELS)
+        require(integer(edge["count"]) and edge["count"] > 0)
+        key = tuple(edge[field] for field in ("checkpoint", "source", "target", "relation", "label"))
+        require(key not in edge_keys)
+        edge_keys.add(key)
+    view_keys = set()
+    candidate_ids = {}
+    for view in refs["views"]:
+        require(type(view) is dict and set(view) == set(reference_view(0, "baseline", "tree")))
+        require(integer(view["candidate"]) and view["candidate"] < len(value["nodes"]))
+        require(view["checkpoint"] in ("baseline", "selected") and view["kind"] in ("tree", "trace"))
+        key = (view["candidate"], view["checkpoint"], view["kind"])
+        require(key not in view_keys)
+        view_keys.add(key)
+        require(view["status"] in ("complete", "not_leaked", "not_present", "unavailable", "budget_exceeded"))
+        require(type(view["nodes"]) is list and all(integer(item) for item in view["nodes"]) and len(set(view["nodes"])) == len(view["nodes"]))
+        require(type(view["edges"]) is list and all(integer(item) and item < len(refs["edges"]) for item in view["edges"]) and len(set(view["edges"])) == len(view["edges"]))
+        candidate = value["nodes"][view["candidate"]]
+        if view["status"] == "complete":
+            require(integer(view["root"]) and integer(view["target"]) and view["root"] in view["nodes"] and view["target"] in view["nodes"])
+            require(all((view["checkpoint"], ident) in identities for ident in view["nodes"]))
+            target_node = next(node for node in refs["nodes"] if (node["checkpoint"], node["id"]) == (view["checkpoint"], view["target"]))
+            expected_size = candidate["size"] if view["checkpoint"] == "selected" else candidate["baseline_heap_size"]
+            if expected_size is not None: require(target_node["size"] == expected_size)
+            previous = candidate_ids.setdefault(view["candidate"], view["target"])
+            require(previous == view["target"])
+            included = [refs["edges"][index] for index in view["edges"]]
+            require(all(edge["checkpoint"] == view["checkpoint"] and edge["source"] in view["nodes"] and edge["target"] in view["nodes"] for edge in included))
+            require(all((edge["relation"] == "reverse_reference") == (view["kind"] == "trace") for edge in included))
+            if view["kind"] == "trace":
+                require(view["root"] == view["target"] and candidate[view["checkpoint"] + "_external_roots"] is not None)
+            else:
+                tree = candidate[view["checkpoint"] + "_tree"]
+                require(tree["status"] == "mapped")
+                root_node = next(node for node in refs["nodes"] if (node["checkpoint"], node["id"]) == (view["checkpoint"], view["root"]))
+                require(root_node["tree"] == tree)
+                require(sum(edge["count"] for edge in included if edge["relation"] == "cycle_back") == tree["cycle_back_edges"])
+                parents = {}
+                for edge in included:
+                    if edge["relation"] == "tree_child":
+                        require(edge["target"] not in parents and edge["target"] != view["root"] and edge["count"] == 1)
+                        parents[edge["target"]] = edge["source"]
+                require(set(parents) == set(view["nodes"]) - {view["root"]})
+                for edge in included:
+                    if edge["relation"] == "cycle_back":
+                        ancestors, current = set(), edge["source"]
+                        while current is not None and current not in ancestors:
+                            ancestors.add(current)
+                            current = parents.get(current)
+                        require(edge["target"] in ancestors)
+            reached = {view["root"]}
+            while True:
+                found = {edge["source"] if view["kind"] == "trace" else edge["target"] for edge in included
+                         if (edge["target"] if view["kind"] == "trace" else edge["source"]) in reached}
+                if found <= reached: break
+                reached |= found
+            require(reached == set(view["nodes"]))
+        else:
+            require(view["root"] is None and view["target"] is None and not view["nodes"] and not view["edges"])
+            if view["status"] == "not_leaked":
+                require(view["kind"] == "tree" and candidate[view["checkpoint"] + "_tree"]["status"] == "not_leaked")
+            if view["status"] == "not_present":
+                require(view["kind"] == "trace" and view["checkpoint"] == "baseline" and candidate["baseline_presence"] == "absent")
+    if refs["status"] in ("complete", "partial"):
+        require(view_keys == {(index, checkpoint, kind) for index in range(len(value["nodes"]))
+                              for checkpoint in ("baseline", "selected") for kind in ("tree", "trace")})
+    if refs["status"] == "complete":
+        require(bool(refs["views"]) and all(view["status"] in ("complete", "not_leaked", "not_present") for view in refs["views"]))
+    if refs["status"] == "not_needed":
+        require(not refs["views"] and not refs["nodes"] and not refs["edges"] and not value["nodes"])
+    if value["status"] == "complete" and selection in ("first-new-leak", "first-strict-growth"):
+        require(refs["status"] == "complete")
 
 def encode_summary(value):
     return (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
@@ -354,7 +770,7 @@ class Tools:
         return report
 
 
-def compare(graph_directory, records):
+def compare(graph_directory, records, first_strict_growth=False):
     result = initial_summary()
     deadline = time.monotonic() + SECONDS
     def reason(name):
@@ -376,7 +792,7 @@ def compare(graph_directory, records):
         scans = read_json(records / "scans.json")
         fixture = read_json(records / "result.json")
         if (type(cleanup) is not dict or cleanup.get("processes_exited") is not True
-                or type(fixture) is not dict or fixture.get("mode") != "heap-control" or fixture.get("scan_mode") != "diagnostic"
+                or type(fixture) is not dict or fixture.get("mode") not in (("heap-control", "product") if first_strict_growth else ("heap-control",)) or fixture.get("scan_mode") != "diagnostic"
                 or type(scans) is not list or len(scans) != len(HEAP_LABELS)):
             raise EvidenceError("input_invalid")
         for label, point in zip(HEAP_LABELS, scans):
@@ -396,6 +812,7 @@ def compare(graph_directory, records):
                 raise ValueError("List/scan mismatch")
             if graph_hash(graph) != point["graph_sha256"]:
                 raise EvidenceError("graph_changed")
+            result["checked_points"].append({"label": name, "leak_nodes": len(nodes), "leak_bytes": sum(nodes.values())})
             return nodes, kinds
         before_graph = graph_directory / "baseline.memgraph"
         before = attempt("list_invalid", lambda: listing("baseline", before_graph, result["baseline"]))
@@ -411,14 +828,21 @@ def compare(graph_directory, records):
             if after is None:
                 return result  # Do not skip an unknown earlier checkpoint.
             changed = {address: size for address, size in after[0].items() if before[0].get(address) != size}
-            if changed:
+            growth = point["leak_nodes"] > result["baseline"]["leak_nodes"] or point["leak_bytes"] > result["baseline"]["leak_bytes"]
+            if growth if first_strict_growth else changed:
                 selected, diff_nodes = index, changed
-                result.update(selection="first-new-leak", selected_label=label, selected=point)
+                result.update(selection="first-strict-growth" if first_strict_growth else "first-new-leak", selected_label=label, selected=point)
                 break
         if selected is None:
             if snapshot(0) != result["baseline"]:
                 raise EvidenceError("graph_changed")
-            result.update(status="complete", selection="no-new-leak")
+            if first_strict_growth:
+                graph = attempt("tree_invalid", lambda: parse_tree_graph(tools.run("tree", "baseline",
+                    ["/usr/bin/leaks", "--noContent", "--nosources", str(before_graph)], (0, 1)), before[0]))
+                result["baseline_roots"] = roots_overview(graph) if graph is not None else {"status": "unavailable", "roots": []}
+                if result["baseline_roots"]["status"] == "budget_exceeded": reason("references_budget")
+                if snapshot(0) != result["baseline"]: reason("graph_changed")
+            result.update(status="complete", selection="no-strict-growth" if first_strict_growth else "no-new-leak")
             return result
         label = result["selected_label"]
         after_graph = graph_directory / (label + ".memgraph")
@@ -437,14 +861,27 @@ def compare(graph_directory, records):
                 "baseline_heap_size": None, "baseline_presence": "unknown", "baseline_tree": empty_tree(), "selected_tree": empty_tree(),
                 "history": {"classification": "unknown", "before_allocs": None, "before_frees": None, "after_allocs": None, "after_frees": None, "heap_diff_present": None},
                 "baseline_external_roots": None, "selected_external_roots": None})
-        for name, graph, nodes, field in (("baseline", before_graph, old, "baseline_tree"), (label, after_graph, new, "selected_tree")):
-            trees = attempt("tree_invalid", lambda: parse_tree(tools.run("tree", name,
+        references = References(result, old.keys() | new.keys())
+        result["references"]["status"] = "unavailable"
+        for index in range(len(candidates)):
+            for checkpoint in ("baseline", "selected"):
+                for kind in ("tree", "trace"):
+                    result["references"]["views"].append(reference_view(index, checkpoint, kind))
+        for name, graph, nodes, field, checkpoint in (("baseline", before_graph, old, "baseline_tree", "baseline"),
+                                                    (label, after_graph, new, "selected_tree", "selected")):
+            parsed = attempt("tree_invalid", lambda: parse_tree_graph(tools.run("tree", name,
                 ["/usr/bin/leaks", "--noContent", "--nosources", str(graph)], (0, 1)), nodes))
-            for address, row in zip(candidates, result["nodes"]):
+            if checkpoint == "baseline":
+                result["baseline_roots"] = roots_overview(parsed) if parsed is not None else {"status": "unavailable", "roots": []}
+                if result["baseline_roots"]["status"] == "budget_exceeded": reason("references_budget")
+            for index, (address, row) in enumerate(zip(candidates, result["nodes"])):
+                view = references.view(index, checkpoint, "tree")
                 if address not in nodes:
                     row[field] = empty_tree("not_leaked")
-                elif trees is not None:
-                    row[field] = dict(trees[address])
+                    view["status"] = "not_leaked"
+                elif parsed is not None:
+                    row[field] = dict(parsed["roots"][parsed["members"][address]["root"]]["summary"])
+                    attempt("references_invalid", lambda: references.add(tree_reference_graph(parsed, address), view))
         def heap(name, graph, diff=False):
             parsed = heap_allocations(tools.run("heap_diff" if diff else "heap", name,
                 ["/usr/bin/heap", "--noContent", "--addresses", "all", *([f"--diffFrom={before_graph}"] if diff else []), str(graph)]))
@@ -461,7 +898,7 @@ def compare(graph_directory, records):
             return parsed
         before_history = attempt("history_unavailable", lambda: history("baseline", before_graph))
         after_history = attempt("history_unavailable", lambda: history(label, after_graph))
-        for address, row in zip(candidates, result["nodes"]):
+        for index, (address, row) in enumerate(zip(candidates, result["nodes"])):
             if baseline_heap is not None:
                 row["baseline_presence"] = "present" if address in baseline_heap else "absent"
                 row["baseline_heap_size"] = baseline_heap.get(address)
@@ -486,8 +923,14 @@ def compare(graph_directory, records):
             for name, graph, size, field in (("baseline", before_graph, row["baseline_heap_size"], "baseline_external_roots"),
                                            (label, after_graph, row["size"], "selected_external_roots")):
                 if size is not None:
-                    row[field] = attempt("trace_unavailable", lambda: trace_roots(tools.run("trace", name,
-                        ["/usr/bin/leaks", "--noContent", "--nosources", f"--traceTree={hex(address)}", str(graph)]), address, size))
+                    report = attempt("trace_unavailable", lambda: tools.run("trace", name,
+                        ["/usr/bin/leaks", "--noContent", "--nosources", f"--traceTree={hex(address)}", str(graph)]))
+                    if report is not None:
+                        row[field] = attempt("trace_unavailable", lambda: trace_roots(report, address, size))
+                        view = references.view(index, "baseline" if name == "baseline" else "selected", "trace")
+                        attempt("references_invalid", lambda: references.add(parse_trace_graph(report, address, size), view))
+                elif name == "baseline" and row["baseline_presence"] == "absent":
+                    references.view(index, "baseline", "trace")["status"] = "not_present"
         if snapshot(0) != result["baseline"] or snapshot(selected) != result["selected"]:
             reason("graph_changed")
     except EvidenceError as error:
@@ -495,25 +938,64 @@ def compare(graph_directory, records):
     except (OSError, ValueError, TypeError, KeyError, RecursionError):
         reason("input_invalid")
     finally:
+        refs = result["references"]
+        if refs["views"]:
+            refs["status"] = "complete" if all(view["status"] in ("complete", "not_leaked", "not_present") for view in refs["views"]) else "partial"
+            if refs["status"] != "complete" and not result["reasons"]: reason("references_invalid")
         if result["reasons"]:
-            result["status"] = "partial" if result["comparison"] is not None else "unavailable"
+            result["status"] = "partial" if result["comparison"] is not None or result["selection"] == "no-strict-growth" else "unavailable"
         elif result["selection"] is not None:
             result["status"] = "complete"
+        bound_summary(result)
     return result
 
+
+
+def prune_references(result):
+    refs = result["references"]
+    used_edges = sorted({index for view in refs["views"] for index in view["edges"]})
+    renumber = {index: new for new, index in enumerate(used_edges)}
+    refs["edges"] = [refs["edges"][index] for index in used_edges]
+    for view in refs["views"]:
+        view["edges"] = [renumber[index] for index in view["edges"]]
+    used_nodes = {(view["checkpoint"], ident) for view in refs["views"] for ident in view["nodes"]}
+    refs["nodes"] = [node for node in refs["nodes"] if (node["checkpoint"], node["id"]) in used_nodes]
+
+
+def bound_summary(result):
+    """Keep complete selected-cycle views before larger reverse paths."""
+    while len(encode_summary(result)) > PUBLIC_LIMIT:
+        refs = result["references"]
+        disposable = [view for view in refs["views"] if view["status"] == "complete" and view["kind"] == "trace"]
+        if not disposable:
+            disposable = [view for view in refs["views"] if view["status"] == "complete" and view["checkpoint"] == "baseline"]
+        if disposable:
+            view = max(disposable, key=lambda item: len(item["nodes"]) + len(item["edges"]))
+            view.update(status="budget_exceeded", root=None, target=None, nodes=[], edges=[])
+            prune_references(result)
+            refs["status"] = "partial"
+        elif result["nodes"]:
+            result["nodes"].pop()
+            result["omitted_candidates"] += 1
+            refs["views"] = [view for view in refs["views"] if view["candidate"] < len(result["nodes"])]
+            prune_references(result)
+            refs["status"] = "partial"
+        elif result["baseline_roots"]["roots"]:
+            result["baseline_roots"] = {"status": "budget_exceeded", "roots": []}
+        else:
+            break
+        result["status"] = "partial"
+        if "summary_budget" not in result["reasons"]:
+            result["reasons"].append("summary_budget")
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--graph-directory", type=Path, required=True)
     parser.add_argument("--records-directory", type=Path, required=True)
+    parser.add_argument("--first-strict-growth", action="store_true")
     args = parser.parse_args(argv)
-    result = compare(args.graph_directory, args.records_directory)
-    while len(encode_summary(result)) > PUBLIC_LIMIT and result["nodes"]:
-        result["nodes"].pop()
-        result["omitted_candidates"] += 1
-        result["status"] = "partial"
-        if "summary_budget" not in result["reasons"]:
-            result["reasons"].append("summary_budget")
+    result = compare(args.graph_directory, args.records_directory, first_strict_growth=args.first_strict_growth)
+    bound_summary(result)
     try:
         validate_summary(result)
         target = args.records_directory / "frozen-nodes.json"

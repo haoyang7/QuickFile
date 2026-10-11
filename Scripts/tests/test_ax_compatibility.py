@@ -2315,6 +2315,40 @@ class AXTerminalCacheIdentityTests(unittest.TestCase):
 
 class AXMallocScribbleWorkflowTests(unittest.TestCase):
     @staticmethod
+    def frozen_summary(*, first_strict_growth=False, selected_label=None, byte_growth=False):
+        if selected_label is not None:
+            # Reuse the parser's synthetic tool reports to produce its complete
+            # reference contract without invoking native leaks or AX fixtures.
+            spec = importlib.util.spec_from_file_location("ax_frozen_workflow_fixture", ROOT / "Scripts/tests/test_ax_frozen_nodes.py")
+            fixtures = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fixtures)
+            with tempfile.TemporaryDirectory(prefix="ax-frozen-workflow-") as directory:
+                before = {0x1000: 124, 0x2000: 128}
+                after = {0x1000: 124, 0x2000: 176} if byte_growth else before | {0x3000: 48}
+                case = fixtures.Case(pathlib.Path(directory), before=before, after=after,
+                                     first=REPORT.HEAP_LABELS.index(selected_label))
+                if byte_growth:
+                    case.baseline_heap = dict(before)
+                    case.heap_diff = {0x2000: 176}
+                    case.before_events = [("ALLOC", address, size) for address, size in before.items()]
+                    case.after_events = case.before_events + [("FREE", 0x2000, 128), ("ALLOC", 0x2000, 176)]
+                return case.compare(first_strict_growth=first_strict_growth)
+        with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
+            from ax_frozen_nodes import initial_summary
+        value = initial_summary()
+        value.update(status="complete", selection="no-strict-growth" if first_strict_growth else "no-new-leak",
+            baseline={"leak_nodes": 3, "leak_bytes": 300, "graph_sha256": "0" * 64},
+            checked_points=[{"label": label, "leak_nodes": 3, "leak_bytes": 300} for label in REPORT.HEAP_LABELS],
+            tools=[{"tool": "list", "label": label, "status": "complete", "return_code": 1,
+                    "cleanup_confirmed": True} for label in REPORT.HEAP_LABELS])
+        if first_strict_growth:
+            value["baseline_roots"] = {"status": "complete", "roots": [{"root_kind": "leak", "root_type": "unknown",
+                "protocol": "none", "nodes": 3, "bytes": 300, "cycle_back_edges": 0}]}
+            value["tools"].append({"tool": "tree", "label": "baseline", "status": "complete", "return_code": 0,
+                                   "cleanup_confirmed": True})
+        return value
+
+    @staticmethod
     def workflow_script(step):
         workflow = (ROOT / ".github/workflows/ax-system-baseline.yml").read_text()
         block = workflow.split(f"      - name: {step}\n", 1)[1]
@@ -2352,13 +2386,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         self.assertEqual(summary["identity"]["scan_mode"], "diagnostic")
 
     def test_frozen_control_preserves_strict_failure_and_gates_offline_evidence(self):
-        no_growth = {"schema": 1, "status": "complete", "selection": "no-new-leak", "selected_label": None,
-                     "baseline": {"leak_nodes": 3, "leak_bytes": 300, "graph_sha256": "0" * 64},
-                     "selected": None, "comparison": None, "candidate_count": 0, "omitted_candidates": 0,
-                     "nodes": [], "tools": [{"tool": "list", "label": label, "status": "complete",
-                                              "return_code": 1, "cleanup_confirmed": True}
-                                             for label in REPORT.HEAP_LABELS],
-                     "reasons": [], "process_cleanup_confirmed": True}
+        no_growth = self.frozen_summary()
         for failure in (None, "strict", "host-exit", "missing", "private", "counts", "timeout", "cleanup",
                         "early-count", "early-bytes"):
             with self.subTest(failure=failure):
@@ -2388,28 +2416,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
     def test_frozen_control_rejects_selection_after_an_earlier_growth_point(self):
         with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
             from ax_frozen_nodes import validate_summary
-        value = {"schema": 1, "status": "complete", "selection": "first-new-leak", "selected_label": "removed-10",
-                 "baseline": {"leak_nodes": 2, "leak_bytes": 252, "graph_sha256": "0" * 64},
-                 "selected": {"leak_nodes": 3, "leak_bytes": 300, "graph_sha256": "1" * 64},
-                 "comparison": {"added_nodes": 1, "added_bytes": 48, "removed_nodes": 0, "removed_bytes": 0,
-                                "retained_addresses": 2, "resized_addresses": 0},
-                 "candidate_count": 1, "omitted_candidates": 0, "nodes": [{
-                     "index": 0, "type": "NSString", "size": 48, "baseline_heap_size": 48,
-                     "baseline_presence": "present",
-                     "baseline_tree": {"status": "not_leaked", "root_kind": None, "root_type": None,
-                                       "nodes": None, "bytes": None, "cycle_back_edges": None},
-                     "selected_tree": {"status": "mapped", "root_kind": "cycle", "root_type": "NSString",
-                                       "nodes": 1, "bytes": 48, "cycle_back_edges": 1},
-                     "history": {"classification": "preexisting", "before_allocs": 1, "before_frees": 0,
-                                 "after_allocs": 1, "after_frees": 0, "heap_diff_present": False},
-                     "baseline_external_roots": 2, "selected_external_roots": 0}],
-                 "tools": [], "reasons": [], "process_cleanup_confirmed": True}
-        commands = [("list", label) for label in ("baseline", "added-10", "registered-10", "removed-10")]
-        commands += [("tree", "baseline"), ("tree", "removed-10"), ("heap", "baseline"),
-                     ("heap_diff", "removed-10"), ("history", "baseline"), ("history", "removed-10"),
-                     ("trace", "baseline"), ("trace", "removed-10")]
-        value["tools"] = [{"tool": tool, "label": label, "status": "complete", "return_code": 0,
-                           "cleanup_confirmed": True} for tool, label in commands]
+        value = self.frozen_summary(selected_label="removed-10")
         validate_summary(value)
         _, summary = self.run_measurement(enabled=False, frozen_control=True, frozen_summary=value,
             first_failure="strict", frozen_failure="earlier-growth",
@@ -2417,6 +2424,130 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
         self.assertFalse(summary["strict_checks_passed"])
         self.assertFalse(summary["frozen_node_checks_passed"])
         self.assertFalse(summary["trials"][0]["frozen_nodes_available"])
+
+    def test_first_strict_growth_identity_requires_heap_diagnostics_without_scribble(self):
+        script = self.workflow_script("Verify investigation identity")
+        outputs = {('sw_vers', '-productVersion'): '26.6.2', ('sw_vers', '-buildVersion'): '25G83',
+                   ('uname', '-m'): 'arm64', ('xcodebuild', '-version'): 'Xcode 26.3\nBuild version 17C529',
+                   ('git', 'rev-parse', 'HEAD'): '1' * 40}
+        for heap, scribble in itertools.product((False, True), repeat=2):
+            with self.subTest(heap=heap, scribble=scribble), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory) / "records"
+                code = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
+                environment = {"AX_SCAN_MODE": "diagnostic", "AX_RECEIPT_MODE": "internal", "AX_TERMINAL_ORIGIN": "false",
+                    "AX_FROZEN_CONTROL": "false", "AX_PURE_APPKIT_CONTROL": "false", "AX_INSTALL_GATE_CONTROL": "false",
+                    "CAUSAL_PROBE": "false", "AX_HEAP_DIAGNOSTICS": str(heap).lower(),
+                    "MALLOC_SCRIBBLE_EXPERIMENT": str(scribble).lower()}
+                with mock.patch.dict(os.environ, environment), contextlib.redirect_stdout(io.StringIO()), \
+                        mock.patch.object(subprocess, "check_output", side_effect=lambda command, **_: outputs[tuple(command)]):
+                    exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                identity = json.loads((root / "summary.json").read_text())["identity"]
+                if heap and not scribble:
+                    self.assertEqual(identity["frozen_node_selection"], "first-strict-growth")
+                else:
+                    self.assertNotIn("frozen_node_selection", identity)
+        _, ordinary = self.run_measurement(enabled=False)
+        self.assertNotIn("frozen_node_selection", ordinary["identity"])
+        self.assertNotIn("frozen_node_checks_passed", ordinary)
+
+    def test_first_strict_growth_runs_both_members_of_all_five_pairs_without_growth(self):
+        invocations, summary = self.run_measurement(enabled=False, first_strict_growth=True)
+        expected = [(None, mode) for pair in range(1, 6)
+                    for mode in (("control", "product") if pair % 2 else ("product", "control"))]
+        self.assertEqual(invocations, expected)
+        self.assertTrue(summary["strict_checks_passed"])
+        self.assertTrue(summary["frozen_node_checks_passed"])
+        for trial in summary["trials"]:
+            self.assertTrue(trial["frozen_nodes_available"])
+            self.assertTrue(trial["frozen_node_checks_passed"])
+            self.assertEqual(trial["frozen_nodes"]["selection"], "no-strict-growth")
+            self.assertIsNone(trial["frozen_nodes"]["selected_label"])
+            self.assertEqual(trial["frozen_node_process_run"]["return_code"], 0)
+
+    def test_first_strict_growth_complete_diagnostics_preserve_the_original_strict_failure(self):
+        for byte_growth in (False, True):
+            with self.subTest(byte_growth=byte_growth):
+                value = self.frozen_summary(first_strict_growth=True, selected_label="added-10", byte_growth=byte_growth)
+                def scans_change(scans):
+                    scans[0].update(leak_nodes=2, leak_bytes=252)
+                    if byte_growth:
+                        for scan in scans[1:]:
+                            scan.update(leak_nodes=2)
+                _, summary = self.run_measurement(enabled=False, first_strict_growth=True, first_failure="strict",
+                    frozen_summary=value, first_scans_change=scans_change)
+                self.assertFalse(summary["strict_checks_passed"])
+                self.assertTrue(summary["frozen_node_checks_passed"])
+                first = summary["trials"][0]
+                self.assertEqual(first["return_code"], 1)
+                self.assertEqual(first["validation_failure_counts"]["heap_baseline"], 1)
+                self.assertEqual(first["validation_failure_counts"]["notifications"], 1)
+                self.assertEqual(first["frozen_nodes"]["selected_label"], "added-10")
+                self.assertTrue(first["frozen_node_checks_passed"])
+
+    def test_first_strict_growth_failures_keep_strict_results_and_continue_only_after_cleanup(self):
+        for failure in ("missing", "partial", "mismatched", "missing-selection", "timeout", "host-exit", "cleanup"):
+            with self.subTest(failure=failure):
+                value = self.frozen_summary(first_strict_growth=True)
+                if failure == "partial":
+                    value.update(status="partial", reasons=["tree_invalid"])
+                    value["tools"][-1]["status"] = "output_invalid"
+                if failure == "mismatched":
+                    value["baseline"]["leak_bytes"] = 400
+                    value["baseline_roots"]["roots"][0]["bytes"] = 400
+                    for point in value["checked_points"]:
+                        point["leak_bytes"] = 400
+                if failure == "missing-selection":
+                    value.update(status="partial", selection=None, reasons=["list_invalid"])
+                invocations, summary = self.run_measurement(enabled=False, first_strict_growth=True,
+                    frozen_summary=value, frozen_failure=failure)
+                self.assertTrue(summary["strict_checks_passed"])
+                self.assertFalse(summary["frozen_node_checks_passed"])
+                self.assertFalse(summary["trials"][0]["frozen_node_checks_passed"])
+                if failure == "cleanup":
+                    self.assertEqual(invocations, [(None, "control")])
+                    self.assertFalse(summary["completed"])
+                else:
+                    self.assertEqual(len(invocations), 10)
+                    self.assertTrue(all(trial["frozen_node_checks_passed"] for trial in summary["trials"][1:]))
+                if failure == "host-exit":
+                    self.assertNotIn("frozen_node_process_run", summary["trials"][0])
+                self.assertEqual(summary["trials"][0]["frozen_nodes_available"], failure in ("partial", "timeout", "cleanup"))
+        _, summary = self.run_measurement(enabled=False, first_strict_growth=True, first_failure="cleanup")
+        self.assertFalse(summary["completed"])
+        self.assertNotIn("frozen_node_process_run", summary["trials"][0])
+
+    def test_first_strict_growth_rejects_delayed_growth_and_false_no_growth(self):
+        for kind in ("delayed-growth", "false-no-growth"):
+            with self.subTest(kind=kind):
+                if kind == "delayed-growth":
+                    value = self.frozen_summary(first_strict_growth=True, selected_label="removed-10")
+                else:
+                    value = self.frozen_summary(first_strict_growth=True)
+                    value["baseline"].update(leak_nodes=2, leak_bytes=252)
+                    value["baseline_roots"]["roots"][0].update(nodes=2, bytes=252)
+                    for point in value["checked_points"]:
+                        point.update(leak_nodes=2, leak_bytes=252)
+                with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
+                    from ax_frozen_nodes import validate_summary
+                validate_summary(value)
+                _, summary = self.run_measurement(enabled=False, first_strict_growth=True, first_failure="strict",
+                    first_scan_change=lambda scan: scan.update(leak_nodes=2, leak_bytes=252),
+                    frozen_summary=value, frozen_failure=kind)
+                self.assertFalse(summary["strict_checks_passed"])
+                self.assertFalse(summary["frozen_node_checks_passed"])
+                self.assertFalse(summary["trials"][0]["frozen_nodes_available"])
+
+    def test_first_strict_growth_rejects_selected_totals_different_from_original_scans(self):
+        value = self.frozen_summary(first_strict_growth=True, selected_label="added-10")
+        def scans_change(scans):
+            scans[0].update(leak_nodes=2, leak_bytes=252)
+            for scan in scans[1:]:
+                scan.update(leak_bytes=301)
+        _, summary = self.run_measurement(enabled=False, first_strict_growth=True, first_failure="strict",
+            first_scans_change=scans_change, frozen_summary=value, frozen_failure="selected-mismatch")
+        self.assertFalse(summary["frozen_node_checks_passed"])
+        self.assertFalse(summary["trials"][0]["frozen_nodes_available"])
+        self.assertEqual(summary["trials"][0]["scan_totals"][1]["leak_bytes"], 301)
 
     def test_external_receipt_requires_live_scribble_before_starting_fixtures(self):
         script = self.workflow_script("Verify investigation identity")
@@ -2985,8 +3116,10 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
     def run_measurement(self, *, enabled=True, first_failure=None, scan_mode="diagnostic", unexpected_diagnostics=False,
                         first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False, install_control=False,
                         first_startup_failures=None, image_cleanup_failure=None, first_records_change=None,
-                        frozen_control=False, frozen_summary=None, frozen_failure=None):
+                        frozen_control=False, frozen_summary=None, frozen_failure=None, first_strict_growth=False,
+                        first_scans_change=None):
         script = self.workflow_script("Measure matched cases with strict heap checks")
+        frozen_analysis = frozen_control or first_strict_growth
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
             summary_file = root / "summary.json"
@@ -2995,6 +3128,10 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
             if frozen_control:
                 value = json.loads(summary_file.read_text())
                 value["identity"]["frozen_control"] = True
+                PROBE.write_json(summary_file, value)
+            if first_strict_growth:
+                value = json.loads(summary_file.read_text())
+                value["identity"]["frozen_node_selection"] = "first-strict-growth"
                 PROBE.write_json(summary_file, value)
             if pure_control:
                 value = json.loads(summary_file.read_text())
@@ -3006,6 +3143,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 PROBE.write_json(summary_file, value)
             script = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
             invocations = []
+            frozen_invocations = []
             builds = []
             test = self
 
@@ -3052,11 +3190,12 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if setting:
                         test.assertEqual(kwargs["env"].get("MallocScribble"), "1" if setting == "on" else None)
                     else:
-                        test.assertEqual(kwargs["env"].get("MallocScribble"), None if frozen_control else "inherited-secret")
+                        test.assertEqual(kwargs["env"].get("MallocScribble"), None if frozen_analysis else "inherited-secret")
                     records = pathlib.Path(command[command.index("--records-directory") + 1])
                     records.mkdir()
-                    if frozen_control:
-                        PROBE.write_json(records / "process-cleanup.json", {"processes_exited": frozen_failure != "host-exit", "errors": []})
+                    if frozen_analysis:
+                        PROBE.write_json(records / "process-cleanup.json", {
+                            "processes_exited": not (self.first and frozen_failure == "host-exit"), "errors": []})
                     if terminal_origin:
                         PROBE.write_json(records / "process-cleanup.json", {"processes_exited": True, "errors": []})
                         # This fake runner explicitly enters offline collection,
@@ -3148,6 +3287,8 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                             scans[2]["host"]["install_probe"]["copy_imp"] = "secret"
                     if self.first and first_scan_change:
                         first_scan_change(scans[0])
+                    if self.first and first_scans_change:
+                        first_scans_change(scans)
                     PROBE.write_json(records / "scans.json", scans)
                     result = {"coverage": "passed"}
                     if terminal_origin and self.first and image_cleanup_failure == "not-run":
@@ -3174,19 +3315,34 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
 
             def run_owned(command, log_path, environment, timeout=180):
                 if command[1] == "Scripts/Investigations/ax_frozen_nodes.py":
-                    test.assertTrue(frozen_control)
+                    test.assertTrue(frozen_analysis)
                     test.assertEqual(timeout, 120)
-                    test.assertEqual(invocations, [(None, "control")])
+                    test.assertEqual("--first-strict-growth" in command, first_strict_growth)
+                    test.assertNotIn("MallocScribble", environment)
+                    frozen_invocations.append(invocations[-1])
+                    if frozen_control:
+                        test.assertEqual(invocations, [(None, "control")])
+                    else:
+                        test.assertLessEqual(len(invocations), 10)
+                        test.assertIn(invocations[-1], ((None, "control"), (None, "product")))
                     saved = json.loads(summary_file.read_text())
-                    test.assertEqual(len(saved["trials"]), 1)
+                    test.assertEqual(len(saved["trials"]), len(invocations))
                     test.assertEqual(saved["strict_checks_passed"], first_failure is None)
+                    test.assertEqual(saved["trials"][-1]["mode"], invocations[-1][1])
+                    test.assertNotIn("frozen_node_process_run", saved["trials"][-1])
+                    test.assertEqual([scan["label"] for scan in saved["trials"][-1]["scan_totals"]], list(REPORT.HEAP_LABELS))
                     records = pathlib.Path(command[command.index("--records-directory") + 1])
-                    if frozen_failure != "missing":
-                        PROBE.write_json(records / "frozen-nodes.json", frozen_summary)
-                    complete = frozen_failure != "cleanup"
-                    return {"return_code": 125 if not complete else 124 if frozen_failure == "timeout" else 0,
-                            "command_return_code": None if frozen_failure else 0,
-                            "status": "timeout" if frozen_failure == "timeout" else "completed",
+                    test.assertIs(json.loads((records / "process-cleanup.json").read_text())["processes_exited"], True)
+                    test.assertTrue(saved["trials"][-1]["process_run"]["cleanup"]["complete"])
+                    test.assertEqual(pathlib.Path(command[command.index("--graph-directory") + 1]), records.parent / "fixture/heap")
+                    failure = frozen_failure if len(invocations) == 1 else None
+                    if failure != "missing":
+                        value = frozen_summary if len(invocations) == 1 and frozen_summary is not None else test.frozen_summary(first_strict_growth=first_strict_growth)
+                        PROBE.write_json(records / "frozen-nodes.json", value)
+                    complete = failure != "cleanup"
+                    return {"return_code": 125 if not complete else 124 if failure == "timeout" else 0,
+                            "command_return_code": None if failure else 0,
+                            "status": "timeout" if failure == "timeout" else "completed",
                             "cleanup": {"complete": complete, "group_members_exited": complete,
                                 "leader_reaped": True, "group_signal": "sent",
                                 "group_inspection": "exited" if complete else "running"}}
@@ -3223,6 +3379,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
             if frozen_failure == "cleanup":
                 self.assertFalse(summary["completed"])
                 self.assertFalse(summary["frozen_node_checks_passed"])
+                self.assertEqual(frozen_invocations, [(None, "control")])
                 return invocations, summary
             if image_cleanup_failure in ("collection", "fresh", "missing", "collection-artifact", "fresh-artifact", "gate-write", "collection-stage"):
                 self.assertFalse(summary["completed"])
@@ -3237,15 +3394,18 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(invocations), 1)
                 self.assertEqual(len(summary["trials"]), 1)
                 self.assertFalse(summary["trials"][0]["process_run"]["cleanup"]["complete"])
+                self.assertEqual(frozen_invocations, [])
                 return invocations, summary
             self.assertEqual(summary["strict_checks_passed"], first_failure is None or first_failure.startswith("terminal"))
             self.assertTrue(summary["completed"])
             self.assertEqual(len(summary["trials"]), 1 if frozen_control else 2 if terminal_origin else 20 if enabled else 10)
+            if first_strict_growth:
+                self.assertEqual(frozen_invocations, invocations[1:] if frozen_failure == "host-exit" else invocations)
             for trial_index, receipt in enumerate(summary["trials"]):
                 self.assertEqual(receipt["scan_mode"], scan_mode)
                 self.assertEqual(receipt["diagnostics_expected"], scan_mode == "diagnostic")
                 for scan_index, scan in enumerate(receipt['scan_totals']):
-                    if first_scan_change and trial_index == scan_index == 0:
+                    if trial_index == 0 and (first_scans_change or first_scan_change and scan_index == 0):
                         continue
                     self.assertEqual(scan, {"label": scan["label"], "leak_nodes": 3, "leak_bytes": 300,
                         "unclassified_nodes": 0, "root_instances": 3, "unexpected_root_groups": 0,

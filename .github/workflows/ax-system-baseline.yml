@@ -9,7 +9,7 @@ on:
         required: false
         default: false
       heap_diagnostics:
-        description: 'Compare macOS 26 heap growth in five matched empty-target/product pairs with bounded summaries'
+        description: 'Compare five macOS 26 empty/product pairs, including references at the first strict node/byte growth'
         type: boolean
         required: false
         default: false
@@ -171,7 +171,7 @@ jobs:
     if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin || inputs.pure_appkit_control || inputs.install_gate_control || inputs.frozen_control }}
     name: macOS 26 ${{ inputs.install_gate_control && 'install gate live' || inputs.pure_appkit_control && 'pure AppKit live' || inputs.scan_mode }} heap comparison (arm64)
     runs-on: macos-26
-    timeout-minutes: ${{ inputs.malloc_scribble && 70 || (inputs.pure_appkit_control || inputs.install_gate_control) && 40 || 35 }}
+    timeout-minutes: ${{ inputs.malloc_scribble && 70 || inputs.heap_diagnostics && 55 || (inputs.pure_appkit_control || inputs.install_gate_control) && 40 || 35 }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       CAUSAL_PROBE: ${{ inputs.ax_causal_probe }}
@@ -246,6 +246,8 @@ jobs:
               identity['install_gate_control'] = True
           if frozen_control:
               identity['frozen_control'] = True
+          if os.environ['AX_HEAP_DIAGNOSTICS'] == 'true' and not identity['malloc_scribble_experiment']:
+              identity['frozen_node_selection'] = 'first-strict-growth'
           root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
           root.mkdir(parents=True, exist_ok=False)
           (root / 'summary.json').write_text(json.dumps({'identity':identity, 'trials':[], 'completed':False,
@@ -276,6 +278,9 @@ jobs:
           pure_control = public_summary['identity'].get('pure_appkit_control', False)
           install_control = public_summary['identity'].get('install_gate_control', False)
           frozen_control = public_summary['identity'].get('frozen_control', False)
+          first_strict_growth = public_summary['identity'].get('frozen_node_selection') == 'first-strict-growth'
+          frozen_analysis = frozen_control or first_strict_growth
+          assert not first_strict_growth or diagnostics_expected and not external_receipt
           scribble_experiment = os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'
           fixtures = {}
           if external_receipt:
@@ -327,7 +332,7 @@ jobs:
                   directory.mkdir()
                   records = directory / 'records'
                   environment = dict(os.environ)
-                  if frozen_control:
+                  if frozen_analysis:
                       environment.pop('MallocScribble', None)
                   if scribble:
                       environment.pop('MallocScribble', None)
@@ -593,7 +598,7 @@ jobs:
                       public_summary['terminal_snapshot_checks_passed'] = not terminal_failed
                       summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
                   frozen_cleanup_complete = True
-                  if frozen_control:
+                  if frozen_analysis:
                       receipt.update(frozen_nodes_available=False, frozen_node_checks_passed=False)
                       cleanup_file = records / 'process-cleanup.json'
                       processes_exited = False
@@ -607,7 +612,9 @@ jobs:
                       if process_run['cleanup']['complete'] and processes_exited:
                           node_run = run_owned([sys.executable, 'Scripts/Investigations/ax_frozen_nodes.py',
                               '--graph-directory', str(directory / 'fixture/heap'),
-                              '--records-directory', str(records)], directory / 'frozen-nodes.log', environment, timeout=120)
+                              '--records-directory', str(records),
+                              *(['--first-strict-growth'] if first_strict_growth else [])],
+                              directory / 'frozen-nodes.log', environment, timeout=120)
                           receipt['frozen_node_process_run'] = node_run
                           frozen_cleanup_complete = node_run['cleanup']['complete']
                           # Preserve the original measurement even if offline
@@ -616,10 +623,18 @@ jobs:
                           node_file = records / 'frozen-nodes.json'
                           try:
                               if (node_file.is_file() and not node_file.is_symlink()
-                                      and node_file.stat().st_size <= 16384):
+                                      and node_file.stat().st_size <= 131072):
                                   data = json.loads(node_file.read_text())
                                   validate_frozen_nodes(data)
                                   scan_totals = {point['label']: point for point in receipt['scan_totals']}
+                                  if first_strict_growth:
+                                      growing = [label for label, point in scan_totals.items()
+                                          if any(point[key] > scan_totals['baseline'][key]
+                                                 for key in ('leak_nodes', 'leak_bytes'))]
+                                      expected_selection = 'first-strict-growth' if growing else 'no-strict-growth'
+                                      if (data['selection'] != expected_selection
+                                              or data['selected_label'] != (growing[0] if growing else None)):
+                                          raise ValueError('Frozen selection differs from first strict node/byte growth')
                                   for label, point in (('baseline', data['baseline']),
                                                        (data['selected_label'], data['selected'])):
                                       if point is not None and any(point[key] != scan_totals[label][key]
@@ -627,7 +642,7 @@ jobs:
                                           raise ValueError('Frozen node counts differ from original scans')
                                   if data['selection'] is not None:
                                       labels = list(scan_totals)
-                                      preceding = (labels[1:] if data['selection'] == 'no-new-leak'
+                                      preceding = (labels[1:] if data['selection'] in ('no-new-leak', 'no-strict-growth')
                                                    else labels[1:labels.index(data['selected_label'])])
                                       if any(scan_totals[label][key] > scan_totals['baseline'][key]
                                              for label in preceding for key in ('leak_nodes', 'leak_bytes')):
@@ -648,7 +663,7 @@ jobs:
           public_summary['strict_checks_passed'] = not failed
           if terminal_origin:
               public_summary['terminal_snapshot_checks_passed'] = not terminal_failed
-          if frozen_control:
+          if frozen_analysis:
               public_summary['frozen_node_checks_passed'] = not frozen_failed
           summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
           raise SystemExit(1 if failed or terminal_failed or frozen_failed else 0)

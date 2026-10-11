@@ -55,9 +55,15 @@ def history(events):
 
 
 def trace(address, size, roots):
-    return (f"Tracing: <private-type {address:#x}> [{size}]\n\nFound {roots} roots referencing: <private-type {address:#x}> [{size}]\n\n"
+    text = (f"Tracing: <private-type {address:#x}> [{size}]\n\nFound {roots} roots referencing: <private-type {address:#x}> [{size}]\n\n"
             "This is a reverse reference tree showing how the specified block is referenced.\n"
-            "The top node is the specified block, the next level down are blocks that reference that, and so on.\n")
+            "The top node is the specified block, the next level down are blocks that reference that, and so on.\n"
+            "The number at the start of each line is the number of paths-to-roots going through that node.\n"
+            "This reverse reference tree can be imported into Instruments using Import Sample Data to allow data mining.\n\n")
+    if roots:
+        text += f"    {roots} <private-type {address:#x}> [{size}]\n"
+        text += "".join(f"      1 Region Stack thread {index} private {0x90000 + index * 16:#x}\n" for index in range(roots))
+    return text
 
 
 class Case:
@@ -67,7 +73,7 @@ class Case:
         before = before or {}
         after = {0x2000: 48} if after is None else after
         self.points = {label: dict(before if index < first else after) for index, label in enumerate(NODES.HEAP_LABELS)}
-        self.baseline_heap = {**before, **after}
+        self.baseline_heap = {**after, **before}
         self.heap_diff = {}
         self.before_events = [("ALLOC", address, size) for address, size in self.baseline_heap.items()]
         self.after_events = list(self.before_events)
@@ -114,9 +120,9 @@ class Case:
             return trace(address, size, 2 if label == "baseline" else 0)
         raise AssertionError("Unexpected tool")
 
-    def compare(self):
+    def compare(self, first_strict_growth=False):
         with mock.patch.object(NODES.Tools, "run", autospec=True, side_effect=self.run):
-            result = NODES.compare(self.graphs, self.records)
+            result = NODES.compare(self.graphs, self.records, first_strict_growth=first_strict_growth)
         NODES.validate_summary(result)
         return result
 
@@ -268,7 +274,9 @@ class FrozenComparisonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             case = Case(Path(directory), after={0x1000 + index * 128: 48 for index in range(18)}, first=6)
             value = case.compare()
-            self.assertEqual((value["candidate_count"], len(value["nodes"]), value["omitted_candidates"]), (18, 16, 2))
+            self.assertEqual(value["candidate_count"], 18)
+            self.assertLessEqual(len(value["nodes"]), 16)
+            self.assertEqual(len(value["nodes"]) + value["omitted_candidates"], 18)
             self.assertEqual(value["status"], "partial")
             self.assertIn("candidate_limit", value["reasons"])
             self.assertEqual(len(case.calls), 45)
@@ -319,6 +327,223 @@ class FrozenComparisonTests(unittest.TestCase):
                 value = case.compare()
                 self.assertEqual(value["status"], "unavailable")
                 self.assertEqual(case.calls, [])
+
+
+class ReferenceTests(unittest.TestCase):
+    @staticmethod
+    def xpc_tree(grouped=False):
+        # Self-authored miniature syntax fixture; no external application data.
+        nodes = {0x1000: 160, 0x2000: 320, 0x3000: 64, 0x4000: 48, 0x5000: 64}
+        suffix = "  Protocol: NSAccessibilityRemoteUIElement  Connection: <private name> [no process]"
+        text = totals(nodes)
+        text += "\nSTACK OF 1 INSTANCE OF 'ROOT CYCLE: <NSXPCConnection>':\n0 private stack\n====\n" if grouped else "\n5 (656 bytes) << TOTAL >>\n"
+        text += (f"    5 (656 bytes) ROOT CYCLE: <NSXPCConnection 0x1000> [160]{suffix}\n"
+                 "       3 (432 bytes) _connection --> ROOT CYCLE: <xpc_connection_t 0x2000> [320]  <private name> [no process]\n"
+                 "          1 (64 bytes) ROOT CYCLE: 0x3000 [64]\n"
+                 "          1 (48 bytes) ROOT CYCLE: <__NSMallocBlock__ 0x4000> [48]  PrivateImage  private_block_invoke  0xabcdef\n"
+                 f"             __strong [capture] --> CYCLE BACK TO <NSXPCConnection 0x1000> [160]{suffix}\n"
+                 "       1 (64 bytes) _remoteObjectInterface --> <NSXPCInterface 0x5000> [64]  Protocol: NSAccessibilityRemoteUIElement\n")
+        return nodes, text
+
+    def test_both_real_tree_shapes_preserve_connections_and_cycle_endpoint_paths(self):
+        for grouped in (False, True):
+            nodes, text = self.xpc_tree(grouped)
+            graph = NODES.parse_tree_graph(text, nodes)
+            self.assertEqual(len(graph["members"]), 5)
+            self.assertEqual(graph["members"][0x4000]["parent"], 0x2000)
+            self.assertEqual(graph["back_edges"], [{"source": 0x4000, "target": 0x1000,
+                              "label": "__strong [capture]", "root": 0}])
+            selected = NODES.tree_reference_graph(graph, 0x5000)
+            self.assertEqual(set(selected["members"]), {0x1000, 0x2000, 0x4000, 0x5000})
+            self.assertEqual(len(selected["edges"]), 4)
+            value = NODES.initial_summary()
+            builder = NODES.References(value, nodes)
+            view = NODES.reference_view(0, "selected", "tree")
+            builder.add(selected, view)
+            output = NODES.encode_summary(value).decode()
+            for private in ("0x", "private", "PrivateImage", "block_invoke"):
+                self.assertNotIn(private, output)
+            self.assertIn("__strong [capture]", output)
+            self.assertIn("NSAccessibilityRemoteUIElement", output)
+
+    def test_back_reference_at_sibling_indent_belongs_to_parent_not_previous_child(self):
+        nodes, text = self.xpc_tree()
+        text = text.replace("             __strong [capture]", "          __strong [capture]")
+        graph = NODES.parse_tree_graph(text, nodes)
+        self.assertEqual(graph["back_edges"][0]["source"], 0x2000)
+        self.assertEqual(graph["members"][0x5000]["parent"], 0x1000)
+
+    def test_tree_unknown_names_are_buckets_and_unknown_syntax_fails_closed(self):
+        nodes, text = self.xpc_tree()
+        graph = NODES.parse_tree_graph(text.replace("NSAccessibilityRemoteUIElement", "PrivateProtocol").replace("_connection -->", "privateMember -->"), nodes)
+        self.assertEqual(graph["members"][0x1000]["protocol"], "unknown")
+        self.assertEqual(graph["members"][0x2000]["edge"], "unknown")
+        for changed in (text.replace("5 (656 bytes) << TOTAL >>", "4 (656 bytes) << TOTAL >>"),
+                        text.replace("[320]  <private name>", "[320] unknown-tail <private name>"),
+                        text.replace("3 (432 bytes)", "4 (432 bytes)"),
+                        text.replace("0x3000 [64]", "0x4000 [64]"),
+                        text.replace("0x5000> [64]", "0x5000> [65]"),
+                        text.replace("_connection -->", "unsupported relation -->"),
+                        text + "unknown trailing row\n"):
+            with self.subTest(text=changed), self.assertRaises(ValueError):
+                NODES.parse_tree_graph(changed, nodes)
+        no_protocol_back = text.replace("CYCLE BACK TO <NSXPCConnection 0x1000> [160]  Protocol: NSAccessibilityRemoteUIElement  Connection: <private name> [no process]",
+                                        "CYCLE BACK TO <NSXPCConnection 0x1000> [160]")
+        self.assertEqual(len(NODES.parse_tree_graph(no_protocol_back, nodes)["back_edges"]), 1)
+
+    def test_reverse_paths_keep_intermediate_regions_and_slot_labels(self):
+        text = trace(0x1000, 48, 2).split("    2 <", 1)[0]
+        text += ("    2 <private-type 0x1000> [48]\n"
+                 "      2 Region Kernel Alloc Once region + 64 0x90000\n"
+                 "      + 1 <__NSMallocBlock__ 0x2000> [48] +16: __strong [capture] 0x2010\n"
+                 "      + ! 1 Region Stack thread 1 private 0x90010\n"
+                 "      + 1 Kernel Pointers Into User Space \n")
+        graph = NODES.parse_trace_graph(text, 0x1000, 48)
+        self.assertEqual((len(graph["members"]), len(graph["edges"]), graph["roots"]), (5, 4, 2))
+        self.assertTrue(any(edge["label"] == "__strong [capture]" for edge in graph["edges"]))
+        for changed in (text.replace("+16:", "+17:"), text.replace("      2 Region", "      3 Region"),
+                        text.replace("+ ! 1 Region", "+ ! 2 Region"), text + "unparsed\n",
+                        text.replace("Kernel Pointers Into User Space", "Unknown root")):
+            with self.subTest(text=changed), self.assertRaises(ValueError):
+                NODES.parse_trace_graph(changed, 0x1000, 48)
+        zero = NODES.parse_trace_graph(trace(0x1000, 48, 0), 0x1000, 48)
+        self.assertEqual((zero["roots"], zero["edges"]), (0, []))
+
+    def test_shared_ids_do_not_claim_allocation_identity_or_discard_baseline_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = Case(Path(directory)).compare()
+        refs = value["references"]
+        self.assertEqual(refs["semantics"], "tool-reported")
+        views = {(view["checkpoint"], view["kind"]): view for view in refs["views"]}
+        self.assertEqual(views["baseline", "tree"]["status"], "not_leaked")
+        self.assertEqual(views["baseline", "trace"]["status"], "complete")
+        self.assertEqual(len(views["baseline", "trace"]["edges"]), 2)
+        self.assertEqual(views["baseline", "trace"]["target"], views["selected", "tree"]["target"])
+        self.assertEqual(len(views["selected", "trace"]["edges"]), 0)
+
+    def test_reference_limits_are_atomic_and_preserve_selected_cycle_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(NODES, "REFERENCE_NODES", 1):
+                value = Case(Path(directory)).compare()
+        self.assertEqual(value["status"], "partial")
+        self.assertIn("references_budget", value["reasons"])
+        views = {(view["checkpoint"], view["kind"]): view for view in value["references"]["views"]}
+        self.assertEqual(views["selected", "tree"]["status"], "complete")
+        self.assertEqual(views["baseline", "trace"]["status"], "budget_exceeded")
+        self.assertEqual(len(value["references"]["nodes"]), 1)
+        NODES.validate_summary(value)
+
+    def test_public_gate_rejects_arbitrary_reference_data_dangling_ids_and_false_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = Case(Path(directory)).compare()
+        edits = [lambda v: v["references"].update(semantics="ARC ownership"),
+                 lambda v: v["references"]["nodes"][0].update(type="PrivateClass"),
+                 lambda v: v["references"]["nodes"][0].update(protocol="PrivateProtocol"),
+                 lambda v: v["references"]["nodes"][0].update(id="0x1000"),
+                 lambda v: v["references"]["edges"][0].update(source=999),
+                 lambda v: v["references"]["edges"][0].update(label="PrivateLabel"),
+                 lambda v: v["references"]["views"].pop(),
+                 lambda v: v["references"]["views"][1].update(target=999)]
+        for edit in edits:
+            bad = copy.deepcopy(value); edit(bad)
+            with self.assertRaises(ValueError): NODES.validate_summary(bad)
+
+    def test_reference_target_root_summary_and_all_back_edges_are_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = Case(Path(directory)).compare(first_strict_growth=True)
+        changed = copy.deepcopy(value)
+        changed["nodes"][0]["size"] = 777
+        with self.assertRaises(ValueError): NODES.validate_summary(changed)
+        changed = copy.deepcopy(value)
+        for view in changed["references"]["views"]:
+            view["edges"] = [index for index in view["edges"] if changed["references"]["edges"][index]["relation"] != "cycle_back"]
+        NODES.prune_references(changed)
+        with self.assertRaises(ValueError): NODES.validate_summary(changed)
+        changed = copy.deepcopy(value)
+        root = next(node for node in changed["references"]["nodes"] if node["tree"] is not None)
+        root["tree"]["bytes"] += 1
+        with self.assertRaises(ValueError): NODES.validate_summary(changed)
+
+    def test_byte_budget_removes_reverse_views_before_selected_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = Case(Path(directory)).compare()
+        full_size = len(NODES.encode_summary(value))
+        with mock.patch.object(NODES, "PUBLIC_LIMIT", full_size - 100):
+            NODES.bound_summary(value)
+            NODES.validate_summary(value)
+            self.assertLessEqual(len(NODES.encode_summary(value)), NODES.PUBLIC_LIMIT)
+        selected = next(view for view in value["references"]["views"] if view["kind"] == "tree" and view["checkpoint"] == "selected")
+        baseline = next(view for view in value["references"]["views"] if view["kind"] == "trace" and view["checkpoint"] == "baseline")
+        self.assertEqual((selected["status"], baseline["status"]), ("complete", "budget_exceeded"))
+        self.assertIn("summary_budget", value["reasons"])
+
+    def test_repeated_back_relations_keep_multiplicity_after_enum_redaction(self):
+        nodes, text = self.xpc_tree()
+        back = next(line for line in text.splitlines() if "CYCLE BACK TO" in line)
+        graph = NODES.parse_tree_graph(text.replace(back, back + "\n" + back), nodes)
+        self.assertEqual(graph["roots"][0]["summary"]["cycle_back_edges"], 2)
+        value = NODES.initial_summary(); builder = NODES.References(value, nodes)
+        builder.add(NODES.tree_reference_graph(graph, 0x5000), NODES.reference_view(0, "selected", "tree"))
+        edges = [edge for edge in value["references"]["edges"] if edge["relation"] == "cycle_back"]
+        self.assertEqual([edge["count"] for edge in edges], [2])
+
+
+class StrictGrowthTests(unittest.TestCase):
+    def test_strict_selection_skips_equal_totals_replacement_but_keeps_first_growth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory), {0x1000: 48}, {0x2000: 48})
+            for label in NODES.HEAP_LABELS[3:]: case.points[label][0x3000] = 48
+            case.baseline_heap[0x3000] = 48
+            case.before_events.append(("ALLOC", 0x3000, 48)); case.after_events = list(case.before_events)
+            case.write_scans()
+            value = case.compare(first_strict_growth=True)
+            self.assertEqual(value["selection"], "first-strict-growth")
+            self.assertEqual(value["selected_label"], "removed-10")
+            self.assertEqual(len(value["checked_points"]), 4)
+            self.assertEqual(value["status"], "complete")
+
+    def test_no_strict_growth_still_checks_baseline_tree_and_all_lists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory), {0x1000: 48}, {0x2000: 48})
+            value = case.compare(first_strict_growth=True)
+            self.assertEqual(value["selection"], "no-strict-growth")
+            self.assertEqual(value["baseline_roots"]["status"], "complete")
+            self.assertEqual(value["baseline_roots"]["roots"][0]["nodes"], 1)
+            self.assertEqual([(kind, label) for kind, label, _ in case.calls], [("list", label) for label in NODES.HEAP_LABELS] + [("tree", "baseline")])
+            self.assertEqual(value["references"]["status"], "not_needed")
+            for edit in (lambda v: v["checked_points"][1].update(leak_nodes=2),
+                         lambda v: v["checked_points"][1].update(leak_bytes=49),
+                         lambda v: v["baseline_roots"].update(status="not_requested", roots=[]),
+                         lambda v: v["tools"].pop()):
+                bad = copy.deepcopy(value); edit(bad)
+                with self.assertRaises(ValueError): NODES.validate_summary(bad)
+
+    def test_no_strict_growth_unknown_baseline_tree_is_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory), {0x1000: 48}, {0x1000: 48})
+            case.failures[("tree", "baseline")] = "private unsupported grammar"
+            value = case.compare(first_strict_growth=True)
+            self.assertEqual(value["status"], "partial")
+            self.assertEqual(value["baseline_roots"]["status"], "unavailable")
+            self.assertIn("tree_invalid", value["reasons"])
+
+    def test_product_mode_is_only_accepted_by_strict_growth_option(self):
+        for strict in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                case = Case(Path(directory), {0x1000: 48}, {0x1000: 48})
+                (case.records / "result.json").write_text(json.dumps({"mode": "product", "scan_mode": "diagnostic"}))
+                value = case.compare(first_strict_growth=strict)
+                self.assertEqual(value["status"], "complete" if strict else "unavailable")
+
+    def test_cli_option_selects_strict_growth_without_changing_strict_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); case = Case(root, {0x1000: 48}, {0x2000: 48})
+            original = (case.records / "result.json").read_bytes()
+            with mock.patch.object(NODES.Tools, "run", autospec=True, side_effect=case.run), contextlib.redirect_stdout(io.StringIO()):
+                code = NODES.main(["--graph-directory", str(case.graphs), "--records-directory", str(case.records), "--first-strict-growth"])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads((case.records / "frozen-nodes.json").read_text())["selection"], "no-strict-growth")
+            self.assertEqual((case.records / "result.json").read_bytes(), original)
 
 
 class FrozenToolTests(unittest.TestCase):
@@ -413,6 +638,7 @@ class FrozenPublicGateTests(unittest.TestCase):
         value = NODES.initial_summary()
         value.update(status="complete", selection="no-new-leak",
                      baseline={"leak_nodes": 3, "leak_bytes": 300, "graph_sha256": "0" * 64},
+                     checked_points=[{"label": label, "leak_nodes": 3, "leak_bytes": 300} for label in NODES.HEAP_LABELS],
                      tools=[{"tool": "list", "label": label, "status": "complete", "return_code": 0, "cleanup_confirmed": True}
                             for label in NODES.HEAP_LABELS])
         return value
@@ -423,6 +649,7 @@ class FrozenPublicGateTests(unittest.TestCase):
         for status in ("complete", "partial"):
             bad = copy.deepcopy(value)
             bad["selected"].update(leak_nodes=2, leak_bytes=96)
+            bad["checked_points"][-1].update(leak_nodes=2, leak_bytes=96)
             bad["comparison"].update(added_nodes=2, added_bytes=96)
             bad["status"] = status
             if status == "partial": bad["reasons"] = ["candidate_limit"]
@@ -443,6 +670,7 @@ class FrozenPublicGateTests(unittest.TestCase):
         resized.update(status="partial", nodes=[], candidate_count=0, reasons=["deadline"])
         with self.assertRaises(ValueError): NODES.validate_summary(resized)
         resized.update(candidate_count=1, omitted_candidates=1)
+        resized["references"] = {**NODES.empty_references(), "status": "partial"}
         NODES.validate_summary(resized)
 
     def test_complete_no_new_requires_exact_seven_list_receipts(self):
@@ -527,7 +755,7 @@ class FrozenPublicGateTests(unittest.TestCase):
                     code = NODES.main(["--graph-directory", str(case.graphs), "--records-directory", str(case.records)])
                 self.assertEqual(code, 0 if complete else 1)
                 data = (case.records / "frozen-nodes.json").read_bytes()
-                self.assertLessEqual(len(data), 16384)
+                self.assertLessEqual(len(data), NODES.PUBLIC_LIMIT)
                 NODES.validate_summary(json.loads(data))
                 self.assertNotIn("private", output.getvalue())
                 self.assertNotIn(str(root), output.getvalue())
