@@ -1,16 +1,16 @@
 # QuickFile Beta 测试指南
 
-当前没有面向普通用户的已放行分发包。无需 Apple 开发者会员的 Community DMG 和使用自己 Apple 团队的证书签名构建是两条独立测试路线。每份产物都要记录版本、build、SHA-256 和实际签名方式，不能互相继承安装、权限或 Finder 验收。Community 采用 ad-hoc 签名，未经公证；Developer ID 和公证不是它的既有能力。
+稳定版 0.1.0 尚未完成验收，也没有面向普通用户的已放行稳定包。当前 Community 实验候选为 `v0.1.0-beta.1`（内部 build `78`，对外 DMG 名为 `QuickFile-v0.1.0-beta.1.dmg`），对应 [GitHub Releases 页面](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.1)的草稿或公开状态以 GitHub 为准；源码提交、Actions run、工具链和四项资产哈希以该页的 `build-provenance.json` 为准。无需 Apple 开发者会员的 Community DMG 和使用自己 Apple 团队的证书签名构建是两条独立测试路线；Community 采用 ad-hoc 签名、未经公证并手动覆盖升级，Developer ID 和公证不是它的既有能力。
 
 ## Community DMG 入口
 
 1. 按[免费自行分发流程](COMMUNITY_DISTRIBUTION.md) 构建候选，或取得候选提供方固定的 DMG、对应 SHA-256 和验证范围说明。核对下载字节与校验和；签名检查通过不代表系统已信任发布者。
-2. 备份现有应用和数据，退出旧版，打开 DMG，将 `QuickFile.app` 拖到“应用程序”，推出镜像后从“应用程序”启动。保持下载时的隔离属性及默认安全设置；系统提供“隐私与安全性 → 仍要打开”时，由测试者确认来源后逐应用批准。记录提示与实际结果，不使用 `xattr -cr`、重签或全局关闭 Gatekeeper 代替验收。
+2. 备份现有应用和数据，退出旧版，打开 DMG，将 `QuickFile.app` 拖到“应用程序”，推出镜像后从“应用程序”启动。保持下载时的隔离属性及默认安全设置；系统提供“隐私与安全性 → 仍要打开”时，由测试者确认来源后逐应用批准。记录提示与实际结果，不以 `xattr -cr`、重签或全局关闭 Gatekeeper 代替验收；手动排障边界见[安装指南](INSTALLATION.md)。
 3. 核对主 App 与嵌入扩展的版本/build、双架构、ad-hoc 签名及权限，并确认实际加载的是本次安装副本。Community 无 Team 和 profile，按 `verify-community-artifact.py` 检查，不套用证书签名路线的 Team 要求。
 4. 记录首次启动及覆盖升级时的 App Group 访问与 Finder 扩展启用结果。取消授权或系统拒绝时保留错误并停止该项；不得关闭沙盒、换共享目录或执行注册修复来把失败算作通过。
 5. 在专用目录完成主 App 创建、Finder 创建、持久目录授权及退出重开闭环，再继续下述核心操作、恢复和重启检查。Community 当前手动覆盖升级，不提供在线版本检查或 Sparkle 自动更新；升级前备份模板和目录授权，升级后重新核对实际加载版本及数据。
 
-最终 DMG 的默认安全设置新机器验收与本机构建验收分开记录。尚未完成的范围保持待测，不能以本机开发环境的成功代替。
+最终 DMG 在默认安全设置的干净机器、完整 Finder 矩阵上的验收与本机构建验收分开记录。完整内存与端到端性能、残余 AX 内存增长归因、诊断 UI、无 Finder 窗口的 Desktop、Mac 重启/注销及普通用户分发门槛仍需完成；尚未完成的范围保持待测，不能以本机开发环境的成功代替。
 
 ## 自有团队签名入口
 

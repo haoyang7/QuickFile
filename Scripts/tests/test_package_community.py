@@ -68,6 +68,7 @@ class CommunityPackagingTests(unittest.TestCase):
         self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
         self.assertEqual(report["verdict"], "pass")
         archive, = self.output.glob("*.dmg")
+        self.assertEqual(archive.name, "QuickFile-community-0.1.0-70.dmg")
         self.assertEqual(list(self.output.glob("*.zip")), [])
         checksum = archive.with_name(archive.name + ".sha256").read_text()
         self.assertEqual(checksum, MODULE.ARTIFACT.sha256(archive) + "  " + archive.name + "\n")
@@ -84,6 +85,44 @@ class CommunityPackagingTests(unittest.TestCase):
             self.assertNotIn("--deep", command)
             self.assertEqual(command[command.index("--sign") + 1], "-")
             self.assertIn("runtime", command)
+        self.assert_clean()
+
+    def test_release_tags_propagate_to_dmg_checksum_and_receipt(self):
+        for tag in ("v0.1.0", "v0.1.0-beta.1", "v0.1.0-beta.12"):
+            with self.subTest(tag=tag):
+                self.arguments.release_tag = tag
+                report = self.package()
+                filename = f"QuickFile-{tag}.dmg"
+                image = self.output / filename
+                self.assertEqual([path.name for path in self.output.glob("*.dmg")], [filename])
+                self.assertEqual([path.name for path in self.output.glob("*.sha256")], [filename + ".sha256"])
+                self.assertEqual(image.with_name(filename + ".sha256").read_text(), MODULE.ARTIFACT.sha256(image) + "  " + filename + "\n")
+                receipt = json.loads((self.output / "artifact-check.json").read_text())
+                self.assertEqual(receipt, report)
+                self.assertEqual(receipt["archive"], filename)
+                self.assertEqual(receipt["archive_sha256"], MODULE.ARTIFACT.sha256(image))
+                self.assertEqual(receipt["archive_bytes"], image.stat().st_size)
+                self.assertEqual(receipt["dmg"]["image"], filename)
+                self.assertEqual(receipt["version"], "0.1.0")
+                self.assertEqual(receipt["build"], "70")
+                instructions = (self.output / "INSTALL.txt").read_text()
+                self.assertIn(f"shasum -a 256 -c {filename}.sha256", instructions)
+                self.assertIn("xattr -dr com.apple.quarantine /Applications/QuickFile.app", instructions)
+                self.assertIn("xattr -cr /Applications/QuickFile.app", instructions)
+                self.assertIn("所有扩展属性", instructions)
+                shutil.rmtree(self.output)
+        self.assert_clean()
+
+    def test_invalid_or_mismatched_release_tags_fail_before_tools(self):
+        before = MODULE.ARTIFACT.tree_manifest(self.app)
+        for tag in ("", "0.1.0", "v0.1.0-beta.0", "v0.1.0-beta.01", "v0.1.0-beta.-1", "v0.1.0-beta.1.2", "v0.1.0-rc.1", "v0.1.0-BETA.1", "../v0.1.0", "v0.1.0/extra", "v0.1.0\n", "v0.1.0;touch unwanted", "v0.1.0$(touch unwanted)", "v0.2.0", "v0.2.0-beta.1"):
+            with self.subTest(tag=tag):
+                self.arguments.release_tag = tag
+                with self.assertRaisesRegex(ValueError, "release tag"):
+                    self.package()
+                self.assertFalse(self.output.exists())
+                self.assertEqual(self.commands, [])
+        self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
         self.assert_clean()
 
     def test_dmg_failure_does_not_publish_and_preserves_recovery_workspace(self):

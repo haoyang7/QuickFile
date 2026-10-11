@@ -101,6 +101,18 @@ def unsigned_build_component(component: Path, architecture: str) -> bool:
     return entitlements == {}
 
 
+def archive_filename(info: dict, release_tag: str | None) -> str:
+    version = info["CFBundleShortVersionString"]
+    if release_tag is None:
+        return f"QuickFile-community-{version}-{info['CFBundleVersion']}.dmg"
+    match = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+)(?:-beta\.[1-9][0-9]*)?", release_tag)
+    if match is None:
+        raise ValueError("release tag must be vVERSION or vVERSION-beta.N with positive N")
+    if match[1] != version:
+        raise ValueError("release tag must match the app marketing version")
+    return f"QuickFile-{release_tag}.dmg"
+
+
 def package(arguments: argparse.Namespace) -> dict:
     raw_output = arguments.output.absolute()
     if raw_output.exists() or raw_output.is_symlink():
@@ -114,6 +126,7 @@ def package(arguments: argparse.Namespace) -> dict:
         raise ValueError("community packaging must use paths outside /Applications")
     input_manifest = ARTIFACT.validate_layout(app, allow_sparkle=True)
     info = ARTIFACT.validate_configuration(app, allow_sparkle_services=True)
+    filename = archive_filename(info, getattr(arguments, "release_tag", None))
     for label, relative, binary_relative in ARTIFACT.COMPONENTS:
         binary = app / relative / binary_relative
         for architecture in ARTIFACT.ARCHITECTURES:
@@ -154,7 +167,6 @@ def package(arguments: argparse.Namespace) -> dict:
             raise ValueError("signed community artifact failed verification")
         delivery = Path(delivery_temporary) / "delivery"
         delivery.mkdir()
-        filename = f"QuickFile-community-{info['CFBundleShortVersionString']}-{info['CFBundleVersion']}.dmg"
         image = delivery / filename
         # A failed detach must preserve its backing image and workspace, outside
         # the automatically removed signing and delivery staging directories.
@@ -171,16 +183,24 @@ def package(arguments: argparse.Namespace) -> dict:
         (delivery / (filename + ".sha256")).write_text(digest + "  " + filename + "\n", encoding="utf-8")
         (delivery / "artifact-check.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (delivery / "INSTALL.txt").write_text(
-            "QuickFile experimental community build\n\n"
-            "The application is ad-hoc signed and unnotarized. Artifact checks do not prove\n"
-            "cross-machine launch, Finder integration, upgrades or Gatekeeper acceptance.\n"
-            "Verify the DMG against its .sha256 file, then open the disk image.\n"
-            "Keep a backup before replacing an existing QuickFile installation.\n"
-            "Quit QuickFile, then drag QuickFile.app onto Applications and eject the image.\n"
-            "Open QuickFile; macOS may block this unnotarized application. Follow only\n"
-            "the system's explicit per-application approval flow if you trust this build.\n"
-            "Enable QuickFile's Finder extension in System Settings, then use the app's\n"
-            "Finder integration verification. Online updates are disabled; upgrades are manual.\n",
+            "QuickFile Community 安装说明\n\n"
+            "1. 从可信的 QuickFile 官方 GitHub Release 下载 DMG 和同名 .sha256 文件。\n"
+            "   在下载目录中运行下列命令；只有显示 OK 且来源可信时继续：\n"
+            f"   shasum -a 256 -c {filename}.sha256\n"
+            "2. 升级前备份 QuickFile 数据与旧版本，然后退出 QuickFile。\n"
+            "3. 打开 DMG，将 QuickFile.app 拖入 Applications；升级时确认替换旧版本。\n"
+            "4. 推出磁盘映像，再从 /Applications 启动 QuickFile。\n\n"
+            "此版本采用 ad-hoc 签名，未经 Apple 公证，macOS 可能阻止首次启动。\n"
+            "请先尝试系统针对该应用提供的“仍要打开”等逐应用批准流程。\n"
+            "确认下载来源可信且 SHA-256 校验通过后，如需移除隔离属性，优先运行：\n"
+            "   xattr -dr com.apple.quarantine /Applications/QuickFile.app\n"
+            "另一命令会递归清除所有扩展属性，影响范围更广：\n"
+            "   xattr -cr /Applications/QuickFile.app\n"
+            "两条 xattr 命令都不提供签名、公证或目录访问授权。无需全局关闭 Gatekeeper 或 SIP。\n\n"
+            "在系统设置中启用 QuickFile 的 Finder 扩展，再在应用内验证 Finder 集成。\n"
+            "Finder 扩展开关与目录授权是独立步骤；按应用提示授权需要使用的目录。\n"
+            "QuickFile 无需“完全磁盘访问”。此版本不自动检查更新，升级需手动下载安装。\n"
+            "产物检查不代表已在干净机器验证启动、Finder 集成或完整权限迁移。\n",
             encoding="utf-8",
         )
         publish_directory(delivery, output)
@@ -191,6 +211,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app", type=Path, required=True, help="unsigned Release QuickFile.app with updates disabled")
     parser.add_argument("--output", type=Path, required=True, help="new output directory; never overwritten")
+    parser.add_argument("--release-tag", help="vVERSION or vVERSION-beta.N matching the app marketing version")
     arguments = parser.parse_args(argv)
     try:
         package(arguments)

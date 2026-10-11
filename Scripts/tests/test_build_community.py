@@ -1,7 +1,9 @@
 """Exercise the build script's actual cleanup heredoc on owned product fixtures."""
 import json
+import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,67 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "Scripts" / "build-community.sh"
 TEMPORARY = ROOT / ".build" / "Temporary"
+
+
+class CommunityBuildArgumentsTests(unittest.TestCase):
+    def setUp(self):
+        TEMPORARY.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="community-build-arguments-tests-", dir=TEMPORARY)
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.output = self.directory / "new output"
+        self.record = self.directory / "package-arguments"
+        tools = self.directory / "tools"
+        tools.mkdir()
+        python = tools / "python3"
+        python.write_text(
+            '#!/bin/bash\n'
+            'if [[ "$1" == Scripts/package-community.py ]]; then\n'
+            '    printf "%s\\0" "$@" > "$QUICKFILE_TEST_PACKAGE_ARGUMENTS"\n'
+            'else\n'
+            f'    exec {shlex.quote(sys.executable)} "$@"\n'
+            'fi\n'
+        )
+        python.chmod(0o755)
+        self.environment = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"], QUICKFILE_TEST_PACKAGE_ARGUMENTS=str(self.record))
+        source = SCRIPT.read_text()
+        # Execute the real argument handling and package invocation, without the
+        # Xcode build, signature tools or host registration side effects.
+        self.program = source.split("command -v xcodegen", 1)[0] + \
+            "TASK_DIRECTORY=" + shlex.quote(str(self.directory / "build")) + "\n" + \
+            source[source.index("PACKAGE_ARGUMENTS=("):]
+
+    def run_arguments(self, *arguments):
+        return subprocess.run(["/bin/bash", "-c", self.program, str(SCRIPT), *arguments], env=self.environment, capture_output=True, text=True)
+
+    def test_old_interface_passes_only_app_and_output(self):
+        result = self.run_arguments("--output", str(self.output))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.record.read_bytes().split(b"\0")[:-1], [
+            b"Scripts/package-community.py", b"--app", os.fsencode(self.directory / "build/DerivedData/Build/Products/Release/QuickFile.app"),
+            b"--output", os.fsencode(self.output),
+        ])
+
+    def test_release_tag_is_passed_as_one_argument(self):
+        for tag in ("v0.1.0", "v0.1.0-beta.1", "v0.1.0-beta.12"):
+            with self.subTest(tag=tag):
+                result = self.run_arguments("--output", str(self.output), "--release-tag", tag)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.record.read_bytes().split(b"\0")[-3:], [b"--release-tag", tag.encode(), b""])
+
+    def test_rejects_invalid_tags_and_option_shapes_before_packaging(self):
+        invalid = [(), ("--unknown", str(self.output)), ("--output",),
+                   ("--output", str(self.output), "--unknown", "v0.1.0"),
+                   ("--output", str(self.output), "--release-tag")]
+        invalid += [("--output", str(self.output), "--release-tag", tag) for tag in (
+            "", "0.1.0", "v0.1.0-beta.0", "v0.1.0-beta.01", "v0.1.0-rc.1", "../v0.1.0", "v0.1.0\n", "v0.1.0;touch unwanted",
+        )]
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                result = self.run_arguments(*arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.record.exists())
+                self.assertFalse(self.output.exists())
 
 
 class CommunityBuildCleanupTests(unittest.TestCase):

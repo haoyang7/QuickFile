@@ -3,8 +3,13 @@
 set -euo pipefail
 
 PROJECT_DIRECTORY=$(cd -- "$(dirname -- "$0")/.." && pwd)
-if [[ $# -ne 2 || "$1" != "--output" ]]; then
-    echo "usage: Scripts/build-community.sh --output NEW_DIRECTORY" >&2
+if [[ ( $# -ne 2 && $# -ne 4 ) || "$1" != "--output" || ( $# -eq 4 && "$3" != "--release-tag" ) ]]; then
+    echo "usage: Scripts/build-community.sh --output NEW_DIRECTORY [--release-tag TAG]" >&2
+    exit 2
+fi
+RELEASE_TAG=${4-}
+if [[ $# -eq 4 && ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[1-9][0-9]*)?$ ]]; then
+    echo "error: release tag must be vVERSION or vVERSION-beta.N with positive N" >&2
     exit 2
 fi
 OUTPUT_DIRECTORY=$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).absolute())' "$2")
@@ -120,6 +125,11 @@ import sys
 if hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() != sys.argv[2]:
     raise SystemExit("error: Package.resolved changed during the build")
 PY
-python3 Scripts/package-community.py \
-    --app "$TASK_DIRECTORY/DerivedData/Build/Products/Release/QuickFile.app" \
+PACKAGE_ARGUMENTS=(
+    --app "$TASK_DIRECTORY/DerivedData/Build/Products/Release/QuickFile.app"
     --output "$OUTPUT_DIRECTORY"
+)
+if [[ -n "$RELEASE_TAG" ]]; then
+    PACKAGE_ARGUMENTS+=(--release-tag "$RELEASE_TAG")
+fi
+python3 Scripts/package-community.py "${PACKAGE_ARGUMENTS[@]}"

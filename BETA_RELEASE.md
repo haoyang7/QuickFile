@@ -1,6 +1,6 @@
 # QuickFile v0.1 Beta 冻结与分发规则
 
-QuickFile 0.1.0 尚未发布，完整运行与分发准入尚未通过。免费自行分发使用独立的 [community 实验流程](COMMUNITY_DISTRIBUTION.md)，必须明确未经公证及实际验证范围。本文的证书签名路线面向 Developer ID、公证发布和注册设备测试；两类产物不能互相继承签名或运行验收。源码版本以 [project.yml](project.yml) 为准，不能据此推断已安装产物或验收状态。
+稳定版 QuickFile 0.1.0 仍未完成发布验收，也未公开发布。当前 Community 实验候选为 `v0.1.0-beta.1`（内部 build `78`，对外 DMG 名为 `QuickFile-v0.1.0-beta.1.dmg`），对应 [GitHub Releases 页面](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.1)的草稿或公开状态以 GitHub 为准；源码提交、Actions run、工具链和四项资产哈希以该页的 `build-provenance.json` 为准。该候选采用 ad-hoc 签名、未经公证并手动覆盖升级。下文为独立的证书签名路线，面向 Developer ID、公证发布和注册设备测试；两类产物不能互相继承签名或运行验收。源码版本以 [project.yml](project.yml) 为准，不能据此推断已安装产物或验收状态。
 
 ## 冻结范围与安全边界
 
