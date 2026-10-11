@@ -178,6 +178,14 @@ def parse_tree_graph(report, nodes):
     seen = set()
     for tree, instances, header_marker, header_kind in blocks:
         stack, ancestors, root_count = [], set(), 0
+        lines = [line for line in tree.splitlines() if line.strip()]
+        aggregate = re.fullmatch(r"( +)(\d{1,6}) \([^\n)]+\) << TOTAL >>", lines[0]) if lines else None
+        group_start, separator_pending = len(seen), False
+        if aggregate:
+            if instances is None or instances < 2 or not 0 < int(aggregate[2]) <= 100000:
+                raise ValueError("Unsupported tree row")
+            lines.pop(0)
+        separated = aggregate and any(re.fullmatch(r" +----", line) for line in lines)
 
         def close_node():
             entry = stack.pop()
@@ -185,8 +193,15 @@ def parse_tree_graph(report, nodes):
             if entry["reported"] != len(seen) - entry["start"]:
                 raise ValueError("Incomplete subtree")
 
-        for line in tree.splitlines():
-            if not line.strip():
+        for line in lines:
+            # Observed multi-instance groups use either blank lines or a ----
+            # separator before every root, never arbitrary skipped content.
+            if aggregate and re.fullmatch(r" +----", line):
+                if len(line) - 4 != len(aggregate[1]) + 2 or separator_pending:
+                    raise ValueError("Unsupported tree row")
+                while stack:
+                    close_node()
+                separator_pending = True
                 continue
             row = re.fullmatch(r"( +)(?:(\d{1,6}) \([^\n)]+\) )?(.*)", line)
             if not row:
@@ -194,6 +209,10 @@ def parse_tree_graph(report, nodes):
             indent, count, text = len(row[1]), row[2], row[3]
             while stack and indent <= stack[-1]["indent"]:
                 close_node()
+            if aggregate and not stack:
+                if bool(separator_pending) != bool(separated) or indent != len(aggregate[1]) + 2:
+                    raise ValueError("Unsupported tree row")
+                separator_pending = False
             edge = None
             if " --> " in text:
                 edge, text = text.split(" --> ", 1)
@@ -241,6 +260,10 @@ def parse_tree_graph(report, nodes):
             seen.add(address)
         while stack:
             close_node()
+        if separator_pending:
+            raise ValueError("Unsupported tree row")
+        if aggregate and int(aggregate[2]) != len(seen) - group_start:
+            raise ValueError("Incomplete subtree")
         if instances is not None and root_count != instances:
             raise ValueError("Root instance count mismatch")
     if seen != set(nodes):
@@ -273,10 +296,18 @@ def trace_roots(report, address, size):
 def parse_trace_graph(report, address, size):
     """Validate all reverse paths; edge direction is referrer -> referenced."""
     roots = trace_roots(report, address, size)
-    marker = "This reverse reference tree can be imported into Instruments using Import Sample Data to allow data mining."
-    if report.count(marker) != 1:
+    preamble = (
+        "This is a reverse reference tree showing how the specified block is referenced.\n"
+        "The top node is the specified block, the next level down are blocks that reference that, and so on.\n"
+        "The number at the start of each line is the number of paths-to-roots going through that node.\n")
+    marker = "This reverse reference tree can be imported into Instruments using Import Sample Data to allow data mining.\n"
+    if report.count(preamble) != 1 or any(report.count(line) != 1 for line in preamble.splitlines()):
         raise ValueError("Unsupported trace preamble")
-    body = report.split(marker, 1)[1]
+    body = report.split(preamble, 1)[1]
+    if marker in report:
+        if report.count(marker) != 1 or not body.startswith(marker):
+            raise ValueError("Unsupported trace preamble")
+        body = body[len(marker):]
     members, edges, stack = {}, [], []
     top = None
 

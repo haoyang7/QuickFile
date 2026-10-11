@@ -165,6 +165,77 @@ class FrozenParserTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             NODES.parse_tree(tree({}), nodes)
 
+    @staticmethod
+    def aggregate_tree(separators=True):
+        # Self-authored shape observed in multi-instance allocation-stack groups.
+        nodes = {0x1000: 48, 0x2000: 80, 0x3000: 64, 0x4000: 32}
+        separator = "      ----\n" if separators else "\n"
+        text = totals(nodes) + "\nSTACK OF 2 INSTANCES OF 'ROOT CYCLE: <NSString>':\nprivate stack\n====\n"
+        text += "    3 (0.19K) << TOTAL >>\n" + separator
+        text += ("      2 (128 bytes) ROOT CYCLE: <NSString 0x1000> [48]\n"
+                 "         1 (80 bytes) list --> <NSArray 0x2000> [80]\n"
+                 "            CYCLE BACK TO <NSString 0x1000> [48]\n")
+        text += separator + "      1 (64 bytes) ROOT CYCLE: <NSString 0x3000> [64]\n"
+        text += ("\nSTACK OF 1 INSTANCE OF 'ROOT LEAK: NSString':\nprivate stack\n====\n"
+                 "    1 (32 bytes) ROOT LEAK: <NSString 0x4000> [32]\n")
+        return nodes, text
+
+    def test_grouped_aggregate_preserves_each_root_and_membership(self):
+        for separators in (False, True):
+            nodes, text = self.aggregate_tree(separators)
+            graph = NODES.parse_tree_graph(text, nodes)
+            self.assertEqual(set(graph["members"]), set(nodes))
+            self.assertEqual([root["summary"]["nodes"] for root in graph["roots"]], [2, 1, 1])
+            self.assertEqual([root["summary"]["bytes"] for root in graph["roots"]], [128, 64, 32])
+            self.assertEqual(graph["members"][0x2000]["parent"], 0x1000)
+            self.assertEqual(graph["back_edges"], [{"source": 0x2000, "target": 0x1000, "label": "unlabeled", "root": 0}])
+
+    def test_grouped_aggregate_rejects_counts_bad_separators_and_unknown_rows(self):
+        nodes, text = self.aggregate_tree()
+        for changed in (
+            text.replace("3 (0.19K)", "4 (0.19K)"),
+            text.replace("3 (0.19K)", "2 (0.19K)"),
+            text.replace("2 INSTANCES", "3 INSTANCES"),
+            text.replace("2 (128 bytes)", "1 (128 bytes)"),
+            text.replace("      ----\n", "", 1),
+            text.replace("      ----\n", "         ----\n", 1),
+            text.replace("      ----\n", "      ----\n      ----\n", 1),
+            text.replace("      ----\n", "      unknown separator\n", 1),
+            text.replace("    1 (32 bytes)", "      ----\n    1 (32 bytes)"),
+            text.replace("      1 (64 bytes)", "    3 (0.19K) << TOTAL >>\n      1 (64 bytes)"),
+            text.replace("<NSString 0x3000> [64]", "<NSString 0x1000> [48]"),
+            text.replace("CYCLE BACK TO <NSString 0x1000>", "CYCLE BACK TO <NSString 0x3000>"),
+            text.replace("ROOT CYCLE: <NSString 0x3000>", "list --> ROOT CYCLE: <NSString 0x3000>"),
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                NODES.parse_tree_graph(changed, nodes)
+
+    def test_trace_accepts_exact_three_or_four_line_preamble_including_zero_roots(self):
+        fourth = "This reverse reference tree can be imported into Instruments using Import Sample Data to allow data mining.\n"
+        for roots in (0, 2):
+            text = trace(0x1000, 48, roots)
+            old = NODES.parse_trace_graph(text, 0x1000, 48)
+            current = NODES.parse_trace_graph(text.replace(fourth, ""), 0x1000, 48)
+            self.assertEqual(current, old)
+            self.assertEqual(current["roots"], roots)
+            self.assertEqual(current["target"], 0x1000)
+
+    def test_trace_short_preamble_rejects_missing_duplicate_unknown_and_invalid_tree(self):
+        fourth = "This reverse reference tree can be imported into Instruments using Import Sample Data to allow data mining.\n"
+        text = trace(0x1000, 48, 2).replace(fourth, "")
+        third = "The number at the start of each line is the number of paths-to-roots going through that node.\n"
+        for changed in (
+            text.replace(third, ""), text.replace(third, third * 2),
+            text.replace(third, third + "unknown instruction\n"),
+            text.replace(third, fourth + third), text.replace(third, third + fourth * 2),
+            text.replace("    2 <", "    3 <"),
+            text.replace("Found 2 roots", "Found 0 roots"),
+            trace(0x1000, 48, 0).replace(fourth, "") + "    1 <private-type 0x1000> [48]\n",
+            text.replace("[48]", "[64]"),
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                NODES.parse_trace_graph(changed, 0x1000, 48)
+
     def test_trace_uses_tool_root_count_not_intermediate_region_rows(self):
         text = trace(0x1000, 48, 2) + "  1 Region private\n  1 Region private\n  1 Region Kernel Alloc Once private\n"
         self.assertEqual(NODES.trace_roots(text, 0x1000, 48), 2)
