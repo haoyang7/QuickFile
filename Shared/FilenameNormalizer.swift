@@ -1,5 +1,18 @@
 import Foundation
 
+// Reject display-direction controls and invisible separators, while retaining
+// joiners, variation selectors and combining marks used by legitimate names.
+enum TemplateNameCharacters {
+    static let forbiddenControls = CharacterSet(charactersIn: Unicode.Scalar(0)...Unicode.Scalar(31))
+        .union(CharacterSet(charactersIn: Unicode.Scalar(127)...Unicode.Scalar(159)))
+        .union(CharacterSet(charactersIn: "\u{061C}\u{200B}\u{200E}\u{200F}"))
+        .union(CharacterSet(charactersIn: "\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}"))
+        .union(CharacterSet(charactersIn: "\u{2066}\u{2067}\u{2068}\u{2069}"))
+
+    static let forbiddenFilenameCharacters = CharacterSet(charactersIn: "/:")
+        .union(forbiddenControls)
+}
+
 struct NormalizedFilename: Equatable, Sendable {
     let baseName: String
     let fileExtension: String
@@ -25,11 +38,7 @@ struct NormalizedFilename: Equatable, Sendable {
 
 struct FilenameNormalizer: Sendable {
     private let fallbackBaseName = "未命名"
-    // C0/C1 controls only: Foundation's controlCharacters also includes format
-    // characters such as the zero-width joiner needed by composed emoji.
-    private let forbiddenCharacters = CharacterSet(charactersIn: "/:")
-        .union(CharacterSet(charactersIn: Unicode.Scalar(0)...Unicode.Scalar(31)))
-        .union(CharacterSet(charactersIn: Unicode.Scalar(127)...Unicode.Scalar(159)))
+    private let forbiddenCharacters = TemplateNameCharacters.forbiddenFilenameCharacters
 
     func normalize(_ requestedFilename: String?, requiredExtension: String) throws -> NormalizedFilename {
         let normalizedExtension = sanitizeExtension(requiredExtension)

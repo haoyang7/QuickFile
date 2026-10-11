@@ -2919,6 +2919,88 @@ final class QuickFileViewModelTests: XCTestCase {
         XCTAssertNil(model.finderAuthorizationQueuePause)
     }
 
+    func testWindowQueuedResumeSurvivesBusyRejectionAndDoesNotReplayNewPause() async throws {
+        let gate = CreationGate()
+        defer { gate.release.signal() }
+        let store = TemplateStore(defaults: defaults)
+        let template = FileTemplate(name: "Direct", fileExtension: "txt", content: "{{clipboard}}")
+        try store.saveTemplates([template])
+        let model = QuickFileViewModel(templateStore: store, templates: [template],
+            authorizedDirectoryStore: makeAuthorizationStore(defaults: defaults),
+            fileCreationService: FileCreationService(clipboardProvider: { gate.blockOnce(); return "direct" }))
+        model.destinationFolder = temporaryDirectory
+        model.cancelFinderAuthorizationRequest()
+        let pauseID = try XCTUnwrap(model.finderAuthorizationQueuePause?.id)
+        let requests = makeRequestStore()
+        let now = Date()
+        let first = FinderAuthorizationRequest(templateID: template.id, destinationFolder: temporaryDirectory,
+            createdAt: now.addingTimeInterval(-2))
+        let second = FinderAuthorizationRequest(templateID: template.id, destinationFolder: temporaryDirectory,
+            createdAt: now.addingTimeInterval(-1))
+        try requests.save(first)
+        try requests.save(second)
+
+        var window = QuickFileWindowPresentationState()
+        window.appear()
+        let generation = try XCTUnwrap(window.requestAuthorizationCheck())
+        // This tests an already-received intent at the scheduling boundary. It
+        // does not establish whether a disabled SwiftUI button can deliver it.
+        XCTAssertNil(window.requestAuthorizationCheck(resumingPauseID: pauseID))
+        let creation = Task { await model.createFile() }
+        let started = await BackgroundWork.run { gate.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(started)
+        XCTAssertTrue(model.isAuthorizationCheckBusy)
+        let receipt = window.takeAuthorizationResumePauseID(for: generation, currentPauseID: model.finderAuthorizationQueuePause?.id)
+        XCTAssertEqual(receipt, pauseID)
+        await model.processPendingFinderAuthorizationRequests(from: requests, resumingPauseID: receipt,
+            isPresentationAvailable: { window.canPresent(generation) }) { _ in
+                XCTFail("The direct creation still owns interactive admission")
+                return nil
+            }
+        XCTAssertEqual(model.finderAuthorizationQueuePause?.id, pauseID)
+        XCTAssertTrue(window.finishAuthorizationCheck(
+            for: generation, isBusy: model.isAuthorizationCheckBusy,
+            resumingPauseID: receipt, currentPauseID: model.finderAuthorizationQueuePause?.id
+        ))
+        XCTAssertFalse(window.shouldResumeAuthorizationCheck(isBusy: model.isAuthorizationCheckBusy))
+
+        gate.release.signal()
+        await creation.value
+        XCTAssertTrue(gate.wasReleasedBeforeTimeout)
+        XCTAssertNotNil(model.createdFileURL)
+        XCTAssertTrue(window.shouldResumeAuthorizationCheck(isBusy: model.isAuthorizationCheckBusy))
+        let retry = try XCTUnwrap(window.requestAuthorizationCheck())
+        let retryReceipt = window.takeAuthorizationResumePauseID(for: retry, currentPauseID: model.finderAuthorizationQueuePause?.id)
+        XCTAssertEqual(retryReceipt, pauseID)
+        var received: [UUID] = []
+        await model.processPendingFinderAuthorizationRequests(from: requests, resumingPauseID: retryReceipt,
+            isPresentationAvailable: { window.canPresent(retry) }) { request in
+                received.append(request.id)
+                return nil
+            }
+        XCTAssertEqual(received, [first.id])
+        let newerPauseID = try XCTUnwrap(model.finderAuthorizationQueuePause?.id)
+        XCTAssertNotEqual(newerPauseID, pauseID)
+        XCTAssertTrue(window.finishAuthorizationCheck(
+            for: retry, isBusy: model.isAuthorizationCheckBusy,
+            resumingPauseID: retryReceipt, currentPauseID: newerPauseID
+        ))
+        XCTAssertFalse(window.shouldResumeAuthorizationCheck(isBusy: model.isAuthorizationCheckBusy))
+
+        let automatic = try XCTUnwrap(window.requestAuthorizationCheck())
+        let automaticReceipt = window.takeAuthorizationResumePauseID(for: automatic, currentPauseID: newerPauseID)
+        XCTAssertNil(automaticReceipt)
+        await model.processPendingFinderAuthorizationRequests(from: requests, resumingPauseID: automaticReceipt,
+            isPresentationAvailable: { window.canPresent(automatic) }) { _ in
+                XCTFail("An automatic check must not bypass the new pause")
+                return nil
+            }
+        XCTAssertTrue(window.finishAuthorizationCheck(for: automatic, isBusy: model.isAuthorizationCheckBusy))
+        XCTAssertEqual(model.finderAuthorizationQueuePause?.id, newerPauseID)
+        XCTAssertFalse(window.shouldResumeAuthorizationCheck(isBusy: model.isAuthorizationCheckBusy))
+        XCTAssertEqual(try requests.takePendingRequest()?.id, second.id)
+    }
+
     func testPausedQueueAllowsNavigationAndStaleWindowCannotResumeAfterReopening() async throws {
         let model = makeViewModel(authorizationStore: makeAuthorizationStore(defaults: defaults))
         let requests = makeRequestStore()

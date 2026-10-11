@@ -39,7 +39,7 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       WORKFLOW_SHA: ${{ github.workflow_sha }}
       # Expressions are data in the environment, never shell source.
-      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag || 'v0.1.0-beta.1' }}
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,6 +48,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
+      - name: Resolve the artifact tag from the event or project version
+        run: python3 Scripts/community-provenance.py resolve
       - name: Install and verify XcodeGen 2.46.0
         run: |
           mkdir -p "$RUNNER_TEMP/quickfile-tools"

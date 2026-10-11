@@ -93,6 +93,90 @@ final class AppNavigationStateTests: XCTestCase {
         XCTAssertFalse(window.isAwaitingAuthorizationCheck)
     }
 
+    func testQueuedCheckMergesOneResumeReceiptWithoutAutomaticReplay() throws {
+        var window = QuickFileWindowPresentationState()
+        window.appear()
+        let generation = try XCTUnwrap(window.requestAuthorizationCheck())
+        let pauseID = UUID()
+        for _ in 0..<100 {
+            XCTAssertNil(window.requestAuthorizationCheck(resumingPauseID: pauseID))
+            XCTAssertNil(window.requestAuthorizationCheck())
+        }
+        XCTAssertEqual(window.takeAuthorizationResumePauseID(for: generation, currentPauseID: pauseID), pauseID)
+        XCTAssertTrue(window.finishAuthorizationCheck(
+            for: generation, isBusy: false, resumingPauseID: pauseID, currentPauseID: UUID()
+        ))
+        XCTAssertTrue(window.shouldResumeAuthorizationCheck(isBusy: false))
+        let followUp = try XCTUnwrap(window.requestAuthorizationCheck())
+        XCTAssertNil(window.takeAuthorizationResumePauseID(for: followUp, currentPauseID: pauseID))
+        XCTAssertTrue(window.finishAuthorizationCheck(for: followUp, isBusy: false))
+        XCTAssertFalse(window.shouldResumeAuthorizationCheck(isBusy: false))
+    }
+
+    func testRunningCheckPreservesNewerResumeAndDiscardsStaleReceipt() throws {
+        var window = QuickFileWindowPresentationState()
+        window.appear()
+        let generation = try XCTUnwrap(window.requestAuthorizationCheck())
+        XCTAssertNil(window.takeAuthorizationResumePauseID(for: generation, currentPauseID: UUID()))
+        let oldPauseID = UUID()
+        let currentPauseID = UUID()
+        XCTAssertNil(window.requestAuthorizationCheck(resumingPauseID: oldPauseID))
+        XCTAssertNil(window.requestAuthorizationCheck(resumingPauseID: currentPauseID))
+        XCTAssertTrue(window.finishAuthorizationCheck(for: generation, isBusy: false))
+        let followUp = try XCTUnwrap(window.requestAuthorizationCheck())
+        XCTAssertEqual(window.takeAuthorizationResumePauseID(for: followUp, currentPauseID: currentPauseID), currentPauseID)
+        XCTAssertTrue(window.finishAuthorizationCheck(for: followUp, isBusy: false))
+        let staleCheck = try XCTUnwrap(window.requestAuthorizationCheck(resumingPauseID: oldPauseID))
+        XCTAssertNil(window.takeAuthorizationResumePauseID(for: staleCheck, currentPauseID: currentPauseID))
+        XCTAssertTrue(window.finishAuthorizationCheck(for: staleCheck, isBusy: false))
+        XCTAssertFalse(window.shouldResumeAuthorizationCheck(isBusy: false))
+    }
+
+    func testBusyCheckReturnsOnlyStillCurrentResumeReceipt() throws {
+        var window = QuickFileWindowPresentationState()
+        window.appear()
+        let pauseID = UUID()
+        let generation = try XCTUnwrap(window.requestAuthorizationCheck(resumingPauseID: pauseID))
+        XCTAssertEqual(window.takeAuthorizationResumePauseID(for: generation, currentPauseID: pauseID), pauseID)
+        XCTAssertTrue(window.finishAuthorizationCheck(
+            for: generation, isBusy: true, resumingPauseID: pauseID, currentPauseID: pauseID
+        ))
+        XCTAssertFalse(window.shouldResumeAuthorizationCheck(isBusy: true))
+        XCTAssertTrue(window.shouldResumeAuthorizationCheck(isBusy: false))
+        let retry = try XCTUnwrap(window.requestAuthorizationCheck())
+        XCTAssertEqual(window.takeAuthorizationResumePauseID(for: retry, currentPauseID: pauseID), pauseID)
+        let newerPauseID = UUID()
+        XCTAssertTrue(window.finishAuthorizationCheck(
+            for: retry, isBusy: true, resumingPauseID: pauseID, currentPauseID: newerPauseID
+        ))
+        let staleRetry = try XCTUnwrap(window.requestAuthorizationCheck())
+        XCTAssertNil(window.takeAuthorizationResumePauseID(for: staleRetry, currentPauseID: newerPauseID))
+        XCTAssertTrue(window.finishAuthorizationCheck(for: staleRetry, isBusy: false))
+        XCTAssertFalse(window.shouldResumeAuthorizationCheck(isBusy: false))
+    }
+
+    func testCloseDiscardsResumeReceiptAndOldGenerationCannotConsumeNewReceipt() throws {
+        var window = QuickFileWindowPresentationState()
+        window.appear()
+        let pauseID = UUID()
+        let old = try XCTUnwrap(window.requestAuthorizationCheck(resumingPauseID: pauseID))
+        window.disappear()
+        window.appear()
+        let reopened = try XCTUnwrap(window.requestAuthorizationCheck())
+        XCTAssertNil(window.takeAuthorizationResumePauseID(for: reopened, currentPauseID: pauseID))
+        XCTAssertNil(window.requestAuthorizationCheck(resumingPauseID: pauseID))
+        XCTAssertNil(window.takeAuthorizationResumePauseID(for: old, currentPauseID: pauseID))
+        XCTAssertFalse(window.finishAuthorizationCheck(
+            for: old, isBusy: true, resumingPauseID: pauseID, currentPauseID: pauseID
+        ))
+        XCTAssertEqual(window.takeAuthorizationResumePauseID(for: reopened, currentPauseID: pauseID), pauseID)
+        XCTAssertTrue(window.finishAuthorizationCheck(for: reopened, isBusy: false))
+        let followUp = try XCTUnwrap(window.requestAuthorizationCheck())
+        XCTAssertNil(window.takeAuthorizationResumePauseID(for: followUp, currentPauseID: pauseID))
+        XCTAssertTrue(window.finishAuthorizationCheck(for: followUp, isBusy: false))
+        XCTAssertFalse(window.shouldResumeAuthorizationCheck(isBusy: false))
+    }
+
     func testClosedWindowClearsItsQueuedAndDeferredAuthorizationCheck() throws {
         var window = QuickFileWindowPresentationState()
         window.appear()

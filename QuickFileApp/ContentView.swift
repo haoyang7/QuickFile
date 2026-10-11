@@ -162,12 +162,15 @@ struct ContentView: View {
 
     @MainActor
     private func schedulePendingFinderAuthorizationRequest(resumingPauseID: UUID? = nil) {
-        guard let generation = windowPresentation.requestAuthorizationCheck() else { return }
+        guard let generation = windowPresentation.requestAuthorizationCheck(resumingPauseID: resumingPauseID) else { return }
         Task { @MainActor in
             guard windowPresentation.canPresent(generation) else { return }
+            let resumePauseID = windowPresentation.takeAuthorizationResumePauseID(
+                for: generation, currentPauseID: viewModel.finderAuthorizationQueuePause?.id
+            )
             await viewModel.processPendingFinderAuthorizationRequests(
                 from: authorizationRequestStore,
-                resumingPauseID: resumingPauseID,
+                resumingPauseID: resumePauseID,
                 isPresentationAvailable: { windowPresentation.canPresent(generation) },
                 willPresent: { selectedTab = .create },
                 confirmAuthorization: { request in
@@ -177,7 +180,10 @@ struct ContentView: View {
                     )
                 }
             )
-            guard windowPresentation.finishAuthorizationCheck(for: generation, isBusy: viewModel.isAuthorizationCheckBusy) else { return }
+            guard windowPresentation.finishAuthorizationCheck(
+                for: generation, isBusy: viewModel.isAuthorizationCheckBusy,
+                resumingPauseID: resumePauseID, currentPauseID: viewModel.finderAuthorizationQueuePause?.id
+            ) else { return }
             hasCheckedStartupAuthorizationRequests = true
             resumeAuthorizationCheckOrApplyRoute()
         }

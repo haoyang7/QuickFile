@@ -128,6 +128,12 @@ final class DiagnosticsViewModel: ObservableObject {
             guard !Task.isCancelled, directoryPresentationGeneration == generation else { return }
             if pendingRuntimeRefreshGeneration != generation { break }
         }
+        if pendingRuntimeRefreshGeneration == generation, extensionSnapshot == nil,
+           runtimeStatusMessage == nil {
+            // Keep the two-pass bound even if the enabled state never settles.
+            // The page's refresh action can start another bounded attempt.
+            runtimeStatusMessage = "扩展状态持续变化，请稍后刷新。"
+        }
     }
 
     private func finishRuntimeRefresh(generation: UUID, includeSameGeneration: Bool = false) {

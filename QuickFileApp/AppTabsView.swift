@@ -46,6 +46,7 @@ struct QuickFileWindowPresentationState: Equatable, Sendable {
     private(set) var generation: UUID?
     private var isAuthorizationCheckScheduled = false
     private var needsAuthorizationCheckWhenIdle = false
+    private var pendingResumePauseID: UUID?
 
     var isAwaitingAuthorizationCheck: Bool {
         isAuthorizationCheckScheduled || needsAuthorizationCheckWhenIdle
@@ -59,6 +60,7 @@ struct QuickFileWindowPresentationState: Equatable, Sendable {
         generation = nil
         isAuthorizationCheckScheduled = false
         needsAuthorizationCheckWhenIdle = false
+        pendingResumePauseID = nil
     }
 
     func canPresent(_ expectedGeneration: UUID) -> Bool {
@@ -67,8 +69,10 @@ struct QuickFileWindowPresentationState: Equatable, Sendable {
 
     /// Coalesce repeated notifications while this window has a queued/running
     /// check. At most one task and one extra-check intent exist per window.
-    mutating func requestAuthorizationCheck() -> UUID? {
+    mutating func requestAuthorizationCheck(resumingPauseID: UUID? = nil) -> UUID? {
         guard let generation else { return nil }
+        // Automatic checks never erase an explicit, already-received resume.
+        if let resumingPauseID { pendingResumePauseID = resumingPauseID }
         guard !isAuthorizationCheckScheduled else {
             needsAuthorizationCheckWhenIdle = true
             return nil
@@ -78,13 +82,30 @@ struct QuickFileWindowPresentationState: Equatable, Sendable {
         return generation
     }
 
+    mutating func takeAuthorizationResumePauseID(for expectedGeneration: UUID, currentPauseID: UUID?) -> UUID? {
+        guard canPresent(expectedGeneration) else { return nil }
+        let pauseID = pendingResumePauseID
+        pendingResumePauseID = nil
+        return pauseID == currentPauseID ? pauseID : nil
+    }
+
     @discardableResult
-    mutating func finishAuthorizationCheck(for expectedGeneration: UUID, isBusy: Bool) -> Bool {
+    mutating func finishAuthorizationCheck(
+        for expectedGeneration: UUID, isBusy: Bool,
+        resumingPauseID: UUID? = nil, currentPauseID: UUID? = nil
+    ) -> Bool {
         guard canPresent(expectedGeneration) else { return false }
         isAuthorizationCheckScheduled = false
         // An app-scoped operation may have rejected this window's check. Keep
         // exactly one retry intent until that operation publishes its release.
-        if isBusy { needsAuthorizationCheckWhenIdle = true }
+        if isBusy {
+            needsAuthorizationCheckWhenIdle = true
+            // Only a rejected check may return its still-current receipt. A
+            // completed resume must not automatically replay a later pause.
+            if pendingResumePauseID == nil, resumingPauseID == currentPauseID {
+                pendingResumePauseID = resumingPauseID
+            }
+        }
         return true
     }
 

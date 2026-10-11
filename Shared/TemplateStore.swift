@@ -480,12 +480,17 @@ public final class TemplateStore: @unchecked Sendable {
         return templates
     }
 
-    public func saveTemplates(_ templates: [FileTemplate]) throws {
-        try saveTemplates(templates, expectedTemplates: nil)
+    // Isolated fixture setup only. Production clients must supply a read baseline.
+    func saveTemplates(_ templates: [FileTemplate]) throws {
+        try saveTemplates(templates, comparingWith: nil)
     }
 
     /// Compares the authoritative configuration while holding the same lock as the write.
-    public func saveTemplates(_ templates: [FileTemplate], expectedTemplates: [FileTemplate]?) throws {
+    public func saveTemplates(_ templates: [FileTemplate], expectedTemplates: [FileTemplate]) throws {
+        try saveTemplates(templates, comparingWith: expectedTemplates)
+    }
+
+    private func saveTemplates(_ templates: [FileTemplate], comparingWith expectedTemplates: [FileTemplate]?) throws {
         guard let defaults else {
             throw StoreError.sharedDefaultsUnavailable
         }

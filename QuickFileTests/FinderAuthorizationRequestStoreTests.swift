@@ -61,6 +61,37 @@ final class FinderAuthorizationRequestStoreTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: alias.path), target.path)
     }
 
+    func testSymbolicLinkQueueLockRejectsSaveAndBothClaimPathsWithoutChangingData() throws {
+        let original = makeRequest(at: 100)
+        try makeStore().save(original)
+        let originalBytes = try Data(contentsOf: requestURL(original))
+        let legacyBytes = try JSONEncoder().encode(makeRequest(at: 99))
+        defaults.set(legacyBytes, forKey: "finderAuthorizationRequest.v1")
+        let target = directoryURL.appendingPathComponent("lock-target")
+        let targetBytes = Data("sentinel".utf8)
+        try targetBytes.write(to: target)
+        let lockURL = directoryURL.appendingPathComponent(".queue.lock")
+        try FileManager.default.removeItem(at: lockURL)
+        try FileManager.default.createSymbolicLink(at: lockURL, withDestinationURL: target)
+
+        let stores = [makeStore(), makeStore(readRequestData: { try Data(contentsOf: $0) })]
+        for store in stores {
+            XCTAssertThrowsError(try store.save(makeRequest(at: 101)))
+            XCTAssertThrowsError(try store.takePendingRequest(referenceDate: date(102))) { error in
+                guard case FinderAuthorizationRequestStore.StoreError.persistenceFailed(let underlying) = error else {
+                    return XCTFail("Unexpected error: \(error)")
+                }
+                XCTAssertEqual((underlying as NSError).code, Int(ELOOP))
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: target), targetBytes)
+        XCTAssertEqual(try Data(contentsOf: requestURL(original)), originalBytes)
+        XCTAssertEqual(try queueFileCount(), 1)
+        XCTAssertEqual(defaults.data(forKey: "finderAuthorizationRequest.v1"), legacyBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directoryURL.appendingPathComponent(".legacy-v1-migrated").path))
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: lockURL.path), target.path)
+    }
+
     func testOversizedReplacementRequestPreservesExistingRequest() throws {
         let original = makeRequest(at: 100)
         let store = makeStore()

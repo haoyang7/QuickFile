@@ -41,6 +41,8 @@ python3 Scripts/verify-community-artifact.py \
 
 ## GitHub Actions 打包
 
+`codex/**` 分支构建从 `project.yml` 唯一的 `MARKETING_VERSION` 推导 `v<版本>` 作为 artifact 文件名，不沿用旧 Beta 标签，也不代表已发布该版本。标签事件保留实际标签，手动运行使用显式 `release_tag`；缺失、重复或格式错误的营销版本会使分支打包失败。产物版本与标签仍须通过一致性检查。
+
 `.github/workflows/community-dmg.yml` 复用 `Scripts/build-community.sh --release-tag ...` 生成发布候选。入口包括 `workflow_dispatch`（输入 `release_tag`，默认 `v0.1.0-beta.1`；工作流先存在于默认分支后，Actions 界面才可手动运行）、推送 `v*` 标签，以及首次 `codex/**` 分支对列出的构建文件进行 bootstrap 的 push；分支 push 受 workflow 的 `paths` 过滤。每次只上传一个包含五项文件的 Actions artifact，不自动创建或公开 GitHub Release。维护者应从该 artifact 取出 `build-provenance.json`，核对源码 SHA、run、工具链和四项主要资产哈希，再决定是否把同一组文件上传到草稿 Release。
 
 ## GitHub Releases 发布流程

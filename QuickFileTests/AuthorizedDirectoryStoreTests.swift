@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import QuickFileCore
 @testable import QuickFileInfrastructure
@@ -39,6 +40,41 @@ final class AuthorizedDirectoryStoreTests: XCTestCase {
         temporaryDirectory = nil
         defaults = nil
         suiteName = nil
+    }
+
+    func testSymbolicLinkRepositoryLockRejectsReadsAndUpdatesWithoutChangingData() throws {
+        let repository = AuthorizedDirectoryRepository(defaults: defaults, storageDirectory: temporaryDirectory)
+        let record = StoredDirectoryAuthorization(id: UUID(),
+            persistentBookmarkData: Data("persistent".utf8), transferBookmarkData: Data("transfer".utf8))
+        try repository.update { $0 = [record] }
+        let snapshotURL = temporaryDirectory.appendingPathComponent("authorizedDirectories.v2.json")
+        let markerURL = temporaryDirectory.appendingPathComponent("authorizedDirectories.migrated")
+        let snapshotBytes = try Data(contentsOf: snapshotURL)
+        let markerBytes = try Data(contentsOf: markerURL)
+        let target = temporaryDirectory.appendingPathComponent("lock-target")
+        let targetBytes = Data("sentinel".utf8)
+        try targetBytes.write(to: target)
+        let lockURL = temporaryDirectory.appendingPathComponent("authorizedDirectories.lock")
+        try FileManager.default.removeItem(at: lockURL)
+        try FileManager.default.createSymbolicLink(at: lockURL, withDestinationURL: target)
+
+        XCTAssertThrowsError(try repository.loadSnapshot()) { error in
+            guard case AuthorizedDirectoryStoreError.persistenceFailed(let underlying) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual((underlying as NSError).code, Int(ELOOP))
+        }
+        XCTAssertThrowsError(try repository.contains(record))
+        var didUpdate = false
+        XCTAssertThrowsError(try repository.update { authorizations in
+            didUpdate = true
+            authorizations.removeAll()
+        })
+        XCTAssertFalse(didUpdate)
+        XCTAssertEqual(try Data(contentsOf: target), targetBytes)
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), snapshotBytes)
+        XCTAssertEqual(try Data(contentsOf: markerURL), markerBytes)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: lockURL.path), target.path)
     }
 
     func testRepositoryReusesDecodeOnlyForExactAuthoritativeBytes() throws {

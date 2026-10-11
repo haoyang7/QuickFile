@@ -154,7 +154,7 @@ struct AuthorizedDirectoryRepository: @unchecked Sendable {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let descriptor = open(directory.appendingPathComponent("authorizedDirectories.lock").path,
-                                  O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+                                  O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
             guard descriptor >= 0 else { throw posixError() }
             defer { close(descriptor) }
             while flock(descriptor, LOCK_EX) != 0 {

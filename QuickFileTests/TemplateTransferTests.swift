@@ -5,6 +5,50 @@ import Darwin
 
 final class TemplateTransferTests: XCTestCase {
 
+    func testTransferRejectsRiskControlsInNamesAndDefaultFilenamesWithoutNormalizingThem() throws {
+        let values = Array(0...31) + Array(127...159)
+            + [0x061C, 0x200B, 0x200E, 0x200F] + Array(0x202A...0x202E) + Array(0x2066...0x2069)
+        for value in values {
+            let control = String(UnicodeScalar(value)!)
+            for field in ["name", "defaultFilename"] {
+                let source = TransferTemplate(name: field == "name" ? "Word 文档" + control : "Word 文档",
+                                              fileExtension: "txt", content: "body", isEnabled: true,
+                                              defaultFilename: field == "defaultFilename" ? "invoice" + control : "")
+                let bundle = TemplateTransferBundle(templates: [source])
+                // Build external JSON without using the validating export path.
+                let bytes = try JSONSerialization.data(withJSONObject: [
+                    "format": "quickfile.templates", "version": 2,
+                    "templates": [["name": source.name, "fileExtension": source.fileExtension,
+                                   "content": source.content, "isEnabled": source.isEnabled,
+                                   "defaultFilename": source.defaultFilename]]
+                ])
+                let error = field == "name" ? TemplateValidationError.invalidName : .invalidDefaultFilename
+                let expected = TemplateTransferError.invalidTemplate(index: 0, reason: error.localizedDescription)
+                XCTAssertThrowsError(try TemplateTransfer.decode(bytes)) {
+                    XCTAssertEqual($0 as? TemplateTransferError, expected)
+                }
+                XCTAssertThrowsError(try TemplateTransfer.encode(bundle)) {
+                    XCTAssertEqual($0 as? TemplateTransferError, expected)
+                }
+                XCTAssertThrowsError(try TemplateTransfer.makeImportPlan(bundle: bundle, existing: [])) {
+                    XCTAssertEqual($0 as? TemplateTransferError, expected)
+                }
+            }
+        }
+    }
+
+    func testTransferPreservesLegitimateNameBytesAndUnrestrictedBodyControls() throws {
+        let name = "می\u{200C}خواهم-👩‍💻-✈\u{FE0F}-e\u{301}"
+        let source = TransferTemplate(name: name, fileExtension: "txt", content: "\u{202E}\u{0}\n",
+                                      isEnabled: true, defaultFilename: name)
+        let bundle = TemplateTransferBundle(templates: [source])
+        let decoded = try TemplateTransfer.decode(TemplateTransfer.encode(bundle))
+        let imported = try XCTUnwrap(TemplateTransfer.makeImportPlan(bundle: decoded, existing: []).additions.first?.template)
+        XCTAssertEqual(Array(imported.name.utf8), Array(name.utf8))
+        XCTAssertEqual(Array(imported.defaultFilename.utf8), Array(name.utf8))
+        XCTAssertEqual(Array(imported.content.utf8), Array(source.content.utf8))
+    }
+
     func testDefaultFilenameUsesVersionTwoAndRoundTripsLiteralBytesAndBudget() throws {
         let source = FileTemplate(name: "A", fileExtension: "", content: "", defaultFilename: ".e\u{301}-👩‍💻-{{date}}-\"\\")
         let bundle = TemplateTransferBundle(templates: [source])
@@ -420,7 +464,7 @@ final class TemplateTransferTests: XCTestCase {
             record("A", extension: "", body: "\""),
             record("A", extension: "", body: "é"),
             record("A", extension: "", body: "e\u{301}"),
-            record("A" + controls, extension: "文\\\"", body: controls + "/📄")
+            record("A\"\\é", extension: "文\\\"", body: controls + "/📄")
         ]
         let encodedCounts = try records.map { try TemplateTransfer.encode(.init(templates: [$0])).count }
         for (candidateIndex, candidate) in records.enumerated() {

@@ -20,6 +20,9 @@ public struct TemplateDraft: Equatable {
     }
 
     public func makeTemplate() throws -> FileTemplate {
+        guard name.rangeOfCharacter(from: TemplateNameCharacters.forbiddenControls) == nil else {
+            throw TemplateValidationError.invalidName
+        }
         let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedName.isEmpty else {
             throw TemplateValidationError.emptyName
@@ -33,11 +36,7 @@ public struct TemplateDraft: Equatable {
             throw TemplateValidationError.invalidExtension
         }
 
-        // Match filename normalization's C0/C1 rule while allowing emoji ZWJ.
-        let forbiddenFilename = CharacterSet(charactersIn: "/:")
-            .union(CharacterSet(charactersIn: Unicode.Scalar(0)...Unicode.Scalar(31)))
-            .union(CharacterSet(charactersIn: Unicode.Scalar(127)...Unicode.Scalar(159)))
-        guard defaultFilename.rangeOfCharacter(from: forbiddenFilename) == nil else {
+        guard defaultFilename.rangeOfCharacter(from: TemplateNameCharacters.forbiddenFilenameCharacters) == nil else {
             throw TemplateValidationError.invalidDefaultFilename
         }
 
@@ -57,6 +56,7 @@ public struct TemplateDraft: Equatable {
 
 public enum TemplateValidationError: LocalizedError, Equatable {
     case emptyName
+    case invalidName
     case emptyExtension
     case invalidDefaultFilename
     case invalidExtension
@@ -66,6 +66,8 @@ public enum TemplateValidationError: LocalizedError, Equatable {
         switch self {
         case .emptyName:
             return "模板名称不能为空。"
+        case .invalidName:
+            return "模板名称不能包含控制字符。"
         case .emptyExtension:
             return "文件扩展名不能为空。"
         case .invalidDefaultFilename:

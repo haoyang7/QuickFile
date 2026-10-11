@@ -36,6 +36,29 @@ def release_tag(env):
     return tag
 
 
+def resolve(env, project=Path("project.yml")):
+    if env.get("GITHUB_REF", "").startswith("refs/tags/") or env.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        tag = release_tag(env)
+    elif env.get("GITHUB_EVENT_NAME") == "push" and re.fullmatch(r"refs/heads/codex/.+", env.get("GITHUB_REF", "")):
+        # The checked-in XcodeGen format has one shared marketing version. Refuse
+        # missing, duplicate or malformed declarations instead of guessing a tag.
+        values = re.findall(r"^\s*MARKETING_VERSION\s*:\s*([^\r\n]*)$", project.read_text(encoding="utf-8"), re.MULTILINE)
+        if len(values) != 1:
+            raise ValueError("project must declare exactly one marketing version")
+        value = values[0].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        tag = checked("v" + checked(value, VERSION, "marketing version"), TAG, "release tag")
+    else:
+        raise ValueError("cannot resolve release tag for this event")
+    destination = env.get("GITHUB_ENV")
+    if not isinstance(destination, str) or not destination:
+        raise ValueError("missing GitHub environment file")
+    with open(destination, "a", encoding="utf-8") as stream:
+        stream.write(f"RELEASE_TAG={tag}\n")
+    return tag
+
+
 def verify_source(env):
     sha = checked(env.get("GITHUB_SHA"), SHA, "event commit")
     if output(["git", "rev-parse", "--verify", "HEAD"]) != sha:
@@ -143,13 +166,15 @@ def write(directory, env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("check", "write"))
+    parser.add_argument("command", choices=("resolve", "check", "write"))
     parser.add_argument("--directory", type=Path)
     arguments = parser.parse_args()
     if arguments.command == "write" and arguments.directory is None:
         parser.error("write requires --directory")
     try:
-        if arguments.command == "check":
+        if arguments.command == "resolve":
+            resolve(os.environ)
+        elif arguments.command == "check":
             check(os.environ)
         else:
             write(arguments.directory, os.environ)

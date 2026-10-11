@@ -2,6 +2,24 @@ import XCTest
 @testable import QuickFileCore
 
 final class FinderMenuModelTests: XCTestCase {
+    func testHistoricalControlsAreRemovedOnlyFromMenuProjection() throws {
+        let values = Array(0...31) + Array(127...159)
+            + [0x061C, 0x200B, 0x200E, 0x200F] + Array(0x202A...0x202E) + Array(0x2066...0x2069)
+        let controls = values.map { String(UnicodeScalar($0)!) }.joined()
+        let name = "می\u{200C}خواهم-👩‍💻-✈\u{FE0F}-e\u{301}"
+        let original = FileTemplate(name: name + controls, fileExtension: ".t" + controls + "xt", content: "unchanged")
+        let historical = try JSONDecoder().decode(FileTemplate.self, from: JSONEncoder().encode(original))
+        let entry = FinderTemplateMenuEntry(template: historical)
+        XCTAssertEqual(entry.id, original.id)
+        XCTAssertEqual(Array(entry.title.utf8), Array((name + " (.txt)").utf8))
+        XCTAssertEqual(Array(historical.name.utf8), Array(original.name.utf8))
+        XCTAssertEqual(Array(historical.fileExtension.utf8), Array(original.fileExtension.utf8))
+        XCTAssertEqual(historical.content, original.content)
+
+        let blank = FileTemplate(name: " " + controls, fileExtension: controls, content: "")
+        XCTAssertEqual(FinderTemplateMenuEntry(template: blank).title, "未命名模板")
+    }
+
     func testCachedMenuMetadataPreservesIdentityTitlesOrderAndDisplayLimit() throws {
         let originals = (0..<300).map {
             FileTemplate(name: "Template \($0)", fileExtension: "txt", content: "original \($0)")

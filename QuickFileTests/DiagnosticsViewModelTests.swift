@@ -171,6 +171,48 @@ final class DiagnosticsViewModelTests: XCTestCase {
         XCTAssertFalse(viewModel.isRefreshingRuntimeStatus)
     }
 
+    func testRepeatedEnabledChangesStopAtTwoProbesAndManualRefreshRecovers() async {
+        var isEnabled = true
+        var probeCount = 0
+        let runtimeGate = DiagnosticsRuntimeReadGate()
+        let viewModel = DiagnosticsViewModel(
+            extensionEnabledProvider: { isEnabled },
+            runtimeProvider: { enabled in
+                probeCount += 1
+                if probeCount <= 2 { isEnabled.toggle() }
+                return FinderExtensionDiagnosticSnapshot(
+                    embeddedIdentifiers: ["test.extension"], embeddingKnown: true,
+                    registration: .registered, registrationEvidence: "test",
+                    enabled: enabled, responded: true
+                )
+            },
+            extensionActivityStore: FinderExtensionActivityStore(
+                defaults: defaults,
+                failureHistoryFileURL: temporaryDirectory.appendingPathComponent("failures.json")
+            ),
+            authorizedDirectoryStore: makeAuthorizationStore(),
+            inventoryReadGate: inventoryReadGate,
+            runtimeReadGate: runtimeGate
+        )
+
+        await viewModel.refreshRuntimeStatus()
+
+        XCTAssertEqual(probeCount, 2, "Continuous enabled-state changes must not start unbounded batches")
+        XCTAssertTrue(viewModel.isFinderExtensionEnabled)
+        XCTAssertNil(viewModel.extensionSnapshot)
+        XCTAssertEqual(viewModel.runtimeStatusMessage, "扩展状态持续变化，请稍后刷新。")
+        XCTAssertFalse(viewModel.isRefreshingRuntimeStatus)
+        XCTAssertFalse(runtimeGate.isReading)
+
+        await viewModel.refreshRuntimeStatus()
+
+        XCTAssertEqual(probeCount, 3, "The exhausted batch must not retain a same-page follow-up")
+        XCTAssertEqual(viewModel.extensionSnapshot?.state, .responding)
+        XCTAssertNil(viewModel.runtimeStatusMessage)
+        XCTAssertFalse(viewModel.isRefreshingRuntimeStatus)
+        XCTAssertFalse(runtimeGate.isReading)
+    }
+
     func testOverlappingRefreshRequestsMergeIntoOneFollowUpProbe() async {
         var probeCount = 0
         var firstContinuation: CheckedContinuation<Bool, Never>?

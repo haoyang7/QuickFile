@@ -36,10 +36,26 @@ class AuthorizationStartupWiringTests(unittest.TestCase):
     def test_window_lifetime_and_request_priority_guards_remain(self):
         scheduler = self.source.split("private func schedulePendingFinderAuthorizationRequest(", 1)[1]
         scheduler = scheduler.split("private func resumeAuthorizationCheckOrApplyRoute()", 1)[0]
-        self.assertIn("guard let generation = windowPresentation.requestAuthorizationCheck()", scheduler)
+        self.assertIn("guard let generation = windowPresentation.requestAuthorizationCheck(resumingPauseID: resumingPauseID)", scheduler)
         self.assertIn("guard windowPresentation.canPresent(generation)", scheduler)
+        self.assertRegex(scheduler, r"let resumePauseID = windowPresentation\.takeAuthorizationResumePauseID\(\s*"
+                         r"for: generation, currentPauseID: viewModel\.finderAuthorizationQueuePause\?\.id\s*\)")
+        processing = scheduler.split("await viewModel.processPendingFinderAuthorizationRequests(", 1)[1]
+        processing = processing.split("guard windowPresentation.finishAuthorizationCheck(", 1)[0]
+        self.assertIn("resumingPauseID: resumePauseID", processing)
         self.assertIn("isPresentationAvailable: { windowPresentation.canPresent(generation) }", scheduler)
-        self.assertIn("windowPresentation.finishAuthorizationCheck(for: generation, isBusy: viewModel.isAuthorizationCheckBusy)", scheduler)
+        self.assertRegex(scheduler, r"guard windowPresentation\.finishAuthorizationCheck\(\s*"
+                         r"for: generation, isBusy: viewModel\.isAuthorizationCheckBusy,\s*"
+                         r"resumingPauseID: resumePauseID, currentPauseID: viewModel\.finderAuthorizationQueuePause\?\.id\s*"
+                         r"\) else \{ return \}")
+        self.assertLess(scheduler.index("guard windowPresentation.canPresent(generation)"),
+                        scheduler.index("windowPresentation.takeAuthorizationResumePauseID("))
+        self.assertLess(scheduler.index("windowPresentation.takeAuthorizationResumePauseID("),
+                        scheduler.index("await viewModel.processPendingFinderAuthorizationRequests("))
+        self.assertLess(scheduler.index("await viewModel.processPendingFinderAuthorizationRequests("),
+                        scheduler.index("guard windowPresentation.finishAuthorizationCheck("))
+        self.assertLess(scheduler.index("guard windowPresentation.finishAuthorizationCheck("),
+                        scheduler.index("hasCheckedStartupAuthorizationRequests = true"))
         self.assertNotIn("refreshAuthorizationBookmarks", scheduler)
         self.assertIn("windowPresentation.disappear()", self.source)
         self.assertIn("!windowPresentation.isAwaitingAuthorizationCheck", self.source)
@@ -55,7 +71,7 @@ class AuthorizationStartupWiringTests(unittest.TestCase):
         self.assertIn(".disabled(viewModel.isBusy || windowPresentation.isAwaitingAuthorizationCheck", feedback)
         self.assertIn("|| finderRequestRecovery.isPresented || finderRequestRecovery.isOperationInFlight", feedback)
         self.assertEqual(self.source.count("resumingPauseID: pause.id"), 1)
-        self.assertIn("resumingPauseID: resumingPauseID", self.source)
+        self.assertIn("windowPresentation.requestAuthorizationCheck(resumingPauseID: resumingPauseID)", self.source)
         self.assertIn("finderAuthorizationRequestPhase.message", feedback)
 
     def test_window_retry_and_navigation_keep_full_drain_ownership(self):
