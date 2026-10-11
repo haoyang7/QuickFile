@@ -1,0 +1,551 @@
+import contextlib
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+SOURCE = Path(__file__).resolve().parents[1] / "Investigations/ax_frozen_nodes.py"
+SPEC = importlib.util.spec_from_file_location("ax_frozen_nodes_tested", SOURCE)
+NODES = importlib.util.module_from_spec(SPEC)
+with mock.patch.object(sys, "path", [str(SOURCE.parent), *sys.path]):
+    SPEC.loader.exec_module(NODES)
+
+
+def totals(nodes):
+    return f"Process 123: {len(nodes)} leaks for {sum(nodes.values())} total leaked bytes.\n"
+
+
+def listing(nodes, kind="NSString"):
+    return totals(nodes) + "\n" + "\n".join(
+        f"Leak: {address:#x}  size={size}  zone: private-zone  {kind}  ObjC  private-image\n"
+        "\tCall stack: private stack never published\n" for address, size in nodes.items())
+
+
+def tree(nodes, cycle=False):
+    result = totals(nodes)
+    if cycle and nodes:
+        items = list(nodes.items())
+        result += "\nSTACK OF 1 INSTANCE OF 'ROOT CYCLE: NSString':\n0 private stack\n====\n"
+        for index, (address, size) in enumerate(items):
+            result += f"{' ' * (4 + index * 3)}{len(items) - index} (bytes) ROOT CYCLE: <NSString {address:#x}> [{size}]\n"
+        address, size = items[0]
+        result += f"{' ' * (4 + len(items) * 3)}CYCLE BACK TO <NSString {address:#x}> [{size}]\n"
+    else:
+        for address, size in nodes.items():
+            result += f"\nSTACK OF 1 INSTANCE OF 'ROOT LEAK: NSString':\n0 private stack\n====\n    1 ({size} bytes) ROOT LEAK: <NSString {address:#x}> [{size}]\n"
+    return result + "\nBinary Images:\nprivate images\n"
+
+
+def heap(nodes):
+    return f"All zones: {len(nodes)} nodes malloced\n" + "".join(
+        f"{address:#x}: private-type ({size} bytes)\n" for address, size in nodes.items())
+
+
+def history(events):
+    return "malloc_history Report Version:  2.0\n" + "".join(
+        f"{kind} {address:#x}-{address + size - 1:#x} [size={size}]: private stack\n" for kind, address, size in events)
+
+
+def trace(address, size, roots):
+    return (f"Tracing: <private-type {address:#x}> [{size}]\n\nFound {roots} roots referencing: <private-type {address:#x}> [{size}]\n\n"
+            "This is a reverse reference tree showing how the specified block is referenced.\n"
+            "The top node is the specified block, the next level down are blocks that reference that, and so on.\n")
+
+
+class Case:
+    def __init__(self, root, before=None, after=None, first=1):
+        self.graphs, self.records = root / "graphs", root / "records"
+        self.graphs.mkdir(); self.records.mkdir()
+        before = before or {}
+        after = {0x2000: 48} if after is None else after
+        self.points = {label: dict(before if index < first else after) for index, label in enumerate(NODES.HEAP_LABELS)}
+        self.baseline_heap = {**before, **after}
+        self.heap_diff = {}
+        self.before_events = [("ALLOC", address, size) for address, size in self.baseline_heap.items()]
+        self.after_events = list(self.before_events)
+        self.calls = []
+        self.failures = {}
+        for label in NODES.HEAP_LABELS:
+            (self.graphs / (label + ".memgraph")).write_bytes(("private graph " + label).encode())
+            # A deliberately empty diff must not hide old allocations newly leaked.
+            (self.graphs / (label + "-diff.txt")).write_text(listing({}))
+        self.write_scans()
+        (self.records / "process-cleanup.json").write_text(json.dumps({"processes_exited": True}))
+        (self.records / "result.json").write_text(json.dumps({"mode": "heap-control", "scan_mode": "diagnostic", "coverage": "failed",
+            "validation_errors": [{"stage": "added-10", "message": "private strict failure"}]}))
+
+    def write_scans(self):
+        (self.records / "scans.json").write_text(json.dumps([
+            {"label": label, "leak_nodes": len(nodes), "leak_bytes": sum(nodes.values()), "exit_code": int(bool(nodes))}
+            for label, nodes in self.points.items()]))
+
+    def run(self, owner, kind, label, command, allowed=(0,)):
+        self.calls.append((kind, label, command))
+        owner.summary["tools"].append({"tool": kind, "label": label, "status": "complete", "return_code": 0, "cleanup_confirmed": True})
+        failure = self.failures.get((kind, label))
+        if isinstance(failure, Exception):
+            if isinstance(failure, NODES.ExitUnconfirmed):
+                owner.summary["tools"][-1].update(status="timeout", return_code=None, cleanup_confirmed=False)
+                owner.summary["process_cleanup_confirmed"] = False
+            raise failure
+        if failure is not None:
+            return failure
+        if kind == "list":
+            return listing(self.points[label])
+        if kind == "tree":
+            return tree(self.points[label], cycle=True)
+        if kind == "heap":
+            return heap(self.baseline_heap)
+        if kind == "heap_diff":
+            return heap(self.heap_diff)
+        if kind == "history":
+            return history(self.before_events if label == "baseline" else self.after_events)
+        if kind == "trace":
+            address = int(command[-2].split("=")[1], 16)
+            size = self.baseline_heap[address] if label == "baseline" else self.points[label][address]
+            return trace(address, size, 2 if label == "baseline" else 0)
+        raise AssertionError("Unexpected tool")
+
+    def compare(self):
+        with mock.patch.object(NODES.Tools, "run", autospec=True, side_effect=self.run):
+            result = NODES.compare(self.graphs, self.records)
+        NODES.validate_summary(result)
+        return result
+
+
+class FrozenParserTests(unittest.TestCase):
+    def test_absolute_list_requires_complete_unique_counts_and_bytes(self):
+        nodes = {0x1000: 48, 0x2000: 80}
+        self.assertEqual(NODES.parse_list(listing(nodes))[0], nodes)
+        self.assertEqual(NODES.parse_list(listing({})), ({}, {}))
+        for text in (listing(nodes).replace("size=80", "size=81"), listing(nodes).replace("0x2000", "0x1000"),
+                     listing(nodes).replace("Leak: 0x2000", "Leak: broken"), listing(nodes) + totals(nodes),
+                     listing(nodes).replace("2 leaks", "1 leak")):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                NODES.parse_list(text)
+        self.assertEqual(set(NODES.parse_list(listing(nodes, "private user class"))[1].values()), {"unknown"})
+
+    def test_default_cycle_membership_counts_one_top_root_and_back_edge(self):
+        nodes = {0x1000: 384, 0x2000: 512, 0x3000: 256}
+        mapping = NODES.parse_tree(tree(nodes, True), nodes)
+        self.assertEqual(set(mapping), set(nodes))
+        self.assertEqual(len({id(value) for value in mapping.values()}), 1)
+        self.assertEqual(mapping[0x3000], {"status": "mapped", "root_kind": "cycle", "root_type": "NSString",
+                                        "nodes": 3, "bytes": 1152, "cycle_back_edges": 1})
+        wrapped = tree(nodes, True).replace("OF 'ROOT CYCLE: NSString'", "OF 'ROOT CYCLE: <NSString>'")
+        self.assertEqual(NODES.parse_tree(wrapped, nodes), mapping)
+        independent = NODES.parse_tree(tree(nodes), nodes)
+        self.assertEqual(len({id(value) for value in independent.values()}), 3)
+        self.assertTrue(all(value["nodes"] == 1 for value in independent.values()))
+
+    def test_tree_rejects_duplicate_missing_unbound_back_edges_and_wrong_counts(self):
+        nodes = {0x1000: 48, 0x2000: 80}
+        text = tree(nodes, True)
+        for changed in (text.replace("1 INSTANCE", "2 INSTANCES"), text.replace("2 (bytes)", "3 (bytes)"),
+                        text.replace("0x2000", "0x1000"), text.replace("0x2000> [80]", "0x2000> [81]"),
+                        text.replace("CYCLE BACK TO <NSString 0x1000>", "CYCLE BACK TO <NSString 0x9999>"),
+                        text.replace("====", "???"), text.replace("ROOT CYCLE: <NSString 0x1000>", "ROOT LEAK: <NSString 0x1000>"),
+                        text.replace("CYCLE BACK TO", "UNSUPPORTED REFERENCE"), text.replace("[80]\n", "[80]\nextra row\n")):
+            with self.subTest(text=changed), self.assertRaises(ValueError):
+                NODES.parse_tree(changed, nodes)
+        with self.assertRaises(ValueError):
+            NODES.parse_tree(tree({}), nodes)
+
+    def test_trace_uses_tool_root_count_not_intermediate_region_rows(self):
+        text = trace(0x1000, 48, 2) + "  1 Region private\n  1 Region private\n  1 Region Kernel Alloc Once private\n"
+        self.assertEqual(NODES.trace_roots(text, 0x1000, 48), 2)
+        self.assertEqual(NODES.trace_roots(trace(0x1000, 48, 0), 0x1000, 48), 0)
+        for changed in (text.replace("0x1000", "0x2000"), text.replace("[48]", "[80]"), text + "Found 2 roots referencing: <private-type 0x1000> [48]\n",
+                        text.replace("Found 2", "Found secret")):
+            with self.assertRaises(ValueError):
+                NODES.trace_roots(changed, 0x1000, 48)
+
+
+class FrozenComparisonTests(unittest.TestCase):
+    def test_old_allocation_becomes_leaked_with_lost_external_roots_despite_empty_diff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory))
+            original = {name: (case.records / name).read_bytes() for name in ("scans.json", "result.json")}
+            value = case.compare()
+            self.assertEqual(value["status"], "complete")
+            self.assertEqual(value["selection"], "first-new-leak")
+            self.assertEqual(value["selected_label"], "added-10")
+            self.assertEqual(value["baseline"]["leak_nodes"], 0)
+            self.assertEqual(value["selected"]["leak_nodes"], 1)
+            node = value["nodes"][0]
+            self.assertEqual(node["history"]["classification"], "preexisting")
+            self.assertEqual((node["baseline_external_roots"], node["selected_external_roots"]), (2, 0))
+            self.assertEqual(node["baseline_tree"]["status"], "not_leaked")
+            self.assertEqual(node["selected_tree"]["root_kind"], "cycle")
+            self.assertEqual([name for kind, name, _ in case.calls if kind == "list"], ["baseline", "added-10"])
+            histories = [command for kind, _, command in case.calls if kind == "history"]
+            self.assertEqual(histories[0][2:], histories[1][2:])
+            self.assertNotIn("private", NODES.encode_summary(value).decode())
+            self.assertNotIn("0x2000", NODES.encode_summary(value).decode())
+            self.assertEqual(original, {name: (case.records / name).read_bytes() for name in original})
+
+    def test_equal_count_replacement_and_resized_address_are_selected(self):
+        for before, after, resized in (({0x1000: 48}, {0x2000: 48}, 0), ({0x1000: 48}, {0x1000: 80}, 1)):
+            with tempfile.TemporaryDirectory() as directory:
+                case = Case(Path(directory), before, after, first=3)
+                value = case.compare()
+                self.assertEqual(value["selected_label"], "removed-10")
+                self.assertEqual(value["comparison"]["resized_addresses"], resized)
+                self.assertEqual(value["comparison"]["added_nodes"], 1 - resized)
+                self.assertEqual(value["comparison"]["removed_nodes"], 1 - resized)
+                self.assertEqual(len([call for call in case.calls if call[0] == "list"]), 4)
+
+    def test_no_new_leak_reads_all_seven_lists_and_does_not_query_other_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory), {0x1000: 48}, {0x1000: 48})
+            value = case.compare()
+            self.assertEqual(value["status"], "complete")
+            self.assertEqual(value["selection"], "no-new-leak")
+            self.assertIsNone(value["selected"])
+            self.assertEqual(value["baseline"]["leak_nodes"], 1)
+            self.assertEqual([(kind, label) for kind, label, _ in case.calls], [("list", label) for label in NODES.HEAP_LABELS])
+
+    def test_missing_earlier_list_never_skips_to_first_later_growth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory), first=3)
+            case.failures[("list", "added-10")] = "partial private output"
+            value = case.compare()
+            self.assertEqual(value["status"], "unavailable")
+            self.assertIsNone(value["selection"])
+            self.assertEqual(len(case.calls), 2)
+            self.assertIn("list_invalid", value["reasons"])
+
+    def test_scan_totals_and_graph_hash_binding_reject_different_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory))
+            case.failures[("list", "added-10")] = listing({0x2000: 80})
+            value = case.compare()
+            self.assertIn("list_invalid", value["reasons"])
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory))
+            run = case.run
+            def mutate(owner, kind, label, command, allowed=(0,)):
+                output = run(owner, kind, label, command, allowed)
+                if label == "added-10":
+                    (case.graphs / "added-10.memgraph").write_bytes(b"changed graph")
+                return output
+            case.run = mutate
+            value = case.compare()
+            self.assertIn("graph_changed", value["reasons"])
+
+    def test_aba_requires_history_and_heap_diff_agreement_size_mismatch_unknown(self):
+        for agrees, requested in ((True, 48), (False, 48), (True, 47)):
+            with tempfile.TemporaryDirectory() as directory:
+                case = Case(Path(directory))
+                case.before_events = [("ALLOC", 0x2000, requested)]
+                case.after_events = case.before_events + [("FREE", 0x2000, requested), ("ALLOC", 0x2000, requested)]
+                case.heap_diff = {0x2000: 48} if agrees else {}
+                value = case.compare()
+                self.assertEqual(value["nodes"][0]["history"]["classification"], "new_allocation" if agrees and requested == 48 else "unknown")
+                self.assertEqual(value["status"], "complete" if agrees and requested == 48 else "partial")
+
+    def test_missing_baseline_address_is_new_only_with_matching_heap_diff(self):
+        for agrees in (True, False):
+            with tempfile.TemporaryDirectory() as directory:
+                case = Case(Path(directory))
+                case.baseline_heap = {}; case.before_events = []
+                case.heap_diff = {0x2000: 48} if agrees else {}
+                value = case.compare()
+                self.assertEqual(value["nodes"][0]["history"]["classification"], "new_allocation" if agrees else "unknown")
+                self.assertEqual(value["nodes"][0]["baseline_presence"], "absent")
+                self.assertIsNone(value["nodes"][0]["baseline_external_roots"])
+                self.assertEqual(len([call for call in case.calls if call[:2] == ("trace", "baseline")]), 0)
+
+    def test_candidate_budget_is_sixteen_and_histories_use_identical_addresses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory), after={0x1000 + index * 128: 48 for index in range(18)}, first=6)
+            value = case.compare()
+            self.assertEqual((value["candidate_count"], len(value["nodes"]), value["omitted_candidates"]), (18, 16, 2))
+            self.assertEqual(value["status"], "partial")
+            self.assertIn("candidate_limit", value["reasons"])
+            self.assertEqual(len(case.calls), 45)
+            queries = [command[2:] for kind, _, command in case.calls if kind == "history"]
+            self.assertEqual(queries[0], queries[1]); self.assertEqual(len(queries[0]), 16)
+            self.assertLessEqual(len(NODES.encode_summary(value)), NODES.PUBLIC_LIMIT)
+
+    def test_unknown_exit_stops_next_tool_but_preserves_comparison_and_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory))
+            original = (case.records / "result.json").read_bytes()
+            case.failures[("tree", "baseline")] = NODES.ExitUnconfirmed()
+            value = case.compare()
+            self.assertEqual(len(case.calls), 3)
+            self.assertEqual(value["comparison"]["added_nodes"], 1)
+            self.assertFalse(value["process_cleanup_confirmed"])
+            self.assertIn("process_exit_unconfirmed", value["reasons"])
+            self.assertEqual((case.records / "result.json").read_bytes(), original)
+
+    def test_parse_failure_keeps_other_bounded_evidence_without_claiming_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory))
+            case.failures[("tree", "added-10")] = "private unknown tree"
+            case.failures[("history", "baseline")] = "private unknown history"
+            value = case.compare()
+            self.assertEqual(value["status"], "partial")
+            self.assertEqual(value["nodes"][0]["selected_tree"]["status"], "unavailable")
+            self.assertEqual(value["nodes"][0]["selected_external_roots"], 0)
+            self.assertIn("tree_invalid", value["reasons"])
+            self.assertIn("history_unavailable", value["reasons"])
+
+    def test_host_not_exited_and_bad_scan_order_do_not_start_tools(self):
+        for kind in ("cleanup", "order", "boolean", "missing", "live", "product"):
+            with tempfile.TemporaryDirectory() as directory:
+                case = Case(Path(directory))
+                if kind == "cleanup":
+                    (case.records / "process-cleanup.json").write_text('{"processes_exited":false}')
+                elif kind in ("live", "product"):
+                    result = json.loads((case.records / "result.json").read_text())
+                    result["scan_mode" if kind == "live" else "mode"] = kind
+                    (case.records / "result.json").write_text(json.dumps(result))
+                else:
+                    points = json.loads((case.records / "scans.json").read_text())
+                    if kind == "order": points.reverse()
+                    if kind == "boolean": points[0]["leak_nodes"] = True
+                    if kind == "missing": points.pop()
+                    (case.records / "scans.json").write_text(json.dumps(points))
+                value = case.compare()
+                self.assertEqual(value["status"], "unavailable")
+                self.assertEqual(case.calls, [])
+
+
+class FrozenToolTests(unittest.TestCase):
+    def tool(self, root, deadline=None):
+        summary = NODES.initial_summary()
+        return NODES.Tools(root / "outputs", summary, time.monotonic() + 90 if deadline is None else deadline), summary
+
+    def test_stdout_is_file_bounded_and_even_whitespace_stderr_is_rejected(self):
+        for stderr in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                tool, summary = self.tool(Path(directory))
+                child = mock.Mock(); child.wait.return_value = 0
+                def spawn(command, **kwargs):
+                    self.assertNotIn("capture_output", kwargs)
+                    self.assertNotEqual(kwargs["stdout"], subprocess.PIPE)
+                    kwargs["stdout"].write(b"bounded output")
+                    if stderr: kwargs["stderr"].write(b" \n")
+                    kwargs["stdout"].flush(); kwargs["stderr"].flush()
+                    return child
+                with mock.patch.object(NODES.subprocess, "Popen", side_effect=spawn):
+                    if stderr:
+                        with self.assertRaises(NODES.EvidenceError): tool.run("list", "baseline", ["tool"])
+                    else:
+                        self.assertEqual(tool.run("list", "baseline", ["tool"]), "bounded output")
+                self.assertTrue(summary["process_cleanup_confirmed"])
+
+    def test_total_deadline_stops_before_spawn_and_single_tool_reserves_reaping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tool, summary = self.tool(Path(directory), time.monotonic() - 1)
+            with mock.patch.object(NODES.subprocess, "Popen") as spawn, self.assertRaises(NODES.EvidenceError) as caught:
+                tool.run("list", "baseline", ["tool"])
+            self.assertEqual(caught.exception.reason, "deadline"); spawn.assert_not_called()
+            self.assertEqual(summary["tools"], [])
+        with tempfile.TemporaryDirectory() as directory:
+            tool, summary = self.tool(Path(directory))
+            child = mock.Mock(); child.wait.side_effect = [subprocess.TimeoutExpired("tool", 13), -9]
+            with mock.patch.object(NODES.subprocess, "Popen", return_value=child), self.assertRaises(NODES.EvidenceError):
+                tool.run("list", "baseline", ["tool"])
+            self.assertLessEqual(child.wait.call_args_list[0].kwargs["timeout"], 13)
+            self.assertLessEqual(child.wait.call_args_list[1].kwargs["timeout"], 2)
+            child.kill.assert_called_once()
+            self.assertEqual(summary["tools"][0]["status"], "timeout")
+            self.assertTrue(summary["process_cleanup_confirmed"])
+
+    def test_spawn_failure_and_unconfirmed_wait_are_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tool, summary = self.tool(Path(directory))
+            with mock.patch.object(NODES.subprocess, "Popen", side_effect=OSError("private path")), self.assertRaises(NODES.EvidenceError):
+                tool.run("list", "baseline", ["tool"])
+            self.assertTrue(summary["process_cleanup_confirmed"])
+            self.assertEqual(summary["tools"][0]["status"], "spawn_failed")
+        with tempfile.TemporaryDirectory() as directory:
+            tool, summary = self.tool(Path(directory))
+            child = mock.Mock(); child.wait.side_effect = subprocess.TimeoutExpired("private path", 1)
+            with mock.patch.object(NODES.subprocess, "Popen", return_value=child), self.assertRaises(NODES.ExitUnconfirmed):
+                tool.run("list", "baseline", ["tool"])
+            self.assertFalse(summary["process_cleanup_confirmed"])
+
+    def test_output_limit_is_checked_before_read_and_nonregular_inputs_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "large"; path.write_bytes(b"x" * 17)
+            with self.assertRaises(ValueError): NODES.read_bytes(path, 16)
+            link = root / "link"; link.symlink_to(path)
+            with self.assertRaises(ValueError): NODES.read_bytes(link)
+            with self.assertRaises(ValueError): NODES.read_bytes(root)
+
+    def test_preexec_failure_without_returned_handle_is_exit_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tool, summary = self.tool(Path(directory))
+            with mock.patch.object(NODES.subprocess, "Popen", side_effect=subprocess.SubprocessError("private preexec failure")), self.assertRaises(NODES.ExitUnconfirmed):
+                tool.run("list", "baseline", ["tool"])
+            self.assertFalse(summary["process_cleanup_confirmed"])
+
+    def test_oversized_actual_tool_file_and_nonzero_exit_remain_failures(self):
+        for too_big in (True, False):
+            with tempfile.TemporaryDirectory() as directory:
+                tool, summary = self.tool(Path(directory))
+                child = mock.Mock(); child.wait.return_value = 0 if too_big else 2
+                def spawn(command, **kwargs):
+                    kwargs["stdout"].write(b"x" * 17); kwargs["stdout"].flush()
+                    return child
+                with mock.patch.object(NODES, "RAW_LIMIT", 16), mock.patch.object(NODES.subprocess, "Popen", side_effect=spawn), self.assertRaises(NODES.EvidenceError):
+                    tool.run("list", "baseline", ["tool"])
+                self.assertEqual(summary["tools"][0]["status"], "output_limit" if too_big else "exit_failed")
+                self.assertTrue(summary["process_cleanup_confirmed"])
+
+
+class FrozenPublicGateTests(unittest.TestCase):
+    @staticmethod
+    def no_new():
+        value = NODES.initial_summary()
+        value.update(status="complete", selection="no-new-leak",
+                     baseline={"leak_nodes": 3, "leak_bytes": 300, "graph_sha256": "0" * 64},
+                     tools=[{"tool": "list", "label": label, "status": "complete", "return_code": 0, "cleanup_confirmed": True}
+                            for label in NODES.HEAP_LABELS])
+        return value
+
+    def test_candidate_conservation_includes_resized_and_partial_omissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = Case(Path(directory)).compare()
+        for status in ("complete", "partial"):
+            bad = copy.deepcopy(value)
+            bad["selected"].update(leak_nodes=2, leak_bytes=96)
+            bad["comparison"].update(added_nodes=2, added_bytes=96)
+            bad["status"] = status
+            if status == "partial": bad["reasons"] = ["candidate_limit"]
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                NODES.validate_summary(bad)
+            if status == "partial":
+                bad.update(candidate_count=2, omitted_candidates=1)
+                NODES.validate_summary(bad)
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory), {0x1000: 48}, {0x1000: 80})
+            case.baseline_heap = {0x1000: 48}
+            case.heap_diff = {0x1000: 80}
+            case.before_events = [("ALLOC", 0x1000, 48)]
+            case.after_events = case.before_events + [("FREE", 0x1000, 48), ("ALLOC", 0x1000, 80)]
+            resized = case.compare()
+        self.assertEqual(resized["status"], "complete")
+        self.assertEqual((resized["candidate_count"], resized["comparison"]["added_nodes"], resized["comparison"]["resized_addresses"]), (1, 0, 1))
+        resized.update(status="partial", nodes=[], candidate_count=0, reasons=["deadline"])
+        with self.assertRaises(ValueError): NODES.validate_summary(resized)
+        resized.update(candidate_count=1, omitted_candidates=1)
+        NODES.validate_summary(resized)
+
+    def test_complete_no_new_requires_exact_seven_list_receipts(self):
+        value = self.no_new()
+        NODES.validate_summary(value)
+        invalid = [[], value["tools"][::-1], value["tools"] + [value["tools"][0]]]
+        invalid += [value["tools"][:index] + value["tools"][index + 1:] for index in range(7)]
+        duplicate = copy.deepcopy(value["tools"]); duplicate[-1] = duplicate[0]
+        invalid.append(duplicate)
+        for tools in invalid:
+            bad = copy.deepcopy(value); bad["tools"] = tools
+            with self.subTest(tools=tools), self.assertRaises(ValueError):
+                NODES.validate_summary(bad)
+
+    def test_complete_first_new_requires_each_actual_tool_and_presence_dependent_trace(self):
+        for presence in ("present", "absent", "mixed"):
+            with tempfile.TemporaryDirectory() as directory:
+                after = {0x2000: 48, 0x3000: 80} if presence == "mixed" else {0x2000: 48}
+                case = Case(Path(directory), after=after, first=3)
+                if presence != "present":
+                    del case.baseline_heap[0x2000]
+                    case.heap_diff = {0x2000: 48}
+                    case.before_events = [("ALLOC", address, size) for address, size in case.baseline_heap.items()]
+                value = case.compare()
+            self.assertEqual(value["status"], "complete")
+            expected = [("list", label) for label in NODES.HEAP_LABELS[:4]]
+            expected += [("tree", "baseline"), ("tree", "removed-10"), ("heap", "baseline"),
+                         ("heap_diff", "removed-10"), ("history", "baseline"), ("history", "removed-10")]
+            for node in value["nodes"]:
+                if node["baseline_presence"] == "present": expected.append(("trace", "baseline"))
+                expected.append(("trace", "removed-10"))
+            self.assertEqual([(tool["tool"], tool["label"]) for tool in value["tools"]], expected)
+            invalid = [[], value["tools"][::-1], value["tools"] + [value["tools"][-1]]]
+            invalid += [value["tools"][:index] + value["tools"][index + 1:] for index in range(len(value["tools"]))]
+            wrong_label = copy.deepcopy(value["tools"]); wrong_label[-1]["label"] = "observer-exited"
+            invalid.append(wrong_label)
+            for tools in invalid:
+                bad = copy.deepcopy(value); bad["tools"] = tools
+                with self.subTest(presence=presence, tools=tools), self.assertRaises(ValueError):
+                    NODES.validate_summary(bad)
+
+    def test_partial_allows_incomplete_tools_but_not_contradictory_candidate_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = Case(Path(directory)).compare()
+        value.update(status="partial", tools=[], reasons=["deadline"])
+        NODES.validate_summary(value)
+        value.update(candidate_count=2, omitted_candidates=1)
+        with self.assertRaises(ValueError): NODES.validate_summary(value)
+
+    def test_minimal_no_new_fixture_and_public_malicious_values(self):
+        value = self.no_new(); NODES.validate_summary(value)
+        changes = [lambda v: v.update(path="private"), lambda v: v.update(schema=True),
+                   lambda v: v.update(status="private"), lambda v: v.update(selection="private"),
+                   lambda v: v.update(process_cleanup_confirmed=1), lambda v: v.update(reasons=["private"]),
+                   lambda v: v["baseline"].update(graph_sha256="/private/path"),
+                   lambda v: v["baseline"].update(leak_nodes=True), lambda v: v.update(candidate_count=1),
+                   lambda v: v.update(status="partial"), lambda v: v.update(reasons=["deadline"])]
+        for change in changes:
+            bad = copy.deepcopy(value); change(bad)
+            with self.subTest(value=bad), self.assertRaises(ValueError): NODES.validate_summary(bad)
+
+    def test_nested_fields_and_false_complete_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = Case(Path(directory)).compare()
+        changes = [lambda v: v["nodes"][0].update(address="0x2000"), lambda v: v["nodes"][0].update(type="private"),
+                   lambda v: v["nodes"][0]["history"].update(classification="old so harmless"),
+                   lambda v: v["nodes"][0]["selected_tree"].update(root_type="private"),
+                   lambda v: v["nodes"][0]["history"].update(classification="unknown"),
+                   lambda v: v["tools"][0].update(command="private"), lambda v: v["tools"][0].update(return_code=True),
+                   lambda v: v["comparison"].update(added_nodes=999)]
+        for change in changes:
+            bad = copy.deepcopy(value); change(bad)
+            with self.assertRaises(ValueError): NODES.validate_summary(bad)
+
+    def test_cli_exit_matches_status_preserves_strict_and_never_prints_raw(self):
+        for complete in (True, False):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); case = Case(root)
+                if not complete: case.failures[("tree", "added-10")] = "private raw tree"
+                output = io.StringIO()
+                with mock.patch.object(NODES.Tools, "run", autospec=True, side_effect=case.run), contextlib.redirect_stdout(output):
+                    code = NODES.main(["--graph-directory", str(case.graphs), "--records-directory", str(case.records)])
+                self.assertEqual(code, 0 if complete else 1)
+                data = (case.records / "frozen-nodes.json").read_bytes()
+                self.assertLessEqual(len(data), 16384)
+                NODES.validate_summary(json.loads(data))
+                self.assertNotIn("private", output.getvalue())
+                self.assertNotIn(str(root), output.getvalue())
+                self.assertEqual(json.loads((case.records / "result.json").read_text())["coverage"], "failed")
+
+    def test_actual_serialization_budget_trims_nodes_and_reports_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); case = Case(root, after={0x1000 + index * 128: 48 for index in range(16)})
+            with mock.patch.object(NODES.Tools, "run", autospec=True, side_effect=case.run), mock.patch.object(NODES, "PUBLIC_LIMIT", 12000), contextlib.redirect_stdout(io.StringIO()):
+                code = NODES.main(["--graph-directory", str(case.graphs), "--records-directory", str(case.records)])
+            data = (case.records / "frozen-nodes.json").read_bytes()
+            self.assertLessEqual(len(data), 12000)
+            value = json.loads(data)
+            self.assertEqual(code, 1)
+            self.assertEqual(value["status"], "partial")
+            self.assertIn("summary_budget", value["reasons"])
+            self.assertEqual(len(value["nodes"]) + value["omitted_candidates"], 16)
+
+
+if __name__ == "__main__":
+    unittest.main()

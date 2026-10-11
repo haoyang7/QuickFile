@@ -2321,6 +2321,103 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
         script = block.split("          python3 - <<'PY'\n", 1)[1].split("          PY\n", 1)[0]
         return "\n".join(line[10:] for line in script.splitlines())
 
+    def test_frozen_control_rejects_conflicting_modes_before_starting_tools(self):
+        script = self.workflow_script("Verify investigation identity")
+        environment = {"AX_FROZEN_CONTROL": "true", "AX_SCAN_MODE": "diagnostic", "AX_RECEIPT_MODE": "internal",
+                       "AX_TERMINAL_ORIGIN": "false", "MALLOC_SCRIBBLE_EXPERIMENT": "false",
+                       "AX_HEAP_DIAGNOSTICS": "false", "CAUSAL_PROBE": "false",
+                       "AX_PURE_APPKIT_CONTROL": "false", "AX_INSTALL_GATE_CONTROL": "false"}
+        outputs = {('sw_vers', '-productVersion'): '26.6.2', ('sw_vers', '-buildVersion'): '25G83',
+                   ('uname', '-m'): 'arm64', ('xcodebuild', '-version'): 'Xcode 26.3\nBuild version 17C529',
+                   ('git', 'rev-parse', 'HEAD'): '1' * 40}
+        variants = [None, ("AX_SCAN_MODE", "live"), ("AX_RECEIPT_MODE", "external-startup")]
+        variants += [(key, "true") for key in ("AX_TERMINAL_ORIGIN", "MALLOC_SCRIBBLE_EXPERIMENT",
+            "AX_HEAP_DIAGNOSTICS", "CAUSAL_PROBE", "AX_PURE_APPKIT_CONTROL", "AX_INSTALL_GATE_CONTROL")]
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory) / "records"
+                code = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
+                with mock.patch.dict(os.environ, environment | (dict([variant]) if variant else {})), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        mock.patch.object(subprocess, "check_output", side_effect=lambda command, **_: outputs[tuple(command)]) as query:
+                    if variant:
+                        with self.assertRaises(AssertionError):
+                            exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        query.assert_not_called()
+                    else:
+                        exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        summary = json.loads((root / "summary.json").read_text())
+                        self.assertEqual(summary["expected_trials"], 1)
+                        self.assertTrue(summary["identity"]["frozen_control"])
+                        self.assertEqual(summary["identity"]["scan_mode"], "diagnostic")
+
+    def test_frozen_control_preserves_strict_failure_and_gates_offline_evidence(self):
+        no_growth = {"schema": 1, "status": "complete", "selection": "no-new-leak", "selected_label": None,
+                     "baseline": {"leak_nodes": 3, "leak_bytes": 300, "graph_sha256": "0" * 64},
+                     "selected": None, "comparison": None, "candidate_count": 0, "omitted_candidates": 0,
+                     "nodes": [], "tools": [{"tool": "list", "label": label, "status": "complete",
+                                              "return_code": 1, "cleanup_confirmed": True}
+                                             for label in REPORT.HEAP_LABELS],
+                     "reasons": [], "process_cleanup_confirmed": True}
+        for failure in (None, "strict", "host-exit", "missing", "private", "counts", "timeout", "cleanup",
+                        "early-count", "early-bytes"):
+            with self.subTest(failure=failure):
+                value = json.loads(json.dumps(no_growth))
+                if failure == "private":
+                    value["private"] = "/private/secret"
+                if failure == "counts":
+                    value["baseline"]["leak_nodes"] = 4
+                scan_change = None
+                if failure in ("early-count", "early-bytes"):
+                    key = "leak_nodes" if failure == "early-count" else "leak_bytes"
+                    value["baseline"][key] -= 1
+                    scan_change = lambda scan: scan.update({key: value["baseline"][key]})
+                strict_failure = failure in ("strict", "early-count", "early-bytes")
+                invocations, summary = self.run_measurement(enabled=False, frozen_control=True,
+                    frozen_summary=value, first_failure="strict" if strict_failure else None,
+                    first_scan_change=scan_change,
+                    frozen_failure=failure if failure != "strict" else None)
+                self.assertEqual(invocations, [(None, "control")])
+                self.assertEqual(summary["strict_checks_passed"], not strict_failure)
+                self.assertEqual(summary["frozen_node_checks_passed"], failure in (None, "strict"))
+                trial = summary["trials"][0]
+                self.assertEqual(trial["frozen_nodes_available"], failure in (None, "strict", "timeout", "cleanup"))
+                if failure == "host-exit":
+                    self.assertNotIn("frozen_node_process_run", trial)
+
+    def test_frozen_control_rejects_selection_after_an_earlier_growth_point(self):
+        with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
+            from ax_frozen_nodes import validate_summary
+        value = {"schema": 1, "status": "complete", "selection": "first-new-leak", "selected_label": "removed-10",
+                 "baseline": {"leak_nodes": 2, "leak_bytes": 252, "graph_sha256": "0" * 64},
+                 "selected": {"leak_nodes": 3, "leak_bytes": 300, "graph_sha256": "1" * 64},
+                 "comparison": {"added_nodes": 1, "added_bytes": 48, "removed_nodes": 0, "removed_bytes": 0,
+                                "retained_addresses": 2, "resized_addresses": 0},
+                 "candidate_count": 1, "omitted_candidates": 0, "nodes": [{
+                     "index": 0, "type": "NSString", "size": 48, "baseline_heap_size": 48,
+                     "baseline_presence": "present",
+                     "baseline_tree": {"status": "not_leaked", "root_kind": None, "root_type": None,
+                                       "nodes": None, "bytes": None, "cycle_back_edges": None},
+                     "selected_tree": {"status": "mapped", "root_kind": "cycle", "root_type": "NSString",
+                                       "nodes": 1, "bytes": 48, "cycle_back_edges": 1},
+                     "history": {"classification": "preexisting", "before_allocs": 1, "before_frees": 0,
+                                 "after_allocs": 1, "after_frees": 0, "heap_diff_present": False},
+                     "baseline_external_roots": 2, "selected_external_roots": 0}],
+                 "tools": [], "reasons": [], "process_cleanup_confirmed": True}
+        commands = [("list", label) for label in ("baseline", "added-10", "registered-10", "removed-10")]
+        commands += [("tree", "baseline"), ("tree", "removed-10"), ("heap", "baseline"),
+                     ("heap_diff", "removed-10"), ("history", "baseline"), ("history", "removed-10"),
+                     ("trace", "baseline"), ("trace", "removed-10")]
+        value["tools"] = [{"tool": tool, "label": label, "status": "complete", "return_code": 0,
+                           "cleanup_confirmed": True} for tool, label in commands]
+        validate_summary(value)
+        _, summary = self.run_measurement(enabled=False, frozen_control=True, frozen_summary=value,
+            first_failure="strict", frozen_failure="earlier-growth",
+            first_scan_change=lambda scan: scan.update(leak_nodes=2, leak_bytes=252))
+        self.assertFalse(summary["strict_checks_passed"])
+        self.assertFalse(summary["frozen_node_checks_passed"])
+        self.assertFalse(summary["trials"][0]["frozen_nodes_available"])
+
     def test_external_receipt_requires_live_scribble_before_starting_fixtures(self):
         script = self.workflow_script("Verify investigation identity")
         for scan_mode, enabled, receipt, diagnostic in (("diagnostic", "true", "external-startup", "false"),
@@ -2887,13 +2984,18 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
 
     def run_measurement(self, *, enabled=True, first_failure=None, scan_mode="diagnostic", unexpected_diagnostics=False,
                         first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False, install_control=False,
-                        first_startup_failures=None, image_cleanup_failure=None, first_records_change=None):
+                        first_startup_failures=None, image_cleanup_failure=None, first_records_change=None,
+                        frozen_control=False, frozen_summary=None, frozen_failure=None):
         script = self.workflow_script("Measure matched cases with strict heap checks")
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
             summary_file = root / "summary.json"
             PROBE.write_json(summary_file, {"identity": {"scan_mode": scan_mode, "receipt_mode": receipt_mode, "terminal_origin": terminal_origin}, "trials": [], "completed": False,
-                                           "expected_trials": 2 if terminal_origin else 20 if enabled else 10})
+                                           "expected_trials": 1 if frozen_control else 2 if terminal_origin else 20 if enabled else 10})
+            if frozen_control:
+                value = json.loads(summary_file.read_text())
+                value["identity"]["frozen_control"] = True
+                PROBE.write_json(summary_file, value)
             if pure_control:
                 value = json.loads(summary_file.read_text())
                 value["identity"]["pure_appkit_control"] = True
@@ -2950,9 +3052,11 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if setting:
                         test.assertEqual(kwargs["env"].get("MallocScribble"), "1" if setting == "on" else None)
                     else:
-                        test.assertEqual(kwargs["env"]["MallocScribble"], "inherited-secret")
+                        test.assertEqual(kwargs["env"].get("MallocScribble"), None if frozen_control else "inherited-secret")
                     records = pathlib.Path(command[command.index("--records-directory") + 1])
                     records.mkdir()
+                    if frozen_control:
+                        PROBE.write_json(records / "process-cleanup.json", {"processes_exited": frozen_failure != "host-exit", "errors": []})
                     if terminal_origin:
                         PROBE.write_json(records / "process-cleanup.json", {"processes_exited": True, "errors": []})
                         # This fake runner explicitly enters offline collection,
@@ -3068,7 +3172,24 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         raise subprocess.TimeoutExpired("probe", timeout)
                     return 1 if self.first and first_failure == "strict" else 0
 
-            def run_owned(command, log_path, environment):
+            def run_owned(command, log_path, environment, timeout=180):
+                if command[1] == "Scripts/Investigations/ax_frozen_nodes.py":
+                    test.assertTrue(frozen_control)
+                    test.assertEqual(timeout, 120)
+                    test.assertEqual(invocations, [(None, "control")])
+                    saved = json.loads(summary_file.read_text())
+                    test.assertEqual(len(saved["trials"]), 1)
+                    test.assertEqual(saved["strict_checks_passed"], first_failure is None)
+                    records = pathlib.Path(command[command.index("--records-directory") + 1])
+                    if frozen_failure != "missing":
+                        PROBE.write_json(records / "frozen-nodes.json", frozen_summary)
+                    complete = frozen_failure != "cleanup"
+                    return {"return_code": 125 if not complete else 124 if frozen_failure == "timeout" else 0,
+                            "command_return_code": None if frozen_failure else 0,
+                            "status": "timeout" if frozen_failure == "timeout" else "completed",
+                            "cleanup": {"complete": complete, "group_members_exited": complete,
+                                "leader_reaped": True, "group_signal": "sent",
+                                "group_inspection": "exited" if complete else "running"}}
                 process = Process(command, env=environment, start_new_session=True)
                 try:
                     code = process.wait(180)
@@ -3098,7 +3219,11 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 self.assertEqual(summary["trials"], [])
                 self.assertEqual(invocations, [])
                 return invocations, summary
-            self.assertEqual(result.exception.code, int(first_failure is not None or image_cleanup_failure is not None))
+            self.assertEqual(result.exception.code, int(first_failure is not None or image_cleanup_failure is not None or frozen_failure is not None))
+            if frozen_failure == "cleanup":
+                self.assertFalse(summary["completed"])
+                self.assertFalse(summary["frozen_node_checks_passed"])
+                return invocations, summary
             if image_cleanup_failure in ("collection", "fresh", "missing", "collection-artifact", "fresh-artifact", "gate-write", "collection-stage"):
                 self.assertFalse(summary["completed"])
                 self.assertEqual(len(invocations), 1)
@@ -3115,7 +3240,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 return invocations, summary
             self.assertEqual(summary["strict_checks_passed"], first_failure is None or first_failure.startswith("terminal"))
             self.assertTrue(summary["completed"])
-            self.assertEqual(len(summary["trials"]), 2 if terminal_origin else 20 if enabled else 10)
+            self.assertEqual(len(summary["trials"]), 1 if frozen_control else 2 if terminal_origin else 20 if enabled else 10)
             for trial_index, receipt in enumerate(summary["trials"]):
                 self.assertEqual(receipt["scan_mode"], scan_mode)
                 self.assertEqual(receipt["diagnostics_expected"], scan_mode == "diagnostic")
