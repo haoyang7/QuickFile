@@ -8,6 +8,52 @@ on:
         type: boolean
         required: false
         default: false
+      heap_diagnostics:
+        description: 'Compare five macOS 26 empty/product pairs, including references at the first strict node/byte growth'
+        type: boolean
+        required: false
+        default: false
+      malloc_scribble:
+        description: 'Run five macOS 26 matched groups of MallocScribble off/on x empty control/product; investigation only'
+        type: boolean
+        required: false
+        default: false
+      scan_mode:
+        description: 'diagnostic: frozen graphs and seven checkpoints; live: ordinary CI scans and six checkpoints (requires malloc_scribble)'
+        type: choice
+        required: false
+        default: diagnostic
+        options:
+          - diagnostic
+          - live
+      receipt_mode:
+        description: 'internal: fixture environment code; external-startup: ordinary binaries and owned-child startup metadata (requires live + malloc_scribble)'
+        type: choice
+        required: false
+        default: internal
+        options:
+          - internal
+          - external-startup
+      terminal_origin:
+        description: 'One off/control + off/product pair, six live scans then one later graph each; requires live + external-startup + malloc_scribble'
+        type: boolean
+        required: false
+        default: false
+      install_gate_control:
+        description: 'Five live off pairs of installed/preflight-only empty controls from one probe build; other inputs must remain defaults'
+        required: false
+        type: boolean
+        default: false
+      pure_appkit_control:
+        description: 'Five live off pairs of patched/pure AppKit empty controls; requires all other inputs at defaults'
+        type: boolean
+        required: false
+        default: false
+      frozen_control:
+        description: 'One frozen empty control with bounded node/reference comparison; other inputs must remain defaults'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +68,7 @@ defaults:
 
 jobs:
   ax-system-probe:
+    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin && !inputs.pure_appkit_control && !inputs.install_gate_control && !inputs.frozen_control }}
     name: macOS ${{ matrix.expected_os }} (arm64)
     strategy:
       fail-fast: false
@@ -115,6 +162,647 @@ jobs:
           python3 - <<'PY'
           import pathlib, shutil
           root = pathlib.Path('.build/Temporary/ax-system-probe')
+          if root.exists():
+              assert not root.is_symlink()
+              shutil.rmtree(root)
+          PY
+
+  ax-heap-diagnostics:
+    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin || inputs.pure_appkit_control || inputs.install_gate_control || inputs.frozen_control }}
+    name: macOS 26 ${{ inputs.install_gate_control && 'install gate live' || inputs.pure_appkit_control && 'pure AppKit live' || inputs.scan_mode }} heap comparison (arm64)
+    runs-on: macos-26
+    timeout-minutes: ${{ inputs.malloc_scribble && 70 || inputs.heap_diagnostics && 55 || (inputs.pure_appkit_control || inputs.install_gate_control) && 40 || 35 }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      CAUSAL_PROBE: ${{ inputs.ax_causal_probe }}
+      MALLOC_SCRIBBLE_EXPERIMENT: ${{ inputs.malloc_scribble }}
+      AX_SCAN_MODE: ${{ inputs.scan_mode }}
+      AX_RECEIPT_MODE: ${{ inputs.receipt_mode }}
+      AX_HEAP_DIAGNOSTICS: ${{ inputs.heap_diagnostics }}
+      AX_TERMINAL_ORIGIN: ${{ inputs.terminal_origin }}
+      AX_PURE_APPKIT_CONTROL: ${{ inputs.pure_appkit_control }}
+      AX_INSTALL_GATE_CONTROL: ${{ inputs.install_gate_control }}
+      AX_FROZEN_CONTROL: ${{ inputs.frozen_control }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Verify investigation identity
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          def output(*command):
+              return subprocess.check_output(command, text=True).strip()
+          assert os.environ['CAUSAL_PROBE'] == 'false', 'Choose one investigation mode'
+          scan_mode = os.environ['AX_SCAN_MODE']
+          receipt_mode = os.environ['AX_RECEIPT_MODE']
+          terminal_origin = os.environ.get('AX_TERMINAL_ORIGIN', 'false') == 'true'
+          pure_control = os.environ.get('AX_PURE_APPKIT_CONTROL', 'false') == 'true'
+          install_control = os.environ.get('AX_INSTALL_GATE_CONTROL', 'false') == 'true'
+          frozen_control = os.environ.get('AX_FROZEN_CONTROL', 'false') == 'true'
+          if frozen_control:
+              assert (scan_mode == 'diagnostic' and receipt_mode == 'internal' and not terminal_origin
+                  and not pure_control and not install_control
+                  and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == os.environ['AX_HEAP_DIAGNOSTICS'] == 'false'), 'Frozen control requires other inputs at defaults'
+          assert not (pure_control and install_control), 'Choose one empty-control investigation'
+          if pure_control or install_control:
+              assert (scan_mode == 'diagnostic' and receipt_mode == 'internal' and not terminal_origin
+                  and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == os.environ['AX_HEAP_DIAGNOSTICS'] == 'false'), 'Empty-control investigation requires other inputs at defaults'
+              scan_mode, receipt_mode = 'live', 'external-startup'
+          assert receipt_mode in ('internal', 'external-startup'), 'Unknown receipt mode'
+          assert receipt_mode != 'external-startup' or (scan_mode == 'live' and (pure_control or install_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true')), 'External startup receipts require live MallocScribble'
+          assert receipt_mode != 'external-startup' or os.environ['AX_HEAP_DIAGNOSTICS'] == 'false', 'External startup receipts cannot request frozen diagnostics'
+          assert scan_mode in ('diagnostic', 'live'), 'Unknown heap scan mode'
+          assert scan_mode != 'live' or pure_control or install_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires malloc_scribble'
+          assert not terminal_origin or (scan_mode == 'live' and receipt_mode == 'external-startup'), 'Terminal origin requires external live comparison'
+          version = output('sw_vers', '-productVersion')
+          architecture = output('uname', '-m')
+          xcode = output('xcodebuild', '-version')
+          assert version.split('.')[0] == '26' and architecture == 'arm64'
+          assert xcode.splitlines()[0] == 'Xcode 26.3'
+          def image_field(name):
+              value = os.environ.get(name, '')
+              return value if re.fullmatch(r'[A-Za-z0-9._-]{1,80}', value) else 'unavailable'
+          # Do not dump environment values, paths or arbitrary allocator settings.
+          allocator_environment = {}
+          for name in ('MallocScribble', 'MallocPreScribble', 'MallocStackLogging',
+                       'MallocStackLoggingNoCompact', 'MallocNanoZone', 'MallocGuardEdges'):
+              value = os.environ.get(name)
+              allocator_environment[name] = 'unset' if value is None else value if value in ('0', '1') else 'other'
+          identity = {'scope':'synthetic-AX-heap-investigation', 'scan_mode':scan_mode, 'receipt_mode':receipt_mode,
+              'terminal_origin':terminal_origin,
+              'checkout_sha':output('git', 'rev-parse', 'HEAD'), 'macos':version,
+              'os_build':output('sw_vers', '-buildVersion'), 'architecture':architecture, 'xcode':xcode,
+              'runner_image':{'os':image_field('ImageOS'), 'version':image_field('ImageVersion')},
+              'inherited_allocator_environment':allocator_environment,
+              'dyld_insert_libraries_present':'DYLD_INSERT_LIBRARIES' in os.environ,
+              'malloc_scribble_experiment':os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'}
+          if pure_control:
+              identity['pure_appkit_control'] = True
+          if install_control:
+              identity['install_gate_control'] = True
+          if frozen_control:
+              identity['frozen_control'] = True
+          if os.environ['AX_HEAP_DIAGNOSTICS'] == 'true' and not identity['malloc_scribble_experiment']:
+              identity['frozen_node_selection'] = 'first-strict-growth'
+          root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
+          root.mkdir(parents=True, exist_ok=False)
+          (root / 'summary.json').write_text(json.dumps({'identity':identity, 'trials':[], 'completed':False,
+              'expected_trials':1 if frozen_control else 2 if terminal_origin else 20 if identity['malloc_scribble_experiment'] else 10}, indent=2) + '\n')
+          print(json.dumps(identity))
+          PY
+      - name: Measure matched cases with strict heap checks
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, sys
+          sys.path.insert(0, 'Scripts/Investigations')
+          from ax_probe_report import validate_heap_diagnostics_summary, validate_terminal_snapshot, validation_failure_counts, terminal_cache_identity, recheck_terminal_cache_identity
+          from ax_external_receipt import fixture_sources, load_prepared_build, validate_external_receipt, validate_install_gate_state, validate_startup_failures
+          from ax_process import run_owned
+          from ax_frozen_nodes import validate_summary as validate_frozen_nodes
+          from ax_bridge_evidence import validate_summary as validate_bridges, encode_summary as encode_bridges, PUBLIC_LIMIT as BRIDGE_LIMIT
+          from ax_parser_evidence import EVIDENCE_LIMIT, validate_evidence, encode_evidence
+          from ax_system_images import ImageWorkerCleanupError, ImageWorkerArtifactError, worker_cleanup_state, write_worker_cleanup
+          import hashlib
+          from importlib import import_module
+          runner = import_module('verify-ax-compatibility')
+          validate_malloc_scribble_receipt = runner.validate_malloc_scribble_receipt
+          root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
+          summary_file = root / 'summary.json'
+          public_summary = json.loads(summary_file.read_text())
+          scan_mode = public_summary['identity']['scan_mode']
+          diagnostics_expected = scan_mode == 'diagnostic'
+          external_receipt = public_summary['identity']['receipt_mode'] == 'external-startup'
+          terminal_origin = public_summary['identity'].get('terminal_origin', False)
+          pure_control = public_summary['identity'].get('pure_appkit_control', False)
+          install_control = public_summary['identity'].get('install_gate_control', False)
+          frozen_control = public_summary['identity'].get('frozen_control', False)
+          first_strict_growth = public_summary['identity'].get('frozen_node_selection') == 'first-strict-growth'
+          frozen_analysis = frozen_control or first_strict_growth
+          assert not first_strict_growth or diagnostics_expected and not external_receipt
+          scribble_experiment = os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'
+          fixtures = {}
+          if external_receipt:
+              for build_mode in (('install-gate',) if install_control else ('patched', 'pure-appkit') if pure_control else ('ordinary',)):
+                  prepared = root / (build_mode + '-fixture')
+                  prefix = build_mode + '-' if pure_control else ''
+                  build_run = run_owned([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
+                      '--prepare-external-fixture', '--work-directory', str(prepared),
+                      '--records-directory', str(root / (prefix + 'build-records')),
+                      *(['--empty-control-mode', build_mode] if pure_control else []),
+                      *(['--prepare-install-gate-fixture'] if install_control else [])], root / (prefix + 'build.log'), dict(os.environ))
+                  build_return_code = build_run['return_code']
+                  if pure_control:
+                      public_summary.setdefault('empty_control_builds', {})[build_mode] = {'return_code': build_return_code, 'process_run': build_run}
+                  else:
+                      public_summary['fixture_build_return_code'] = build_return_code
+                      public_summary['fixture_build_process_run'] = build_run
+                  summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+                  if build_return_code != 0 or not build_run['cleanup']['complete']:
+                      raise SystemExit(1)
+                  source_hashes = {name: hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() for name in fixture_sources(build_mode)}
+                  build = load_prepared_build(prepared, source_hashes, build_mode)
+                  fixtures[build_mode] = (prepared, build['executables'])
+                  if pure_control:
+                      public_summary['empty_control_builds'][build_mode]['manifest'] = build
+                  else:
+                      public_summary['fixture_executables'] = build['executables']
+                      public_summary['fixture_sources'] = source_hashes
+                      if install_control:
+                          public_summary['install_gate_build'] = build
+                  summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+          failed = False
+          terminal_failed = False
+          frozen_failed = False
+          bridge_failed = False
+          for trial in range(1, 2 if terminal_origin or frozen_control else 6):
+              # Reverse both factors between groups to expose order effects.
+              modes = ('control', 'product') if trial % 2 else ('product', 'control')
+              if frozen_control:
+                  modes = ('control',)
+              if pure_control:
+                  modes = ('patched', 'pure-appkit') if trial % 2 else ('pure-appkit', 'patched')
+              if install_control:
+                  modes = ('installed', 'preflight-only') if trial % 2 else ('preflight-only', 'installed')
+              settings = ('off',) if terminal_origin or pure_control or install_control else (('off', 'on') if trial % 2 else ('on', 'off')) if scribble_experiment else (None,)
+              for scribble, mode in ((setting, mode) for setting in settings for mode in modes):
+                  if external_receipt:
+                      prepared, expected_hashes = fixtures['install-gate' if install_control else mode if pure_control else 'ordinary']
+                  directory = root / (f'pair-{trial}-{scribble}-{mode}' if scribble else f'pair-{trial}-{mode}')
+                  directory.mkdir()
+                  records = directory / 'records'
+                  environment = dict(os.environ)
+                  if frozen_analysis:
+                      environment.pop('MallocScribble', None)
+                  if scribble:
+                      environment.pop('MallocScribble', None)
+                      if scribble == 'on':
+                          environment['MallocScribble'] = '1'
+                  process_run = run_owned([sys.executable, 'Scripts/Investigations/verify-ax-compatibility.py',
+                      '--work-directory', str(directory / 'fixture'), '--records-directory', str(records),
+                      *(['--heap-diagnostics'] if diagnostics_expected else []),
+                      *(['--malloc-scribble', scribble] if scribble else []),
+                      *(['--external-startup-receipt', '--prepared-fixture-directory', str(prepared)] if external_receipt else []),
+                      *(['--terminal-origin'] if terminal_origin else []),
+                      *(['--empty-control-mode', mode] if pure_control else []),
+                      *(['--install-gate', mode] if install_control else []),
+                      *(['--heap-control'] if mode == 'control' or pure_control or install_control else [])], directory / 'runner.log', environment)
+                  return_code = process_run['return_code']
+                  failed |= return_code != 0 or not process_run['cleanup']['complete']
+                  receipt = {'trial': trial, 'mode': mode, 'scan_mode': scan_mode, 'return_code': return_code,
+                             'diagnostics_expected': diagnostics_expected, 'diagnostics_available': False, 'process_run': process_run,
+                             'receipt_mode': public_summary['identity']['receipt_mode']}
+                  if pure_control:
+                      receipt['fixture_mode_verified'] = False
+                  if install_control:
+                      receipt['capability_install_gate_verified'] = False
+                  receipt['failure_classification_available'] = False
+                  result_file = records / 'result.json'
+                  if result_file.is_file() and not result_file.is_symlink() and result_file.stat().st_size <= 65536:
+                      try:
+                          failure_counts = validation_failure_counts(json.loads(result_file.read_text()))
+                      except (ValueError, TypeError, KeyError):
+                          pass
+                      else:
+                          receipt.update(failure_classification_available=True, validation_failure_counts=failure_counts)
+                          failed |= any(failure_counts.values())
+                  failed |= not receipt['failure_classification_available']
+                  input_file = records / 'inputs.json'
+                  if input_file.is_file() and not input_file.is_symlink() and input_file.stat().st_size <= 16384:
+                      try:
+                          capabilities = json.loads(input_file.read_text())['capabilities']
+                          if pure_control:
+                              runner.validate_empty_control_capabilities(capabilities, mode)
+                              receipt['fixture_mode_verified'] = True
+                          if install_control:
+                              runner.validate_install_gate_capabilities(capabilities, mode)
+                              receipt.update(capability_install_gate_verified=True, capability_install_gate=capabilities['install_probe'])
+                          images = capabilities['images']
+                          if (type(images) is not dict or set(images) != {'AppKit', 'CoreFoundation'}
+                                  or any(type(value) is not str or not re.fullmatch(r'[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}', value)
+                                         for value in images.values())):
+                              raise ValueError('Invalid system image identities')
+                          receipt['images'] = images
+                      except (ValueError, TypeError, KeyError, RuntimeError):
+                          failed = True
+                  if 'images' not in receipt:
+                      failed = True
+                  if scribble:
+                      receipt.update(malloc_scribble=scribble, environment_verified=False)
+                      environment_file = records / 'malloc-scribble.json'
+                      if environment_file.is_file() and not environment_file.is_symlink() and environment_file.stat().st_size <= 1024:
+                          try:
+                              actual_environment = json.loads(environment_file.read_text())
+                              validate_malloc_scribble_receipt(actual_environment, scribble)
+                          except (ValueError, TypeError, KeyError, RuntimeError):
+                              pass
+                          else:
+                              receipt.update(environment_verified=True, process_environment=actual_environment)
+                      failed |= not receipt['environment_verified']
+                  if external_receipt:
+                      receipt['external_startup_verified'] = False
+                      startup_file = records / 'external-startup.json'
+                      if startup_file.is_file() and not startup_file.is_symlink() and startup_file.stat().st_size <= 4096:
+                          try:
+                              startup = json.loads(startup_file.read_text())
+                              validate_external_receipt(startup, scribble, expected_hashes, mode if install_control else None)
+                          except (ValueError, TypeError, KeyError, RuntimeError):
+                              pass
+                          else:
+                              receipt.update(external_startup_verified=True, startup_environment=startup)
+                      failed |= not receipt['external_startup_verified']
+                      receipt['startup_failures_available'] = False
+                      failures_file = records / 'startup-failures.json'
+                      if failures_file.is_file() and not failures_file.is_symlink() and failures_file.stat().st_size <= 2048:
+                          try:
+                              startup_failures = json.loads(failures_file.read_text())
+                              validate_startup_failures(startup_failures)
+                          except (ValueError, TypeError):
+                              pass
+                          else:
+                              receipt.update(startup_failures_available=True, startup_failures=startup_failures)
+                              failed |= bool(startup_failures)
+                      failed |= not receipt['startup_failures_available']
+                  if install_control:
+                      receipt['initial_install_gate_verified'] = False
+                      initial_file = records / 'install-gate-initial.json'
+                      if initial_file.is_file() and not initial_file.is_symlink() and initial_file.stat().st_size <= 1024:
+                          try:
+                              initial_gate = json.loads(initial_file.read_text())
+                              validate_install_gate_state(initial_gate, mode)
+                          except (ValueError, TypeError, RuntimeError):
+                              pass
+                          else:
+                              receipt.update(initial_install_gate_verified=True, initial_install_gate=initial_gate)
+                      failed |= not receipt['initial_install_gate_verified'] or not receipt['capability_install_gate_verified']
+                  summary = records / 'heap-diagnostics.json'
+                  if diagnostics_expected and summary.is_file() and not summary.is_symlink() and summary.stat().st_size <= 16384:
+                      try:
+                          data = json.loads(summary.read_text())
+                          validate_heap_diagnostics_summary(data)
+                      except (ValueError, TypeError, KeyError):
+                          failed = True
+                      else:
+                          receipt.update(diagnostics_available=True, diagnostics=data)
+                          failed |= data['status'] != 'complete' or data['cohorts_status'] != 'complete'
+                  if diagnostics_expected and not receipt['diagnostics_available']:
+                      failed = True
+                  # Include only bounded original scan totals so a zero allocation
+                  # diff cannot be mistaken for a passing heap-baseline assertion.
+                  scan_file = records / 'scans.json'
+                  receipt['scan_totals'] = []
+                  if scan_file.is_file() and not scan_file.is_symlink() and scan_file.stat().st_size <= 16384:
+                      try:
+                          scans = json.loads(scan_file.read_text())
+                          labels = ['baseline', 'added-10', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited']
+                          if scan_mode == 'live':
+                              labels.remove('added-10')
+                          if type(scans) is not list or [item['label'] for item in scans] != labels:
+                              raise ValueError('Incomplete scan totals')
+                          totals = []
+                          for item in scans:
+                              fields = {name: item[name] for name in ['leak_nodes', 'leak_bytes', 'unclassified_nodes']}
+                              groups = item['groups']
+                              if (type(groups) is not list
+                                      or any(type(group) is not dict or type(group['root_type']) is not str or not group['root_type']
+                                             or type(group['root_instances']) is not int
+                                             or not 0 <= group['root_instances'] <= 1_000_000_000 for group in groups)):
+                                  raise ValueError('Invalid scan root groups')
+                              fields['root_instances'] = sum(group['root_instances'] for group in groups)
+                              fields['unexpected_root_groups'] = sum(group['root_type'] != 'NSXPCConnection' for group in groups)
+                              if any(type(value) is not int or not 0 <= value <= 1_000_000_000 for value in fields.values()):
+                                  raise ValueError('Invalid scan totals')
+                              destroyed_stack = item['destroyed_notification_stack_present']
+                              if type(destroyed_stack) is not bool:
+                                  raise ValueError('Invalid destroyed notification stack flag')
+                              fields['destroyed_notification_stack_present'] = destroyed_stack
+                              tool_exit = item['exit_code']
+                              if type(tool_exit) is not int or not -128 <= tool_exit <= 255:
+                                  raise ValueError('Invalid scan tool exit code')
+                              fields['tool_exit_code'] = tool_exit
+                              failed |= tool_exit not in (0, 1)
+                              if install_control:
+                                  validate_install_gate_state(item['host'].get('install_probe'), mode)
+                                  fields['install_probe'] = item['host']['install_probe']
+                              totals.append(dict(label=item['label'], **fields))
+                          if mode == 'control' or pure_control or install_control:
+                              zero_fields = ['buttons', 'allocatedButtons', 'destroyedButtons', 'compensations', 'mutableCompensations']
+                              if any(type(item['host'][key]) is not int or item['host'][key] != 0
+                                     for item in scans for key in zero_fields):
+                                  raise ValueError('Control had target activity')
+                              receipt['control_zero_targets'] = True
+                          receipt['scan_totals'] = totals
+                      except (ValueError, TypeError, KeyError, RuntimeError):
+                          failed = True
+                  if not receipt['scan_totals']:
+                      failed = True
+                  if terminal_origin:
+                      receipt.update(terminal_snapshot_available=False, terminal_snapshot_checks_passed=False)
+                      collection_cleanup = records / 'terminal-image-worker.json'
+                      image_cleanup = 'unconfirmed'
+                      artifact_cleanup = 'unconfirmed'
+                      # A failed sidecar write can leave an older success receipt.
+                      # The runner's terminal stage takes precedence for artifacts;
+                      # it does not establish or revoke proof of process exit.
+                      cleanup, cleanup_errors = None, None
+                      cleanup_file = records / 'process-cleanup.json'
+                      cleanup_stages = {'reader', 'host', 'launch_services', 'external_receipt', 'heap_diagnostics',
+                                        'terminal_snapshot', 'terminal_snapshot_receipt', 'cleanup_receipt',
+                                        'validation_receipt', 'result_receipt'}
+                      try:
+                          if cleanup_file.is_file() and not cleanup_file.is_symlink() and cleanup_file.stat().st_size <= 4096:
+                              with cleanup_file.open('rb') as stream:
+                                  payload = stream.read(4097)
+                              if len(payload) <= 4096:
+                                  cleanup = json.loads(payload)
+                                  errors = cleanup.get('errors') if type(cleanup) is dict else None
+                                  if (type(errors) is list and len(errors) <= 16
+                                          and all(type(stage) is str and stage in cleanup_stages for stage in errors)):
+                                      cleanup_errors = errors
+                      except (OSError, ValueError, TypeError):
+                          pass
+                      if collection_cleanup.exists() or collection_cleanup.is_symlink():
+                          exited, cleaned = worker_cleanup_state(collection_cleanup)
+                          image_cleanup = 'confirmed' if exited else 'unconfirmed'
+                          artifact_cleanup = 'complete' if cleaned else 'failed' if exited else 'unconfirmed'
+                      else:
+                          # Only an explicit runner receipt proves that offline
+                          # analysis was never entered. Absence alone proves no exit.
+                          if cleanup_errors is not None and cleanup.get('processes_exited') is False:
+                              image_cleanup = 'not-run'
+                              artifact_cleanup = 'not-run'
+                      if cleanup_errors is None or 'terminal_snapshot' in cleanup_errors:
+                          artifact_cleanup = 'failed'
+                      gate_cleanup = directory / 'terminal-image-upload-worker.json'
+                      if not process_run['cleanup']['complete']:
+                          image_cleanup = 'unconfirmed'
+                      image_error = (ImageWorkerCleanupError() if image_cleanup == 'unconfirmed' else
+                                     ImageWorkerArtifactError() if artifact_cleanup == 'failed' else None)
+                      if image_error is None and image_cleanup != 'not-run':
+                          try:
+                              write_worker_cleanup(gate_cleanup, True)
+                          except ImageWorkerArtifactError as error:
+                              image_error = error
+                              artifact_cleanup = 'failed'
+                      terminal_file = records / 'terminal-snapshot.json'
+                      if terminal_file.is_file() and not terminal_file.is_symlink() and terminal_file.stat().st_size <= 65536:
+                          try:
+                              terminal = json.loads(terminal_file.read_text())
+                              if image_cleanup == 'not-run' and (type(terminal) is not dict or terminal.get('analysis_status') != 'not-run'):
+                                  raise ValueError('Unexpected offline analysis')
+                              try:
+                                  validate_terminal_snapshot(terminal, None if image_cleanup == 'not-run' else gate_cleanup, image_error)
+                              except ImageWorkerCleanupError:
+                                  # Validation finished and removed unverifiable
+                                  # optional identities. Preserve the old terminal.
+                                  image_cleanup = 'unconfirmed'
+                                  artifact_cleanup = 'unconfirmed'
+                              except ImageWorkerArtifactError:
+                                  artifact_cleanup = 'failed'
+                          except (ValueError, TypeError, KeyError):
+                              pass
+                          else:
+                              # Filtered/unverified frames remain explicitly partial.
+                              # Successful bounded extraction does not require a full
+                              # public stack and does not alter the six-scan verdict.
+                              rows = terminal['root_groups'] + terminal['allocation_groups']
+                              usable = (terminal['parsing_status'] == 'complete'
+                                  and not terminal['omitted_root_groups'] and not terminal['omitted_allocation_groups']
+                                  and all(row['stack']['reported_frames'] and not row['stack']['missing_frames']
+                                          and not row['stack']['unparsed_lines'] for row in rows))
+                              receipt.update(terminal_snapshot_available=True, terminal_snapshot=terminal,
+                                             terminal_snapshot_checks_passed=usable)
+                      receipt['terminal_image_worker_cleanup'] = image_cleanup
+                      receipt['terminal_image_worker_artifact_cleanup'] = artifact_cleanup
+                      terminal_failed |= (not receipt['terminal_snapshot_checks_passed'] or image_cleanup == 'unconfirmed'
+                                          or artifact_cleanup == 'failed')
+                  public_summary['trials'].append(receipt)
+                  public_summary['strict_checks_passed'] = not failed
+                  if terminal_origin:
+                      public_summary['terminal_snapshot_checks_passed'] = not terminal_failed
+                  summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+                  # Persist the old six scans, strict verdict and safe terminal
+                  # before optional cache compilation/query or fresh validation.
+                  if terminal_origin and receipt['terminal_snapshot_available']:
+                      receipt['terminal_cache_image_identity'] = terminal_cache_identity(receipt['terminal_snapshot'])
+                      if image_cleanup == 'confirmed' and artifact_cleanup == 'complete':
+                          try:
+                              receipt['terminal_cache_image_identity'] = recheck_terminal_cache_identity(records, receipt['terminal_snapshot'], gate_cleanup)
+                          except ImageWorkerCleanupError:
+                              image_cleanup = artifact_cleanup = 'unconfirmed'
+                          except ImageWorkerArtifactError:
+                              artifact_cleanup = 'failed'
+                      receipt['terminal_image_worker_cleanup'] = image_cleanup
+                      receipt['terminal_image_worker_artifact_cleanup'] = artifact_cleanup
+                      terminal_failed |= image_cleanup == 'unconfirmed' or artifact_cleanup == 'failed'
+                      public_summary['terminal_snapshot_checks_passed'] = not terminal_failed
+                      summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+                  frozen_cleanup_complete = True
+                  bridge_cleanup_complete = True
+                  if frozen_analysis:
+                      receipt.update(frozen_nodes_available=False, frozen_node_checks_passed=False,
+                          parser_evidence_available=False, bridge_evidence_available=False, bridge_checks_passed=False)
+                      cleanup_file = records / 'process-cleanup.json'
+                      processes_exited = False
+                      try:
+                          if (cleanup_file.is_file() and not cleanup_file.is_symlink()
+                                  and cleanup_file.stat().st_size <= 4096):
+                              cleanup = json.loads(cleanup_file.read_text())
+                              processes_exited = type(cleanup) is dict and cleanup.get('processes_exited') is True
+                      except (OSError, ValueError, TypeError):
+                          pass
+                      if process_run['cleanup']['complete'] and processes_exited:
+                          node_run = run_owned([sys.executable, 'Scripts/Investigations/ax_frozen_nodes.py',
+                              '--graph-directory', str(directory / 'fixture/heap'),
+                              '--records-directory', str(records),
+                              '--bridge-evidence',
+                              *(['--first-strict-growth'] if first_strict_growth else [])],
+                              directory / 'frozen-nodes.log', environment, timeout=120)
+                          receipt['frozen_node_process_run'] = node_run
+                          frozen_cleanup_complete = node_run['cleanup']['complete']
+                          # Preserve the original measurement even if offline
+                          # decoding or the second public-output gate fails.
+                          summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+                          node_file = records / 'frozen-nodes.json'
+                          try:
+                              if (node_file.is_file() and not node_file.is_symlink()
+                                      and node_file.stat().st_size <= 131072):
+                                  data = json.loads(node_file.read_text())
+                                  validate_frozen_nodes(data)
+                                  scan_totals = {point['label']: point for point in receipt['scan_totals']}
+                                  if first_strict_growth:
+                                      growing = [label for label, point in scan_totals.items()
+                                          if any(point[key] > scan_totals['baseline'][key]
+                                                 for key in ('leak_nodes', 'leak_bytes'))]
+                                      expected_selection = 'first-strict-growth' if growing else 'no-strict-growth'
+                                      if (data['selection'] != expected_selection
+                                              or data['selected_label'] != (growing[0] if growing else None)):
+                                          raise ValueError('Frozen selection differs from first strict node/byte growth')
+                                  for label, point in (('baseline', data['baseline']),
+                                                       (data['selected_label'], data['selected'])):
+                                      if point is not None and any(point[key] != scan_totals[label][key]
+                                              for key in ('leak_nodes', 'leak_bytes')):
+                                          raise ValueError('Frozen node counts differ from original scans')
+                                  if data['selection'] is not None:
+                                      labels = list(scan_totals)
+                                      preceding = (labels[1:] if data['selection'] in ('no-new-leak', 'no-strict-growth')
+                                                   else labels[1:labels.index(data['selected_label'])])
+                                      if any(scan_totals[label][key] > scan_totals['baseline'][key]
+                                             for label in preceding for key in ('leak_nodes', 'leak_bytes')):
+                                          raise ValueError('Frozen node selection contradicts earlier growth')
+                                  receipt.update(frozen_nodes_available=True, frozen_nodes=data,
+                                      frozen_node_checks_passed=(data['status'] == 'complete'
+                                          and node_run['return_code'] == 0 and frozen_cleanup_complete))
+                          except (OSError, ValueError, TypeError, KeyError, RecursionError):
+                              pass
+                          if frozen_cleanup_complete and receipt['frozen_nodes_available']:
+                              try:
+                                  parser_file = records / 'parser-evidence.json'
+                                  if (not parser_file.is_file() or parser_file.is_symlink()
+                                          or parser_file.stat().st_size > EVIDENCE_LIMIT):
+                                      raise ValueError('Missing bounded parser evidence')
+                                  evidence = json.loads(parser_file.read_text())
+                                  validate_evidence(evidence)
+                                  nodes = receipt['frozen_nodes']
+                                  if 'graph_changed' in nodes['reasons']:
+                                      raise ValueError('Parser evidence graph changed')
+                                  for document in evidence['documents']:
+                                      tool = nodes['tools'][document['tool_index']]
+                                      point = (nodes['baseline'] if document['label'] == 'baseline' else
+                                          nodes['selected'] if document['label'] == nodes['selected_label'] else None)
+                                      if (point is None or document['graph_sha256'] != point['graph_sha256']
+                                              or tool['tool'] != document['tool'] or tool['label'] != document['label']
+                                              or tool['status'] != 'complete' or not tool['cleanup_confirmed']
+                                              or (document['error'] != 'none' and
+                                                  ('tree_invalid' if document['tool'] == 'tree' else 'references_invalid') not in nodes['reasons'])):
+                                          raise ValueError('Unbound parser evidence')
+                                      if document['error'] == 'none':
+                                          ordinal = sum(t['tool'] == 'trace' and t['label'] == 'baseline'
+                                              for t in nodes['tools'][:document['tool_index']])
+                                          views = [v for v in nodes['references']['views'] if v['kind'] == 'trace'
+                                              and v['checkpoint'] == 'baseline' and v['status'] != 'not_present']
+                                          if ordinal >= len(views) or views[ordinal]['status'] != 'complete':
+                                              raise ValueError('Baseline trace was not validated')
+                                  payload = encode_evidence(evidence)
+                                  name = f'parser-evidence-trial-{trial}-{mode}.json'
+                                  if trial not in range(1, 6) or mode not in ('control', 'product'):
+                                      raise ValueError('Unexpected parser evidence destination')
+                                  with (root / name).open('xb') as destination:
+                                      destination.write(payload)
+                                  receipt.update(parser_evidence_available=True, parser_evidence={
+                                      'file':name, 'sha256':hashlib.sha256(payload).hexdigest(),
+                                      'bytes':len(payload), 'status':evidence['status'],
+                                      'documents':len(evidence['documents'])})
+                              except (OSError, ValueError, TypeError, KeyError, IndexError, RecursionError):
+                                  receipt['frozen_node_checks_passed'] = False
+                              try:
+                                  bridge_file = records / 'bridge-evidence.json'
+                                  if (not bridge_file.is_file() or bridge_file.is_symlink()
+                                          or bridge_file.stat().st_size > BRIDGE_LIMIT):
+                                      raise ValueError('Missing bounded bridge evidence')
+                                  payload = bridge_file.read_bytes()
+                                  bridges = json.loads(payload)
+                                  validate_bridges(bridges, receipt['frozen_nodes'])
+                                  if payload != encode_bridges(bridges, receipt['frozen_nodes']):
+                                      raise ValueError('Noncanonical bridge evidence')
+                                  bridge_cleanup_complete = bridges['process_cleanup_confirmed']
+                                  receipt.update(bridge_evidence_available=True, bridge_evidence=bridges,
+                                      bridge_checks_passed=bridge_cleanup_complete and bridges['status'] in ('complete', 'not_needed'))
+                              except (OSError, ValueError, TypeError, KeyError, IndexError, RecursionError):
+                                  pass
+                      frozen_failed |= not receipt['frozen_node_checks_passed']
+                      bridge_failed |= not receipt['bridge_checks_passed']
+                      public_summary['frozen_node_checks_passed'] = not frozen_failed
+                      public_summary['bridge_checks_passed'] = not bridge_failed
+                      summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+                  print(json.dumps(receipt, separators=(',', ':')), flush=True)
+                  if not process_run['cleanup']['complete'] or not frozen_cleanup_complete or not bridge_cleanup_complete or terminal_origin and (image_cleanup == 'unconfirmed' or artifact_cleanup == 'failed'):
+                      # Do not contaminate another case when group exit is unknown.
+                      raise SystemExit(1)
+          public_summary['completed'] = True
+          public_summary['strict_checks_passed'] = not failed
+          if terminal_origin:
+              public_summary['terminal_snapshot_checks_passed'] = not terminal_failed
+          if frozen_analysis:
+              public_summary['frozen_node_checks_passed'] = not frozen_failed
+              public_summary['bridge_checks_passed'] = not bridge_failed
+          summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+          raise SystemExit(1 if failed or terminal_failed or frozen_failed or bridge_failed else 0)
+          PY
+      - name: Upload bounded diagnostic summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ax-heap-diagnostics-summary
+          path: .build/Temporary/ax-heap-diagnostics/summary.json
+          if-no-files-found: error
+          retention-days: 7
+          include-hidden-files: true # Only the exact allowlisted summary under .build.
+          overwrite: false
+      - name: Gate anonymous parser evidence
+        if: always()
+        id: parser-evidence
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, sys
+          sys.path.insert(0, 'Scripts/Investigations')
+          from ax_parser_evidence import EVIDENCE_LIMIT, validate_evidence, encode_evidence
+          root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
+          summary = json.loads((root / 'summary.json').read_text())
+          receipts = {case['parser_evidence']['file']: case['parser_evidence']
+              for case in summary['trials'] if case.get('parser_evidence_available') is True}
+          verified = set()
+          for trial in range(1, 6):
+              for mode in ('control', 'product'):
+                  name = f'parser-evidence-trial-{trial}-{mode}.json'
+                  path = root / name
+                  if not path.exists() and not path.is_symlink():
+                      continue
+                  if not path.is_file() or path.is_symlink() or path.stat().st_size > EVIDENCE_LIMIT:
+                      raise SystemExit('Invalid parser evidence artifact')
+                  payload = path.read_bytes()
+                  value = json.loads(payload)
+                  validate_evidence(value)
+                  expected = {'file': name, 'sha256': hashlib.sha256(payload).hexdigest(),
+                      'bytes': len(payload), 'status': value['status'], 'documents': len(value['documents'])}
+                  if receipts.get(name) != expected or payload != encode_evidence(value):
+                      raise SystemExit('Unbound parser evidence artifact')
+                  verified.add(name)
+          if verified != set(receipts):
+              raise SystemExit('Missing parser evidence artifact')
+          if verified:
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('safe=true\n')
+          PY
+      - name: Upload anonymous parser evidence
+        if: always() && steps.parser-evidence.outputs.safe == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ax-parser-evidence
+          path: |
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-1-control.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-1-product.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-2-control.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-2-product.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-3-control.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-3-product.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-4-control.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-4-product.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-5-control.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-5-product.json
+          if-no-files-found: error
+          retention-days: 7
+          include-hidden-files: true # Only the exact allowlisted token files under .build.
+          overwrite: false
+      - name: Remove synthetic memory graphs and raw logs
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import pathlib, shutil
+          root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
           if root.exists():
               assert not root.is_symlink()
               shutil.rmtree(root)

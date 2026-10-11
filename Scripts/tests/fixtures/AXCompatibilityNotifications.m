@@ -2,10 +2,110 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <mach-o/dyld.h>
+#ifndef QUICKFILE_AX_PURE_APPKIT_CONTROL
 #import "AXCompatibility.h"
+#endif
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+#if defined(QUICKFILE_AX_EMPTY_CONTROL) || defined(QUICKFILE_AX_MALLOC_RECEIPT) || defined(QUICKFILE_AX_OWNERSHIP_PROBE) || defined(QUICKFILE_AX_COPY_LIFETIME)
+#error Install gate controls do not support other fixture instrumentation
+#endif
+#import <objc/runtime.h>
+static Class installProbeClass;
+static IMP savedCopy, savedMutableCopy, replacementCopy, replacementMutableCopy;
+static NSUInteger installGateCalls;
+static BOOL installPreflightCompleted;
+
+static NSString *installProbeMode(void) {
+    const char *value = getenv("QUICKFILE_AX_INSTALL_PROBE_MODE");
+    if (value && !strcmp(value, "installed")) return @"installed";
+    if (value && !strcmp(value, "preflight-only")) return @"preflight-only";
+    return @"invalid";
+}
+
+BOOL QuickFileAXInstallProbeGate(Class cls, IMP copy, IMP mutableCopy, IMP corrected, IMP correctedMutable) {
+    installGateCalls++;
+    installProbeClass = cls;
+    savedCopy = copy; savedMutableCopy = mutableCopy;
+    replacementCopy = corrected; replacementMutableCopy = correctedMutable;
+    installPreflightCompleted = cls && copy && mutableCopy && corrected && correctedMutable
+        && copy != corrected && mutableCopy != correctedMutable
+        && class_getMethodImplementation(cls, @selector(copy)) == copy
+        && class_getMethodImplementation(cls, @selector(mutableCopy)) == mutableCopy;
+    return installPreflightCompleted && [installProbeMode() isEqual:@"installed"];
+}
+
+static NSString *installIMPState(SEL selector, IMP saved, IMP replacement) {
+    if (!installProbeClass || !saved || !replacement) return @"unavailable";
+    IMP current = class_getMethodImplementation(installProbeClass, selector);
+    return current == saved ? @"saved" : current == replacement ? @"replacement" : @"other";
+}
+
+static NSDictionary *installProbeSnapshot(void) {
+    return @{@"mode":installProbeMode(), @"preflight_completed":@(installPreflightCompleted),
+        @"gate_calls":@(installGateCalls), @"copy_imp":installIMPState(@selector(copy), savedCopy, replacementCopy),
+        @"mutable_copy_imp":installIMPState(@selector(mutableCopy), savedMutableCopy, replacementMutableCopy)};
+}
+#endif
+#if defined(QUICKFILE_AX_PURE_APPKIT_CONTROL) && !defined(QUICKFILE_AX_EMPTY_CONTROL)
+#error Pure AppKit requires the explicit empty-control build
+#endif
+#if defined(QUICKFILE_AX_EMPTY_CONTROL) && (defined(QUICKFILE_AX_MALLOC_RECEIPT) || defined(QUICKFILE_AX_OWNERSHIP_PROBE) || defined(QUICKFILE_AX_COPY_LIFETIME))
+#error Empty controls do not support internal diagnostic instrumentation
+#endif
+#ifdef QUICKFILE_AX_MALLOC_RECEIPT
+static NSString *mallocScribbleEnvironment(void) {
+    const char *value = getenv("MallocScribble");
+    return value == NULL ? @"unset" : (!strcmp(value, "1") ? @"1" : @"other");
+}
+#endif
 #ifdef QUICKFILE_AX_OWNERSHIP_PROBE
 extern void AXOwnershipProbeInstall(NSString *directory, BOOL balance);
 extern NSDictionary *AXOwnershipProbeSnapshot(void);
+#endif
+#ifdef QUICKFILE_AX_COPY_LIFETIME
+#import <stdatomic.h>
+// Each slot observes one actual return value for the lifetime of this host.
+// Zeroing weak references establish loss of weak access, not completion of free.
+static __weak id copyLifetimeResults[60];
+static BOOL copyLifetimeMutable[60], observingCopyLifetime;
+static unsigned copyLifetimeCount;
+static atomic_ulong copyLifetimeInvalid;
+
+void QuickFileAXObserveCopyLifetime(__unsafe_unretained id result, BOOL mutableCopy) {
+    if (![NSThread isMainThread]) {
+        atomic_fetch_add_explicit(&copyLifetimeInvalid, 1, memory_order_relaxed);
+        return;
+    }
+    if (observingCopyLifetime) {
+        atomic_fetch_add_explicit(&copyLifetimeInvalid, 1, memory_order_relaxed);
+        return;
+    }
+    observingCopyLifetime = YES;
+    BOOL valid = result != nil && copyLifetimeCount < 60;
+    for (unsigned i = 0; valid && i < copyLifetimeCount; i++) {
+        if (copyLifetimeResults[i] == result) valid = NO;
+    }
+    if (valid) {
+        unsigned index = copyLifetimeCount++;
+        copyLifetimeMutable[index] = mutableCopy;
+        copyLifetimeResults[index] = result;
+        valid = copyLifetimeResults[index] == result;
+    }
+    if (!valid) atomic_fetch_add_explicit(&copyLifetimeInvalid, 1, memory_order_relaxed);
+    observingCopyLifetime = NO;
+}
+
+static NSDictionary *copyLifetimeSnapshot(void) {
+    unsigned observed[2] = {0}, live[2] = {0};
+    for (unsigned i = 0; i < copyLifetimeCount; i++) {
+        unsigned kind = copyLifetimeMutable[i] ? 1 : 0;
+        observed[kind]++;
+        if (copyLifetimeResults[i] != nil) live[kind]++;
+    }
+    return @{@"ordinary":@(observed[0]), @"mutable":@(observed[1]),
+        @"liveOrdinary":@(live[0]), @"liveMutable":@(live[1]),
+        @"invalid":@(atomic_load_explicit(&copyLifetimeInvalid, memory_order_relaxed))};
+}
 #endif
 static NSDictionary *systemImages(void) {
     NSMutableDictionary *images = [NSMutableDictionary new];
@@ -44,10 +144,25 @@ static NSUInteger allocatedButtons = 0, destroyedButtons = 0;
 @end
 @implementation Owner
 - (void)publish:(NSInteger)sequence action:(NSString *)action {
-    NSMutableDictionary *record = [@{@"compensations":@(QuickFileAXCompensatedCopies()), @"mutableCompensations":@(QuickFileAXCompensatedMutableCopies()), @"pid":@(getpid()), @"sequence":@(sequence), @"action":action,
+    NSMutableDictionary *record = [@{
+#ifdef QUICKFILE_AX_PURE_APPKIT_CONTROL
+       @"compensations":@0, @"mutableCompensations":@0,
+#else
+       @"compensations":@(QuickFileAXCompensatedCopies()), @"mutableCompensations":@(QuickFileAXCompensatedMutableCopies()),
+#endif
+       @"pid":@(getpid()), @"sequence":@(sequence), @"action":action,
        @"buttons":@(self.buttons.count), @"allocatedButtons":@(allocatedButtons), @"destroyedButtons":@(destroyedButtons)} mutableCopy];
 #ifdef QUICKFILE_AX_OWNERSHIP_PROBE
     record[@"ownership"] = AXOwnershipProbeSnapshot();
+#endif
+#ifdef QUICKFILE_AX_COPY_LIFETIME
+    record[@"copyLifetime"] = copyLifetimeSnapshot();
+#endif
+#ifdef QUICKFILE_AX_MALLOC_RECEIPT
+    record[@"malloc_scribble"] = mallocScribbleEnvironment();
+#endif
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+    record[@"install_probe"] = installProbeSnapshot();
 #endif
     NSData *data = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:NULL];
     [data writeToFile:[self.directory stringByAppendingPathComponent:@"ready.json"] atomically:YES];
@@ -86,16 +201,47 @@ int main(int argc, const char **argv) {
  @autoreleasepool {
     BOOL systemBaseline = argc == 3 && !strcmp(argv[2], "--system-baseline");
     if (argc != 2 && !systemBaseline) return 2;
+#if defined(QUICKFILE_AX_EMPTY_CONTROL) || defined(QUICKFILE_AX_INSTALL_PROBE)
+    if (systemBaseline) return 2;
+#endif
+#ifdef QUICKFILE_AX_PURE_APPKIT_CONTROL
+    BOOL enabled = NO;
+#else
     // A system baseline never installs or attempts the product compensation.
     BOOL enabled = systemBaseline ? NO : QuickFileInstallAXCompatibility();
+#endif
     if (!strcmp(argv[1], "--capabilities")) {
-        NSDictionary *capabilities = @{@"enabled":@(enabled),
-            @"status":systemBaseline ? @"system-baseline" : @(QuickFileAXCompatibilityStatus()), @"images":systemImages()};
+        NSMutableDictionary *capabilities = [@{@"enabled":@(enabled),
+#ifdef QUICKFILE_AX_PURE_APPKIT_CONTROL
+            @"status":@"pure-appkit", @"images":systemImages()} mutableCopy];
+#else
+            @"status":systemBaseline ? @"system-baseline" : @(QuickFileAXCompatibilityStatus()), @"images":systemImages()} mutableCopy];
+#endif
+#ifdef QUICKFILE_AX_EMPTY_CONTROL
+#ifdef QUICKFILE_AX_PURE_APPKIT_CONTROL
+        capabilities[@"empty_control_mode"] = @"pure-appkit";
+#else
+        capabilities[@"empty_control_mode"] = @"patched";
+#endif
+#endif
+#ifdef QUICKFILE_AX_MALLOC_RECEIPT
+        capabilities[@"malloc_scribble"] = mallocScribbleEnvironment();
+#endif
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+        capabilities[@"install_probe"] = installProbeSnapshot();
+#endif
         NSData *json = [NSJSONSerialization dataWithJSONObject:capabilities options:NSJSONWritingSortedKeys error:NULL];
         puts([[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
         return 0;
     }
+#ifdef QUICKFILE_AX_INSTALL_PROBE
+    NSDictionary *probe = installProbeSnapshot();
+    NSString *expected = [installProbeMode() isEqual:@"installed"] ? @"replacement" : @"saved";
+    if (!installPreflightCompleted || installGateCalls != 1 || [installProbeMode() isEqual:@"invalid"]
+        || ![probe[@"copy_imp"] isEqual:expected] || ![probe[@"mutable_copy_imp"] isEqual:expected]) return 3;
+#elif !defined(QUICKFILE_AX_PURE_APPKIT_CONTROL)
     if (!enabled && !systemBaseline) return 3;
+#endif
 #ifdef QUICKFILE_AX_OWNERSHIP_PROBE
     if (!systemBaseline) return 4;
     AXOwnershipProbeInstall(@(argv[1]), QUICKFILE_AX_OWNERSHIP_PROBE == 2);

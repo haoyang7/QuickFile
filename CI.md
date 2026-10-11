@@ -4,6 +4,8 @@
 
 ## 工作流范围
 
+[Community DMG](.github/workflows/community-dmg.yml) 独立负责分发包构建：固定事件提交，在 macOS 15 arm64 / Xcode 26.3 / XcodeGen 2.46.0 上生成并检查 ad-hoc Universal DMG，拒绝源码漂移，只上传五项交付文件，保留 14 天。它由版本标签、手动入口或匹配路径的 `codex/**` 分支推送触发，不自动公开 Release。首次手动入口需先让工作流进入默认分支；分支推送可先验证流程。来源记录、下载核对及正式发布步骤见[免费自行分发](COMMUNITY_DISTRIBUTION.md#github-actions-打包)。
+
 [主 CI](.github/workflows/ci.yml) 在 main 的相关代码/配置变更、PR 和手动触发时运行；根目录纯文档修改不自动启动；`Scripts/` 等受监控目录内的文档仍会触发检查。
 
 | 作业 | 环境 | 验证 |
@@ -27,13 +29,82 @@ Python 脚本测试同时运行 [架构守卫](Scripts/verify-architecture.py)�
 
 AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数组分配代次和系统调用点；已核对映像另测当前产品补偿。`ax_causal_probe=true` 跳过前两项无插桩运行，执行所有权插桩，并只对已审查 UUID 运行独立补释放对照。插桩结果中的堆扫描来自同一个插桩进程，必须与另次无插桩运行区分。macOS 27.0/27.0.1 的已测映像已自行释放目标 copy，调查矩阵不对其启用补释放。
 
+`malloc_scribble=true` 单独启动 macOS 26 配对调查：同一 runner 交替执行 5 组 `MallocScribble` 关闭/开启 × 空白对照/产品路径，共 20 次。关闭时删除继承变量，开启时设置为 `1`，并核对实际宿主与 AX reader 的环境回执。默认 `scan_mode=diagnostic` 保留完整分配历史，离线扫描冻结堆图及额外的 `added-10` 检查点；`scan_mode=live` 使用普通 CI 相同的实时扫描命令、栈记录配置与六个检查点，不采集或声明分配代次诊断。live 模式要求同时开启 `malloc_scribble`。
+
+`receipt_mode=internal` 是默认回执路径，在夹具中编译额外的环境读取代码。`receipt_mode=external-startup` 要求 `malloc_scribble=true`、`scan_mode=live`、`heap_diagnostics=false` 和 `ax_causal_probe=false`：只构建一次普通 host/reader，不定义 `QUICKFILE_AX_MALLOC_RECEIPT`，将同一签名 App 和 reader 按字节复制到 20 个独立 case。准备清单绑定当前夹具源码哈希；每次复制、实际子进程启动检查、测量完成和子进程退出后均校验两个可执行文件的 SHA-256，工作流再次对照统一构建哈希。这里保证本轮 off/on 和 control/product 复用相同字节，不宣称与另一个 CI job 的独立构建逐字节相同。
+
+外部回执只读取本轮持有的实际 `Popen` 子进程，通过 `KERN_PROCARGS2` 核验启动 executable 路径对应的文件、前后存活、非空且匹配的已知 `PATH`，再确认 `MallocScribble` 为 unset 或 `1`。不可读取、空环境、解析异常、身份或哈希不匹配均失败；仅公开字面状态、布尔和哈希，不导出环境内容。这是启动元数据与磁盘文件核验，不是当前 `getenv`、进程映射字节或对象所有权证明；其他进程和其他系统映像的环境可见性不能从 owned fixture 推广。Darwin 的环境访问限制见 [XNU sysctl_procargsx](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c)。
+
+`KERN_PROCARGS2` 返回长度须严格小于原缓冲区容量；等于容量时按 `result_size` 失败，因为 [XNU 的兼容分支可成功返回截断数据](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sysctl.c#L1561)。完整数据中，非空键值区的末条自身 NUL 后可直接 EOF，[尾部对齐不保证额外空项](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exec.c#L6226)。额外空项仍终止解析；缺条目终止 NUL、空环境、重复键或非法键值继续失败，不新增 apple 尾部格式容错，也不补 NUL 或重试。
+
+`pure_appkit_control=true` 单独选择纯 AppKit 空白对照调查，其他输入须保持默认值（包括 `scan_mode=diagnostic`、`receipt_mode=internal`）；此入口明确采用 **live + external-startup + MallocScribble off**，不采集终点图。它在同一 macOS 26 runner 执行 5 对 `patched` / `pure-appkit` 空白宿主，逐对反转顺序，共 10 case、60 个普通实时扫描点。两种宿主共用仓库测试夹具的 Owner、窗口、IPC 和 checkpoint 序列，均在 reader 准备后取基线，要求零目标、零补偿、零通知；每个严格失败保留到终态。`pure-appkit` 的编译分支不导入生产 AX 头文件，不编译或链接 `QuickFileApp/AXCompatibility.m`，也不调用其安装与计数函数；它仍包含仓库测试宿主和 reader，不提供产品销毁覆盖。原有 heap-control 会链接并安装生产补丁，零补偿不能据此排除补丁的影响。
+
+此入口各构建一次两种模式，准备清单 schema 2 分别记录模式、固定源码哈希、链接输入、两个可执行文件 SHA-256 和 `nm` 的生产 AX 符号计数。纯宿主和 reader 必须没有 `QuickFileInstallAXCompatibility` / `QuickFileAX*` 符号；带补丁宿主须保留四个预期生产导出。每个 case 校验清单模式、capabilities 模式与该模式的可执行字节，并沿用外部启动回执；不编译宿主内部 MallocScribble 回执。只在同一模式内要求复用相同字节，两侧构建不同，不能称为同一 binary。新增 capabilities 字段仅存在于两种显式空白构建，普通构建清单和默认流程保持 schema 1。工作流仍只上传受限摘要，不公开本地路径、任意符号或原始 `nm` 输出；结果只能检验此测试宿主中生产补丁链接/安装的影响，不能单凭增长或通过证明对象所有权、分配年龄或排除基线漏报。
+
+`install_gate_control=true` 单独启用安装末端对照，要求其他工作流输入均为默认值。它构建一次带 `QUICKFILE_AX_INSTALL_PROBE` 的 host 和普通 reader，逐例核对同一组可执行文件 SHA-256，然后交替执行五对 `installed` / `preflight-only` 空窗口对照，共 10 cases、60 个原 live 扫描点。两模式均固定 MallocScribble off、external-startup、零目标与零通知，不捕获终点图。gate 仅在所有原安装前置检查以及两份原 IMP 保存之后执行；两模式均保存原/替换 IMP 供比较，`preflight-only` 跳过整个 `class_addMethod` / `method_setImplementation` 路径，`installed` 照常继续。该宏未定义时不包含调查 hook，不改变普通产品路径。
+
+该入口的构建清单 schema 3 绑定 `install-gate` 模式、源文件哈希、生产对象/宿主的唯一调查宏、reader 无宏及链接输入，不能借用 ordinary 或 pure AppKit 构建。外部启动回执在两个实际 owned PID 上核验 `QUICKFILE_AX_INSTALL_PROBE_MODE` 的固定值；它仍只证明启动元数据。capability 子进程与实际测量宿主分别验收：实际初始 ready 和后续每次 ready 均须显示前置检查已完成、gate 恰好调用一次，以及两个当前 IMP 分别匹配保存值或替换值；公开摘要保留初始和六个扫描点的固定状态，不公开地址。前置检查不支持时两模式都失败，off 不能只凭模式名称通过。严格堆断言及清理失败保留，失败后按既有安全边界收集后续对照。该链接宿主仍包含测试代码和调查回执；结果可比较最后的 IMP 替换路径，不能独自证明泄漏所有权、基线漏报或补丁因果缺陷，也不能与先前不同二进制的 pure 对照直接等同。
+
+所有 external-startup case 另验收 `startup-failures.json`，公开最多四条按 host、reader、complete、final 排序且阶段唯一的失败记录，仅含固定 `stage`、`reason` 和 `errno`（null 或 0…4095 整数）。原因区分启动身份、sysctl 容量/读取、解析、PATH 可见性、开关值、字节哈希及回执完整性；失败 syscall 的 errno 在返回时立即保存，未知异常仅公开 `unclassified`。摘要缺失、字段/枚举/阶段组合或 errno 类型越界都使工作流失败。原私有错误和固定 category 计数继续保留；一次角色失败可进一步导致 complete/final 两次完整性失败，不能将这些计数视为独立环境读取。成功回执、读取时点和次数、宿主/reader 字节及六点严格扫描不变，不增加重试；回执失败削弱验证范围，不豁免同时观察到的堆增长。
+
+`terminal_origin=true` 是另一个有界入口，要求同时传入 `malloc_scribble=true`、`scan_mode=live`、`receipt_mode=external-startup`、`heap_diagnostics=false`、`ax_causal_probe=false`。它将上述 20 case 改为按顺序执行一次 off/control 和一次 off/product；同一构建的两个可执行文件继续逐次核对 SHA-256。每例先完成普通 CI 的全部六个实时扫描点，然后在 `observer-exited` 扫描之后、宿主停止之前仅捕获一份后续堆图；合计 12 个原扫描点和 2 次终点捕获。host/reader 均退出后，才用该图生成 grouped/list 两份离线文本，不增加基线前采样、不启用 NoCompact 优先模式、不记录分配年龄或代次。
+
+`terminal_snapshot` 将每个 grouped 根组与其自身分配栈关联，list 仅汇总全图的固定类型、大小与分配栈计数，不将 list 子节点归属到某个 NSXPC 根。公开帧按原帧号规范为 `allocation-first`（从分配端向调用者），保留重复帧及 index；这不是调用时序。每一保留帧必须通过本机 `SystemSymbols` 的系统映像、地址/偏移与符号核验，上传前再次独立查找符号。地址、路径、任意类型和未经核验的符号均不公开；非白名单类型仅记 `unknown`。摘要最多保留 16 个根组、96 个分配组和总计 96 次符号核验尝试（含失败查找），另记缺帧、不可解析行、过滤帧、未验证帧及预算省略数；原始栈和堆图不上传。终点对象的 JSON 编码与实际缩进文件分别受原有 64 KiB 上限约束；提高保留组数不改变这两处限制或无省略组的判定。
+
+终点摘要 schema 3 的每个保留根组另含 `reported_image_counts`，按报告中的图像标签计入固定的 AppKit、Foundation、CoreFoundation、libxpc、libobjc、libmalloc、libdispatch 或 `other` 桶。它只描述可解析帧中的报告标签，不是独立映像核验；未知标签不公开。`reported_filtered_reason_counts` 将图像前置过滤分为 `known_image_excluded`（后三个固定图像桶）和 `unrecognized_image`（`other`），不把过滤误记为符号核验失败。上述计数不增加符号查找，缺帧与不可解析行仍单独记录。`allocation_type_totals` 在 list 截断前累计全部节点，以固定 `HEAP_TYPES` 和 `unknown` 记录节点/字节总数及 `retained_*`、`omitted_*` 范围；公开 gate 核对逐类守恒、保留组计数和全图总数，未成功解析时该账本为 `null`。完整类型账本不补齐省略的分配栈，也不改变省略组的失败判定，不建立跨扫描对象身份、分配年龄或所有权关系。
+
+终点 schema 3 另在保留根组的 `other_image_identity` 中记录 `other` 帧的映像身份，最多处理 96 个根帧，独立于原 96 次符号核验预算。目标 PC 仅匹配本报告 `Binary Images` 的唯一范围，再以唯一 UUID 关联离线验证进程已加载的映像。验证要求规范的 `/System/Library/` 或 `/usr/lib/` 路径、当前 dyld shared-cache membership 及 `MH_DYLIB_IN_CACHE`；不按报告路径加载，不依赖目标与验证进程共享地址。仅公开原帧 index、安全 basename/UUID 和固定失败计数；重叠或无效报告范围、冲突 UUID、未加载或未核验映像、验证进程失败/超时和预算省略均不能生成身份。未知标签、符号、PC、路径仍不公开。
+
+验证 helper 仅在 host/reader 退出后的终点离线处理及上传 gate 中运行。它固定加载 AppKit，在有界的 owned 子进程内持有 dyld 回调，完整写出本轮私有结果文件后以 `os._exit` 退出，避免无法注销的 Python callback 在析构后被调用；父进程通过 `run_owned` 的独立私有进程组和有界退出回执确认回收。正常错误或已确认回收的超时可降级为身份不可用；退出未确认时禁止启动后续 helper。collection 保存原终点后保留清理失败，上传 gate 以独立清理回执复核；本例的六点、原严格失败和通过结构校验的旧终点先保存到摘要，再停止后续 case。公开 `terminal_image_worker_cleanup` 只取 `confirmed`、`unconfirmed` 或 `not-run`；后者仅用于 runner 明确未进入离线分析的情况，缺少必要回执不能证明退出，也不等于证明 worker 已启动。另以 `terminal_image_worker_artifact_cleanup` 区分 `complete`、`failed`、`unconfirmed` 与 `not-run`。进程退出已确认但产物删除失败时，保留已确认的退出状态，保存本例原严格类别与安全终点后使调查失败，停止后续 case；未删除目录留存。回执写入失败也保留固定产物错误且不重试该文件；若跨进程无法读取有效退出回执，仍按证据未知处理。私有 sidecar schema 2 分别记录退出与产物回收，仅接受普通文件，最多读取 129 字节并拒绝超过 128 字节、额外键或非严格布尔值。上传前还读取 runner 的 `process-cleanup.json`：仅接受有界普通文件中的固定 `errors` stage 列表；`terminal_snapshot` 优先于旧 sidecar 的产物成功状态，缺失或非法 stage 回执也阻止新 helper 与后续 case。这个 stage 只表明终点收集或产物处理失败，不指定删除失败原因；进程退出证据仍由 sidecar 决定。原严格失败、六点和通过完整结构/隐私校验的终点先保存，再停止。此回执不能替代终点内容校验。结果文件按原 schema/字节预算读取，supervisor 的 stdout/stderr 合并日志必须为空，纯空白 stderr 也拒绝。上传 gate 先完整拒绝非法结构，再以一次新的验证进程重新核验所有 basename/UUID，不能只接受字符串格式。若 fresh catalog 不可用或某个身份无法再次核验，仅原地移除相应新增帧，累计 `local_catalog_unavailable` / `uuid_not_verified` 并将该身份字段标记为 `partial`；旧终点计数、栈状态、完整性判定和严格失败继续保留。新字段的 `complete` 仅表示已解析的 `other` 帧全部找到唯一系统映像，不能补齐缺失/不可解析帧，也不改变原栈覆盖、64 KiB 摘要上限或终点完整性失败。它只识别系统组件，不核验原始符号，不证明构造函数、对象所有权、分配年龄或跨扫描身份。
+
+`terminal_origin` 还可产生独立 case 字段 `terminal_cache_image_identity`（schema 1），不修改原 `terminal_snapshot` schema 3、loaded 身份、64 KiB 上限或严格结论。它从本次实际解析的 grouped stdout 重新导出根序号、原 frame index 与唯一报告 UUID；私有绑定记录校验原终点文件和纯 stdout 的 SHA-256，上传时再次从报告导出映射，不能仅信请求表。现有混合 stdout/stderr 日志不作绑定源。公开字段绑定最终发布终点的规范 JSON SHA-256，只含固定状态/原因计数、active cache UUID 及已核验的根/帧序号、safe basename/UUID，不上传原始报告、地址、路径、标签或符号。
+
+缓存查询复用 `SharedCacheCapability.c --lookup OUTPUT UUID...` 的一次 setup、一次正式完整遍历和 closed 检查；最多 96 个去重 canonical UUID、16384 个回调，完整遍历后才排除所有重复 UUID。返回文件最多 24 KiB，公开字段连同 case 缩进也限制为 24 KiB。collection 与上传各自拥有短期编译/查询目录，通过 `run_owned` 确认编译器和查询进程退出后回收，不跨进程转交 binary。collection 先保存旧终点，上传先保存六点、strict 和安全旧终点，再 fresh 查询并要求同一 active cache UUID；普通编译、查询、格式、绑定、预算或身份复核失败仅使新增诊断 `partial`/`unavailable`，不改变旧终点通过条件。退出未知或产物处理失败仍保存原证据并阻断后续 helper/case。`complete` 仅表示本次已解析且在预算内的 other 根帧均有缓存映像证据；缓存身份不等于本进程 loaded 身份，不验证构造函数、所有权、年龄或基线漏报。
+
+
+独立的 `SharedCacheCapability.c` / `test_shared_cache_capability.py` 随现有 macOS unittest（含独立 macOS 27 兼容性检查）验证当前活动 shared cache 的 SPI 枚举能力，Linux 明确跳过原生部分。固定 Apple dyld 版本的声明与遍历契约见夹具源码；API 不可用、格式不支持或能力失败都使测试失败。夹具在同一进程严格执行一次 setup 遍历，再建立 setup 后的 loaded census，最后执行一次正式遍历，不循环重试。setup 独立要求 API 成功、回调 schema/预算完整及活动 cache UUID 前后相同；失败禁止正式阶段，setup rows 不复用。正式遍历再次绑定同一 cache UUID。schema 2 保留 setup/measurement 的独立 API 返回码、接收/有效记录数、schema 错误及 UUID 稳定性，并按固定阶段计数初始 observer 回放、setup、census、正式枚举和格式化中的 add/remove；初始回放不等于新加载。census 建立后直至有界结果格式化结束的任何变化仍失败；最终状态核对后才输出，`measurement_closed` 表示该关闭点，不声称覆盖输出或进程退出之后。固定 Apple 入口可能在首次调用时初始化 introspection 依赖，相关源码链接见夹具；这不证明任何特定远端失败实际加载了哪个组件。测试继续核对规范系统路径与 cache membership、重复 UUID 整组排除及计数守恒；`loaded_uuid_records` 是此独立非 AX 进程在 setup 后的加载回调记录数，不保证 UUID 唯一，未加载计数仅相对此进程，不能推断覆盖另一验证 helper 的全部映像。遍历完整性仍依赖 API 成功返回的契约，并非独立解析所有 cache 文件。Python 严格校验子进程输出后才公开有界的源码/二进制 SHA-256、OS/架构、cache UUID、固定计数和少量安全 basename/UUID，不输出 PID、PC、路径、环境或任意错误文本。编译、正常、失败与超时路径使用 owned supervisor，产物位于 `.build/Temporary/` 独立目录并回收二进制/缓存；退出未确认则失败并停止后续子命令。此能力测试尚未接入终点映像核验，不改变原符号权限、AX 六点扫描或严格增长判定。
+
+终点摘要的 `parsing_status` 只说明两份文本的节点/字节/根组结构是否完整，`stacks_status` 单独说明已报告帧的公开覆盖。应用帧、隐藏系统帧或预算过滤会使栈为 `partial`，不能称为完整原始栈，即使剩下的系统帧均已核验。`terminal_snapshot_checks_passed` 要求捕获和离线工具成功、计数结构完整、无省略组、每组有栈且无缺帧或不可解析行；明确计数的过滤/未验证帧允许受限提取成功，同时保留 `partial` 栈状态。捕获/工具超时、格式不支持、缺栈等会使调查失败，原六点的 `strict_checks_passed` 和断言类别仍独立保留；退出已确认时两例继续收集。终点图是较晚的一次暂停观察，计数相同也不证明与之前扫描中的对象相同，分配来源与保守引用关系都不能证明所有权或基线漏报。
+
+两种扫描模式只上传受限的 `ax-heap-diagnostics-summary`，明确记录扫描/回执模式、checkout、系统映像、进程环境、扫描节点/字节/根数、未知根和目标堆栈标记，以及逐扫描工具返回码和固定类别的断言失败计数；原始堆图、环境和日志不上传。原严格检查失败、回执缺失或该模式所需证据不完整都会使调查失败，同时继续收集后续对照；构建失败则保留未完成状态。运行返回码、断言分类与分配诊断完整性分别记录，live 不宣称完整分配诊断。每 case 的命令最多 180 秒，之后另有有界回收。独立 supervisor 保持私有进程组 leader 的 PID 身份，命令结束、失败或超时后均在回收 leader 前终止该组并核对组内已无运行成员，再等待 leader；不向已回收 leader 的历史 PGID 发送终止信号。`process_run` 分别记录原命令返回码、超时/协议状态和组清理结果；`group_inspection` 区分已退出、仍有运行成员、查询失败/超时、格式异常及 `leader_unverified`，不公开 PID 或进程表。检查必须见到唯一且 PGID 一致的未回收 leader；leader 缺失、重复或不一致时不得将空组视为已退出。无法确认组退出时保留失败并停止后续 case。runner 对 reader、host 各自执行有界 wait、terminate/wait、kill/wait，一方失败仍执行另一方、Launch Services 和必要回执清理；两进程退出未确认时不运行离线图分析。结束后清理夹具、缓存、堆图及原始日志。不同扫描模式的结果不能直接互相替代；内部回执仍会改变夹具二进制，外部读取也增加启动检查耗时。Scribble 用于调查残留指针是否影响保守扫描，但也可能改变分配器行为；环境回执、通过的重复运行和计数变化均不能替代对象所有权或基线漏报的因果证据。
+
 AX 读取权限由实际 reader 可执行文件检查；不匹配映像或缺权限明确报告未覆盖，已匹配映像安装拒绝、通知不足、扫描失败仍失败。目标按钮的两个观察者须逐项恰好收到一次，重复和缺失不能互相抵消；总通知和未匹配通知另行记录。产品扫描先建立不含目标按钮的 AX/XPC 启动基线，再要求目标 AX 泄漏为零、无未分类节点和未知根；已知 NSXPCConnection 基线的节点数、字节数与根数均不能增长。解析器分别保存 ROOT LEAK/CYCLE 分类与实际根类型。全堆报告与目标 AX 数量分别记录，不能将稳定的非零基线写成全堆零泄漏。专项使用一次性 synthetic AppKit 宿主，不代替签名安装 App、Finder 或 VoiceOver 验收。
 
 产品验证另在首批按钮注册后、每批销毁后及观察者退出后扫描，始终与最初的空窗口基线比较。堆断言或逐按钮通知断言失败后继续收集剩余检查点；最终收据标为 `failed`，进程返回非零。后续堆恢复不能撤销前面的失败。扫描不可用、进程异常或协议握手失败仍立即中止，已有原始记录仅留在本地临时目录。
 
+`--copy-lifetime` 使用另一独立宿主，在已匹配的两个产品调用点登记实际返回数组。专用编译宏启用固定的 60 个 ARC 弱引用槽，每槽仅写入一次；普通和可变 copy 各须覆盖 30 次，并与补偿、按钮销毁计数一致。每个检查点拒绝缺失记录、异常登记和仍可获取的弱引用，后续释放不能撤销失败。弱引用清零表示对象已不能通过 weak 获取，不代表析构全部完成或存储已归还。该插桩会影响堆扫描的可达性判断，因此此模式只验证生命周期与通知，不运行或声明通过整堆检查；全部命令检查点与观察窗口保持。原无插桩通知与全堆检查仍独立运行，原堆增长约束不变；正常产品构建不包含此回调。
+
+手动 AX 工作流的 `heap_diagnostics` 入口只在 macOS 26 arm64 运行五对独立的空目标对照和产品夹具，在相邻配对间交替先后顺序，与 `ax_causal_probe` 互斥。每个实例使用原有空窗口基线和全部检查点，并在首次添加按钮后、读取与订阅前增加检查点；同次活体扫描保存内存图，在 runner 上离线分析对象差分。任何实例失败、超时、摘要缺失、对象差分解析或分配分类不完整都会使调查 job 失败，后续实例的成功不能撤销它。控制台只输出经过字段白名单、枚举、数量和字节上限校验的脱敏摘要。系统符号只允许经过固定 Apple 映像路径及本进程 `dladdr` 元数据双重核对的无序计数；原始内存图、地址、路径、完整分配栈及日志不上传，结束后回收。摘要的 `status` 表示对象差分解析完整度；`symbols_status` 单独记录符号覆盖，未解析或隐藏的系统符号会使其不完整，但不改变产品退出码和对象差分判定。离线分配分类结合基线全堆清单和未压缩的分配历史，区分基线后分配、基线前已存在及身份不确定的对象；地址相等本身不能证明对象身份。`cohorts_status` 单独记录分配分类是否完整；候选地址最多 128 个，额外工具调用共限时 45 秒，无法确认的对象保留为未知。诊断模式使用未压缩的分配日志和完整历史内存图，普通验证模式不变。分类不完整或工具不可用不能覆盖原始堆断言或产品退出码。无目标对照使用 `--heap-control`，保留相同检查点与 AX 读取次数，将添加和移除按钮的位置替换为空窗口 checkpoint；每阶段的目标按钮、累计分配/销毁、两类补偿以及 reader 注册/通知必须为零。对照收据标为 `measured`，不声明产品补偿通过。该入口用于归因，不替代常规 CI 或证明内存问题已修复。
+
+`frozen_control=true` 选择一次 macOS 26 空目标冻结对照，其余输入必须保持默认值。它复用原有 `--heap-diagnostics --heap-control` 的七个检查点和严格断言，工作流显式取消继承的 `MallocScribble`，宿主继续使用既有 NoCompact 日志配置；此模式没有外部启动环境回执，也不等同于普通六点实时扫描。原 runner 及 host/reader 退出均已确认后，独立进程组才执行节点分析。按检查点顺序选择首个完整的非空泄漏差集，再将同图的绝对列表、默认泄漏树、分配历史和外部根查询交叉核对。`traceTree` 的根数表示工具报告的进程根到对象的引用路径，默认泄漏树用于节点与循环的关联；两者均不证明完整图边或对象所有权。基线前已存在的分配可能在引用消失后成为泄漏，不能据分配时间豁免增长。
+
+单独使用 `heap_diagnostics=true` 时，既有五对空目标/产品冻结调查也执行节点分析，选择原严格扫描中节点数或字节数首次超过基线的检查点。更早的等量地址替换不会提前结束选点；根数及其他严格检查继续独立阻断。没有节点或字节增长时明确记为 `no-strict-growth`，仍解析基线泄漏树以核验实际系统输出格式。工作流再次核对选点与原扫描一致。该入口保留 NoCompact 和七点采样的边界，不能恢复其他普通 live 运行中未保存的对象。
+
+节点摘要的 schema 2 保留同次运行的匿名对象编号、允许列出的连接协议、父子引用、循环回边，以及基线和选中快照的反向引用路径。堆对象的相同编号只对应相同地址；分配历史另行判断是否为同一分配，避免地址复用造成误判。非堆根使用独立身份，不能反推堆地址。关系标记为 `tool-reported`，不能仅凭循环标记推断完整 ARC 所有权，也不能据此确认 Apple 的桥接字段扫描误报。
+
+新增节点分析最多选择 16 个地址，引用表最多 512 个节点记录、1024 条边，总工具期限 90 秒、单命令 15 秒，外层进程组期限 120 秒；原 runner 的期限和回收规则不变。五对分析的工作流期限为 55 分钟，覆盖既有 runner 与新增离线进程的期限。公开节点摘要不超过 128 KiB，以容纳含上百节点的反向引用树；只允许固定字段、枚举与计数，原始地址、路径、堆图、历史和树文本不上传。超出摘要预算时优先保留选中快照的循环路径，省略视图明确标记为不完整。无新增差集明确记为 `no-new-leak`，不据此声明没有泄漏或历史问题已修复；缺失、截断、格式不支持、候选省略及身份不确定分别保留不完整状态。原严格结论与新增诊断结论分别保存，任一失败均使该调查失败。
+
+泄漏树或反向引用解析失败时，另保存有界的匿名词法证据，帮助修复实际系统输出格式。每 case 最多 2 MiB，只保留固定词表、标点、缩进、结构计数和稳定匿名编号；未知文本不可还原，原始地址、路径、任意符号及报告正文不上传。证据绑定同次图哈希、工具序号与失败类别，截断显式标记。上传前再次核对固定文件名、规范编码、哈希和摘要回执；未绑定文件阻止整个词法证据 artifact 上传，原扫描摘要仍独立保留。它不替代引用图、所有权证据或原严格检查。
+
+解析器支持 macOS 26 的多实例分组 `TOTAL` 包装和三句反向引用说明，同时兼容带第四句 Instruments 说明的格式。汇总行不算对象；逐组成员数、根数、子树计数及分隔缩进仍须一致。未知输出格式继续报告不完整；匿名词法证据丢失的原文含义不能靠猜测恢复。
+
+首次严格增长候选的基线反向引用在解析成功时也保留有界匿名语法，标记 `error=none` 并绑定该次成功工具和完整基线引用视图。固定词表可区分已审核的 continuation 分配函数及 Swift metadata 描述；保留引用槽偏移以核验中间节点的结构。名称和布局只用于提出可检验的分配来源假设，不能证明缓存状态、实际所有权或目标系统实现与某份源码相同。
+
+反向路径中的无地址槽位根接受完整的 `<TYPE> +offset: __strong slot` 叶子格式，路径数必须为 1。它使用独立的槽位身份，公开类型为 `unknown`、大小为零，不反推基址或对象大小；同一快照内相同槽位的描述、偏移及直接目标必须一致。此格式不把未知名称解释为 Swift 根，也不改变泄漏树根分类、严格扫描、检查点或基线。
+
+线程寄存器根只接受完整的 `Thread N description $x0` 至 `$x30` 格式，可带有界的 `--> offset N` 内部偏移；偏移必须小于直接父对象的已知大小。线程序号与描述有界，路径数必须为 1，必须有父节点且不可包含子节点。公开摘要使用 `unknown`、零大小和 `other` 根类别，身份按检查点隔离；报告中的线程序号不代表跨快照物理线程身份。同一快照的相同线程及寄存器不能指向冲突目标或偏移。词法证据保留固定语法、寄存器名、内部偏移与路径计数，线程序号替换为合成编号，整个显示描述匿名化；不公开实际线程标识或队列名。旧证据已经丢失的终端语义不能通过新解析器恢复。
+
+冻结调查另采集基线反向路径中 `64B +40 → 48B` 结构的桥接对象，要求 48B 目标同时出现在该候选选中快照的完整泄漏树视图内；按地址去重，最多选取两个。该结构仅用于选样，不识别分配器或所有权。侧录复用基线完整堆清单，补充选中快照完整堆清单、两侧相同地址集合的分配历史及定点出向布局；与原节点分析共享 90 秒期限和 45 次工具调用总上限，原 16 候选覆盖不减。没有剩余预算、格式不支持、历史缺失或采样省略均保留不完整状态。侧录绑定最终节点摘要及两张图的摘要、候选编号和原基线引用视图，经过独立的固定字段校验后纳入调查摘要，最多 32 KiB。原始布局、地址及分配栈留在 runner 私有目录并随本轮回收。
+
+桥接侧录区分完整堆清单中的存活状态、分配历史变化和工具报告的槽位目标。`CONTENTS` 表示工具报告的出向引用，`REFERENCES TO THIS` 是入向引用；入向区段可包含经完整格式校验的堆槽、线程寄存器或区域根，仍逐行核对引用数，不把入向根当成出向槽位。没有报告 `+40` 引用不等于物理槽位清零。侧录的分配代际只检查桥接源 P；`original_target_address` 仅表示槽位目标与原目标地址相同，不证明目标 M 未释放后复用。工具可达性变化不能替代 ARC 所有权或产品因果证据。侧录不改变原严格检查、基线或增长判据；缺失、不完整及清理未确认仍使调查失败。
+
+桥接摘要 schema 2 为布局保留固定解析错误码和匿名语法，绑定对应记录、检查点、工具调用与图摘要。最多四份、每份不超过 4 KiB，整个桥接摘要仍不超过 32 KiB；截断或无法等价重放必须显式标记并保留不完整结论。仅在扫描头后接受一次经格式校验的 `Call stack:` 元数据行；匿名证据以固定标记替代该行，不上传帧内容，也不把它计入入向引用数或用于所有权归因。描述、路径和真实地址不公开；只有原文已核验的基址加偏移关系才编码为槽位关系，零地址和非法字符结构也保留。完整匿名语法须核对原文与重放的解析成败、固定错误码以及槽位状态和尺寸；不以匿名名称核验类型身份。匿名化不能将原文的拒绝条件变成通过证据。工具执行成功与布局解析成功分别记录；缺失 `CONTENTS`、未知入向或出向格式不能合并成已验证的空槽位。
+
 ## 有限、可追溯的 CI 证据
 
-每个 macOS job 创建独立 runner 临时目录，原生测试与 Release 构建分别显式指定 `tests.xcresult` / `release.xcresult` 的 `-resultBundlePath`。已有结果目录或符号链接会失败，不清除或覆盖上次失败结果。非 CI 本地运行默认在 `.build/VerificationResults.XXXXXX` 创建新目录。`run-native` 保留原失败退出码；退出成功但缺少任一结果 bundle 也判为失败。
+每个 macOS job 创建独立 runner 临时目录，原生测试与 Release 构建分别显式指定 `tests.xcresult` / `release.xcresult` 的 `-resultBundlePath`。已有结果目录或符号链接会失败，不清除或覆盖上次失败结果。原生自检每次在 `.build/Temporary/release-readiness.XXXXXX/` 创建独立的 Debug、Release 和包缓存，解析使用本轮 DerivedData，构建设置查询显式指定本轮产品和中间目录。成功、失败或收到 HUP/INT/TERM 时回收本轮缓存和 App，保留 `records/cleanup.json` 及结果 bundle；外部提供的结果目录只用于保存结果，不参与清理。非 CI 本地运行默认结果目录为本轮目录中的 `Results/`。`run-native` 保留原失败退出码；退出成功但缺少任一结果 bundle 也判为失败。
+
+Xcode 的 macOS App 构建会添加 Launch Services 注册步骤，文件回收不能证明注册状态已恢复。CI 临时 runner 没有日常安装版；本机验证结束后须按 [临时产物回收约定](CONTRIBUTING.md#临时产物回收) 恢复日常 App 与 Finder 扩展的实际加载身份，并在清理后验收真实 Finder 菜单。自检脚本的清理收据只记录本轮文件回收结果。
 
 每个 macOS job 只上传两份从有限字段生成的 synthetic CI JSON 回执，不读取或导出 xcresult 内容：
 
@@ -46,7 +117,7 @@ AX 读取权限由实际 reader 可执行文件检查；不匹配映像或缺权
 
 原始 `.xcresult` 留在 runner 本地，随托管 runner 回收；不上传原始 trace、测试附件/消息、完整日志、整个 `.build`/DerivedData、证书、profile、环境变量 dump、书签或用户数据。新增或修改回执逻辑后应检查生成的两份回执与 Actions 日志、确认身份/退出码/失败路径，再判断是否需要另行设计经过审查的数值型 xcresult 摘要；不能直接扩大为原包上传。
 
-工作流仍只需要 `contents: read`，checkout 不保留凭据，不使用 secrets，不配置证书/profile、不发布 App/ZIP，不引入自托管或付费大 runner。fork/untrusted PR 使用原有 `pull_request` 权限边界，不使用 `pull_request_target`。现有路径过滤保留；未来若设置 required checks，必须先解决纯文档 PR 被过滤后永久 Pending 的问题，不能仅凭工作流配置推定仓库已设置 required checks。
+上述验证工作流只需要 `contents: read`，checkout 不保留凭据，不使用 secrets，不配置证书/profile，只上传验证收据，不发布 App/ZIP；Community DMG 的五项分发产物按前述独立流程上传。各流程不引入自托管或付费大 runner。fork/untrusted PR 使用原有 `pull_request` 权限边界，不使用 `pull_request_target`。现有路径过滤保留；未来若设置 required checks，必须先解决纯文档 PR 被过滤后永久 Pending 的问题，不能仅凭工作流配置推定仓库已设置 required checks。
 
 ## 本机与远程验证
 

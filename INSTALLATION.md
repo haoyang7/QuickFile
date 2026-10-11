@@ -1,0 +1,58 @@
+# QuickFile Community 安装指南
+
+本指南适用于 GitHub Releases 对应发布页中的 Community DMG。当前实验候选的发布状态以对应发布页为准；如需核对版本、内部 build、源码提交和工作流身份，再查看其中的 `build-provenance.json`。没有对应发布页时，不视为可下载发布。Community 采用 ad-hoc 签名、未经 Apple 公证，不含 Sparkle，升级采用手动覆盖安装。
+
+## 下载与核对
+
+只从 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 的同一发布页下载匹配资产。普通安装只需要下面前两项；其余三项是按需查看的说明与收据：
+
+- `QuickFile-<tag>.dmg`，当前候选示例为 `QuickFile-v0.1.0-beta.1.dmg`（`<tag>` 本身包含 `v`）
+- 对应的 `.sha256` 文件
+- `artifact-check.json`（按需）
+- `INSTALL.txt`（按需）
+- `build-provenance.json`（按需）
+
+`build-provenance.json` 记录源码 SHA、Actions run、工具链和前四项资产的 SHA-256。按需查看时，它用于确认下载资产属于同一次构建，不替代签名、公证或完整实机验收。
+
+在下载目录先核对 DMG 字节。文件名必须替换为发布页实际列出的名称：
+
+```bash
+DMG='QuickFile-v0.1.0-beta.1.dmg'
+shasum -a 256 -c "${DMG}.sha256"
+```
+
+校验失败、资产来自不同发布页或 `build-provenance.json` 与当前发布页不匹配时停止安装。不要用 CI artifact、旧候选或自行重打包的文件替代对应发布页资产。
+
+## 安装与首次打开
+
+1. 退出正在运行的 QuickFile，备份模板、目录授权和现有安装。升级前保留旧版，直到新版本完成基本创建检查。
+2. 双击 DMG，将 `QuickFile.app` 拖到“应用程序”快捷方式；复制完成后推出磁盘映像，再从“应用程序”打开 QuickFile。
+3. 这是未经公证的第三方 App。首次打开若被 macOS 阻止，先按系统提示在“系统设置 → 隐私与安全性”中使用“仍要打开 / Open Anyway”，只批准这一个可信且已核对校验和的应用。可参考 [Apple 关于被阻止 App 的说明](https://support.apple.com/102445)。
+4. 不选择“允许来自任何来源”，不执行 `sudo spctl --master-disable`，不关闭 SIP，也不把这些操作作为安装要求。
+
+## 启用 Finder 扩展
+
+Finder 扩展开关与目录授权是两项独立的系统操作：
+
+- macOS 15 及以后，按 Apple 当前界面打开“系统设置 → 通用 → 登录项与扩展”，进入 Finder 扩展列表并启用 QuickFile。
+- 较早的受支持 macOS 版本可能在“隐私与安全性 → 扩展”中显示 Finder 扩展；界面名称和位置以本机系统为准，使用系统设置搜索“Finder 扩展”，不要套用另一版本的固定路径。
+
+可参考 [Apple 关于登录项与扩展设置的说明](https://support.apple.com/guide/mac-help/mtusr003/mac)。启用后在 Finder 文件夹背景打开右键菜单，选择 Markdown，确认新文件创建并选中。
+
+首次从 Finder 创建时，QuickFile 可能通过原生系统面板请求目标目录访问。只选择本次需要的目录；App Group 的系统提示与目录授权分开处理。QuickFile 不需要“完全磁盘访问”，不要为解决单个目录授权问题授予全局权限。
+
+## 未公证 App 的手动排障
+
+系统界面批准是首选。只有在可信官方发布页资产已通过对应 `.sha256` 核对、且仍需排查隔离属性影响时，才把下列命令作为一次性的手动排障，并记录已使用命令：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/QuickFile.app
+```
+
+这只递归删除指定 App 的 `com.apple.quarantine` 属性。`xattr -cr /Applications/QuickFile.app` 会递归清除该 App 的全部扩展属性，范围更宽；它们都不是代码签名或公证，也不会授予 Finder 目录权限或 App Group 授权。不要在默认安全设置验收中依靠任一命令判定通过，也不要对来源不明或校验不匹配的 App 使用这些命令。当前用户拥有该 App 写权限时通常无需管理员权限；若出现 `Operation not permitted`，先核对文件所有权和路径并按系统提示处理，不把 `sudo` 作为默认步骤。不应把清除隔离属性作为正常安装步骤。
+
+## 升级与恢复
+
+Community 没有在线更新或 Sparkle 自动安装。升级时先备份并退出旧版，再按同一校验、拖拽、推出和首次打开流程覆盖安装；打开后在“关于”中核对版本/build，重新确认 Finder 扩展实际加载的是当前 `/Applications/QuickFile.app`，再验证模板、目录授权和 Finder 创建。若系统拒绝启动或扩展未响应，保留提示原文并停止该项验收，不通过重签、注册修复或关闭安全功能掩盖失败。
+
+跨机器启动、完整 Finder 矩阵、默认安全设置干净机器、Mac 重启/注销、完整内存与残余 AX 内存归因仍按[发布清单](RELEASE_CHECKLIST.md)分别验收。产物收据只说明文件和包层检查结果，不能代替这些实测。

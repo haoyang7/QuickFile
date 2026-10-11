@@ -148,16 +148,59 @@ final class FinderExtensionDiagnosticsTests: XCTestCase {
     }
 
     func testCommandClosesReaderWhenDescendantRetainsOutput() throws {
-        let marker = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: marker) }
-        let start = ProcessInfo.processInfo.systemUptime
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let readyPath = directory.appendingPathComponent("ready").path
+        let releasePath = directory.appendingPathComponent("release").path
+        XCTAssertEqual(mkfifo(readyPath, 0o600), 0)
+        XCTAssertEqual(mkfifo(releasePath, 0o600), 0)
+        let ready = open(readyPath, O_RDWR | O_NONBLOCK | O_CLOEXEC)
+        guard ready >= 0 else { return XCTFail("Cannot open helper readiness FIFO") }
+        defer { close(ready) }
+        let release = open(releasePath, O_RDWR | O_NONBLOCK | O_CLOEXEC)
+        guard release >= 0 else { return XCTFail("Cannot open helper release FIFO") }
+        defer { close(release) }
+        let exits = kqueue()
+        guard exits >= 0 else { return XCTFail("Cannot observe helper exit") }
+        defer { close(exits) }
+        let handshake = DescendantHandshake(ready: ready, exits: exits)
+        func releaseHelper() {
+            var byte: UInt8 = 10
+            XCTAssertEqual(write(release, &byte, 1), 1)
+        }
+        defer {
+            releaseHelper()
+            // Recover a late readiness message on failure before removing the FIFOs.
+            if handshake.pid == nil { handshake.observeReadiness(timeout: 6) }
+            if handshake.pid != nil && !handshake.exited {
+                XCTAssertTrue(handshake.waitForExit(timeout: 6), "Helper did not exit during cleanup")
+            }
+        }
+        let helper = """
+            exec 3<> "$1" 4<> "$2" || exit 1
+            printf '%s\\n' "$$" >&3
+            IFS= read -r -t 5 release <&4 || exit 1
+            trap '' PIPE
+            if printf retained 2>/dev/null; then
+                /usr/bin/printf 'reader-open\\n' >&3
+            else
+                /usr/bin/printf 'survived\\n' >&3
+            fi
+            """
+        let started = ProcessInfo.processInfo.systemUptime
         let result = RegistrationCommand.run(executable: "/bin/sh", arguments: ["-c",
-            "(/bin/sleep 0.5; printf survived > '\(marker.path)') & exit 0"], timeout: 0.1)
+            "/bin/sh -c \"$1\" helper \"$2\" \"$3\" & exit 0", "command", helper, readyPath, releasePath],
+            timeout: 0.1, waitForChild: { handshake.wait(pid: $0, status: $1, options: $2) })
         assertFailure(result, .timeout)
-        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 0.4)
-        // The helper descendants exit naturally and must survive the query cleanup.
-        Thread.sleep(forTimeInterval: 0.55)
-        XCTAssertEqual(try String(contentsOf: marker), "survived")
+        let readyAt = try XCTUnwrap(handshake.readyAt, "Descendant never retained the output pipe")
+        XCTAssertLessThan(readyAt - started, 3, "Fixture readiness exceeded its bound")
+        // The deadline already exists at the first waitpid check. Startup can consume
+        // that deadline, but a live descendant still holds stdout until we release it.
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - readyAt, 0.4)
+        releaseHelper()
+        XCTAssertEqual(DescendantHandshake.readMessage(from: ready, timeout: 3), "survived")
+        XCTAssertTrue(handshake.waitForExit(timeout: 3), "Helper did not exit after release")
     }
 
     func testCommandLaunchFailure() {
@@ -220,6 +263,75 @@ final class FinderExtensionDiagnosticsTests: XCTestCase {
                 return XCTFail("Reaping did not release command capacity")
             }
             Thread.sleep(forTimeInterval: 0.005)
+        }
+    }
+
+    // This test calls run synchronously. Its first wait sets checkedReadiness before
+    // run can publish the callback to a deferred reaper; the flag never changes again.
+    // Deferred calls only read that published flag and call waitpid. Handshake metadata
+    // and descriptor operations remain confined to the test thread.
+    private final class DescendantHandshake: @unchecked Sendable {
+        let ready: Int32
+        let exits: Int32
+        private var checkedReadiness = false
+        private(set) var pid: pid_t?
+        private(set) var readyAt: TimeInterval?
+        private(set) var exited = false
+
+        init(ready: Int32, exits: Int32) {
+            self.ready = ready
+            self.exits = exits
+        }
+
+        func wait(pid: pid_t, status: UnsafeMutablePointer<Int32>, options: Int32) -> pid_t {
+            if !checkedReadiness {
+                checkedReadiness = true
+                observeReadiness(timeout: 3)
+            }
+            return Darwin.waitpid(pid, status, options)
+        }
+
+        func observeReadiness(timeout: TimeInterval) {
+            pid = Self.readMessage(from: ready, timeout: timeout).flatMap(Int32.init)
+            guard let helper = pid else { return }
+            var event = kevent64_s()
+            event.ident = UInt64(helper)
+            event.filter = Int16(EVFILT_PROC)
+            event.flags = UInt16(EV_ADD | EV_ONESHOT)
+            event.fflags = UInt32(NOTE_EXIT)
+            if kevent64(exits, &event, 1, nil, 0, 0, nil) == 0 {
+                readyAt = ProcessInfo.processInfo.systemUptime
+            } else if errno == ESRCH {
+                exited = true
+            }
+        }
+
+        func waitForExit(timeout: TimeInterval) -> Bool {
+            var event = kevent64_s()
+            var bound = timespec(tv_sec: Int(timeout), tv_nsec: 0)
+            exited = kevent64(exits, nil, 0, &event, 1, 0, &bound) == 1
+                && event.ident == pid.map(UInt64.init) && event.fflags & UInt32(NOTE_EXIT) != 0
+            return exited
+        }
+
+        static func readMessage(from descriptor: Int32, timeout: TimeInterval) -> String? {
+            let deadline = ProcessInfo.processInfo.systemUptime + timeout
+            var bytes = [UInt8]()
+            while bytes.count < 64 {
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else { return nil }
+                var event = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+                let polled = poll(&event, 1, Int32(remaining * 1_000))
+                if polled < 0 && errno == EINTR { continue }
+                guard polled == 1 else { return nil }
+                var byte: UInt8 = 0
+                let count = read(descriptor, &byte, 1)
+                if count < 0 && (errno == EINTR || errno == EAGAIN) { continue }
+                guard count == 1 else { return nil }
+                if byte == 10 { return String(decoding: bytes, as: UTF8.self) }
+                bytes.append(byte)
+            }
+            return nil
         }
     }
 

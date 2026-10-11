@@ -349,7 +349,7 @@ struct CreateFileView: View {
             showTemplateManager()
         case .startVerification:
             guard let folder = viewModel.destinationFolder else { return }
-            Task { await finderIntegrationViewModel.startVerification(in: folder) }
+            finderIntegrationViewModel.startVerification(in: folder)
         case .checkVerification:
             Task { await finderIntegrationViewModel.checkVerification() }
         case .openFolder:

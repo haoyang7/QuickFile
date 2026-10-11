@@ -1,0 +1,99 @@
+name: Community DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag matching the marketing version (for example v0.1.0-beta.1)'
+        required: true
+        default: 'v0.1.0-beta.1'
+        type: string
+  push:
+    tags: ['v*']
+    # Bootstrap the workflow on a development branch before merging it.
+    branches: ['codex/**']
+    paths:
+      - '.github/workflows/community-dmg.yml'
+      - 'Scripts/build-community.sh'
+      - 'Scripts/package-community.py'
+      - 'Scripts/community_dmg.py'
+      - 'Scripts/verify-community-artifact.py'
+      - 'Scripts/community-provenance.py'
+      - 'Scripts/tests/test_community_provenance.py'
+      - 'project.yml'
+      - 'QuickFile.xcodeproj/**'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  community-dmg:
+    name: Universal Community DMG (macOS 15 arm64)
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+      # Expressions are data in the environment, never shell source.
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag || 'v0.1.0-beta.1' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install and verify XcodeGen 2.46.0
+        run: |
+          mkdir -p "$RUNNER_TEMP/quickfile-tools"
+          archive="$RUNNER_TEMP/quickfile-tools/xcodegen.zip"
+          curl --fail --silent --show-error --location \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip \
+            --output "$archive"
+          printf '%s  %s\n' \
+            4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806 \
+            "$archive" | shasum --algorithm 256 --check
+          unzip -q "$archive" -d "$RUNNER_TEMP/quickfile-tools"
+          test "$("$RUNNER_TEMP/quickfile-tools/xcodegen/bin/xcodegen" version)" = 'Version: 2.46.0'
+          echo "$RUNNER_TEMP/quickfile-tools/xcodegen/bin" >> "$GITHUB_PATH"
+      - name: Verify event commit, clean source and pinned host tools
+        run: python3 Scripts/community-provenance.py check
+      - name: Test provenance failure boundaries
+        run: python3 -m unittest discover -s Scripts/tests -p test_community_provenance.py -v
+      - name: Build and strictly verify Community DMG
+        run: ./Scripts/build-community.sh --output .build/Temporary/community-dmg-delivery --release-tag "$RELEASE_TAG"
+      - name: Reject source drift and record delivery provenance
+        id: provenance
+        run: python3 Scripts/community-provenance.py write --directory .build/Temporary/community-dmg-delivery
+      - name: Upload exactly five delivery assets
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.provenance.outputs.artifact_name }}
+          path: |
+            ${{ steps.provenance.outputs.dmg }}
+            ${{ steps.provenance.outputs.checksum }}
+            .build/Temporary/community-dmg-delivery/artifact-check.json
+            .build/Temporary/community-dmg-delivery/INSTALL.txt
+            .build/Temporary/community-dmg-delivery/build-provenance.json
+          retention-days: 14
+          if-no-files-found: error
+          include-hidden-files: false
+          overwrite: false
+      - name: Explain download and verification scope
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_NAME: ${{ steps.provenance.outputs.artifact_name }}
+        run: |
+          {
+            printf '### Community DMG download\n\n'
+            printf '[Download the delivery ZIP](%s) (`%s`; retained for 14 days).\n\n' "$ARTIFACT_URL" "$ARTIFACT_NAME"
+            printf 'Extract all five files. Verify the DMG with `shasum --algorithm 256 --check QuickFile-%s.dmg.sha256`, then read `INSTALL.txt`.\n\n' "$RELEASE_TAG"
+            printf 'Source commit: `%s`; release tag: `%s`. `build-provenance.json` binds the four delivery files to this commit, run, and tool versions.\n\n' "$GITHUB_SHA" "$RELEASE_TAG"
+            printf '%s\n' 'Universal arm64/x86_64; ad-hoc signed and unnotarized; online updates disabled. Artifact checks do not establish cross-machine launch, Finder integration, upgrades, or Gatekeeper acceptance. This workflow does not publish a GitHub Release.'
+          } >> "$GITHUB_STEP_SUMMARY"

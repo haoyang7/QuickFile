@@ -230,16 +230,30 @@ final class FinderIntegrationViewModel: ObservableObject {
         }
     }
 
-    func startVerification(in folder: URL) async {
-        guard !isVerificationOperationInFlight else { return }
+    @discardableResult
+    func startVerification(in folder: URL) -> Task<Void, Never>? {
+        guard !isVerificationOperationInFlight else { return nil }
         isVerificationOperationInFlight = true
-        defer { isVerificationOperationInFlight = false }
         cancelVerification()
         isEnabled = statusProvider()
-        guard isEnabled else { return }
+        guard isEnabled else {
+            isVerificationOperationInFlight = false
+            return nil
+        }
         let generation = verificationGeneration
         verificationFolder = folder
         verificationState = .preparing
+        // Admit the action before enqueuing work, so closing the last window or
+        // changing the destination invalidates even a task that has not started.
+        return Task { [weak self] in
+            guard let self else { return }
+            await self.performVerification(in: folder, generation: generation)
+        }
+    }
+
+    private func performVerification(in folder: URL, generation: UInt64) async {
+        defer { isVerificationOperationInFlight = false }
+        guard generation == verificationGeneration else { return }
         let capture = directoryIdentityProvider
         let identityResult = await BackgroundWork.result { try capture(folder) }
         guard generation == verificationGeneration else { return }

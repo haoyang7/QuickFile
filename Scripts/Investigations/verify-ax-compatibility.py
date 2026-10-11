@@ -14,9 +14,17 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import shutil
 import subprocess
+import sys
 import time
-from ax_probe_report import disassemble_symbols, leak_groups
+from ax_process import reap_owned
+from ax_probe_report import (capture_terminal_snapshot, collect_heap_diagnostics, collect_terminal_snapshot,
+                             disassemble_symbols, empty_terminal_snapshot, leak_groups)
+from ax_external_receipt import (EXECUTABLES, FIXTURE_SOURCES, INSTALL_ENV, INSTALL_MODES, STARTUP_STAGES, StartupReceiptError,
+                                 fixture_hashes, fixture_sources, load_prepared_fixture, startup_failure,
+                                 owned_child_receipt, require_fixture_hashes, validate_empty_control_build,
+                                 validate_external_receipt, validate_install_gate_build, validate_install_gate_state)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -41,13 +49,35 @@ def wait_json(path, predicate, processes):
     raise TimeoutError(f"Fixture handshake timed out: {path.name}")
 
 
-def preflight_reason(host, reader, system_baseline=False):
+def validate_empty_control_capabilities(host, mode):
+    if mode not in ("patched", "pure-appkit") or type(host) is not dict or host.get("empty_control_mode") != mode:
+        raise RuntimeError("Empty-control capability mode differs from prepared build")
+    if mode == "pure-appkit" and (host.get("enabled") is not False or host.get("status") != "pure-appkit"):
+        raise RuntimeError("Pure AppKit capability unexpectedly contains the product patch")
+    if mode == "patched" and (host.get("enabled") is not True or host.get("status") != "enabled"):
+        raise RuntimeError("Patched empty-control capability did not install the product patch")
+
+
+def validate_install_gate_capabilities(host, mode):
+    if type(host) is not dict:
+        raise RuntimeError("Invalid install-gate capability")
+    validate_install_gate_state(host.get("install_probe"), mode)
+    if (host.get("enabled") is not (mode == "installed")
+            or host.get("status") != ("enabled" if mode == "installed" else "probe-preflight-only")):
+        raise RuntimeError("Install-gate capability does not match the method state")
+
+
+def preflight_reason(host, reader, system_baseline=False, empty_control_mode=None, install_gate=None):
+    if install_gate:
+        validate_install_gate_capabilities(host, install_gate)
+    if empty_control_mode:
+        validate_empty_control_capabilities(host, empty_control_mode)
     if not system_baseline and host["status"] in ("unsupported-images", "unsupported-architecture"):
         return host["status"]
     if system_baseline:
         if host["enabled"] or host["status"] != "system-baseline":
             raise RuntimeError("System baseline must preserve the unpatched implementation")
-    elif not host["enabled"]:
+    elif empty_control_mode != "pure-appkit" and install_gate != "preflight-only" and not host["enabled"]:
         raise RuntimeError(f"Unexpected installation refusal: {host['status']}")
     if not isinstance(reader.get("trusted"), bool):
         raise RuntimeError("AX reader returned an invalid capability receipt")
@@ -86,11 +116,63 @@ def validate_notifications(receipt, expected_buttons, read_only=False):
         raise RuntimeError(f"Invalid destroyed notification accounting: {receipt}")
 
 
+def validate_control_host(receipt):
+    keys = ("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")
+    if any(type(receipt.get(key)) is not int or receipt[key] != 0 for key in keys):
+        raise RuntimeError(f"Heap control created targets or applied compensation: {receipt}")
+
+
+def validate_control_reader(receipt, completed=False):
+    keys = ("notifications", "all_notifications", "unmatched_notifications", "tracked_buttons")
+    if not completed:
+        keys += ("buttons", "registrations")
+    if (any(type(receipt.get(key)) is not int or receipt[key] != 0 for key in keys)
+            or receipt.get("target_notification_counts") != []):
+        raise RuntimeError(f"Heap control read targets, registered targets or received notifications: {receipt}")
+
+
+def validate_malloc_scribble_receipt(receipt, requested):
+    expected = "1" if requested == "on" else "unset"
+    if (requested not in ("off", "on") or type(receipt) is not dict
+            or set(receipt) != {"requested", "host", "reader"}
+            or receipt["requested"] != requested
+            or receipt["host"] != expected or receipt["reader"] != expected):
+        raise RuntimeError("Actual host/reader MallocScribble environment was not confirmed")
+
+
+def validate_copy_lifetime_host(receipt, expected_copies=None):
+    lifetime = receipt.get("copyLifetime")
+    keys = ("ordinary", "mutable", "liveOrdinary", "liveMutable", "invalid")
+    host_keys = ("destroyedButtons", "compensations", "mutableCompensations")
+    if (not isinstance(lifetime, dict)
+            or any(type(lifetime.get(key)) is not int or lifetime[key] < 0 for key in keys)
+            or any(type(receipt.get(key)) is not int or receipt[key] < 0 for key in host_keys)):
+        raise RuntimeError(f"Invalid copy lifetime accounting: {receipt}")
+    destroyed = receipt["destroyedButtons"]
+    if (lifetime["ordinary"] != destroyed or lifetime["mutable"] != destroyed
+            or receipt["compensations"] != lifetime["ordinary"] + lifetime["mutable"]
+            or receipt["mutableCompensations"] != lifetime["mutable"]
+            or any(lifetime[key] != 0 for key in ("liveOrdinary", "liveMutable", "invalid"))
+            or (expected_copies is not None and destroyed != expected_copies)):
+        raise RuntimeError(f"Copy lifetime coverage or weak unavailability failed: {receipt}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-directory", required=True, type=Path)
     parser.add_argument("--records-directory", required=True, type=Path)
     parser.add_argument("--system-baseline", action="store_true")
+    parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; compensation-enabled modes only")
+    parser.add_argument("--heap-control", action="store_true", help="Match the selected product scan checkpoints with an empty window and no target buttons; requires --heap-diagnostics or --malloc-scribble")
+    parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; uses ordinary live scans unless --heap-diagnostics is selected")
+    parser.add_argument("--prepare-external-fixture", action="store_true", help="Build host/reader once without running them; ordinary binaries unless --empty-control-mode is explicit")
+    parser.add_argument("--prepare-install-gate-fixture", action="store_true", help="Prepare one diagnostic host/reader build for both install-gate modes")
+    parser.add_argument("--install-gate", choices=INSTALL_MODES, help="Use the prepared install-gate fixture; requires external off/live empty control")
+    parser.add_argument("--external-startup-receipt", action="store_true", help="Read owned child startup metadata outside the ordinary fixture; requires live MallocScribble and a prepared fixture")
+    parser.add_argument("--prepared-fixture-directory", type=Path)
+    parser.add_argument("--empty-control-mode", choices=("patched", "pure-appkit"), help="Explicit empty-control build/measurement; pure-appkit excludes the production AX implementation; measurement requires external startup receipts, MallocScribble off and --heap-control")
+    parser.add_argument("--terminal-origin", action="store_true", help="Capture one later heap graph after all six live scans; requires external startup receipts and MallocScribble off")
+    parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
     parser.add_argument("--balance-copies", action="store_true", help="Causal experiment: add one autorelease at the traced call sites; requires --ownership-trace")
@@ -99,6 +181,38 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.prepare_install_gate_fixture:
+        if args.install_gate or args.empty_control_mode:
+            parser.error("Install-gate preparation cannot select a measurement or empty-control build mode")
+        args.prepare_external_fixture = True
+    if args.install_gate and (args.prepare_external_fixture or args.empty_control_mode or args.terminal_origin
+            or not args.heap_control or not args.external_startup_receipt or args.malloc_scribble != "off"):
+        parser.error("--install-gate requires the prepared external off/live empty control")
+    if args.empty_control_mode and not args.prepare_external_fixture and (
+            not args.heap_control or not args.external_startup_receipt or args.malloc_scribble != "off" or args.terminal_origin):
+        parser.error("--empty-control-mode requires an independent preparation or external off/live heap control without a terminal graph")
+    if args.prepare_external_fixture and any((args.malloc_scribble, args.external_startup_receipt,
+            args.prepared_fixture_directory, args.system_baseline, args.heap_diagnostics, args.heap_control,
+            args.copy_lifetime, args.read_only, args.ownership_trace, args.balance_copies,
+            args.expected_appkit_uuid, args.expected_corefoundation_uuid, args.terminal_origin)):
+        parser.error("--prepare-external-fixture requires an independent fixture build")
+    if args.external_startup_receipt and (not args.malloc_scribble or not args.prepared_fixture_directory
+            or any((args.system_baseline, args.heap_diagnostics, args.copy_lifetime, args.read_only,
+                    args.ownership_trace, args.balance_copies, args.expected_appkit_uuid, args.expected_corefoundation_uuid))):
+        parser.error("external startup receipts require live MallocScribble and a prepared fixture")
+    if args.prepared_fixture_directory and not args.external_startup_receipt:
+        parser.error("--prepared-fixture-directory requires --external-startup-receipt")
+    if args.terminal_origin and (not args.external_startup_receipt or args.malloc_scribble != "off"):
+        parser.error("--terminal-origin requires external startup receipts with --malloc-scribble off")
+    if args.malloc_scribble and args.system_baseline:
+        parser.error("--malloc-scribble requires product mode")
+    if args.copy_lifetime and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
+                                   args.ownership_trace, args.read_only, args.malloc_scribble)):
+        parser.error("--copy-lifetime requires independent product mode without other probes")
+    if args.heap_control and (not (args.heap_diagnostics or args.malloc_scribble) or args.system_baseline):
+        parser.error("--heap-control requires --heap-diagnostics or --malloc-scribble and cannot use --system-baseline")
+    if args.heap_diagnostics and args.system_baseline:
+        parser.error("--heap-diagnostics requires product mode")
     if args.read_only and not args.system_baseline:
         parser.error("--read-only requires --system-baseline")
     if args.ownership_trace and (not args.system_baseline or args.read_only):
@@ -119,12 +233,14 @@ def main():
     records.mkdir(parents=True, exist_ok=False)
     state = work / "state"
     state.mkdir()
+    graphs = work / "heap"
+    if args.heap_diagnostics or args.terminal_origin:
+        graphs.mkdir()
     app = work / "AXCompatibilityFixture.app"
     executable = app / "Contents/MacOS/AXCompatibilityFixture"
-    executable.parent.mkdir(parents=True)
     reader_executable = work / "ax-reader"
-    sources = ["QuickFileApp/AXCompatibility.m", "QuickFileApp/AXCompatibility.h",
-               "Scripts/tests/fixtures/AXCompatibilityNotifications.m", "Scripts/tests/fixtures/AXCompatibilityReader.swift"]
+    build_mode = "install-gate" if args.prepare_install_gate_fixture or args.install_gate else args.empty_control_mode or "ordinary"
+    sources = fixture_sources(build_mode)
     commands = []
 
     def run(command, timeout=60):
@@ -135,30 +251,122 @@ def main():
         result.check_returncode()
         return result
 
-    common = ["xcrun", "clang", "-O2", "-I", str(ROOT / "QuickFileApp")]
-    run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[0]), "-o", str(work / "AXCompatibility.o")])
-    probe_arguments = []
-    if args.ownership_trace:
-        sources.append("Scripts/Investigations/AXOwnershipProbe.m")
-        run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[-1]), "-o", str(work / "AXOwnershipProbe.o")])
-        probe_arguments = [f"-DQUICKFILE_AX_OWNERSHIP_PROBE={2 if args.balance_copies else 1}", str(work / "AXOwnershipProbe.o")]
-    run(common + ["-fobjc-arc", "-framework", "AppKit", "-framework", "ApplicationServices",
-                  str(ROOT / sources[2]), str(work / "AXCompatibility.o"), *probe_arguments, "-o", str(executable)])
-    run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-parse-as-library", str(ROOT / sources[3]),
-         "-o", str(reader_executable)])
-    (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
-        "CFBundleIdentifier": "local.quickfile.tests.ax-compatibility", "CFBundleName": "AXCompatibilityFixture",
-        "CFBundleExecutable": "AXCompatibilityFixture", "CFBundlePackageType": "APPL", "CFBundleVersion": "1"}))
-    entitlements = work / "entitlements.plist"
-    entitlements.write_bytes(plistlib.dumps({"com.apple.security.get-task-allow": True}))
-    run(["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(app)])
+    source_hashes = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources}
+    if args.external_startup_receipt:
+        prepared = args.prepared_fixture_directory.resolve()
+        prepared.relative_to(ROOT / ".build/Temporary")
+        expected_hashes = load_prepared_fixture(prepared, source_hashes, build_mode)
+        prepared_app = prepared / app.name
+        if prepared_app.is_symlink() or any(path.is_symlink() for path in prepared_app.rglob("*")):
+            raise RuntimeError("Prepared fixture contains symbolic links")
+        shutil.copytree(prepared_app, app)
+        shutil.copy2(prepared / "ax-reader", reader_executable)
+        require_fixture_hashes(work, expected_hashes)
+    else:
+        executable.parent.mkdir(parents=True)
+        common = ["xcrun", "clang", "-O2"]
+        if build_mode != "pure-appkit":
+            common += ["-I", str(ROOT / "QuickFileApp")]
+        if args.empty_control_mode:
+            common.append("-DQUICKFILE_AX_EMPTY_CONTROL")
+        if build_mode == "install-gate":
+            common.append("-DQUICKFILE_AX_INSTALL_PROBE")
+        if build_mode == "pure-appkit":
+            common.append("-DQUICKFILE_AX_PURE_APPKIT_CONTROL")
+        if args.malloc_scribble:
+            common.append("-DQUICKFILE_AX_MALLOC_RECEIPT")
+        if args.copy_lifetime:
+            common.append("-DQUICKFILE_AX_COPY_LIFETIME")
+        production_objects = []
+        if build_mode != "pure-appkit":
+            run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[0]), "-o", str(work / "AXCompatibility.o")])
+            production_objects.append(str(work / "AXCompatibility.o"))
+        probe_arguments = []
+        if args.ownership_trace:
+            sources.append("Scripts/Investigations/AXOwnershipProbe.m")
+            run(common + ["-fno-objc-arc", "-c", str(ROOT / sources[-1]), "-o", str(work / "AXOwnershipProbe.o")])
+            probe_arguments = [f"-DQUICKFILE_AX_OWNERSHIP_PROBE={2 if args.balance_copies else 1}", str(work / "AXOwnershipProbe.o")]
+        run(common + ["-fobjc-arc", "-framework", "AppKit", "-framework", "ApplicationServices",
+                      str(ROOT / FIXTURE_SOURCES[0]), *production_objects, *probe_arguments, "-o", str(executable)])
+        run(["xcrun", "swiftc", "-O", "-swift-version", "5", "-parse-as-library",
+             *(["-DQUICKFILE_AX_MALLOC_RECEIPT", "-module-cache-path", str(work / "swift-module-cache")]
+               if args.malloc_scribble else ["-module-cache-path", str(work / "swift-module-cache")]
+               if args.prepare_external_fixture else []), str(ROOT / FIXTURE_SOURCES[1]),
+             "-o", str(reader_executable)])
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "local.quickfile.tests.ax-compatibility", "CFBundleName": "AXCompatibilityFixture",
+            "CFBundleExecutable": "AXCompatibilityFixture", "CFBundlePackageType": "APPL", "CFBundleVersion": "1"}))
+        entitlements = work / "entitlements.plist"
+        entitlements.write_bytes(plistlib.dumps({"com.apple.security.get-task-allow": True}))
+        run(["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(app)])
+    if args.prepare_external_fixture:
+        manifest = {"schema": 3 if build_mode == "install-gate" else 2 if args.empty_control_mode else 1, "build_mode": build_mode, "sources": source_hashes,
+                    "executables": fixture_hashes(work)}
+        if build_mode == "install-gate":
+            presence = {}
+            for role, name in EXECUTABLES.items():
+                symbols = run(["xcrun", "nm", "-j", str(work / name)]).stdout.splitlines()
+                if "_main" not in symbols:
+                    raise RuntimeError("Install-gate executable symbol table unavailable")
+                presence[role] = "_QuickFileAXInstallProbeGate" in symbols
+            definitions = [flag[2:] for flag in common if flag.startswith("-D")]
+            manifest["build_evidence"] = {
+                "link_inputs": {"host": [FIXTURE_SOURCES[0]] + [Path(path).name for path in production_objects], "reader": [FIXTURE_SOURCES[1]]},
+                "compile_definitions": {"production": definitions, "host": definitions, "reader": []},
+                "gate_symbol_present": presence}
+            validate_install_gate_build(manifest["build_evidence"])
+        if args.empty_control_mode:
+            counts = {}
+            for role, name in EXECUTABLES.items():
+                symbols = run(["xcrun", "nm", "-j", str(work / name)]).stdout.splitlines()
+                if "_main" not in symbols:
+                    raise RuntimeError("Empty-control executable symbol table unavailable")
+                production = {symbol for symbol in symbols if symbol.startswith(("_QuickFileInstallAXCompatibility", "QuickFileInstallAXCompatibility", "_QuickFileAX", "QuickFileAX"))}
+                counts[role] = len(production)
+                if role == "host" and build_mode == "patched" and not {
+                        "_QuickFileInstallAXCompatibility", "_QuickFileAXCompatibilityStatus",
+                        "_QuickFileAXCompensatedCopies", "_QuickFileAXCompensatedMutableCopies"} <= production:
+                    raise RuntimeError("Patched empty-control build is missing production exports")
+            manifest["build_evidence"] = {
+                "link_inputs": {"host": [FIXTURE_SOURCES[0]] + [Path(path).name for path in production_objects],
+                                "reader": [FIXTURE_SOURCES[1]]},
+                "production_ax_symbol_counts": counts}
+            validate_empty_control_build(manifest["build_evidence"], build_mode)
+        write_json(work / "fixture-build.json", manifest)
+        write_json(records / "fixture-build.json", manifest)
+        print(json.dumps(manifest))
+        return 0
+    external_receipt = None
+    startup_failures = []
+    if args.external_startup_receipt:
+        external_receipt = {"receipt_mode": "external-startup", "requested": args.malloc_scribble,
+                            "host": None, "reader": None, "executables": expected_hashes,
+                            "binary_reuse_verified": False}
+        if args.install_gate:
+            external_receipt["install_gate"] = args.install_gate
+        write_json(records / "external-startup.json", external_receipt)
+        write_json(records / "startup-failures.json", startup_failures)
     environment = dict(os.environ)
     environment.pop("QUICKFILE_DISABLE_AX_COMPATIBILITY", None)
+    # Preserve the reader's existing inherited environment by default. The paired
+    # experiment changes only MallocScribble, not its stack-logging behavior.
+    reader_environment = dict(os.environ) if args.malloc_scribble else None
+    allocator_receipt = {"requested": args.malloc_scribble, "host": "missing", "reader": "missing"}
+    if args.malloc_scribble:
+        for target_environment in (environment, reader_environment):
+            target_environment.pop("MallocScribble", None)
+            if args.malloc_scribble == "on":
+                target_environment["MallocScribble"] = "1"
+        write_json(records / "malloc-scribble.json", allocator_receipt)
+    if args.install_gate:
+        for target_environment in (environment, reader_environment):
+            target_environment[INSTALL_ENV] = args.install_gate
     host_arguments = ["--system-baseline"] if args.system_baseline else []
     capability = subprocess.run([str(executable), "--capabilities", *host_arguments], env=environment,
                                 capture_output=True, text=True, check=True, timeout=15)
     capabilities = json.loads(capability.stdout)
-    reader_capability = subprocess.run([str(reader_executable), "--capabilities"], env=environment,
+    reader_capability = subprocess.run([str(reader_executable), "--capabilities"],
+                                       env=reader_environment if args.malloc_scribble else environment,
                                        capture_output=True, text=True, check=True, timeout=15)
     reader_capabilities = json.loads(reader_capability.stdout)
     if args.balance_copies and capabilities["images"] != {
@@ -167,44 +375,127 @@ def main():
     write_json(records / "inputs.json", {"capabilities": capabilities, "reader_capabilities": reader_capabilities,
         "system": run(["sw_vers"]).stdout,
         "sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources}})
-    reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline)
+    reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline, args.empty_control_mode, args.install_gate)
     if reason:
-        print(json.dumps({"coverage": "not-covered", "reason": reason,
-                          "host": capabilities, "reader": reader_capabilities}))
+        receipt = {"coverage": "not-covered", "reason": reason,
+                   "host": capabilities, "reader": reader_capabilities}
+        if args.heap_diagnostics or args.malloc_scribble:
+            receipt["mode"] = "heap-control" if args.heap_control else "product"
+            receipt["scan_mode"] = "diagnostic" if args.heap_diagnostics else "live"
+        if args.copy_lifetime:
+            receipt.update(mode="copy-lifetime", instrumented=True)
+        if args.empty_control_mode:
+            receipt["empty_control_mode"] = args.empty_control_mode
+        print(json.dumps(receipt))
         return 77
     environment.update(MallocStackLogging="1", MallocStackLoggingNoCompact="1")
+    if args.heap_diagnostics:
+        # Full frozen histories must preserve free/reallocation generations.
+        # MallocStackLogging would take precedence over NoCompact if both were set.
+        environment.pop("MallocStackLogging")
     results = []
     validation_errors = []
     checkpoints = []
+    copy_lifetime_hosts = []
     expected_registrations = 0 if args.read_only else 20
     host = reader = None
     observer_exited = None
     sequence = reader_sequence = 0
+    terminal_snapshot = empty_terminal_snapshot() if args.terminal_origin else None
     with (records / "host.log").open("w") as host_log, (records / "reader.log").open("w") as reader_log:
         def validate(stage, validator, *values):
             # Assertion failures must not discard later lifecycle evidence. They
             # remain fatal even if a subsequent scan returns to the baseline.
             try:
                 validator(*values)
-            except RuntimeError as error:
-                validation_errors.append({"stage": stage, "message": str(error)})
+            except Exception as error:
+                if isinstance(error, RuntimeError):
+                    validation_errors.append({"stage": stage, "message": str(error)})
+                if stage in STARTUP_STAGES:
+                    startup_failures.append(startup_failure(stage, error))
+                    write_json(records / "startup-failures.json", startup_failures)
+                if not isinstance(error, RuntimeError):
+                    raise
                 write_json(records / "validation-errors.json", validation_errors)
 
-        def command(action):
+        def record_copy_lifetime_host(receipt, expected_copies=None):
+            copy_lifetime_hosts.append(receipt)
+            write_json(records / "copy-lifetime-hosts.json", copy_lifetime_hosts)
+            validate(f"copy-lifetime-host-{receipt['sequence']}", validate_copy_lifetime_host, receipt, expected_copies)
+
+        def command(action, expected_copies=None):
             nonlocal sequence
             sequence += 1
             write_json(state / "command.json", {"sequence": sequence, "action": action, "count": 10})
-            return wait_json(state / "ready.json", lambda value: value["sequence"] == sequence, [host])
+            receipt = wait_json(state / "ready.json", lambda value: value["sequence"] == sequence, [host])
+            if args.heap_control:
+                validate(f"control-host-{sequence}", validate_control_host, receipt)
+            if args.install_gate:
+                validate(f"install-gate-host-{sequence}", validate_install_gate_state, receipt.get("install_probe"), args.install_gate)
+            if args.copy_lifetime:
+                record_copy_lifetime_host(receipt, expected_copies)
+            return receipt
 
         def observe():
             nonlocal reader_sequence
             reader_sequence += 1
             write_json(state / "reader-command.json", {"sequence": reader_sequence})
-            return wait_json(state / "reader-ready.json", lambda value: value["sequence"] == reader_sequence, [host, reader])
+            receipt = wait_json(state / "reader-ready.json", lambda value: value["sequence"] == reader_sequence, [host, reader])
+            if args.malloc_scribble and reader_sequence == 1 and not args.external_startup_receipt:
+                record_allocator_environment("reader", receipt)
+                validate("malloc-scribble", validate_malloc_scribble_receipt, allocator_receipt, args.malloc_scribble)
+            if args.heap_control:
+                validate(f"control-reader-{reader_sequence}", validate_control_reader, receipt)
+            return receipt
+
+        def record_allocator_environment(role, receipt):
+            value = receipt.get("malloc_scribble", "missing")
+            allocator_receipt[role] = value if value in ("unset", "1", "other", "missing") else "other"
+            write_json(records / "malloc-scribble.json", allocator_receipt)
+
+        def record_external_environment(role, process, path, child_environment):
+            value = owned_child_receipt(process, path, child_environment, args.malloc_scribble, expected_hashes[role], args.install_gate)
+            external_receipt[role] = value
+            allocator_receipt[role] = value["malloc_scribble"]
+            write_json(records / "external-startup.json", external_receipt)
+            write_json(records / "malloc-scribble.json", allocator_receipt)
+
+        def finish_external_receipt():
+            for directory, reason in ((prepared, "prepared_hash"), (work, "working_hash")):
+                try:
+                    require_fixture_hashes(directory, expected_hashes)
+                except OSError as error:
+                    # Preserve the original I/O exception and execution/cleanup
+                    # path; only attach an allowlisted diagnostic reason.
+                    error._startup_hash_reason = reason
+                    raise
+                except RuntimeError as error:
+                    raise StartupReceiptError(reason, str(error)) from None
+            external_receipt["binary_reuse_verified"] = True
+            write_json(records / "external-startup.json", external_receipt)
+            try:
+                validate_external_receipt(external_receipt, args.malloc_scribble, expected_hashes, args.install_gate)
+            except RuntimeError as error:
+                raise StartupReceiptError("receipt_incomplete", str(error)) from None
 
         def scan(label, host_state):
+            if args.copy_lifetime:
+                # Preserve commands evaluated at scan call sites. This separate
+                # probe measures weak availability without sampling the heap.
+                return
             started = time.monotonic()
-            result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(host.pid)],
+            target = str(host.pid)
+            if args.heap_diagnostics:
+                graph = graphs / f"{label}.memgraph"
+                capture = subprocess.run(["leaks", "--noContent", "--fullStacks", "--fullStackHistory", f"--outputGraph={graph}", target],
+                                         capture_output=True, text=True, timeout=60)
+                (graphs / f"{label}-capture.txt").write_text(capture.stdout + capture.stderr)
+                if capture.returncode not in (0, 1) or not graph.is_file():
+                    raise RuntimeError("Diagnostic heap graph capture was unavailable")
+                # --outputGraph suppresses the text report. Decode that same
+                # snapshot offline; do not sample the live heap a second time.
+                target = str(graph)
+            result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", target],
                                     capture_output=True, text=True, timeout=60)
             (records / f"{label}-leaks.txt").write_text(result.stdout + result.stderr)
             match = re.search(r"(\d+) leaks for (\d+) total leaked bytes", result.stdout)
@@ -225,32 +516,53 @@ def main():
         try:
             host = subprocess.Popen([str(executable), str(state), *host_arguments], env=environment, stdout=host_log, stderr=host_log)
             initial = wait_json(state / "ready.json", lambda value: value["sequence"] == 0, [host])
+            if args.install_gate:
+                write_json(records / "install-gate-initial.json", initial.get("install_probe"))
+                validate("install-gate-host-0", validate_install_gate_state, initial.get("install_probe"), args.install_gate)
+            if args.external_startup_receipt:
+                validate("external-startup-host", record_external_environment, "host", host, executable, environment)
+            elif args.malloc_scribble:
+                record_allocator_environment("host", initial)
+            if args.heap_control:
+                validate("control-host-0", validate_control_host, initial)
+            if args.copy_lifetime:
+                record_copy_lifetime_host(initial)
             if args.system_baseline:
                 scan("baseline", initial)
             reader_arguments = ["--read-only"] if args.read_only else []
             reader = subprocess.Popen([str(reader_executable), str(host.pid), str(executable), str(state), *reader_arguments],
-                                      stdout=reader_log, stderr=reader_log)
+                                      env=reader_environment, stdout=reader_log, stderr=reader_log)
+            if args.external_startup_receipt:
+                validate("external-startup-reader", record_external_environment, "reader", reader, reader_executable, reader_environment)
             if not args.system_baseline:
                 # Establish AX/XPC setup before the baseline, with no owned test
                 # buttons yet. All target destruction remains after this scan.
                 warmed = observe()
-                if warmed["buttons"] or warmed["registrations"] or warmed["notifications"]:
+                if not args.heap_control and (warmed["buttons"] or warmed["registrations"] or warmed["notifications"]):
                     raise RuntimeError(f"AX baseline warm-up was not empty: {warmed}")
                 scan("baseline", command("checkpoint"))
             for cycle in range(1, args.cycles + 1):
-                command("add")
+                added = command("checkpoint" if args.heap_control else "add")
+                if args.heap_diagnostics and cycle == 1:
+                    # Split button construction from the first AX subscription;
+                    # this remains subject to the original empty-window baseline.
+                    scan("added-10", added)
                 observed = observe()
-                if observed["buttons"] != 10 or observed["registrations"] != expected_registrations:
+                if not args.heap_control and (observed["buttons"] != 10 or observed["registrations"] != expected_registrations):
                     raise RuntimeError(f"AX registrations incomplete: {observed}")
                 if not args.system_baseline and cycle == 1:
                     # Locate setup growth without replacing the empty baseline
                     # or destroying any target button before the first scan.
                     scan("registered-10", command("checkpoint"))
-                removed = command("remove")
+                removed = command("checkpoint" if args.heap_control else "remove")
                 observe()
-                if removed["destroyedButtons"] != cycle * 10:
+                if not args.heap_control and removed["destroyedButtons"] != cycle * 10:
                     raise RuntimeError(f"Buttons did not deallocate: {removed}")
-                checkpoints.append({key: removed[key] for key in ("allocatedButtons", "destroyedButtons", "ownership") if key in removed})
+                checkpoint_keys = (("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")
+                                   if args.heap_control else ("allocatedButtons", "destroyedButtons", "ownership"))
+                if args.copy_lifetime:
+                    checkpoint_keys += ("copyLifetime",)
+                checkpoints.append({key: removed[key] for key in checkpoint_keys if key in removed})
                 if not args.system_baseline or cycle in {1, 3, args.cycles}:
                     scan(f"removed-{cycle * 10}", removed)
             (state / "stop-reader").touch()
@@ -259,7 +571,10 @@ def main():
                 raise RuntimeError("AX observer did not exit successfully")
             notification_receipt = json.loads((state / "reader-completed.json").read_text())
             write_json(records / "notifications.json", notification_receipt)
-            validate("notifications", validate_notifications, notification_receipt, args.cycles * 10, args.read_only)
+            if args.heap_control:
+                validate("notifications", validate_control_reader, notification_receipt, True)
+            else:
+                validate("notifications", validate_notifications, notification_receipt, args.cycles * 10, args.read_only)
             notification_count = notification_receipt.get("notifications")
             observer_exited = time.monotonic()
             if args.idle_seconds > 10:
@@ -270,8 +585,12 @@ def main():
                 if remaining <= 0:
                     break
                 time.sleep(min(1, remaining))
-            final = command("checkpoint")
+            final = command("checkpoint", 30 if args.copy_lifetime else None)
             scan("observer-exited", final)
+            if args.terminal_origin:
+                # The ordinary six scans are finished. This later capture never
+                # changes their totals or strict validation results.
+                terminal_snapshot = capture_terminal_snapshot(host.pid, graphs / "terminal.memgraph")
             ordinary = final["compensations"] - final["mutableCompensations"]
             if args.system_baseline:
                 if final["compensations"] != 0 or final["mutableCompensations"] != 0:
@@ -299,6 +618,34 @@ def main():
                     if args.balance_copies and (ownership["live"] or any(
                             group["destroyed_return_offsets"] for entry in results for group in entry.get("groups", []))):
                         raise RuntimeError(f"Diagnostic balance left live target arrays or AX leak groups: {ownership}")
+            elif args.heap_control:
+                summary = {"coverage": "measured", "mode": "heap-control", "reader_mode": "subscribed",
+                           "destroyed_buttons": final["destroyedButtons"],
+                           "allocated_buttons": final["allocatedButtons"], "buttons": final["buttons"],
+                           "notifications": notification_count, "notification_receipt": notification_receipt,
+                           "ordinary_compensations": ordinary, "mutable_compensations": final["mutableCompensations"],
+                           "ax_leak_nodes": None if validation_errors else 0,
+                           "baseline_leak_nodes": results[0]["leak_nodes"],
+                           "baseline_leak_bytes": results[0]["leak_bytes"],
+                           "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
+                           "images": capabilities["images"], "checkpoints": checkpoints,
+                           "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
+                           "scope": "empty-window control with the "
+                                    + ("diagnostic" if args.heap_diagnostics else "ordinary live")
+                                    + " product checkpoint sequence and strict heap guard; "
+                                    "application AX reads and observers active; zero target buttons; no product destruction coverage"}
+            elif args.copy_lifetime:
+                summary = {"coverage": "passed", "mode": "copy-lifetime", "instrumented": True,
+                           "copy_lifetime": final.get("copyLifetime"), "checkpoints": checkpoints,
+                           "destroyed_buttons": final["destroyedButtons"],
+                           "notifications": notification_count, "notification_receipt": notification_receipt,
+                           "ordinary_compensations": ordinary, "mutable_compensations": final["mutableCompensations"],
+                           "images": capabilities["images"], "idle_seconds": args.idle_seconds,
+                           "scope": "synthetic AppKit fixture with diagnostic weak copy tracking; "
+                                    "verifies two compensated copy branches and destroyed notifications; "
+                                    "requires that weak targets cannot be acquired after the existing autorelease pool drains; "
+                                    "this does not establish completed object destruction; "
+                                    "not an installed-app or VoiceOver test"}
             else:
                 if ordinary < 30 or final["mutableCompensations"] < 30:
                     validation_errors.append({"stage": "compensation-branches",
@@ -313,29 +660,86 @@ def main():
                            "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
                            "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX groups and no increase over the non-AX startup baseline; not an installed-app or VoiceOver test"}
+            if args.external_startup_receipt:
+                validate("external-startup-complete", finish_external_receipt)
+                summary["receipt_mode"] = "external-startup"
+            if args.empty_control_mode:
+                summary["empty_control_mode"] = args.empty_control_mode
+                summary["product_compensation_enabled"] = args.empty_control_mode == "patched"
+                summary["scope"] += "; " + args.empty_control_mode + " empty control; no product destruction coverage"
+            if args.install_gate:
+                summary["install_gate"] = args.install_gate
+                summary["product_compensation_enabled"] = args.install_gate == "installed"
+                summary["scope"] += "; install-gate empty control; no product destruction coverage"
             if validation_errors:
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors
                 write_json(records / "validation-errors.json", validation_errors)
+            if args.heap_diagnostics or args.malloc_scribble:
+                summary["mode"] = "heap-control" if args.heap_control else "product"
+                summary["scan_mode"] = "diagnostic" if args.heap_diagnostics else "live"
+            if args.malloc_scribble:
+                summary["malloc_scribble"] = allocator_receipt
+                summary["scope"] += "; MallocScribble environment experiment only; not an ownership fix or proof of completed free"
             write_json(records / "result.json", summary)
-            print(json.dumps(summary))
         finally:
-            if reader and reader.poll() is None:
-                (state / "stop-reader").touch()
+            primary_exception = sys.exc_info()[0] is not None
+            cleanup = {"primary_exception": primary_exception, "errors": []}
+            if primary_exception:
+                validation_errors.append({"stage": "execution", "message": "Fixture execution failed"})
+
+            def cleanup_step(stage, operation):
                 try:
-                    reader.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    reader.terminate()
-                    reader.wait(timeout=5)
-            if host and host.poll() is None:
-                (state / "quit").touch()
-                try:
-                    host.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    host.terminate()
-                    host.wait(timeout=5)
-            subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
-                            "-u", str(app)], capture_output=True, timeout=15)
+                    return operation()
+                except Exception:
+                    # Cleanup must retain the original exception/strict failure,
+                    # and one failed operation must not skip independent cleanup.
+                    cleanup["errors"].append(stage)
+                    validation_errors.append({"stage": "cleanup", "message": stage})
+
+            for role, process, stop in (("reader", reader, "stop-reader"), ("host", host, "quit")):
+                value = cleanup_step(role, lambda: reap_owned(process, state / stop))
+                cleanup[role] = value
+                if value is not None and (not value["exited"] or value["errors"]):
+                    cleanup["errors"].append(role)
+                    validation_errors.append({"stage": "cleanup", "message": role})
+            exited = all(cleanup[role] is not None and cleanup[role]["exited"] for role in ("reader", "host"))
+            cleanup["processes_exited"] = exited
+
+            def unregister():
+                result = subprocess.run(["/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+                    "-u", str(app)], capture_output=True, timeout=15)
+                if result.returncode != 0:
+                    raise RuntimeError("Launch Services cleanup failed")
+
+            cleanup_step("launch_services", unregister)
+            if args.external_startup_receipt:
+                def final_external_receipt():
+                    external_receipt["binary_reuse_verified"] = False
+                    write_json(records / "external-startup.json", external_receipt)
+                    if not exited:
+                        raise RuntimeError("Owned process exit not confirmed")
+                    validate("external-startup-final", finish_external_receipt)
+                cleanup_step("external_receipt", final_external_receipt)
+            # No offline analysis may treat a still-live owned process as exited.
+            if exited:
+                if args.heap_diagnostics:
+                    cleanup_step("heap_diagnostics", lambda: collect_heap_diagnostics(graphs, records))
+                if args.terminal_origin:
+                    cleanup_step("terminal_snapshot", lambda: collect_terminal_snapshot(graphs / "terminal.memgraph", records, terminal_snapshot))
+            elif args.terminal_origin:
+                cleanup_step("terminal_snapshot_receipt", lambda: write_json(records / "terminal-snapshot.json", terminal_snapshot))
+            cleanup_step("cleanup_receipt", lambda: write_json(records / "process-cleanup.json", cleanup))
+            if "summary" not in locals():
+                summary = {"coverage": "failed"}
+            if primary_exception or validation_errors:
+                summary["coverage"] = "failed"
+            summary["cleanup"] = cleanup
+            if validation_errors:
+                summary["validation_errors"] = validation_errors
+                cleanup_step("validation_receipt", lambda: write_json(records / "validation-errors.json", validation_errors))
+            cleanup_step("result_receipt", lambda: write_json(records / "result.json", summary))
+            print(json.dumps(summary))
     return 1 if validation_errors else 0
 
 
