@@ -513,6 +513,64 @@ class ReferenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Conflicting trace object"):
             NODES.parse_trace_graph(changed, 0x1000, 48)
 
+    def test_register_interior_offsets_are_bounded_and_bound_to_parent(self):
+        text = self.register_trace()
+        key = ("thread-register", 7, "x25")
+        for offset in (0, 16, 47):
+            changed = text.replace("$x25", f"$x25 --> offset {offset}")
+            graph = NODES.parse_trace_graph(changed, 0x1000, 48)
+            self.assertEqual(graph["members"][key]["slot_binding"][1:], (0x1000, offset))
+            self.assertEqual(graph["slots"], [])
+        for offset in ("48", "49", "1000000001", "00000000000", "-1", "+1", "opaque", "16 extra"):
+            with self.subTest(offset=offset), self.assertRaises(ValueError):
+                NODES.parse_trace_graph(text.replace("$x25", f"$x25 --> offset {offset}"), 0x1000, 48)
+        # An indirect register root is checked against its immediate heap parent.
+        indirect = text.replace("      1 Thread", "      1 <private-type 0x2000> [24] +8: __strong 0x2008\n        1 Thread")
+        NODES.parse_trace_graph(indirect.replace("$x25", "$x25 --> offset 23"), 0x1000, 48)
+        with self.assertRaisesRegex(ValueError, "Unbound reference slot"):
+            NODES.parse_trace_graph(indirect.replace("$x25", "$x25 --> offset 24"), 0x1000, 48)
+        region = text.replace("      1 Thread", "      1 Region Stack private 0x9000\n        1 Thread")
+        NODES.parse_trace_graph(region.replace("$x25", "$x25 --> offset 1000000000"), 0x1000, 48)
+
+    def test_register_offset_direct_and_reply_group_paths_share_binding(self):
+        # Synthetic identities with the observed 80-byte parent and reply slot.
+        direct = trace(0x1000, 80, 1).split("    1 <", 1)[0]
+        direct += "    1 <private-type 0x1000> [80]\n      1 Thread 7  private $x4 --> offset 16\n"
+        indirect = trace(0x2000, 80, 1).split("    1 <", 1)[0]
+        indirect += ("    1 <dispatch_group_t 0x2000> [80]\n"
+                     "      1 <private-type 0x1000> [80]    +48: _replyGroup 0x1030\n"
+                     "        1 Thread 7  private $x4 --> offset 16\n")
+        first = NODES.parse_trace_graph(direct, 0x1000, 80)
+        second = NODES.parse_trace_graph(indirect, 0x2000, 80)
+        key = ("thread-register", 7, "x4")
+        self.assertEqual(first["members"][key], second["members"][key])
+        self.assertEqual(second["slots"], [{"source": 0x1000, "target": 0x2000, "offset": 48}])
+        builder = NODES.References(NODES.initial_summary(), [0x1000, 0x2000])
+        builder.add(first, NODES.reference_view(0, "baseline", "trace"))
+        builder.add(second, NODES.reference_view(1, "baseline", "trace"))
+        with self.assertRaisesRegex(ValueError, "Invalid reverse nesting"):
+            NODES.parse_trace_graph(direct + "        1 Region Stack private 0x9000\n", 0x1000, 80)
+
+    def test_register_interior_offset_conflicts_with_same_checkpoint_binding(self):
+        text = self.register_trace()
+        first = NODES.parse_trace_graph(text.replace("$x25", "$x25 --> offset 16"), 0x1000, 48)
+        value = NODES.initial_summary()
+        builder = NODES.References(value, [0x1000])
+        builder.add(first, NODES.reference_view(0, "baseline", "trace"))
+        before = copy.deepcopy(value)
+        for suffix in ("", " --> offset 17"):
+            changed = NODES.parse_trace_graph(text.replace("$x25", "$x25" + suffix), 0x1000, 48)
+            with self.assertRaisesRegex(ValueError, "Conflicting trace object"):
+                builder.add(changed, NODES.reference_view(1, "baseline", "trace"))
+            self.assertEqual(value, before)
+        repeated = text.replace("Found 1 root", "Found 2 root").replace("    1 <", "    2 <")
+        repeated += text.splitlines()[-1] + " --> offset 16\n"
+        with self.assertRaisesRegex(ValueError, "Conflicting trace object"):
+            NODES.parse_trace_graph(repeated, 0x1000, 48)
+        # Explicit zero and an omitted offset describe the same slot value.
+        self.assertEqual(NODES.parse_trace_graph(text, 0x1000, 48),
+                         NODES.parse_trace_graph(text.replace("$x25", "$x25 --> offset 0"), 0x1000, 48))
+
     def test_register_root_rejects_unknown_syntax_and_invalid_graph(self):
         text = self.register_trace(description="private")
         for changed in (

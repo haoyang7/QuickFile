@@ -328,11 +328,15 @@ def parse_trace_graph(report, address, size):
         if register_root:
             if paths != 1 or not stack:
                 raise ValueError("Unsupported reverse object")
+            offset = int(register_root[6] or 0)
+            parent = members[stack[-1]["address"]]
+            if parent["size"] and offset >= parent["size"]:
+                raise ValueError("Unbound reference slot")
             # Report-local thread ordinals identify register slots within a
             # checkpoint only; they do not identify a thread across snapshots.
             key = ("thread-register", int(register_root[1]), register_root[5])
             obj = {"address": key, "kind": "unknown", "protocol": "none", "size": 0, "region": "other",
-                   "slot_binding": (register_root[3], stack[-1]["address"])}
+                   "slot_binding": (register_root[3], stack[-1]["address"], offset)}
             terminal, leaf_only = True, True
         elif slot_root:
             description, offset, slot = slot_root[1], int(slot_root[2]), int(slot_root[3], 16)

@@ -172,6 +172,25 @@ class ParserEvidenceTests(unittest.TestCase):
                          (len(decoded["members"]), len(decoded["edges"]), decoded["roots"]))
         self.assertEqual(doc["status"], "complete")
 
+    def test_register_interior_offset_anonymization_and_replay(self):
+        text = fixtures.ReferenceTests.register_trace(register="x4", description="Thread_123456 /Users/private 998877")
+        text = text.replace("$x4", "$x4 --> offset 16")
+        collector, doc = self.capture(text, target=(0x1000, 48), error=None)
+        replay, _, target = E.decode_document(doc)
+        self.assertRegex(replay, r"Thread 1  opaque[0-9]+ \$x4 --> offset 16")
+        graph = NODES.parse_trace_graph(replay, *target)
+        self.assertEqual(graph["members"][("thread-register", 1, "x4")]["slot_binding"][1:], (target[0], 16))
+        for secret in ("123456", "Users", "private", "998877"):
+            self.assertNotIn(secret, E.encode_evidence(collector.value).decode())
+        _, second = self.capture(text, target=(0x1000, 48), collector=collector, index=1, error=None)
+        self.assertEqual(doc["lines"], second["lines"])
+        for changed in (text.replace("offset 16", "offset 48"), text.replace("offset 16", "offset 1000000001"),
+                        text.replace("offset 16", "offset -1"), text.replace("Thread 7", "Thread opaque2")):
+            _, invalid = self.capture(changed, target=(0x1000, 48))
+            replay, _, target = E.decode_document(invalid)
+            with self.subTest(replay=replay), self.assertRaises(ValueError):
+                NODES.parse_trace_graph(replay, *target)
+
     def test_register_invalid_and_legacy_opaque_evidence_stay_rejected(self):
         text = fixtures.ReferenceTests.register_trace(description="private")
         for changed in (text.replace("$x25", "$x31"), text.replace("Thread 7", "Thread 1000000001"),

@@ -131,9 +131,10 @@ def validate_evidence(value):
 
 def thread_register(text):
     """Recognize only the bounded ARM64 register terminal syntax."""
-    match = re.fullmatch(r"Thread ([0-9]{1,10})( +)([^\r\n\t]{1,1024}?)( +)\$(x(?:[0-9]|[12][0-9]|30))", text)
+    match = re.fullmatch(r"Thread ([0-9]{1,10})( +)([^\r\n\t]{1,1024}?)( +)\$(x(?:[0-9]|[12][0-9]|30))"
+                        r"(?: --> offset ([0-9]{1,10}))?", text)
     if (match and int(match[1]) <= INTEGER_LIMIT and match[3].strip()
-            and match[3].isprintable()):
+            and match[3].isprintable() and (match[6] is None or int(match[6]) <= INTEGER_LIMIT)):
         return match
     return None
 

@@ -58,6 +58,20 @@ SYNTAX_LEX = re.compile(r"[ \t]+|[<>\[\]:+\-$()]|[^ \t<>\[\]:+\-$()\x00-\x1f\x7f
 SYNTAX_STRIDE = 1 << 40
 
 
+def _stack_metadata(line):
+    """The observed debug-layout allocation stack, not a reference edge."""
+    if len(line.encode("utf-8")) > 65536 or not line.startswith("\tCall stack: "):
+        return False
+    frames = line[len("\tCall stack: "):].rstrip(" ").split(" | ")
+    if not 1 <= len(frames) <= 256:
+        return False
+    for frame in frames:
+        match = re.fullmatch(ADDRESS + r" \(([^()\r\n\t|]{1,1024})\) ([^\r\n\t|]{1,4096})", frame)
+        if not match or not match[1].strip() or not match[2].strip() or not frame.isprintable():
+            return False
+    return True
+
+
 def layout_syntax(report, source, target, source_size, tool_index, graph_sha256):
     """Opaque descriptions and identities; preserve only checked pointer arithmetic."""
     addresses, opaque = {}, {}
@@ -99,9 +113,20 @@ def layout_syntax(report, source, target, source_size, tool_index, graph_sha256)
     lines = report[:-1].split("\n") if doc["ends_newline"] else report.split("\n")
     total = 0
     for line in lines:
-        if len(doc["lines"]) >= SYNTAX_LINES or len(line) > 16384:
+        stack_metadata = _stack_metadata(line)
+        if len(doc["lines"]) >= SYNTAX_LINES or (len(line) > 16384 and not stack_metadata):
             doc["status"] = "truncated"
             break
+        if stack_metadata:
+            # Its private frames are outside the incoming/outgoing slot evidence.
+            # Retain the line and its position, so misplaced/duplicate metadata still fails.
+            doc["lines"].append([["stack_metadata", 0]])
+            total += 1
+            if total > SYNTAX_TOKENS or len(json.dumps(doc, separators=(",", ":")).encode()) > SYNTAX_LIMIT - 32:
+                doc["lines"].pop()
+                doc["status"] = "truncated"
+                break
+            continue
         replacements, numbers, slots, thread_numbers = {}, set(), {}, {}
         # Only structural numeric fields survive. All unrelated decimal text is opaque.
         header = re.fullmatch(r"REFERENCES TO THIS: (\d{1,10})", line)
@@ -111,12 +136,14 @@ def layout_syntax(report, source, target, source_size, tool_index, graph_sha256)
             replacements[obj.start(1)] = (obj.end(1), obj[1])
             if int(obj[3]) <= 1_000_000_000:
                 numbers.add(obj.span(3))
-        thread = re.fullmatch(r" +Thread ([0-9]{1,10}) +(.*?) +\$([^ ]+)", line)
+        thread = re.fullmatch(r" +Thread ([0-9]{1,10}) +(.*?) +\$([^ ]+)(?: --> offset ([0-9]{1,10}))?", line)
         if thread:
             # Neither real thread numbers nor any part of its display name leaves the report.
             if int(thread[1]) <= 1_000_000_000:
                 thread_numbers[thread.span(1)] = identity(opaque, ("thread", thread[1]))
             replacements[thread.start(2)] = (thread.end(2), thread[2])
+            if thread[4] is not None and int(thread[4]) <= 1_000_000_000:
+                numbers.add(thread.span(4))
         region = re.fullmatch(r" +Region (.+?) (" + ADDRESS + r")(?: --> offset (\d{1,10}))?", line)
         if region:
             replacements[region.start(1)] = (region.end(1), region[1])
@@ -200,6 +227,8 @@ def decode_layout_syntax(doc):
             return hex(token[1] * SYNTAX_STRIDE)
         if tag in ("zero", "boundary", "nonprintable"):
             return {"zero": "0x0", "boundary": "\u2028", "nonprintable": "\u200d"}[tag]
+        if tag == "stack_metadata":
+            return "\tCall stack: 0x1 (opaque) opaque"
         return hex(token[1] * SYNTAX_STRIDE + token[2])
     report = "\n".join("".join(token_text(token) for token in line) for line in doc["lines"])
     if doc["ends_newline"]:
@@ -233,7 +262,7 @@ def validate_layout_syntax(doc, tool_index, graph_sha256):
                 require(len(token) == 2 and bounded(token[1]))
             elif tag == "address":
                 require(len(token) == 2 and bounded(token[1], 1, 1024))
-            elif tag in ("zero", "boundary", "nonprintable"):
+            elif tag in ("zero", "boundary", "nonprintable", "stack_metadata"):
                 require(len(token) == 2 and type(token[1]) is int and token[1] == 0)
             elif tag == "slot":
                 require(len(token) == 3 and bounded(token[1], 0, 1024) and bounded(token[2]))
@@ -255,12 +284,17 @@ def parse_layout(report, source, target, source_size):
     if sum(line.startswith("SCANNING ") for line in lines) != 1 or lines.count("CONTENTS:") != 1:
         raise ValueError("Missing contents")
     prefix = [line for line in lines[1:lines.index("CONTENTS:")] if line.strip()]
+    if prefix and _stack_metadata(prefix[0]):
+        prefix = prefix[1:]
     header = re.fullmatch(r"REFERENCES TO THIS: (\d{1,10})", prefix[0]) if prefix else None
     if not header or len(prefix) - 1 != int(header[1]):
         raise ValueError("Incomplete incoming references")
     for line in prefix[1:]:
         thread = re.fullmatch(r" +(Thread .+)", line)
-        if thread and thread_register(thread[1]) is not None:
+        register = thread_register(thread[1]) if thread else None
+        if register is not None:
+            if int(register[6] or "0") >= source_size:
+                raise ValueError("Unbound incoming reference")
             continue
         region = re.fullmatch(r" +Region ([^\r\n\t<>]{1,1024}?) (" + ADDRESS + r")(?: --> offset (\d{1,10}))?", line)
         if (region and region[1].strip() and region[1].isprintable()

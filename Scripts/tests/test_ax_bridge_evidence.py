@@ -251,6 +251,68 @@ class BridgeTests(unittest.TestCase):
         doc = bridge.layout_syntax(layout().replace("synthetic", "NSXPCConnection"), P, M, 64, 3, "a" * 64)
         self.assertEqual(doc["status"], "complete")
 
+    def test_known_stack_metadata_is_bounded_and_not_reference_evidence(self):
+        frame = "0x1234 (private-image) private_allocation_function"
+        metadata = "\tCall stack: " + " | ".join([frame] * 100) + " \n"
+        report = layout().replace("REFERENCES TO THIS:", metadata + "REFERENCES TO THIS:")
+        result, frozen = self.collect(tools=FakeTools({("layout", "baseline"): report}))
+        self.assertEqual(result["status"], "complete")
+        evidence = result["records"][0]["baseline"]
+        self.assertEqual(evidence["state"], "original_target_address")
+        self.assertEqual(evidence["syntax"]["status"], "complete")
+        self.assertIn([["stack_metadata", 0]], evidence["syntax"]["lines"])
+        encoded = bridge.encode_summary(result, frozen)
+        for secret in (b"private-image", b"private_allocation_function", b"0x1234"):
+            self.assertNotIn(secret, encoded)
+        self.assertEqual(bridge.parse_layout(*bridge.decode_layout_syntax(evidence["syntax"]))["state"], "original_target_address")
+
+    def test_stack_metadata_position_count_and_grammar_are_strict(self):
+        metadata = "\tCall stack: 0x1234 (private-image) private_function\n"
+        reports = (layout().replace("CONTENTS:\n", "CONTENTS:\n" + metadata),
+                   layout().replace("REFERENCES TO THIS: 1\n", "REFERENCES TO THIS: 2\n" + metadata),
+                   layout().replace("REFERENCES TO THIS:", metadata * 2 + "REFERENCES TO THIS:"),
+                   layout().replace("REFERENCES TO THIS:", "\tCall stack: unknown\nREFERENCES TO THIS:"),
+                   layout().replace("REFERENCES TO THIS:", "unknown prefix\n" + metadata + "REFERENCES TO THIS:"),
+                   layout().replace("REFERENCES TO THIS:", "\tCall stack: " + " | ".join(["0x1 (image) function"] * 257) + "\nREFERENCES TO THIS:"))
+        for report in reports:
+            with self.assertRaises(ValueError):
+                bridge.parse_layout(report, P, M, 64)
+        wrong_count = layout().replace("REFERENCES TO THIS: 1", metadata + "REFERENCES TO THIS: 2")
+        with self.assertRaises(ValueError):
+            bridge.parse_layout(wrong_count, P, M, 64)
+
+    def test_stack_metadata_limit_counts_utf8_bytes(self):
+        frame = "0x1 (image) " + "文" * 3500
+        metadata = "\tCall stack: " + " | ".join([frame] * 6)
+        metadata += " " * (65536 - len(metadata.encode("utf-8")))
+        self.assertEqual(len(metadata.encode("utf-8")), 65536)
+        self.assertLess(len(metadata), 65536)
+        report = layout().replace("REFERENCES TO THIS:", metadata + "\nREFERENCES TO THIS:")
+        result, _ = self.collect(tools=FakeTools({("layout", "baseline"): report}))
+        self.assertEqual(result["status"], "complete")
+        oversized = layout().replace("REFERENCES TO THIS:", metadata + " \nREFERENCES TO THIS:")
+        with self.assertRaisesRegex(ValueError, "Incomplete incoming references"):
+            bridge.parse_layout(oversized, P, M, 64)
+
+    def test_thread_root_offset_is_bounded_by_scanned_source(self):
+        incoming = f"   <synthetic {NEW:#x}> [64]    +40: {NEW + 40:#x}"
+        for offset in (0, 40, 63):
+            report = layout().replace(incoming, f"   Thread 1 private worker $x25 --> offset {offset}")
+            self.assertEqual(bridge.parse_layout(report, P, M, 64)["state"], "original_target_address")
+            doc = bridge.layout_syntax(report, P, M, 64, 3, "a" * 64)
+            bridge.validate_layout_syntax(doc, 3, "a" * 64)
+            self.assertEqual(doc["status"], "complete")
+            self.assertEqual(bridge.parse_layout(*bridge.decode_layout_syntax(doc))["state"], "original_target_address")
+        for offset in ("64", "1000000001", "-1", "0x10"):
+            report = layout().replace(incoming, f"   Thread 1 private worker $x25 --> offset {offset}")
+            with self.assertRaises(ValueError):
+                bridge.parse_layout(report, P, M, 64)
+        report = layout().replace(incoming, "   Thread 1 private worker $x25 --> offset 64")
+        doc = bridge.layout_syntax(report, P, M, 64, 3, "a" * 64)
+        self.assertEqual(doc["status"], "complete")
+        with self.assertRaisesRegex(ValueError, "Unbound incoming reference"):
+            bridge.parse_layout(*bridge.decode_layout_syntax(doc))
+
     def test_conflicting_baseline_slot_cannot_be_complete(self):
         result, frozen = self.collect(tools=FakeTools({('layout', 'baseline'): layout(NEW, 96)}))
         self.assertEqual(result['status'], 'partial')
