@@ -4,6 +4,8 @@
 
 ## 工作流范围
 
+Community 分支构建的 artifact 标签由 `project.yml` 唯一营销版本推导为 `v<版本>`，不沿用旧 Beta 标签；版本标签事件与手动 `release_tag` 输入保留原值。分支产物不代表该版本已公开发布。
+
 [Community DMG](.github/workflows/community-dmg.yml) 独立负责分发包构建：固定事件提交，在 macOS 15 arm64 / Xcode 26.3 / XcodeGen 2.46.0 上生成并检查 ad-hoc Universal DMG，拒绝源码漂移，只上传五项交付文件，保留 14 天。它由版本标签、手动入口或匹配路径的 `codex/**` 分支推送触发，不自动公开 Release。首次手动入口需先让工作流进入默认分支；分支推送可先验证流程。来源记录、下载核对及正式发布步骤见[免费自行分发](COMMUNITY_DISTRIBUTION.md#github-actions-打包)。
 
 [主 CI](.github/workflows/ci.yml) 在 main 的相关代码/配置变更、PR 和手动触发时运行；根目录纯文档修改不自动启动；`Scripts/` 等受监控目录内的文档仍会触发检查。

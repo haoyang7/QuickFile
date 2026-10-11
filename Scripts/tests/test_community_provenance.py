@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -38,7 +39,8 @@ class CommunityProvenanceTests(unittest.TestCase):
                         GITHUB_REPOSITORY="example/QuickFile", GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
                         GITHUB_SERVER_URL="https://github.com", RUNNER_OS="macOS", RUNNER_ARCH="ARM64",
                         DEVELOPER_DIR="/Applications/Xcode_26.3.app/Contents/Developer",
-                        GITHUB_OUTPUT=str(self.base / "outputs"), PRIVATE_ENV="DO-NOT-PUBLISH")
+                        GITHUB_OUTPUT=str(self.base / "outputs"), GITHUB_ENV=str(self.base / "environment"),
+                        PRIVATE_ENV="DO-NOT-PUBLISH")
         self.commands = {("git", "rev-parse", "--verify", "HEAD"): "a" * 40,
                          ("git", "status", "--porcelain", "--untracked-files=normal"): "",
                          ("sw_vers", "-productVersion"): "15.7.1", ("uname", "-m"): "arm64",
@@ -51,6 +53,67 @@ class CommunityProvenanceTests(unittest.TestCase):
     def write(self):
         with patch.object(MODULE, "output", side_effect=lambda command: self.commands[tuple(command)]):
             return MODULE.write(self.delivery, self.env)
+
+    def test_branch_resolves_artifact_tag_after_marketing_version_increases(self):
+        project = self.base / "project.yml"
+        for version in ("0.1.0", "0.2.0", "12.34.56"):
+            with self.subTest(version=version):
+                project.write_text(f'settings:\n  base:\n    MARKETING_VERSION: "{version}"\n')
+                environment = self.base / ("environment-" + version)
+                env = {**self.env, "RELEASE_TAG": "", "GITHUB_ENV": str(environment)}
+                self.assertEqual(MODULE.resolve(env, project), "v" + version)
+                self.assertEqual(environment.read_text(), f"RELEASE_TAG=v{version}\n")
+
+    def test_actual_tags_and_explicit_dispatch_beta_are_preserved_without_project_fallback(self):
+        missing_project = self.base / "missing-project.yml"
+        for tag in ("v0.2.0", "v0.2.0-beta.12"):
+            for event, ref in (("push", "refs/tags/" + tag),
+                               ("workflow_dispatch", "refs/heads/codex/example")):
+                with self.subTest(tag=tag, event=event):
+                    env = {**self.env, "RELEASE_TAG": tag, "GITHUB_EVENT_NAME": event, "GITHUB_REF": ref}
+                    self.assertEqual(MODULE.resolve(env, missing_project), tag)
+        self.assertEqual(Path(self.env["GITHUB_ENV"]).read_text(),
+                         "RELEASE_TAG=v0.2.0\n" * 2 + "RELEASE_TAG=v0.2.0-beta.12\n" * 2)
+
+    def test_resolve_cli_writes_only_validated_project_version(self):
+        (self.base / "project.yml").write_text('settings:\n  base:\n    MARKETING_VERSION: "0.2.0"\n')
+        result = subprocess.run([sys.executable, str(ROOT / "Scripts/community-provenance.py"), "resolve"],
+                                cwd=self.base, env={**self.env, "RELEASE_TAG": ""},
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(self.env["GITHUB_ENV"]).read_text(), "RELEASE_TAG=v0.2.0\n")
+
+    def test_resolution_rejects_missing_duplicate_malformed_or_injected_project_versions(self):
+        project = self.base / "project.yml"
+        env = {**self.env, "RELEASE_TAG": ""}
+        for source in ('settings: {}\n', 'MARKETING_VERSION: "0.2.0"\nMARKETING_VERSION: "0.2.0"\n',
+                       'MARKETING_VERSION: "0.2.0-beta.1"\n', 'MARKETING_VERSION: "0.2"\n',
+                       'MARKETING_VERSION: "0.2.0; echo injected"\n',
+                       'MARKETING_VERSION: "$(echo injected)"\n',
+                       'MARKETING_VERSION: "0.2.0\nOTHER=value"\n'):
+            project.write_text(source)
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                MODULE.resolve(env, project)
+        project.unlink()
+        with self.assertRaises(FileNotFoundError):
+            MODULE.resolve(env, project)
+        self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
+
+    def test_resolution_rejects_invalid_explicit_tags_missing_inputs_and_unsupported_events(self):
+        missing_project = self.base / "missing-project.yml"
+        for tag in (None, "", "v0.2.0\nOTHER=value", "$(echo injected)", "v0.2.0-beta.0"):
+            env = {**self.env, "GITHUB_EVENT_NAME": "workflow_dispatch", "RELEASE_TAG": tag}
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                MODULE.resolve(env, missing_project)
+        for event, ref in (("push", "refs/heads/main"), ("pull_request", "refs/heads/codex/example"),
+                           ("push", "refs/heads/codex/"), ("push", "")):
+            with self.subTest(event=event, ref=ref), self.assertRaises(ValueError):
+                MODULE.resolve({**self.env, "GITHUB_EVENT_NAME": event, "GITHUB_REF": ref}, missing_project)
+        with self.assertRaises(ValueError):
+            MODULE.resolve({**self.env, "GITHUB_REF": "refs/tags/v0.2.0-beta.2"}, missing_project)
+        with self.assertRaises(ValueError):
+            MODULE.resolve({**self.env, "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_ENV": ""}, missing_project)
+        self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
 
     def test_receipt_binds_exact_assets_to_commit_run_tools_and_internal_build(self):
         payload = self.write()

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import QuickFileCore
@@ -53,6 +54,36 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
             store.latestActivity(),
             FinderExtensionActivity(kind: .menuPrepared, timestamp: timestamp)
         )
+    }
+
+    func testSymbolicLinkActivityLockRejectsOperationsWithoutChangingData() throws {
+        let timestamp = Date(timeIntervalSince1970: 200)
+        let failure = FinderExtensionActivityFailure(reason: .writeFailed, errorDomain: nil, errorCode: nil)
+        try makeStore().record(.fileCreationFailed, failure: failure, at: timestamp)
+        let latestURL = failureHistoryFileURL.appendingPathExtension("latest-v2.json")
+        let historyBytes = try Data(contentsOf: failureHistoryFileURL)
+        let latestBytes = try Data(contentsOf: latestURL)
+        defaults.set(historyBytes, forKey: "finderExtension.failureHistory.v1")
+        defaults.set(latestBytes, forKey: "finderExtension.latestActivity.v1")
+        let target = temporaryDirectory.appendingPathComponent("lock-target")
+        let targetBytes = Data("sentinel".utf8)
+        try targetBytes.write(to: target)
+        let lockURL = failureHistoryFileURL.appendingPathExtension("lock")
+        try FileManager.default.removeItem(at: lockURL)
+        try FileManager.default.createSymbolicLink(at: lockURL, withDestinationURL: target)
+
+        XCTAssertNil(makeStore().latestActivity())
+        XCTAssertThrowsError(try makeStore().record(.fileCreated, at: timestamp.addingTimeInterval(1))) { error in
+            XCTAssertEqual((error as NSError).code, Int(ELOOP))
+        }
+        XCTAssertThrowsError(try makeStore().recentFailures(referenceDate: timestamp))
+        XCTAssertThrowsError(try makeStore().clearFailureHistory())
+        XCTAssertEqual(try Data(contentsOf: target), targetBytes)
+        XCTAssertEqual(try Data(contentsOf: failureHistoryFileURL), historyBytes)
+        XCTAssertEqual(try Data(contentsOf: latestURL), latestBytes)
+        XCTAssertEqual(defaults.data(forKey: "finderExtension.failureHistory.v1"), historyBytes)
+        XCTAssertEqual(defaults.data(forKey: "finderExtension.latestActivity.v1"), latestBytes)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: lockURL.path), target.path)
     }
 
     func testNewActivityReplacesThePreviousRecord() throws {

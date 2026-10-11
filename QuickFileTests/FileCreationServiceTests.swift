@@ -4,6 +4,25 @@ import Darwin
 
 final class FileCreationServiceTests: XCTestCase {
 
+    func testCreationSanitizesHistoricalDefaultsAndExplicitInputOnDisk() throws {
+        let name = "می\u{200C}خواهم-👩‍💻-✈\u{FE0F}-e\u{301}"
+        let template = FileTemplate(name: "historical\u{202E}\u{0}\n", fileExtension: "t\u{2066}xt", content: "new",
+                                    defaultFilename: name + "\u{202E}gnp\u{0}x\nz.txt")
+        let service = FileCreationService()
+        let cases: [(String?, String)] = [
+            (nil, name + "-gnp-x-z.txt"),
+            ("override\u{061C}" + name + "\u{200B}.txt", "override-" + name + "-.txt")
+        ]
+        for (requested, expected) in cases {
+            let result = try service.createFile(for: .init(template: template, destinationFolder: temporaryDirectory,
+                                                          requestedFilename: requested))
+            XCTAssertEqual(Array(result.fileURL.lastPathComponent.utf8), Array(expected.utf8))
+            XCTAssertEqual(try String(contentsOf: result.fileURL, encoding: .utf8), "new")
+        }
+        let filenames = try FileManager.default.contentsOfDirectory(atPath: temporaryDirectory.path)
+        XCTAssertEqual(Set(filenames.map { Array($0.utf8) }), Set(cases.map { Array($0.1.utf8) }))
+    }
+
     func testDefaultFilenamePriorityLiteralVariablesAndConflictNeverOverwrite() throws {
         let template = FileTemplate(name: "A", fileExtension: "md", content: "new", defaultFilename: "默认-{{date}}.md")
         let service = FileCreationService()

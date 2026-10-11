@@ -160,7 +160,7 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
         )
 
         let lockURL = failureHistoryFileURL.appendingPathExtension("lock")
-        let descriptor = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }

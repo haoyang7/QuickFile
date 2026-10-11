@@ -28,12 +28,15 @@ public struct FinderTemplateMenuEntry: Equatable, Identifiable, Sendable {
     public init(template: FileTemplate) {
         id = template.id
         // Older stored templates can bypass draft validation. Keep their identity and
-        // contents intact while ensuring Finder never receives a blank action label.
-        let displayName = template.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "未命名模板" : template.name
-        let fileExtension = template.fileExtension.trimmingCharacters(
-            in: CharacterSet(charactersIn: ". ").union(.whitespacesAndNewlines)
-        )
+        // contents intact while removing controls from the display projection.
+        let safeName = template.name.components(separatedBy: TemplateNameCharacters.forbiddenControls).joined()
+        let displayName = safeName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "未命名模板" : safeName
+        let fileExtension = template.fileExtension
+            .components(separatedBy: TemplateNameCharacters.forbiddenFilenameCharacters).joined()
+            .trimmingCharacters(
+                in: CharacterSet(charactersIn: ". ").union(.whitespacesAndNewlines)
+            )
         guard !fileExtension.isEmpty else {
             title = displayName
             return

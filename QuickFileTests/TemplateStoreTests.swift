@@ -339,6 +339,40 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertEqual(try store.reloadTemplates(), [repaired])
     }
 
+    func testHistoricalUnsafeNamesRemainReadableAndAllowBoundedRepair() throws {
+        let url = temporaryDirectory.appendingPathComponent("historical-names.json")
+        let first = FileTemplate(name: "Old\u{202E}\u{0000}\n", fileExtension: "txt", content: "keep",
+                                 defaultFilename: "invoice\u{202E}gnp.txt")
+        let second = FileTemplate(name: "Other\u{2066}", fileExtension: "txt", content: "keep")
+        let third = FileTemplate(name: "Third", fileExtension: "txt", content: "keep")
+        let historical = [first, second, third]
+        try JSONEncoder().encode(historical).write(to: url)
+        let store = TemplateStore(defaults: defaults, storageURL: url)
+        XCTAssertEqual(try store.reloadTemplates(), historical)
+        try store.saveTemplates([third, second, first], expectedTemplates: historical)
+        try store.saveTemplates([second, first], expectedTemplates: [third, second, first])
+        var disabled = first
+        disabled.isEnabled = false
+        try store.saveTemplates([second, disabled], expectedTemplates: [second, first])
+        XCTAssertEqual(try store.reloadTemplates(), [second, disabled])
+
+        var stillUnsafe = disabled
+        stillUnsafe.name += "more"
+        let previousBytes = try Data(contentsOf: url)
+        XCTAssertThrowsError(try store.saveTemplates([second, stillUnsafe], expectedTemplates: [second, disabled]))
+        XCTAssertEqual(try Data(contentsOf: url), previousBytes)
+
+        var repaired = disabled
+        repaired.name = "Old"
+        repaired.defaultFilename = "invoice.txt"
+        try store.saveTemplates([second, repaired], expectedTemplates: [second, disabled])
+        XCTAssertEqual(try store.reloadTemplates(), [second, repaired])
+        try store.saveTemplates([repaired], expectedTemplates: [second, repaired])
+        XCTAssertEqual(try store.reloadTemplates(), [repaired])
+        XCTAssertThrowsError(try store.saveTemplates([repaired, first], expectedTemplates: [repaired]))
+        XCTAssertEqual(try store.reloadTemplates(), [repaired])
+    }
+
     func testLegacyMigrationPreservesOversizedHistoricalTemplate() throws {
         let historical = [FileTemplate(name: String(repeating: "n", count: 1_025), fileExtension: "txt", content: "keep")]
         defaults.set(try JSONEncoder().encode(historical), forKey: "templates.v1")

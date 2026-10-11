@@ -4,6 +4,18 @@ import XCTest
 final class FilenameNormalizerTests: XCTestCase {
     private let normalizer = FilenameNormalizer()
 
+    func testSanitizesEveryRiskControlInBaseNameAndExtension() throws {
+        let values = Array(0...31) + Array(127...159)
+            + [0x061C, 0x200B, 0x200E, 0x200F] + Array(0x202A...0x202E) + Array(0x2066...0x2069)
+        for value in values {
+            let control = String(UnicodeScalar(value)!)
+            let result = try normalizer.normalize("invoice" + control + "gnp.txt", requiredExtension: "t" + control + "xt")
+            XCTAssertEqual(Array(try result.filename(sequence: 1).utf8), Array("invoice-gnp.txt".utf8),
+                           "U+\(String(value, radix: 16))")
+            XCTAssertEqual(try result.filename(sequence: 2), "invoice-gnp 2.txt")
+        }
+    }
+
     func testAddsRequiredExtension() throws {
         let result = try normalizer.normalize("报告", requiredExtension: "md")
 
@@ -53,7 +65,7 @@ final class FilenameNormalizerTests: XCTestCase {
     }
 
     func testPreservesUnicodeJoinersAndCombiningMarksWhileRemovingControls() throws {
-        let name = "👩🏽‍💻e\u{301}می\u{200C}خواهم"
+        let name = "👩🏽‍💻✈\u{FE0F}e\u{301}می\u{200C}خواهم"
         let result = try normalizer.normalize(name + "\u{0}\u{7F}\u{85}end", requiredExtension: "t\u{0}x\u{7F}t")
         XCTAssertEqual(try result.filename(sequence: 1), name + "---end.txt")
         let emojiExtension = try normalizer.normalize("note", requiredExtension: "👩🏽‍💻")
