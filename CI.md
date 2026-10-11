@@ -86,6 +86,8 @@ AX 读取权限由实际 reader 可执行文件检查；不匹配映像或缺权
 
 解析器支持 macOS 26 的多实例分组 `TOTAL` 包装和三句反向引用说明，同时兼容带第四句 Instruments 说明的格式。汇总行不算对象；逐组成员数、根数、子树计数及分隔缩进仍须一致。未知对象或引用根继续报告不完整；匿名词法证据丢失的原文含义不能靠猜测恢复。
 
+首次严格增长候选的基线反向引用在解析成功时也保留有界匿名语法，标记 `error=none` 并绑定该次成功工具和完整基线引用视图。固定词表可区分已审核的 continuation 分配函数及 Swift metadata 描述；保留引用槽偏移以核验中间节点的结构。名称和布局只用于提出可检验的分配来源假设，不能证明缓存状态、实际所有权或目标系统实现与某份源码相同。没有地址和大小的未知根即使保留了偏移仍继续解析失败；原严格扫描、检查点、基线及夹具执行保持不变。
+
 ## 有限、可追溯的 CI 证据
 
 每个 macOS job 创建独立 runner 临时目录，原生测试与 Release 构建分别显式指定 `tests.xcresult` / `release.xcresult` 的 `-resultBundlePath`。已有结果目录或符号链接会失败，不清除或覆盖上次失败结果。原生自检每次在 `.build/Temporary/release-readiness.XXXXXX/` 创建独立的 Debug、Release 和包缓存，解析使用本轮 DerivedData，构建设置查询显式指定本轮产品和中间目录。成功、失败或收到 HUP/INT/TERM 时回收本轮缓存和 App，保留 `records/cleanup.json` 及结果 bundle；外部提供的结果目录只用于保存结果，不参与清理。非 CI 本地运行默认结果目录为本轮目录中的 `Results/`。`run-native` 保留原失败退出码；退出成功但缺少任一结果 bundle 也判为失败。

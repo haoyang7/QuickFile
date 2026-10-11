@@ -848,13 +848,19 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None)
             return nodes, kinds
         def parse_report(tool, name, report, nodes=None, target=None):
             try:
-                return parse_tree_graph(report, nodes) if tool == "tree" else parse_trace_graph(report, *target)
+                parsed = parse_tree_graph(report, nodes) if tool == "tree" else parse_trace_graph(report, *target)
             except ValueError as error:
                 if collector is not None:
                     point = result["baseline"] if name == "baseline" else result["selected"]
                     collector.record(tool, name, len(result["tools"]) - 1, point["graph_sha256"],
                                      report, error, nodes=nodes, target=target)
                 raise
+            # A candidate's original referrers are needed even when parsing
+            # succeeds: a recognized graph alone drops allocation names/slots.
+            if collector is not None and tool == "trace" and name == "baseline":
+                collector.record(tool, name, len(result["tools"]) - 1, result["baseline"]["graph_sha256"],
+                                 report, None, target=target)
+            return parsed
         def tree_report(name, graph, nodes):
             report = tools.run("tree", name, ["/usr/bin/leaks", "--noContent", "--nosources", str(graph)], (0, 1))
             return parse_report("tree", name, report, nodes=nodes)
@@ -989,6 +995,20 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None)
         elif result["selection"] is not None:
             result["status"] = "complete"
         bound_summary(result)
+        if collector is not None:
+            # Budgeting can remove a successfully parsed view. Do not let its
+            # optional syntax invalidate the independently useful failure docs.
+            baseline_tools = [index for index, tool in enumerate(result["tools"])
+                              if (tool["tool"], tool["label"]) == ("trace", "baseline")]
+            baseline_views = [view for view in result["references"]["views"]
+                              if view["kind"] == "trace" and view["checkpoint"] == "baseline"
+                              and view["status"] != "not_present"]
+            complete = {index for index, view in zip(baseline_tools, baseline_views) if view["status"] == "complete"}
+            documents = collector.value["documents"]
+            kept = [doc for doc in documents if doc["error"] != "none" or doc["tool_index"] in complete]
+            if len(kept) != len(documents):
+                collector.value["omitted_documents"] += len(documents) - len(kept)
+                collector.value.update(status="truncated", documents=kept)
     return result
 
 

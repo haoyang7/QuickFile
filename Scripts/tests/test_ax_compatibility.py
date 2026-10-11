@@ -2533,6 +2533,31 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     else:
                         exec(compile(code, "ax-system-baseline.yml", "exec"), {})
                         self.assertEqual(output.read_text(), "safe=true\n")
+
+    def test_successful_baseline_syntax_requires_its_complete_reference_view(self):
+        with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
+            from ax_parser_evidence import Collector
+        for complete in (True, False):
+            with self.subTest(complete=complete):
+                value = self.frozen_summary(first_strict_growth=True, selected_label="added-10")
+                index = next(i for i, t in enumerate(value["tools"]) if (t["tool"], t["label"]) == ("trace", "baseline"))
+                collector = Collector()
+                collector.record("trace", "baseline", index, value["baseline"]["graph_sha256"],
+                    "Tracing: <__NSMallocBlock__ 0x3000> [48]\n", None, target=(0x3000, 48))
+                if not complete:
+                    value.update(status="partial", reasons=["references_invalid"])
+                    value["references"]["status"] = "partial"
+                    view = next(v for v in value["references"]["views"] if (v["kind"], v["checkpoint"]) == ("trace", "baseline"))
+                    view.update(status="unavailable", root=None, target=None, nodes=[], edges=[])
+                _, summary = self.run_measurement(enabled=False, first_strict_growth=True, first_failure="strict",
+                    frozen_summary=value, parser_evidence=collector.value,
+                    first_scan_change=lambda scan: scan.update(leak_nodes=2, leak_bytes=252))
+                first = summary["trials"][0]
+                self.assertTrue(first["frozen_nodes_available"])
+                self.assertEqual(first["parser_evidence_available"], complete)
+                self.assertEqual(first["frozen_node_checks_passed"], complete)
+                self.assertFalse(summary["strict_checks_passed"])
+
     def test_first_strict_growth_complete_diagnostics_preserve_the_original_strict_failure(self):
         for byte_growth in (False, True):
             with self.subTest(byte_growth=byte_growth):

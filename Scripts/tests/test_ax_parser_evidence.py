@@ -27,7 +27,7 @@ class ParserEvidenceTests(unittest.TestCase):
     def capture(self, text, nodes=None, target=None, collector=None, index=0, error="Unsupported tree row"):
         collector = collector or E.Collector()
         collector.record("trace" if target else "tree", "baseline", index, "a" * 64,
-                         text, ValueError(error), nodes=nodes, target=target)
+                         text, None if error is None else ValueError(error), nodes=nodes, target=target)
         E.validate_evidence(collector.value)
         return collector, collector.value["documents"][-1]
 
@@ -118,6 +118,41 @@ class ParserEvidenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 E.validate_evidence(collector.value)
 
+    def test_addressless_root_offsets_do_not_authorize_unknown_roots(self):
+        text = trace(0x1000, 48, 1).split("    1 <", 1)[0]
+        text += ("    1 <__NSMallocBlock__ 0x1000> [48]\n"
+                 "      1 <Swift metadata> +216: __strong 0x70d8\n")
+        _, doc = self.capture(text, target=(0x1000, 48), error="Unsupported reverse object")
+        replay, _, target = E.decode_document(doc)
+        self.assertIn("<Swift metadata> +216: __strong", replay)
+        self.assertNotIn("0x70d8", replay)
+        with self.assertRaisesRegex(ValueError, "Unsupported reverse object"):
+            NODES.parse_trace_graph(replay, *target)
+        for label in ("PrivateClass PrivateOwner", "/Swift/metadata", "Swift PrivateOwner"):
+            _, unknown = self.capture(text.replace("Swift metadata", label), target=(0x1000, 48))
+            replay, _, _ = E.decode_document(unknown)
+            self.assertNotIn("Private", replay)
+            self.assertNotIn("/", replay)
+
+    def test_successful_baseline_trace_retains_reviewed_allocation_syntax(self):
+        text = trace(0x1000, 48, 1).split("    1 <", 1)[0]
+        text += ("    1 <__NSMallocBlock__ 0x1000> [48]\n"
+                 "      1 <calloc in _dispatch_continuation_alloc_from_heap 0x2000> [64] +40: 0x2028\n"
+                 "        1 <calloc in _dispatch_malloc_continuation_alloc 0x3000> [64] +16: 0x3010\n"
+                 "          1 Region Stack thread 77 private 0x90000\n")
+        _, doc = self.capture(text, target=(0x1000, 48), error=None)
+        replay, _, target = E.decode_document(doc)
+        self.assertEqual(doc["error"], "none")
+        self.assertIn("calloc in _dispatch_continuation_alloc_from_heap", replay)
+        self.assertIn("calloc in _dispatch_malloc_continuation_alloc", replay)
+        self.assertEqual(NODES.parse_trace_graph(replay, *target)["roots"], 1)
+        self.assertEqual([token[2] for line in doc["lines"] for token in line if token[0] == "slot"], [40, 16])
+        for key, value in (("tool", "tree"), ("label", "added-10")):
+            changed = copy.deepcopy(doc)
+            changed[key] = value
+            with self.assertRaises(ValueError):
+                E.validate_evidence({"schema": 1, "status": "complete", "documents": [changed], "omitted_documents": 0})
+
     def test_bounded_lines_tokens_documents_and_bytes(self):
         for text in ("X" * (E.LINE_LENGTH_LIMIT + 1), "x\n" * (E.LINE_LIMIT + 1),
                      ("x " * 4096 + "\n") * 10):
@@ -163,7 +198,8 @@ class ParserEvidenceTests(unittest.TestCase):
             self.assertEqual(summary["schema"], 2)
             evidence = json.loads((case.records / "parser-evidence.json").read_bytes())
             E.validate_evidence(evidence)
-            self.assertEqual(len(evidence["documents"]), 1)
+            self.assertEqual(len(evidence["documents"]), 2)
+            self.assertEqual([doc["error"] for doc in evidence["documents"]], ["missing_unique_leak_totals", "none"])
             self.assertNotIn("parser_evidence", summary)
             (case.records / "frozen-nodes-private").rmdir()
             with mock.patch.object(NODES.Tools, "run", autospec=True, side_effect=case.run), mock.patch.object(NODES, "validate_evidence", side_effect=ValueError), contextlib.redirect_stdout(io.StringIO()):
@@ -187,11 +223,29 @@ class ParserEvidenceTests(unittest.TestCase):
             self.assertIn("tree_invalid", captured["reasons"])
             self.assertIn("references_invalid", captured["reasons"])
             E.validate_evidence(collector.value)
-            self.assertEqual(len(collector.value["documents"]), 2)
+            self.assertEqual(len(collector.value["documents"]), 3)
             for doc in collector.value["documents"]:
                 receipt = captured["tools"][doc["tool_index"]]
                 self.assertEqual((receipt["tool"], receipt["label"], receipt["status"]), (doc["tool"], doc["label"], "complete"))
-                self.assertEqual(doc["graph_sha256"], captured["selected"]["graph_sha256"])
+                point = captured["baseline"] if doc["label"] == "baseline" else captured["selected"]
+                self.assertEqual(doc["graph_sha256"], point["graph_sha256"])
+
+    def test_reference_budgets_keep_failure_docs_without_unbound_success(self):
+        for budget in ("references", "summary"):
+            with self.subTest(budget=budget), tempfile.TemporaryDirectory(dir=self.temporary_root) as directory:
+                case = Case(Path(directory), before={0x1000: 48}, after={0x1000: 48, 0x2000: 80})
+                case.failures[("tree", "baseline")] = "private malformed report"
+                case.failures[("trace", "baseline")] = trace(0x2000, 80, 512 if budget == "references" else 50)
+                collector = E.Collector()
+                with mock.patch.object(NODES.Tools, "run", autospec=True, side_effect=case.run), \
+                        mock.patch.object(NODES, "PUBLIC_LIMIT", NODES.PUBLIC_LIMIT if budget == "references" else 10000):
+                    result = NODES.compare(case.graphs, case.records, first_strict_growth=True, collector=collector)
+                NODES.validate_summary(result)
+                E.validate_evidence(collector.value)
+                self.assertIn("references_budget" if budget == "references" else "summary_budget", result["reasons"])
+                self.assertEqual([doc["error"] for doc in collector.value["documents"]], ["missing_unique_leak_totals"])
+                self.assertEqual(collector.value["omitted_documents"], 1)
+                self.assertEqual(collector.value["status"], "truncated")
 
 
 if __name__ == "__main__":

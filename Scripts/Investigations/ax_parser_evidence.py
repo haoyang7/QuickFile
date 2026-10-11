@@ -1,4 +1,4 @@
-"""Bounded lexical evidence for failed parsers, never a second graph parser.
+"""Bounded lexical evidence for parser failures and candidate baseline traces.
 
 Unknown text loses its meaning. Decoding reproduces allowlisted syntax and stable
 anonymous identities for local experiments; it cannot recover original text.
@@ -30,6 +30,8 @@ The top node is the specified block the next level down are blocks that referenc
 The number at the start of each line is the number of paths to roots going through that node
 This reverse reference tree can be imported into Instruments using Import Sample Data to allow data mining
 Region Stack __DATA Kernel Pointers Into User Space offset
+Swift Metadata metadata calloc in _dispatch_continuation_alloc_from_heap
+_dispatch_malloc_continuation_alloc _dispatch_alloc_continuation_alloc _dispatch_async_f_slow
 """))
 # Path separators stay inside opaque lexemes, even when every component is allowlisted.
 PUNCT = frozenset('<>[]():;,+-=>.!|\'"{}*?&%#@~`^$─│├└┌┐┘┬┴┼→←↳')
@@ -50,7 +52,7 @@ ERROR_TEXT = (
     "Invalid reverse nesting", "Missing trace tree",
 )
 ERROR_CODES = {message: message.lower().replace("/", "_").replace(" ", "_") for message in ERROR_TEXT}
-ERRORS = frozenset((*ERROR_CODES.values(), "other_parser_error"))
+ERRORS = frozenset((*ERROR_CODES.values(), "other_parser_error", "none"))
 
 
 def encode_evidence(value):
@@ -81,6 +83,7 @@ def validate_evidence(value):
         indices.add(doc["tool_index"])
         require(type(doc["graph_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", doc["graph_sha256"]) is not None)
         require(type(doc["error"]) is str and doc["error"] in ERRORS and doc["status"] in ("complete", "truncated"))
+        require(doc["error"] != "none" or (doc["tool"] == "trace" and doc["label"] == "baseline"))
         require(type(doc["nodes"]) is list and len(doc["nodes"]) <= 100000 and all(pair(item) for item in doc["nodes"]))
         require(len({item[0] for item in doc["nodes"]}) == len(doc["nodes"]))
         require((doc["tool"] == "tree" and doc["target"] is None) or (doc["tool"] == "trace" and not doc["nodes"] and pair(doc["target"])))
@@ -136,6 +139,9 @@ def _numbers(line):
         r"^Found (\d+) roots? referencing:",
         r"(?:0x[0-9a-fA-F]{1,16}>?) \[(\d+)\]",
         r"\] +\+(\d+):",
+        # Preserve structural offsets even when the formatter omits address/size.
+        # This does not make an unknown root acceptable to the graph parser.
+        r"^[ +!:|]*\d+ <[^<>\n]+> +\+(\d+):",
         r"--> offset (\d+)(?:$| )",
         r"\] +\+\d+: [^\n]*? \+ (\d+) 0x[0-9a-fA-F]{1,16}(?: --> offset \d+)?$",
     )
@@ -164,7 +170,7 @@ class Collector:
             self.value["status"] = "truncated"
             return
         doc = {"tool": tool, "label": label, "tool_index": tool_index, "graph_sha256": graph_sha256,
-               "error": ERROR_CODES.get(str(error), "other_parser_error"), "status": "complete",
+               "error": "none" if error is None else ERROR_CODES.get(str(error), "other_parser_error"), "status": "complete",
                "lines": [], "nodes": [], "target": None}
         try:
             doc["nodes"] = [[self._id(self.addresses, address), size] for address, size in (nodes or {}).items()]

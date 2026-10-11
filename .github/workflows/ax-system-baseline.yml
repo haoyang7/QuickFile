@@ -672,8 +672,16 @@ jobs:
                                       if (point is None or document['graph_sha256'] != point['graph_sha256']
                                               or tool['tool'] != document['tool'] or tool['label'] != document['label']
                                               or tool['status'] != 'complete' or not tool['cleanup_confirmed']
-                                              or ('tree_invalid' if document['tool'] == 'tree' else 'references_invalid') not in nodes['reasons']):
+                                              or (document['error'] != 'none' and
+                                                  ('tree_invalid' if document['tool'] == 'tree' else 'references_invalid') not in nodes['reasons'])):
                                           raise ValueError('Unbound parser evidence')
+                                      if document['error'] == 'none':
+                                          ordinal = sum(t['tool'] == 'trace' and t['label'] == 'baseline'
+                                              for t in nodes['tools'][:document['tool_index']])
+                                          views = [v for v in nodes['references']['views'] if v['kind'] == 'trace'
+                                              and v['checkpoint'] == 'baseline' and v['status'] != 'not_present']
+                                          if ordinal >= len(views) or views[ordinal]['status'] != 'complete':
+                                              raise ValueError('Baseline trace was not validated')
                                   payload = encode_evidence(evidence)
                                   name = f'parser-evidence-trial-{trial}-{mode}.json'
                                   if trial not in range(1, 6) or mode not in ('control', 'product'):
