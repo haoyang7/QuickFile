@@ -18,6 +18,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
+#include <errno.h>
+#include <fcntl.h>
 
 struct dyld_shared_cache_dylib_text_info {
     uint64_t version, loadAddressUnslid, textSegmentSize;
@@ -30,6 +32,9 @@ extern int dyld_shared_cache_iterate_text(const uuid_t,
     void (^)(const struct dyld_shared_cache_dylib_text_info *)) __attribute__((weak_import));
 
 enum { MAX_IMAGES = 16384, MAX_LOADED = 512, MAX_COMMANDS = 65536, SAMPLE_LIMIT = 8, OUTPUT_LIMIT = 16384, DETAIL_LIMIT = 8192 };
+enum { REQUEST_LIMIT = 96, LOOKUP_OUTPUT_LIMIT = 24576, LOOKUP_DETAIL_LIMIT = 22000 };
+static uuid_t requests[REQUEST_LIMIT];
+static size_t request_count;
 struct row { uuid_t uuid; char basename[97]; bool eligible; };
 static struct row rows[MAX_IMAGES];
 // One record per dyld add callback; UUIDs need not be unique.
@@ -231,7 +236,7 @@ struct experiment {
     struct traversal setup, measured;
     bool census_started, measured_started, census_valid, format_complete, final_cache_stable;
     struct event_snapshot events;
-    char details[DETAIL_LIMIT];
+    char details[LOOKUP_DETAIL_LIMIT];
 };
 static bool experiment_ok(const struct experiment *value) {
     return traversal_ok(value->setup) && value->measured_started && traversal_ok(value->measured)
@@ -240,6 +245,24 @@ static bool experiment_ok(const struct experiment *value) {
 }
 static void format_details(struct experiment *value, size_t capacity) {
     qsort(rows, count, sizeof(*rows), compare_rows);
+    if (request_count) {
+        struct buffer out = {value->details, capacity, 0, false};
+        append(&out, "[");
+        for (size_t r = 0; r < request_count; r++) {
+            size_t matches = 0, found = 0;
+            for (size_t i = 0; i < count; i++) if (!uuid_compare(requests[r], rows[i].uuid)) { matches++; found = i; }
+            const char *reason = !matches ? "uuid_missing" : matches != 1 ? "uuid_duplicate" :
+                                 !rows[found].eligible ? "image_excluded" : "verified";
+            append(&out, "%s{\"request_index\":%zu,\"reason\":\"%s\"", r ? "," : "", r, reason);
+            if (!strcmp(reason, "verified")) {
+                char identifier[37]; uuid_unparse_upper(rows[found].uuid, identifier);
+                append(&out, ",\"basename\":\"%s\",\"uuid\":\"%s\"", rows[found].basename, identifier);
+            }
+            append(&out, "}");
+        }
+        append(&out, "]"); value->format_complete = !out.failed;
+        return;
+    }
     size_t duplicate_groups = 0, duplicate_rows = 0, duplicate_excluded = 0, unique = 0, matched_loaded = 0;
     for (size_t i = 0; i < count; i++) {
         if (!unique_at(i)) {
@@ -266,6 +289,16 @@ static void format_traversal(struct buffer *out, struct traversal value) {
 }
 static bool format_report(char output[OUTPUT_LIMIT], const uuid_t expected, const struct experiment *value) {
     char identifier[37]; uuid_unparse_upper(expected, identifier);
+    if (request_count) {
+        struct buffer out = {output, LOOKUP_OUTPUT_LIMIT, 0, false};
+        append(&out, "{\"schema\":1,\"mode\":\"lookup\",\"status\":\"%s\",\"active_cache_uuid\":\"%s\","
+               "\"requests\":%zu,\"setup_calls\":%zu,\"measurement_calls\":%zu,\"callbacks\":%zu,"
+               "\"measurement_closed\":true,\"result\":%s}\n",
+               experiment_ok(value) ? "complete" : "failed", identifier, request_count,
+               value->setup.calls, value->measured.calls, value->measured.callbacks,
+               experiment_ok(value) ? value->details : "null");
+        return !out.failed;
+    }
     struct buffer out = {output, OUTPUT_LIMIT, 0, false};
     append(&out, "{\"schema\":2,\"status\":\"%s\",\"active_cache_uuid\":\"%s\",\"image_budget\":%d,\"setup\":",
            experiment_ok(value) ? "complete" : "failed", identifier, MAX_IMAGES);
@@ -342,6 +375,7 @@ enum scenario { VALID, SETUP_API, SETUP_SCHEMA, SETUP_BUDGET, SETUP_EMPTY, SETUP
                 FORMAT_ADD, FORMAT_REMOVE, FORMAT_CACHE, FORMAT_BUDGET, EVENT_OVERFLOW, SCENARIOS };
 static enum scenario scenario;
 static size_t setup_calls, measured_calls, cache_reads;
+static bool lookup_late_duplicate;
 static bool fake_contains(const char *path) { (void)path; return true; }
 static bool fake_cache_uuid(uuid_t value) {
     uuid_parse("11111111-1111-1111-1111-111111111111", value);
@@ -376,6 +410,9 @@ static int fake_iterate(const uuid_t expected, void (^callback)(const struct dyl
     if (((scenario == SETUP_SCHEMA || scenario == SETUP_MULTIPLE) && setup) || ((scenario == ENUM_SCHEMA || scenario == ENUM_MULTIPLE) && !setup)) info.version = 99;
     size_t total = scenario == SETUP_BUDGET && setup ? MAX_IMAGES + 1 : setup ? 1 : 2;
     for (size_t i = 0; i < total; i++) { callback(&info); info.dylibUuid[0]++; }
+    if (!setup && lookup_late_duplicate) {
+        uuid_copy(info.dylibUuid, requests[0]); info.path = "/private/excluded"; callback(&info);
+    }
     if (!setup && (scenario == ENUM_ADD || scenario == ENUM_MULTIPLE)) observer_added(NULL, 0);
     if (!setup && (scenario == ENUM_REMOVE || scenario == ENUM_MULTIPLE)) observer_removed(NULL, 0);
     if (setup && scenario == EVENT_OVERFLOW) for (size_t i = 0; i < MAX_IMAGES; i++) observer_added(NULL, 0);
@@ -442,8 +479,54 @@ static int self_test(void) {
     printf("{\"mode\":\"self-test\",\"tests\":%zu,\"passed\":true}\n", tests);
     return 0;
 }
+static int lookup_test(void) {
+    uuid_t expected; uuid_parse("11111111-1111-1111-1111-111111111111", expected);
+    request_count = 1; uuid_copy(requests[0], expected);
+    for (size_t i = 0; i < 4; i++) {
+        scenario = i == 2 ? FORMAT_CACHE : VALID;
+        lookup_late_duplicate = i == 1;
+        setup_calls = measured_calls = cache_reads = 0;
+        struct experiment value; char output[LOOKUP_OUTPUT_LIMIT];
+        if (!execute(&fake, expected, &value, output, i == 3 ? 8 : LOOKUP_DETAIL_LIMIT)
+            || setup_calls != 1 || measured_calls != 1 || phase != CLOSED
+            || !strstr(output, i >= 2 ? "\"result\":null" : i == 1 ? "uuid_duplicate" : "verified")
+            || (i == 1 && strstr(output, "basename")) || (i >= 2 && experiment_ok(&value))) return 1;
+    }
+    printf("{\"mode\":\"lookup-self-test\",\"tests\":4,\"passed\":true}\n");
+    return 0;
+}
+static int lookup(int argc, const char **argv) {
+    if (argc < 4 || argc > REQUEST_LIMIT + 3) return 2;
+    request_count = (size_t)argc - 3;
+    for (size_t i = 0; i < request_count; i++) {
+        char canonical[37];
+        if (strlen(argv[i + 3]) != 36 || uuid_parse(argv[i + 3], requests[i]) || uuid_is_null(requests[i])) return 2;
+        uuid_unparse_upper(requests[i], canonical);
+        if (strcmp(canonical, argv[i + 3])) return 2;
+        for (size_t j = 0; j < i; j++) if (!uuid_compare(requests[j], requests[i])) return 2;
+    }
+    if (!_dyld_get_shared_cache_uuid || !dyld_shared_cache_iterate_text) return 78;
+    uuid_t expected;
+    if (!_dyld_get_shared_cache_uuid(expected) || uuid_is_null(expected)) return 1;
+    struct experiment value; char output[LOOKUP_OUTPUT_LIMIT];
+    if (!execute(&native, expected, &value, output, LOOKUP_DETAIL_LIMIT)) return 1;
+    // The private output is separate from stdout/stderr; no partial file is a success.
+    int fd = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return 1;
+    size_t size = strlen(output), done = 0;
+    while (done < size) {
+        ssize_t n = write(fd, output + done, size - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); return 1; }
+        done += (size_t)n;
+    }
+    if (close(fd)) return 1;
+    return experiment_ok(&value) ? 0 : 1;
+}
 int main(int argc, const char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--lookup")) return lookup(argc, argv);
     if (argc != 2) return 2;
+    if (!strcmp(argv[1], "--lookup-self-test")) return lookup_test();
     if (!strcmp(argv[1], "--self-test")) return self_test();
     if (!strcmp(argv[1], "--census-race-add")) return census_race_test(false);
     if (!strcmp(argv[1], "--census-race-remove")) return census_race_test(true);

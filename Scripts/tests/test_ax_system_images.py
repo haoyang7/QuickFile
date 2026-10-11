@@ -320,6 +320,117 @@ class AXSystemImageTests(unittest.TestCase):
             self.assertFalse(IMAGES.worker_cleanup_confirmed(receipt))
 
 
+class AXCacheImageTests(unittest.TestCase):
+    @staticmethod
+    def packet(identifiers):
+        return {"schema": 1, "mode": "lookup", "status": "complete", "active_cache_uuid": SECOND,
+                "requests": len(identifiers), "setup_calls": 1, "measurement_calls": 1,
+                "callbacks": 16384, "measurement_closed": True,
+                "result": [{"request_index": i, "reason": "verified", "basename": "Foundation", "uuid": identifier}
+                           for i, identifier in enumerate(identifiers)]}
+
+    def test_lookup_protocol_checks_indices_identity_closed_traversal_and_privacy(self):
+        value = self.packet([IDENTIFIER])
+        IMAGES.validate_cache_lookup(value, [IDENTIFIER])
+        changes = [lambda v: v.update(schema=True), lambda v: v.update(status="failed"),
+                   lambda v: v.update(setup_calls=2), lambda v: v.update(measurement_calls=0),
+                   lambda v: v.update(callbacks=16385), lambda v: v.update(measurement_closed=False),
+                   lambda v: v.update(private="secret"), lambda v: v.update(active_cache_uuid="private"),
+                   lambda v: v["result"][0].update(request_index=True), lambda v: v["result"][0].update(uuid=SECOND),
+                   lambda v: v["result"][0].update(reason="secret"), lambda v: v["result"][0].update(basename="/private/secret"),
+                   lambda v: v["result"].append(v["result"][0])]
+        for change in changes:
+            bad = json.loads(json.dumps(value)); change(bad)
+            with self.assertRaises(ValueError):
+                IMAGES.validate_cache_lookup(bad, [IDENTIFIER])
+        for reason in ("uuid_missing", "uuid_duplicate", "image_excluded"):
+            changed = self.packet([IDENTIFIER]); changed["result"] = [{"request_index": 0, "reason": reason}]
+            IMAGES.validate_cache_lookup(changed, [IDENTIFIER])
+            changed["result"][0]["uuid"] = IDENTIFIER
+            with self.assertRaises(ValueError):
+                IMAGES.validate_cache_lookup(changed, [IDENTIFIER])
+
+    def test_requests_reject_noncanonical_duplicate_or_over_budget_before_processes(self):
+        for value in ([], [IDENTIFIER.lower()], [IDENTIFIER, IDENTIFIER], ["/private/secret"], [None], [IDENTIFIER] * 97):
+            with mock.patch.object(IMAGES.ax_process, "run_owned") as run, self.assertRaises(ValueError):
+                IMAGES.shared_cache_images(value, None)
+            run.assert_not_called()
+
+    def exercise(self, fail_stage=None, failure=None):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(IMAGES, "WORKER_ROOT", Path(directory)), \
+                mock.patch.object(IMAGES, "_cleanup_unconfirmed", False):
+            receipt = Path(directory) / "receipt.json"
+            IMAGES.write_worker_cleanup(receipt, True)
+            calls = []
+            def run(command, log, environment, timeout):
+                stage = log.stem; calls.append(stage)
+                self.assertEqual(timeout, 60 if stage == "compile" else 20)
+                self.assertEqual(environment["TMPDIR"], str(log.parent))
+                log.write_bytes(b" \n" if failure == "stderr" and stage == "lookup" else b"")
+                if stage == "lookup":
+                    payload = json.dumps(self.packet(command[3:])).encode()
+                    if failure == "budget":
+                        payload += b" " * IMAGES.CACHE_OUTPUT_LIMIT
+                    if failure == "duplicate-field":
+                        payload = payload[:-1] + b',"schema":1}'
+                    if failure == "deep-json":
+                        payload = b"[" * 10000 + b"0" + b"]" * 10000
+                        self.assertLess(len(payload), IMAGES.CACHE_OUTPUT_LIMIT)
+                    Path(command[2]).write_bytes(payload)
+                if fail_stage == stage:
+                    if failure == "exception":
+                        raise OSError("/private/secret")
+                    if failure == "unknown":
+                        return {"cleanup": {"complete": False}}
+                    return {"status": failure, "return_code": 124, "cleanup": {"complete": True}}
+                return {"status": "completed", "return_code": 0, "cleanup": {"complete": True}}
+            with mock.patch.object(IMAGES.ax_process, "run_owned", side_effect=run):
+                if failure in ("exception", "unknown"):
+                    with self.assertRaises(IMAGES.ImageWorkerCleanupError) as raised:
+                        IMAGES.shared_cache_images([IDENTIFIER], receipt)
+                    self.assertNotIn("private", str(raised.exception))
+                    self.assertEqual(IMAGES.worker_cleanup_state(receipt), (False, False))
+                    with self.assertRaises(IMAGES.ImageWorkerCleanupError):
+                        IMAGES.shared_cache_images([IDENTIFIER], receipt)
+                    self.assertEqual(len(list(Path(directory).glob("ax-cache-images-*"))), 1)
+                else:
+                    value = IMAGES.shared_cache_images([IDENTIFIER], receipt)
+                    self.assertEqual(value, None if failure else self.packet([IDENTIFIER]))
+                    self.assertEqual(IMAGES.worker_cleanup_state(receipt), (True, True))
+                    self.assertEqual(list(Path(directory).iterdir()), [receipt])
+            self.assertEqual(calls, ["compile"] if fail_stage == "compile" else ["compile", "lookup"])
+
+    def test_compile_query_failure_and_confirmed_timeout_recover_without_extra_commands(self):
+        self.exercise()
+        for stage in ("compile", "lookup"):
+            for failure in ("failed", "timeout", "start_failed"):
+                with self.subTest(stage=stage, failure=failure):
+                    self.exercise(stage, failure)
+        for failure in ("stderr", "budget", "duplicate-field"):
+            self.exercise(failure=failure)
+
+    def test_missing_or_negative_exit_proof_stops_later_compile_query_and_retains_directory(self):
+        for stage in ("compile", "lookup"):
+            for failure in ("unknown", "exception"):
+                with self.subTest(stage=stage, failure=failure):
+                    self.exercise(stage, failure)
+
+    def test_deep_json_is_optional_format_failure_with_confirmed_artifact_cleanup(self):
+        self.exercise(failure="deep-json")
+
+    def test_cache_artifact_failure_keeps_confirmed_exit_and_fixed_error(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(IMAGES, "WORKER_ROOT", Path(directory)):
+            receipt = Path(directory) / "receipt.json"; IMAGES.write_worker_cleanup(receipt, True)
+            with mock.patch.object(IMAGES.ax_process, "run_owned", return_value={
+                    "status": "completed", "return_code": 1, "cleanup": {"complete": True}}), \
+                    mock.patch.object(IMAGES.shutil, "rmtree", side_effect=PermissionError(13, "/private/secret")), \
+                    self.assertRaises(IMAGES.ImageWorkerArtifactError) as raised:
+                IMAGES.shared_cache_images([IDENTIFIER], receipt)
+            self.assertNotIn("private", str(raised.exception))
+            self.assertEqual(IMAGES.worker_cleanup_state(receipt), (True, False))
+            self.assertEqual(len(list(Path(directory).glob("ax-cache-images-*"))), 1)
+
+
 @unittest.skipUnless(sys.platform == "darwin", "dyld capability is macOS-only")
 class AXSystemImageNativeTests(unittest.TestCase):
     def test_owned_worker_normal_failure_timeout_are_reaped(self):

@@ -23,6 +23,10 @@ COMMAND_LIMIT = 65536
 CATALOG_BYTE_LIMIT = 262144
 WORKER_SECONDS = 10
 WORKER_ROOT = Path(__file__).resolve().parents[2] / ".build/Temporary"
+CACHE_SOURCE = Path(__file__).resolve().parents[2] / "Scripts/tests/fixtures/SharedCacheCapability.c"
+CACHE_REQUEST_LIMIT = 96
+CACHE_OUTPUT_LIMIT = 24576
+CACHE_REASONS = ("verified", "uuid_missing", "uuid_duplicate", "image_excluded")
 _cleanup_unconfirmed = False
 UUID = r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}"
 BASENAME = r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,95}"
@@ -314,6 +318,109 @@ def loaded_system_images(cleanup_path=None):
             except (OSError, ImageWorkerArtifactError) as error:
                 # Keep an earlier fixed error/cause; never retry a failed receipt.
                 # A pre-cleanup sidecar already distinguishes exited from cleaned.
+                if original_error is None:
+                    raise ImageWorkerArtifactError() from error
+
+
+def canonical_uuid(value):
+    return (type(value) is str and re.fullmatch(UUID, value) is not None
+            and value != "00000000-0000-0000-0000-000000000000")
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate image field")
+        result[key] = value
+    return result
+
+
+def validate_cache_lookup(value, identifiers):
+    """Only a completed, closed native traversal can attest requested UUIDs."""
+    integer = lambda v, lo, hi: type(v) is int and lo <= v <= hi
+    if (type(value) is not dict or set(value) != {"schema", "mode", "status", "active_cache_uuid", "requests",
+            "setup_calls", "measurement_calls", "callbacks", "measurement_closed", "result"}
+            or not integer(value["schema"], 1, 1) or value["mode"] != "lookup" or value["status"] != "complete"
+            or not canonical_uuid(value["active_cache_uuid"]) or not integer(value["requests"], len(identifiers), len(identifiers))
+            or any(not integer(value[key], 1, 1) for key in ("setup_calls", "measurement_calls"))
+            or not integer(value["callbacks"], 1, 16384) or value["measurement_closed"] is not True
+            or type(value["result"]) is not list or len(value["result"]) != len(identifiers)):
+        raise ValueError("Invalid shared-cache lookup")
+    for index, row in enumerate(value["result"]):
+        if (type(row) is not dict or row.get("reason") not in CACHE_REASONS
+                or not integer(row.get("request_index"), index, index)):
+            raise ValueError("Invalid shared-cache lookup row")
+        verified = row["reason"] == "verified"
+        if set(row) != ({"request_index", "reason", "basename", "uuid"} if verified else {"request_index", "reason"}):
+            raise ValueError("Invalid shared-cache lookup fields")
+        if verified and (not safe_identity({key: row[key] for key in ("basename", "uuid")}) or row["uuid"] != identifiers[index]):
+            raise ValueError("Invalid shared-cache lookup identity")
+
+
+def shared_cache_images(identifiers, cleanup_path):
+    """Own compilation and one query; confirmed ordinary failures are optional."""
+    global _cleanup_unconfirmed
+    if (type(identifiers) is not list or not 1 <= len(identifiers) <= CACHE_REQUEST_LIMIT
+            or not all(canonical_uuid(value) for value in identifiers) or len(set(identifiers)) != len(identifiers)):
+        raise ValueError("Invalid shared-cache requests")
+    exited, cleaned = worker_cleanup_state(cleanup_path)
+    if not exited:
+        raise ImageWorkerCleanupError()
+    if not cleaned:
+        raise ImageWorkerArtifactError()
+    try:
+        WORKER_ROOT.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="ax-cache-images-", dir=WORKER_ROOT))
+    except OSError:
+        return None
+    confirmed = True
+    try:
+        binary, output = work / "SharedCacheLookup", work / "lookup.json"
+        environment = dict(os.environ, TMPDIR=str(work), CLANG_MODULE_CACHE_PATH=str(work / "cache"), PYTHONDONTWRITEBYTECODE="1")
+        commands = (("compile", ["xcrun", "clang", "-std=c11", "-fblocks", "-O1", "-g0", "-Wall", "-Wextra", "-Werror",
+                     "-fmodules-cache-path=" + str(work / "cache"), str(CACHE_SOURCE), "-o", str(binary)], 60),
+                    ("lookup", [str(binary), "--lookup", str(output), *identifiers], 20))
+        for stage, command, timeout in commands:
+            write_worker_cleanup(cleanup_path, False, False)
+            confirmed = False
+            try:
+                run = ax_process.run_owned(command, work / (stage + ".log"), environment, timeout=timeout)
+                confirmed = run["cleanup"]["complete"] is True
+            except Exception as error:
+                raise ImageWorkerCleanupError() from error
+            if confirmed:
+                write_worker_cleanup(cleanup_path, True, False)
+            try:
+                (work / (stage + "-process.json")).write_text(json.dumps(run) + "\n")
+            except OSError as error:
+                raise (ImageWorkerArtifactError() if confirmed else ImageWorkerCleanupError()) from error
+            if not confirmed:
+                raise ImageWorkerCleanupError()
+            if run["status"] != "completed" or run["return_code"]:
+                return None
+        if (work / "lookup.log").stat().st_size:
+            return None
+        with output.open("rb") as stream:
+            payload = stream.read(CACHE_OUTPUT_LIMIT + 1)
+        if len(payload) > CACHE_OUTPUT_LIMIT:
+            return None
+        result = json.loads(payload, object_pairs_hook=unique_object)
+        validate_cache_lookup(result, identifiers)
+        return result
+    except ImageWorkerCleanupError:
+        _cleanup_unconfirmed = True
+        raise
+    except (OSError, ValueError, RecursionError):
+        return None
+    finally:
+        if confirmed:
+            original_error = sys.exc_info()[1]
+            try:
+                shutil.rmtree(work)
+                if original_error is None:
+                    write_worker_cleanup(cleanup_path, True)
+            except (OSError, ImageWorkerArtifactError) as error:
                 if original_error is None:
                     raise ImageWorkerArtifactError() from error
 

@@ -21,6 +21,10 @@ TEMPORARY_ROOT = ROOT / ".build/Temporary"
 SPEC = importlib.util.spec_from_file_location("shared_cache_process", ROOT / "Scripts/Investigations/ax_process.py")
 PROCESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROCESS)
+CACHE_SPEC = importlib.util.spec_from_file_location("shared_cache_images_tested", ROOT / "Scripts/Investigations/ax_system_images.py")
+CACHE = importlib.util.module_from_spec(CACHE_SPEC)
+with mock.patch.object(sys, "path", [str(ROOT / "Scripts/Investigations"), *sys.path]):
+    CACHE_SPEC.loader.exec_module(CACHE)
 OUTPUT_LIMIT = 16384
 IMAGE_LIMIT = 16384
 SAMPLE_LIMIT = 8
@@ -93,6 +97,7 @@ def decode_output(raw, mode="probe"):
         invalid_output()
     expected = {
         "self-test": {"mode": "self-test", "tests": SELF_TESTS, "passed": True},
+        "lookup-self-test": {"mode": "lookup-self-test", "tests": 4, "passed": True},
         "invalid-schema": {"mode": "invalid-schema", "reason": "callback_schema"},
         "timeout": {"mode": "timeout"},
     }
@@ -328,6 +333,8 @@ class SharedCacheOutputTests(unittest.TestCase):
                            else b"PRIVATE_CHILD_OUTPUT /private/secret pid=123")
                     if stage == "self-test":
                         raw = json.dumps({"mode": "self-test", "tests": SELF_TESTS, "passed": True}).encode()
+                    if stage == "lookup-self-test":
+                        raw = json.dumps({"mode": stage, "tests": 4, "passed": True}).encode()
                     if stage in ("census-race-add", "census-race-remove"):
                         packet = sample_output()
                         packet.update(status="failed", result=None, measurement=None, loaded_inventory_unchanged=False)
@@ -352,7 +359,7 @@ class SharedCacheOutputTests(unittest.TestCase):
                 self.assertEqual(receipt["status"], "failed")
                 self.assertEqual(receipt["cleanup_complete"], failure != "cleanup")
                 self.assertEqual(calls, ["compile"] if failure in ("compile", "cleanup") else
-                                 ["compile", "self-test", "census-race-add", "census-race-remove", "probe"])
+                                 ["compile", "self-test", "lookup-self-test", "census-race-add", "census-race-remove", "probe"])
                 if failure == "unavailable":
                     self.assertEqual(receipt["capability"], {"status": "unavailable", "reason": "spi_missing"})
                 else:
@@ -384,6 +391,7 @@ class SharedCacheNativeTests(unittest.TestCase):
             commands = [("compile", ["xcrun", "clang", "-std=c11", "-fblocks", "-O1", "-g0", "-Wall", "-Wextra",
                                       "-Werror", "-fmodules-cache-path=" + str(build / "cache"), str(SOURCE), "-o", str(binary)], 60, 0),
                         ("self-test", [str(binary), "--self-test"], 10, 0),
+                        ("lookup-self-test", [str(binary), "--lookup-self-test"], 10, 0),
                         ("census-race-add", [str(binary), "--census-race-add"], 10, 1),
                         ("census-race-remove", [str(binary), "--census-race-remove"], 10, 1),
                         ("probe", [str(binary), "--probe"], 20, 0),
@@ -418,6 +426,18 @@ class SharedCacheNativeTests(unittest.TestCase):
                     raise ValueError("Unexpected owned command result")
                 if stage == "compile":
                     receipt["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+            stage = "cache-lookup"
+            cleanup = records / "cache-worker.json"
+            CACHE.write_worker_cleanup(cleanup, True)
+            identifiers = [receipt["capability"]["result"]["loaded_samples"][0]["uuid"]]
+            try:
+                with mock.patch.object(CACHE, "WORKER_ROOT", build):
+                    lookup = CACHE.shared_cache_images(identifiers, cleanup)
+            finally:
+                groups_exited = CACHE.worker_cleanup_confirmed(cleanup)
+            if lookup is None or lookup["result"][0]["reason"] != "verified":
+                raise ValueError("Native lookup not established")
+            receipt["cache_lookup"] = lookup  # The helper applied its exact schema and privacy gate.
             receipt.update(status="complete", failure_stage=None)
         except Exception:
             failed = True

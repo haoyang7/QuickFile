@@ -244,7 +244,7 @@ jobs:
           python3 - <<'PY'
           import json, os, pathlib, re, sys
           sys.path.insert(0, 'Scripts/Investigations')
-          from ax_probe_report import validate_heap_diagnostics_summary, validate_terminal_snapshot, validation_failure_counts
+          from ax_probe_report import validate_heap_diagnostics_summary, validate_terminal_snapshot, validation_failure_counts, terminal_cache_identity, recheck_terminal_cache_identity
           from ax_external_receipt import fixture_sources, load_prepared_build, validate_external_receipt, validate_install_gate_state, validate_startup_failures
           from ax_process import run_owned
           from ax_system_images import ImageWorkerCleanupError, ImageWorkerArtifactError, worker_cleanup_state, write_worker_cleanup
@@ -551,12 +551,28 @@ jobs:
                       receipt['terminal_image_worker_artifact_cleanup'] = artifact_cleanup
                       terminal_failed |= (not receipt['terminal_snapshot_checks_passed'] or image_cleanup == 'unconfirmed'
                                           or artifact_cleanup == 'failed')
-                  print(json.dumps(receipt, separators=(',', ':')), flush=True)
                   public_summary['trials'].append(receipt)
                   public_summary['strict_checks_passed'] = not failed
                   if terminal_origin:
                       public_summary['terminal_snapshot_checks_passed'] = not terminal_failed
                   summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+                  # Persist the old six scans, strict verdict and safe terminal
+                  # before optional cache compilation/query or fresh validation.
+                  if terminal_origin and receipt['terminal_snapshot_available']:
+                      receipt['terminal_cache_image_identity'] = terminal_cache_identity(receipt['terminal_snapshot'])
+                      if image_cleanup == 'confirmed' and artifact_cleanup == 'complete':
+                          try:
+                              receipt['terminal_cache_image_identity'] = recheck_terminal_cache_identity(records, receipt['terminal_snapshot'], gate_cleanup)
+                          except ImageWorkerCleanupError:
+                              image_cleanup = artifact_cleanup = 'unconfirmed'
+                          except ImageWorkerArtifactError:
+                              artifact_cleanup = 'failed'
+                      receipt['terminal_image_worker_cleanup'] = image_cleanup
+                      receipt['terminal_image_worker_artifact_cleanup'] = artifact_cleanup
+                      terminal_failed |= image_cleanup == 'unconfirmed' or artifact_cleanup == 'failed'
+                      public_summary['terminal_snapshot_checks_passed'] = not terminal_failed
+                      summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+                  print(json.dumps(receipt, separators=(',', ':')), flush=True)
                   if not process_run['cleanup']['complete'] or terminal_origin and (image_cleanup == 'unconfirmed' or artifact_cleanup == 'failed'):
                       # Do not contaminate another case when group exit is unknown.
                       raise SystemExit(1)

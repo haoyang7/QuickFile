@@ -639,6 +639,30 @@ def terminal_other_images(frames, context, budget):
             "frames": public, "reason_counts": reasons}
 
 
+def terminal_roots(body, nodes):
+    roots, root_keys = [], set()
+    blocks = re.split(r"(?=^STACK OF )", body, flags=re.MULTILINE)[1:]
+    for block in blocks:
+        header, _, remainder = block.partition("\n")
+        match = re.fullmatch(r"STACK OF (\d+) INSTANCES? OF 'ROOT (LEAK|CYCLE): ([^\n]+)':", header)
+        stack, separator, tree = remainder.partition("\n====\n")
+        tree_lines = [line for line in tree.splitlines() if line.strip()]
+        first = re.fullmatch(r"\s+(\d+) \([^)]+\) ROOT (LEAK|CYCLE): (.+)", tree_lines[0]) if tree_lines else None
+        if (not match or not separator or not first or (match[2], match[3]) != (first[2], first[3])
+                or not 1 <= int(match[1]) <= int(first[1]) <= TERMINAL_NODE_LIMIT):
+            raise ValueError("Invalid terminal root group")
+        frames, unparsed = terminal_frames(stack)
+        key = (match[2], match[3], frames)
+        if key in root_keys:
+            raise ValueError("Duplicate terminal root group")
+        root_keys.add(key)
+        roots.append({"type": match[3] if match[3] in HEAP_TYPES else "unknown", "kind": match[2],
+                      "instances": int(match[1]), "tree_nodes": int(first[1]), "private_stack": (frames, unparsed)})
+    if sum(root["tree_nodes"] for root in roots) != nodes:
+        raise ValueError("Incomplete terminal root groups")
+    return roots
+
+
 def terminal_snapshot_summary(grouped, listed, resolver, image_worker_receipt=None, image_worker_error=None):
     """Parse observed leaks v4 grouped/v3 list syntax, without a node-to-root join.
 
@@ -687,26 +711,7 @@ def terminal_snapshot_summary(grouped, listed, resolver, image_worker_receipt=No
             allocation_counts[(kind, size, frames, unparsed)] += 1
         if byte_count != result["leak_bytes"]:
             raise ValueError("Terminal list bytes disagree")
-        roots, root_keys = [], set()
-        blocks = re.split(r"(?=^STACK OF )", reports[0][0], flags=re.MULTILINE)[1:]
-        for block in blocks:
-            header, _, remainder = block.partition("\n")
-            match = re.fullmatch(r"STACK OF (\d+) INSTANCES? OF 'ROOT (LEAK|CYCLE): ([^\n]+)':", header)
-            stack, separator, tree = remainder.partition("\n====\n")
-            tree_lines = [line for line in tree.splitlines() if line.strip()]
-            first = re.fullmatch(r"\s+(\d+) \([^)]+\) ROOT (LEAK|CYCLE): (.+)", tree_lines[0]) if tree_lines else None
-            if (not match or not separator or not first or (match[2], match[3]) != (first[2], first[3])
-                    or not 1 <= int(match[1]) <= int(first[1]) <= TERMINAL_NODE_LIMIT):
-                raise ValueError("Invalid terminal root group")
-            frames, unparsed = terminal_frames(stack)
-            key = (match[2], match[3], frames)
-            if key in root_keys:
-                raise ValueError("Duplicate terminal root group")
-            root_keys.add(key)
-            roots.append({"type": match[3] if match[3] in HEAP_TYPES else "unknown", "kind": match[2],
-                          "instances": int(match[1]), "tree_nodes": int(first[1]), "private_stack": (frames, unparsed)})
-        if sum(root["tree_nodes"] for root in roots) != result["leak_nodes"]:
-            raise ValueError("Incomplete terminal root groups")
+        roots = terminal_roots(reports[0][0], result["leak_nodes"])
         result["root_instances"] = sum(root["instances"] for root in roots)
         budget = [TERMINAL_FRAME_LIMIT]
         image_budget = [TERMINAL_IMAGE_FRAME_LIMIT]
@@ -817,6 +822,7 @@ def collect_terminal_snapshot(graph, records, capture):
     (records / "terminal-snapshot.json").write_text(json.dumps(result, indent=2) + "\n")
     if cleanup_error is not None:
         raise cleanup_error
+    collect_terminal_cache_identity(records, result, reports.get("grouped") if result["capture_status"] == "complete" else None)
     return result
 
 
@@ -983,6 +989,178 @@ def validate_terminal_snapshot(value, image_worker_receipt=None, image_worker_er
             identity["frames"] = retained
     if cleanup_error is not None:
         raise cleanup_error
+
+
+CACHE_IDENTITY_REASONS = ("binding_unavailable", "report_images_invalid", "report_range_missing", "report_uuid_ambiguous",
+                          "budget_omitted", "lookup_unavailable", "cache_changed", "uuid_missing", "uuid_duplicate",
+                          "image_excluded", "identity_changed", "output_budget")
+CACHE_RECORD_LIMIT = 49152  # Private binding manifest plus the independently bounded native packet.
+
+
+def terminal_cache_identity(terminal, reason="binding_unavailable"):
+    reasons = dict.fromkeys(CACHE_IDENTITY_REASONS, 0)
+    if reason:
+        reasons[reason] = 1
+    return {"schema": 1, "source": "active-shared-cache", "status": "unavailable",
+            "terminal_sha256": hashlib.sha256(json.dumps(terminal, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "active_cache_uuid": None, "frames": [], "reason_counts": reasons}
+
+
+def terminal_cache_bindings(grouped, terminal):
+    """Derive private root/frame UUIDs from the report, never a claimed map."""
+    if type(grouped) is not str or len(grouped.encode()) > REPORT_BYTE_LIMIT or terminal["parsing_status"] != "complete":
+        raise ValueError("Cache binding source unavailable")
+    totals = re.findall(r"^Process \d+: (\d+) leaks? for (\d+) total leaked bytes\.\s*$", grouped, re.MULTILINE)
+    if len(totals) != 1 or tuple(map(int, totals[0])) != (terminal["leak_nodes"], terminal["leak_bytes"]):
+        raise ValueError("Cache binding totals differ")
+    roots = terminal_roots(grouped.split("\nBinary Images:", 1)[0], terminal["leak_nodes"])
+    if len(roots[:TERMINAL_ROOT_LIMIT]) != len(terminal["root_groups"]):
+        raise ValueError("Cache binding roots differ")
+    try:
+        ranges = ax_system_images.report_images(grouped)
+    except ValueError:
+        ranges = None
+    bindings, reasons, remaining = [], dict.fromkeys(CACHE_IDENTITY_REASONS, 0), 96
+    for root_index, (root, published) in enumerate(zip(roots, terminal["root_groups"])):
+        frames, unparsed = root["private_stack"]
+        images = dict.fromkeys((*HEAP_IMAGES, "other"), 0)
+        for _, label, *_ in frames:
+            images[terminal_reported_image(label)] += 1
+        if (any(root[key] != published[key] for key in ("type", "kind", "instances", "tree_nodes"))
+                or images != published["reported_image_counts"] or len(frames) != published["stack"]["reported_frames"]
+                or unparsed != published["stack"]["unparsed_lines"]
+                or (frames[-1][0] + 1 - len(frames) if frames else None) != published["stack"]["missing_frames"]):
+            raise ValueError("Cache binding root differs")
+        for index, label, address, *_ in frames:
+            if terminal_reported_image(label) != "other":
+                continue
+            if not remaining:
+                reasons["budget_omitted"] += 1
+                continue
+            remaining -= 1
+            matches = [] if ranges is None else [identifier for start, end, identifier in ranges if start <= address <= end]
+            if ranges is None:
+                reasons["report_images_invalid"] += 1
+            elif not matches:
+                reasons["report_range_missing"] += 1
+            elif matches[0] is None:
+                reasons["report_uuid_ambiguous"] += 1
+            else:
+                bindings.append({"root_index": root_index, "index": index, "uuid": matches[0]})
+    return bindings, reasons
+
+
+def read_cache_file(path, limit):
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > limit:
+        raise ValueError("Cache input unavailable")
+    with path.open("rb") as stream:
+        payload = stream.read(limit + 1)
+    if len(payload) > limit:
+        raise ValueError("Cache input budget")
+    return payload
+
+
+def collect_terminal_cache_identity(records, terminal, grouped):
+    # The old terminal is already durable. This optional work only follows exit
+    # and never runs against the AX target or a report-provided executable path.
+    packet = {"schema": 1, "status": "unavailable"}
+    try:
+        bindings, reasons = terminal_cache_bindings(grouped, terminal)
+        terminal_bytes = read_cache_file(records / "terminal-snapshot.json", 65536)
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    else:
+        try:
+            # Existing terminal-grouped.txt combines stdout+stderr. Preserve the
+            # exact parsed stdout separately; do not reinterpret the mixed log.
+            (records / "terminal-cache-grouped.txt").write_text(grouped)
+        except OSError as error:
+            raise ax_system_images.ImageWorkerArtifactError() from error
+        identifiers = list(dict.fromkeys(row["uuid"] for row in bindings))
+        lookup = ax_system_images.shared_cache_images(identifiers, records / "terminal-image-worker.json") if identifiers else None
+        packet = {"schema": 1, "status": "bound", "terminal_sha256": hashlib.sha256(terminal_bytes).hexdigest(),
+                  "grouped_sha256": hashlib.sha256(grouped.encode()).hexdigest(), "bindings": bindings,
+                  "reason_counts": reasons, "lookup": lookup}
+    encoded = json.dumps(packet, separators=(",", ":")) + "\n"
+    if len(encoded.encode()) > CACHE_RECORD_LIMIT:
+        encoded = '{"schema":1,"status":"unavailable"}\n'
+    try:
+        (records / "terminal-cache-images.json").write_text(encoded)
+    except OSError as error:
+        raise ax_system_images.ImageWorkerArtifactError() from error
+
+
+def recheck_terminal_cache_identity(records, terminal, cleanup_path):
+    """A separate optional field; never edits the schema-3 terminal object."""
+    result = terminal_cache_identity(terminal)
+    try:
+        packet = json.loads(read_cache_file(records / "terminal-cache-images.json", CACHE_RECORD_LIMIT),
+                            object_pairs_hook=ax_system_images.unique_object)
+        if type(packet) is not dict or set(packet) != {"schema", "status", "terminal_sha256", "grouped_sha256", "bindings", "reason_counts", "lookup"}:
+            return result
+        if type(packet["schema"]) is not int or packet["schema"] != 1 or packet["status"] != "bound":
+            return result
+        terminal_bytes = read_cache_file(records / "terminal-snapshot.json", 65536)
+        grouped_bytes = read_cache_file(records / "terminal-cache-grouped.txt", REPORT_BYTE_LIMIT)
+        if (packet["terminal_sha256"] != hashlib.sha256(terminal_bytes).hexdigest()
+                or packet["grouped_sha256"] != hashlib.sha256(grouped_bytes).hexdigest()):
+            return result
+        original = json.loads(terminal_bytes, object_pairs_hook=ax_system_images.unique_object)
+        # The earlier loaded-image fresh gate may prune only that optional field.
+        def stable(value):
+            value = json.loads(json.dumps(value))
+            for root in value["root_groups"]:
+                root.pop("other_image_identity")
+            return value
+        if stable(original) != stable(terminal):
+            return result
+        bindings, reasons = terminal_cache_bindings(grouped_bytes.decode("utf-8"), terminal)
+        # JSON equality treats bool as int. Canonical bytes preserve exact types.
+        canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"))
+        if canonical(packet["bindings"]) != canonical(bindings) or canonical(packet["reason_counts"]) != canonical(reasons):
+            return result
+        identifiers = list(dict.fromkeys(row["uuid"] for row in bindings))
+        lookup = packet["lookup"]
+        if lookup is not None:
+            if not identifiers:
+                return result
+            ax_system_images.validate_cache_lookup(lookup, identifiers)
+        if not identifiers:
+            if lookup is not None:
+                return result
+            result["reason_counts"] = reasons
+        elif lookup is None:
+            reasons["lookup_unavailable"] += len(bindings)
+            result["reason_counts"] = reasons
+        else:
+            fresh = ax_system_images.shared_cache_images(identifiers, cleanup_path)
+            if fresh is None:
+                reasons["lookup_unavailable"] += len(bindings)
+            elif fresh["active_cache_uuid"] != lookup["active_cache_uuid"]:
+                reasons["cache_changed"] += len(bindings)
+            else:
+                result["active_cache_uuid"] = fresh["active_cache_uuid"]
+                positions = {identifier: index for index, identifier in enumerate(identifiers)}
+                for binding in bindings:
+                    index = positions[binding["uuid"]]
+                    before, after = lookup["result"][index], fresh["result"][index]
+                    reason = before["reason"] if before["reason"] != "verified" else after["reason"]
+                    if reason != "verified":
+                        reasons[reason] += 1
+                    elif before != after:
+                        reasons["identity_changed"] += 1
+                    else:
+                        result["frames"].append({**binding, "basename": after["basename"]})
+            result["reason_counts"] = reasons
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        return terminal_cache_identity(terminal)
+    total = len(result["frames"]) + sum(result["reason_counts"].values())
+    result["status"] = ("not-needed" if not total else "complete" if not sum(result["reason_counts"].values()) else
+                        "partial" if result["frames"] else "unavailable")
+    # Include the field's actual case nesting/indentation, not just compact JSON.
+    if len(json.dumps({"trials": [{"terminal_cache_image_identity": result}]}, indent=2).encode()) > ax_system_images.CACHE_OUTPUT_LIMIT:
+        return terminal_cache_identity(terminal, "output_budget")
+    return result
 
 
 def disassemble_symbols(state, work, records):

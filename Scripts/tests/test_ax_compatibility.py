@@ -553,6 +553,12 @@ class AXCompatibilityCopyLifetimeTests(unittest.TestCase):
 
 
 class AXTerminalSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        # Pure parser tests never compile or query a native shared cache.
+        patch = mock.patch.object(REPORT.ax_system_images, "shared_cache_images", return_value=None)
+        self.cache_lookup = patch.start()
+        self.addCleanup(patch.stop)
+
     def test_other_root_images_use_report_ranges_and_fresh_local_uuid_at_each_gate(self):
         identifier = "12345678-1234-1234-1234-123456789ABC"
         image = {"basename": "libsystem_pthread.dylib", "uuid": identifier}
@@ -2166,6 +2172,147 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
         self.assertEqual([error["stage"] for error in summary["validation_errors"]], ["compensation-branches"])
 
 
+class AXTerminalCacheIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.reports, self.catalog = AXTerminalSnapshotTests.image_reports()
+        self.images = REPORT.ax_system_images
+        with mock.patch.object(self.images, "loaded_system_images", return_value=self.catalog):
+            self.terminal = AXTerminalSnapshotTests.summary(self.reports)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.records = pathlib.Path(temporary.name)
+        self.cleanup = self.records / "terminal-image-worker.json"
+        self.images.write_worker_cleanup(self.cleanup, True)
+        PROBE.write_json(self.records / "terminal-snapshot.json", self.terminal)
+
+    def packet(self, identifiers):
+        return {"schema": 1, "mode": "lookup", "status": "complete", "active_cache_uuid": "33333333-3333-3333-3333-333333333333",
+                "requests": len(identifiers), "setup_calls": 1, "measurement_calls": 1, "callbacks": 3000,
+                "measurement_closed": True, "result": [{"request_index": i, "reason": "verified", **self.catalog[value]}
+                                                       for i, value in enumerate(identifiers)]}
+
+    def collect(self):
+        def lookup(identifiers, cleanup):
+            self.assertEqual(json.loads((self.records / "terminal-snapshot.json").read_text()), self.terminal)
+            return self.packet(identifiers)
+        with mock.patch.object(self.images, "shared_cache_images", side_effect=lookup):
+            REPORT.collect_terminal_cache_identity(self.records, self.terminal, self.reports[0])
+        return json.loads((self.records / "terminal-cache-images.json").read_text())
+
+    def test_separate_identity_binds_report_frames_and_final_terminal_without_repairing_loaded(self):
+        packet = self.collect()
+        self.assertEqual([(row["root_index"], row["index"]) for row in packet["bindings"]], [(0, 2), (0, 3)])
+        terminal = json.loads(json.dumps(self.terminal))
+        identity = terminal["root_groups"][0]["other_image_identity"]
+        identity["frames"] = []; identity["reason_counts"]["local_catalog_unavailable"] = 2; identity["status"] = "partial"
+        before = json.dumps(terminal, sort_keys=True)
+        with mock.patch.object(self.images, "shared_cache_images", side_effect=lambda identifiers, _: self.packet(identifiers)) as query:
+            value = REPORT.recheck_terminal_cache_identity(self.records, terminal, self.cleanup)
+        query.assert_called_once()
+        self.assertEqual(value["status"], "complete")
+        self.assertEqual(len(value["frames"]), 2)
+        self.assertEqual(value["terminal_sha256"], REPORT.terminal_cache_identity(terminal)["terminal_sha256"])
+        self.assertEqual(before, json.dumps(terminal, sort_keys=True))
+        self.assertNotIn("private", json.dumps(value))
+
+    def test_bad_binding_hash_root_frame_uuid_and_private_packet_are_rejected_before_fresh_query(self):
+        original = self.collect()
+        mutations = [lambda v: v.update(private="secret"), lambda v: v.update(schema=True),
+                     lambda v: v.update(terminal_sha256="0" * 64), lambda v: v.update(grouped_sha256="0" * 64),
+                     lambda v: v["bindings"][0].update(root_index=1), lambda v: v["bindings"][0].update(root_index=False),
+                     lambda v: v["bindings"][0].update(index=3), lambda v: v["bindings"][0].update(uuid=v["bindings"][1]["uuid"]),
+                     lambda v: v["bindings"].reverse(), lambda v: v["reason_counts"].update(private=1),
+                     lambda v: v["lookup"]["result"][0].update(basename="/private/secret")]
+        before = json.dumps(self.terminal, sort_keys=True)
+        for change in mutations:
+            packet = json.loads(json.dumps(original)); change(packet)
+            PROBE.write_json(self.records / "terminal-cache-images.json", packet)
+            with mock.patch.object(self.images, "shared_cache_images") as query:
+                value = REPORT.recheck_terminal_cache_identity(self.records, self.terminal, self.cleanup)
+            query.assert_not_called()
+            self.assertEqual(value["status"], "unavailable")
+            self.assertEqual(value["frames"], [])
+            self.assertNotIn("private", json.dumps(value))
+        PROBE.write_json(self.records / "terminal-cache-images.json", original)
+        (self.records / "terminal-cache-grouped.txt").write_text(self.reports[0] + "extra")
+        with mock.patch.object(self.images, "shared_cache_images") as query:
+            self.assertEqual(REPORT.recheck_terminal_cache_identity(self.records, self.terminal, self.cleanup)["frames"], [])
+        query.assert_not_called()
+        self.assertEqual(before, json.dumps(self.terminal, sort_keys=True))
+
+    def test_fresh_cache_change_missing_uuid_or_basename_change_never_publishes_old_identity(self):
+        packet = self.collect()
+        for failure in ("unavailable", "cache", "duplicate", "basename"):
+            fresh = json.loads(json.dumps(packet["lookup"]))
+            if failure == "unavailable":
+                fresh = None
+            elif failure == "cache":
+                fresh["active_cache_uuid"] = "44444444-4444-4444-4444-444444444444"
+            elif failure == "duplicate":
+                fresh["result"][0] = {"request_index": 0, "reason": "uuid_duplicate"}
+            else:
+                fresh["result"][0]["basename"] = "Changed"
+            with mock.patch.object(self.images, "shared_cache_images", return_value=fresh):
+                value = REPORT.recheck_terminal_cache_identity(self.records, self.terminal, self.cleanup)
+            self.assertEqual(len(value["frames"]), 0 if failure in ("unavailable", "cache") else 1)
+            self.assertEqual(value["reason_counts"][{"unavailable": "lookup_unavailable", "cache": "cache_changed",
+                "duplicate": "uuid_duplicate", "basename": "identity_changed"}[failure]], 2 if failure in ("unavailable", "cache") else 1)
+            if failure in ("unavailable", "cache"):
+                self.assertIsNone(value["active_cache_uuid"])
+
+    def test_request_dedup_and_frame_budget_do_not_change_old_summary_or_symbol_budget(self):
+        grouped, listed = self.reports
+        grouped = grouped.replace("3 private-fixture 0x2000 secret_caller + 4\n2 private-fixture 0x1000 secret_caller + 4",
+            "\n".join(f"{i} private-fixture 0x1000 secret_caller + 4" for i in reversed(range(2, 104))))
+        with mock.patch.object(self.images, "loaded_system_images", return_value=self.catalog):
+            terminal = AXTerminalSnapshotTests.summary((grouped, listed))
+        PROBE.write_json(self.records / "terminal-snapshot.json", terminal)
+        before = json.dumps(terminal, sort_keys=True)
+        with mock.patch.object(self.images, "shared_cache_images", side_effect=lambda ids, _: self.packet(ids)) as query:
+            REPORT.collect_terminal_cache_identity(self.records, terminal, grouped)
+            value = REPORT.recheck_terminal_cache_identity(self.records, terminal, self.cleanup)
+        self.assertEqual([len(call.args[0]) for call in query.call_args_list], [1, 1])
+        self.assertEqual(len(value["frames"]), 96)
+        self.assertEqual(value["reason_counts"]["budget_omitted"], 6)
+        self.assertLessEqual(len(json.dumps(value, indent=2).encode()), 24576)
+        self.assertEqual(before, json.dumps(terminal, sort_keys=True))
+        path = self.records / "terminal-cache-images.json"
+        packet = json.loads(path.read_text())
+        packet["lookup"]["result"][0]["basename"] = "A" * 96
+        PROBE.write_json(path, packet)
+        with mock.patch.object(self.images, "shared_cache_images", return_value=packet["lookup"]):
+            bounded = REPORT.recheck_terminal_cache_identity(self.records, terminal, self.cleanup)
+        unbounded = json.loads(json.dumps(value))
+        for frame in unbounded["frames"]:
+            frame["basename"] = "A" * 96
+        self.assertGreater(len(json.dumps({"trials": [{"terminal_cache_image_identity": unbounded}]}, indent=2).encode()), 24576)
+        self.assertEqual(bounded["frames"], [])
+        self.assertEqual(bounded["reason_counts"]["output_budget"], 1)
+        self.assertEqual(before, json.dumps(terminal, sort_keys=True))
+
+    def test_real_collector_uses_stdout_and_saves_old_terminal_before_optional_cleanup_failure(self):
+        capture = REPORT.empty_terminal_snapshot(); capture.update(capture_status="complete", capture_exit_code=0)
+        for kind in (None, self.images.ImageWorkerCleanupError, self.images.ImageWorkerArtifactError):
+            def lookup(ids, cleanup):
+                saved = json.loads((self.records / "terminal-snapshot.json").read_text())
+                self.assertEqual(AXTerminalSnapshotTests.without_image_identity(saved), AXTerminalSnapshotTests.without_image_identity(self.terminal))
+                if kind:
+                    raise kind() from OSError("/private/secret")
+                return self.packet(ids)
+            with mock.patch.object(REPORT.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 1, text, "PRIVATE_STDERR") for text in self.reports]), \
+                    mock.patch.object(REPORT, "SystemSymbols", return_value=AXTerminalSnapshotTests.resolver()), \
+                    mock.patch.object(self.images, "loaded_system_images", return_value=self.catalog), \
+                    mock.patch.object(self.images, "shared_cache_images", side_effect=lookup):
+                if kind:
+                    with self.assertRaises(kind):
+                        REPORT.collect_terminal_snapshot(self.records / "terminal.memgraph", self.records, capture)
+                else:
+                    REPORT.collect_terminal_snapshot(self.records / "terminal.memgraph", self.records, capture)
+            self.assertEqual((self.records / "terminal-cache-grouped.txt").read_text(), self.reports[0])
+            self.assertIn("PRIVATE_STDERR", (self.records / "terminal-grouped.txt").read_text())
+            self.assertEqual(json.loads((self.records / "terminal-snapshot.json").read_text())["schema"], 3)
+
+
 class AXMallocScribbleWorkflowTests(unittest.TestCase):
     @staticmethod
     def workflow_script(step):
@@ -2536,6 +2683,92 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
         self.assertEqual(invocations, [("off", "control"), ("off", "product")])
         self.assertEqual(summary["trials"][0]["terminal_image_worker_artifact_cleanup"], "complete")
         self.assertFalse(summary["strict_checks_passed"])
+
+    def test_deep_cache_json_preserves_collection_upload_evidence_and_allows_next_case(self):
+        fixture = AXTerminalCacheIdentityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        images = REPORT.ax_system_images
+        real_lookup = images.shared_cache_images
+        capture = REPORT.empty_terminal_snapshot(); capture.update(capture_status="complete", capture_exit_code=0)
+        for failure_phase in ("collection", "upload"):
+            with self.subTest(failure_phase=failure_phase):
+                calls, cleanup_states, phase = [], [], "collection"
+                def lookup(identifiers, cleanup):
+                    try:
+                        return real_lookup(identifiers, cleanup)
+                    finally:
+                        cleanup_states.append(images.worker_cleanup_state(cleanup))
+                def owned(command, log, environment, timeout):
+                    calls.append((phase, log.stem))
+                    log.write_bytes(b"")
+                    if log.stem == "lookup":
+                        payload = (b"[" * 10000 + b"0" + b"]" * 10000 if phase == failure_phase
+                                   else json.dumps(fixture.packet(command[3:])).encode())
+                        pathlib.Path(command[2]).write_bytes(payload)
+                    return {"status": "completed", "return_code": 0, "cleanup": {"complete": True}}
+                def collect(records):
+                    nonlocal phase
+                    with mock.patch.object(REPORT.subprocess, "run", side_effect=[
+                            subprocess.CompletedProcess([], 1, text, "") for text in fixture.reports]):
+                        REPORT.collect_terminal_snapshot(records / "terminal.memgraph", records, capture)
+                    self.assertEqual(images.worker_cleanup_state(records / "terminal-image-worker.json"), (True, True))
+                    self.assertEqual(json.loads((records / "terminal-snapshot.json").read_text()), fixture.terminal)
+                    phase = "upload"
+                with mock.patch.object(images, "WORKER_ROOT", fixture.records / "workers"), \
+                        mock.patch.object(images, "ax_process", mock.Mock(run_owned=mock.Mock(side_effect=owned))), \
+                        mock.patch.object(images, "shared_cache_images", side_effect=lookup), \
+                        mock.patch.object(images, "loaded_system_images", return_value=fixture.catalog):
+                    invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                        terminal_origin=True, first_failure="strict", first_records_change=collect)
+                self.assertEqual(calls, [("collection", "compile"), ("collection", "lookup")]
+                                 + ([("upload", "compile"), ("upload", "lookup")] if failure_phase == "upload" else []))
+                self.assertEqual(cleanup_states, [(True, True)] * (2 if failure_phase == "upload" else 1))
+                self.assertEqual(invocations, [("off", "control"), ("off", "product")])
+                first = summary["trials"][0]
+                self.assertEqual(first["terminal_snapshot"], fixture.terminal)
+                self.assertEqual(first["terminal_image_worker_cleanup"], "confirmed")
+                self.assertEqual(first["terminal_image_worker_artifact_cleanup"], "complete")
+                self.assertEqual(first["terminal_cache_image_identity"]["status"], "unavailable")
+                self.assertEqual(first["terminal_cache_image_identity"]["frames"], [])
+                self.assertEqual(first["validation_failure_counts"]["heap_baseline"], 1)
+                self.assertEqual(len(first["scan_totals"]), 6)
+                self.assertFalse(summary["strict_checks_passed"])
+                self.assertEqual(list((fixture.records / "workers").iterdir()), [])
+
+    def test_optional_cache_upload_persists_old_evidence_before_query_and_stops_on_cleanup_failure(self):
+        fixture = AXTerminalCacheIdentityTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        packet = fixture.collect()
+        images = REPORT.ax_system_images
+        for failure in (None, "unavailable", "malformed", "fresh", "fresh-artifact"):
+            def transfer(records):
+                for name in ("terminal-snapshot.json", "terminal-cache-images.json", "terminal-cache-grouped.txt"):
+                    (records / name).write_bytes((fixture.records / name).read_bytes())
+                if failure == "malformed":
+                    bad = json.loads((records / "terminal-cache-images.json").read_text()); bad["private"] = "secret"
+                    PROBE.write_json(records / "terminal-cache-images.json", bad)
+            def query(ids, cleanup):
+                saved = json.loads((cleanup.parent.parent / "summary.json").read_text())
+                self.assertEqual(len(saved["trials"]), 1)
+                first = saved["trials"][0]
+                self.assertEqual(len(first["scan_totals"]), 6)
+                self.assertEqual(first["validation_failure_counts"]["heap_baseline"], 1)
+                self.assertEqual(first["terminal_snapshot"], fixture.terminal)
+                if failure in ("fresh", "fresh-artifact"):
+                    raise (images.ImageWorkerCleanupError() if failure == "fresh" else images.ImageWorkerArtifactError()) from OSError("/private/secret")
+                return None if failure == "unavailable" else packet["lookup"]
+            with self.subTest(failure=failure), mock.patch.object(images, "loaded_system_images", return_value=fixture.catalog), \
+                    mock.patch.object(images, "shared_cache_images", side_effect=query) as fresh:
+                invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                    terminal_origin=True, first_failure="strict", first_records_change=transfer,
+                    image_cleanup_failure=failure if failure in ("fresh", "fresh-artifact") else None)
+            self.assertEqual(fresh.call_count, int(failure != "malformed"))
+            self.assertEqual(len(invocations), 1 if failure in ("fresh", "fresh-artifact") else 2)
+            first = summary["trials"][0]
+            self.assertEqual(first["terminal_snapshot"], fixture.terminal)
+            self.assertTrue(first["terminal_snapshot_checks_passed"])
+            self.assertEqual(len(first["scan_totals"]), 6)
+            self.assertFalse(summary["strict_checks_passed"])
+            self.assertEqual(first["terminal_cache_image_identity"]["status"], "complete" if failure is None else "unavailable")
+            self.assertEqual(len(first["terminal_cache_image_identity"]["frames"]), 2 if failure is None else 0)
 
     def test_terminal_worker_unknown_exit_does_not_publish_malformed_old_evidence(self):
         with mock.patch.object(REPORT.ax_system_images, "loaded_system_images") as load:
