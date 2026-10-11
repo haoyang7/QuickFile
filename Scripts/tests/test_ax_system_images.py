@@ -1,18 +1,21 @@
 import ctypes
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[1] / "Investigations/ax_system_images.py"
 SPEC = importlib.util.spec_from_file_location("ax_system_images_tested", SOURCE)
 IMAGES = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(IMAGES)
+with mock.patch.object(sys, "path", [str(SOURCE.parent), *sys.path]):
+    SPEC.loader.exec_module(IMAGES)
 IDENTIFIER = "12345678-1234-1234-1234-123456789ABC"
 SECOND = "22345678-1234-1234-1234-123456789ABC"
 
@@ -131,62 +134,231 @@ class AXSystemImageTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(len(callbacks_seen[0]), 2)
             raise RawExit()
-        with mock.patch.object(IMAGES, "_loaded_images", side_effect=loaded), mock.patch.object(IMAGES.os, "write", side_effect=write), \
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(IMAGES, "_loaded_images", side_effect=loaded), mock.patch.object(IMAGES.os, "write", side_effect=write), \
                 mock.patch.object(IMAGES.os, "_exit", side_effect=raw_exit), self.assertRaises(RawExit):
-            IMAGES._worker_entry()
+            IMAGES._worker_entry(Path(directory) / "catalog.json")
         self.assertEqual(json.loads(b"".join(chunks)), result)
         for failure in (OSError("private error"), 0):
-            with mock.patch.object(IMAGES, "_loaded_images", side_effect=loaded), \
+            with tempfile.TemporaryDirectory() as directory, mock.patch.object(IMAGES, "_loaded_images", side_effect=loaded), \
                     mock.patch.object(IMAGES.os, "write", side_effect=failure if isinstance(failure, Exception) else None, return_value=0), \
                     mock.patch.object(IMAGES.os, "_exit", side_effect=RawExit) as leave, self.assertRaises(RawExit):
-                IMAGES._worker_entry()
+                IMAGES._worker_entry(Path(directory) / "catalog.json")
             leave.assert_called_once_with(1)
+
+    def test_worker_output_close_cannot_hide_late_inventory_change_or_error(self):
+        class RawExit(BaseException):
+            pass
+        close = os.close
+        for failure in ("changed", "close-error"):
+            state = {"failed": False}
+            result = {"schema": 1, "images": [{"basename": "Foo", "uuid": IDENTIFIER}]}
+            def finish(descriptor):
+                close(descriptor)
+                if failure == "close-error":
+                    raise OSError("private close error")
+                state["failed"] = True
+            with tempfile.TemporaryDirectory() as directory:
+                with mock.patch.object(IMAGES, "_loaded_images", return_value=(result, (None, None, state))), \
+                        mock.patch.object(IMAGES.os, "close", side_effect=finish), \
+                        mock.patch.object(IMAGES.os, "_exit", side_effect=RawExit) as leave, self.assertRaises(RawExit):
+                    IMAGES._worker_entry(Path(directory) / "catalog.json")
+                leave.assert_called_once_with(1)
+                self.assertEqual(json.loads((Path(directory) / "catalog.json").read_text()), result)
 
     def test_worker_protocol_rejects_partial_duplicate_and_private_output(self):
         image = {"basename": "Foo", "uuid": IDENTIFIER}
-        good = json.dumps({"schema": 1, "images": [image]}).encode()
-        results = [(1, good, b""), (0, good, b"secret"), (0, good[:-1], b""),
-                   (0, json.dumps({"schema": 1, "images": [image, image]}).encode(), b""),
-                   (0, json.dumps({"schema": True, "images": [image]}).encode(), b""),
-                   (0, json.dumps({"schema": 1, "images": [{**image, "path": "secret"}]}).encode(), b"")]
-        for code, output, errors in results:
-            with mock.patch.object(IMAGES.subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, errors)):
-                self.assertIsNone(IMAGES.loaded_system_images())
-        with mock.patch.object(IMAGES.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, good, b"")):
-            self.assertEqual(IMAGES.loaded_system_images(), {IDENTIFIER: image})
-            with mock.patch.object(IMAGES, "CATALOG_BYTE_LIMIT", 1):
-                self.assertIsNone(IMAGES.loaded_system_images())
-        with mock.patch.object(IMAGES.subprocess, "Popen", side_effect=OSError("private spawn error")):
-            self.assertIsNone(IMAGES.loaded_system_images())
+        encode = lambda value: json.dumps(value, separators=(",", ":")).encode() + b"\n"
+        good = encode({"schema": 1, "images": [image]})
+        outputs = [(1, good), (0, good + b"secret"), (0, good[:-2]),
+                   (0, encode({"schema": 1, "images": [image, image]})),
+                   (0, encode({"schema": True, "images": [image]})),
+                   (0, encode({"schema": 1, "images": [{**image, "path": "secret"}]}))]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(IMAGES, "WORKER_ROOT", Path(directory)):
+            for code, payload in [*outputs, (0, good)]:
+                def run(command, log, environment, timeout):
+                    log.write_bytes(b"")
+                    Path(command[-1]).write_bytes(payload)
+                    self.assertEqual(command[-2], "--worker")
+                    self.assertEqual(environment["TMPDIR"], str(log.parent))
+                    self.assertEqual(timeout, IMAGES.WORKER_SECONDS)
+                    return {"status": "completed", "return_code": code, "cleanup": {"complete": True}}
+                with mock.patch.object(IMAGES.ax_process, "run_owned", side_effect=run):
+                    self.assertEqual(IMAGES.loaded_system_images(), {IDENTIFIER: image} if (code, payload) == (0, good) else None)
+                    with mock.patch.object(IMAGES, "CATALOG_BYTE_LIMIT", 1):
+                        self.assertIsNone(IMAGES.loaded_system_images())
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_combined_log_must_be_empty_even_for_whitespace_stderr(self):
+        good = {"schema": 1, "images": [{"basename": "Foo", "uuid": IDENTIFIER}]}
+        for errors in (b" ", b"\n", b"private error"):
+            with self.subTest(errors=errors), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(IMAGES, "WORKER_ROOT", Path(directory)):
+                def run(command, log, environment, timeout):
+                    log.write_bytes(errors)
+                    Path(command[-1]).write_text(json.dumps(good, separators=(",", ":")) + "\n")
+                    return {"status": "completed", "return_code": 0, "cleanup": {"complete": True}}
+                with mock.patch.object(IMAGES.ax_process, "run_owned", side_effect=run):
+                    self.assertIsNone(IMAGES.loaded_system_images())
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_confirmed_timeout_and_known_spawn_failure_degrade_without_poisoning_next_worker(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(IMAGES, "WORKER_ROOT", Path(directory)):
+            receipt = Path(directory) / "cleanup.json"
+            IMAGES.write_worker_cleanup(receipt, True)
+            for status in ("timeout", "start_failed", "protocol_failed"):
+                with mock.patch.object(IMAGES.ax_process, "run_owned", return_value={
+                        "status": status, "return_code": 124, "cleanup": {"complete": True}}) as run:
+                    self.assertIsNone(IMAGES.loaded_system_images(receipt))
+                    self.assertTrue(IMAGES.worker_cleanup_confirmed(receipt))
+                    run.assert_called_once()
+            self.assertEqual(list(Path(directory).iterdir()), [receipt])
+
+    def test_missing_exit_receipt_is_fatal_and_blocks_every_later_helper(self):
+        for failure in (OSError("private reap error"), {"cleanup": {"complete": False}}, {}):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(IMAGES, "WORKER_ROOT", Path(directory)), \
+                    mock.patch.object(IMAGES, "_cleanup_unconfirmed", False):
+                receipt = Path(directory) / "cleanup.json"
+                IMAGES.write_worker_cleanup(receipt, True)
+                kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+                with mock.patch.object(IMAGES.ax_process, "run_owned", **kwargs) as run:
+                    with self.assertRaises(IMAGES.ImageWorkerCleanupError) as error:
+                        IMAGES.loaded_system_images(receipt)
+                    if isinstance(failure, Exception):
+                        self.assertIs(error.exception.__cause__, failure)
+                    self.assertFalse(IMAGES.worker_cleanup_confirmed(receipt))
+                    self.assertFalse(json.loads(receipt.read_text())["cleanup_confirmed"])
+                    with self.assertRaises(IMAGES.ImageWorkerCleanupError):
+                        IMAGES.loaded_system_images()  # Also blocks a caller without a sidecar.
+                    run.assert_called_once()
+                self.assertEqual(len(list(Path(directory).glob("ax-system-images-*"))), 1)  # Unknown ownership keeps private evidence.
+
+    def test_confirmed_process_with_artifact_failure_is_distinct_and_retains_directory(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(IMAGES, "WORKER_ROOT", Path(directory)):
+            receipt = Path(directory) / "cleanup.json"
+            IMAGES.write_worker_cleanup(receipt, True)
+            error = PermissionError(13, "private directory")
+            with mock.patch.object(IMAGES.ax_process, "run_owned", return_value={
+                    "status": "completed", "return_code": 1, "cleanup": {"complete": True}}), \
+                    mock.patch.object(IMAGES.shutil, "rmtree", side_effect=error), \
+                    self.assertRaises(IMAGES.ImageWorkerArtifactError) as raised:
+                IMAGES.loaded_system_images(receipt)
+            self.assertIs(raised.exception.__cause__, error)
+            self.assertNotIn("private", str(raised.exception))
+            self.assertEqual(IMAGES.worker_cleanup_state(receipt), (True, False))
+            self.assertFalse(IMAGES._cleanup_unconfirmed)
+            self.assertEqual(len(list(Path(directory).glob("ax-system-images-*"))), 1)
+            with mock.patch.object(IMAGES.ax_process, "run_owned") as run, self.assertRaises(IMAGES.ImageWorkerArtifactError):
+                IMAGES.loaded_system_images(receipt)
+            run.assert_not_called()
+
+    def test_failed_receipt_write_is_not_retried_or_replaced_by_cleanup_error(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(IMAGES, "WORKER_ROOT", Path(directory)):
+            receipt = Path(directory) / "cleanup.json"
+            IMAGES.write_worker_cleanup(receipt, True)
+            error = PermissionError(13, "private receipt")
+            with mock.patch.object(Path, "write_text", side_effect=error) as write, \
+                    mock.patch.object(IMAGES.shutil, "rmtree", side_effect=OSError("private cleanup")), \
+                    mock.patch.object(IMAGES.ax_process, "run_owned") as run, self.assertRaises(IMAGES.ImageWorkerArtifactError) as raised:
+                IMAGES.loaded_system_images(receipt)
+            self.assertIs(raised.exception.__cause__, error)
+            self.assertNotIn("private", str(raised.exception))
+            write.assert_called_once()
+            run.assert_not_called()
+            self.assertTrue(IMAGES.worker_cleanup_confirmed(receipt))  # No child was attempted.
+
+    def test_nonregular_receipts_are_rejected_before_read_or_worker_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fifo = root / "fifo"
+            os.mkfifo(fifo)
+            for path in (root, fifo):
+                with self.subTest(kind=path.name), mock.patch.object(Path, "open") as read, \
+                        mock.patch.object(IMAGES.ax_process, "run_owned") as run:
+                    self.assertFalse(IMAGES.worker_cleanup_confirmed(path))
+                    with self.assertRaises(IMAGES.ImageWorkerCleanupError):
+                        IMAGES.loaded_system_images(path)
+                read.assert_not_called()
+                run.assert_not_called()
+
+    def test_receipt_read_is_bounded_even_if_file_grows_after_stat(self):
+        value = {"schema": 2, "cleanup_confirmed": True, "artifacts_cleaned": True}
+        data = json.dumps(value).encode()
+        class Stream(io.BytesIO):
+            def read(self, size=-1):
+                self.requested = size
+                return super().read(size)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_bytes(data)
+            for length in (128, 129, 10000):
+                stream = Stream(data + b" " * (length - len(data)))
+                with mock.patch.object(Path, "open", return_value=stream):
+                    self.assertEqual(IMAGES.worker_cleanup_state(path), (True, True) if length == 128 else (False, False))
+                self.assertEqual(stream.requested, 129)
+            for key in ("cleanup_confirmed", "artifacts_cleaned"):
+                for bad in (1, None, "true"):
+                    path.write_text(json.dumps(dict(value, **{key: bad})))
+                    self.assertEqual(IMAGES.worker_cleanup_state(path), (False, False))
+
+    def test_cleanup_receipt_rejects_missing_malformed_or_private_fields_before_spawn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / "cleanup.json"
+            values = [None, {}, {"schema": True, "cleanup_confirmed": True, "artifacts_cleaned": True},
+                      {"schema": 2, "cleanup_confirmed": 1, "artifacts_cleaned": True},
+                      {"schema": 2, "cleanup_confirmed": False, "artifacts_cleaned": True},
+                      {"schema": 2, "cleanup_confirmed": False, "artifacts_cleaned": False},
+                      {"schema": 2, "cleanup_confirmed": True, "artifacts_cleaned": True, "secret": "private"}, "x" * 129]
+            for value in values:
+                if value is not None:
+                    receipt.write_text(json.dumps(value))
+                with mock.patch.object(IMAGES.ax_process, "run_owned") as run, self.assertRaises(IMAGES.ImageWorkerCleanupError):
+                    IMAGES.loaded_system_images(receipt)
+                run.assert_not_called()
+            receipt.unlink()
+            receipt.symlink_to(Path(directory) / "absent")
+            self.assertFalse(IMAGES.worker_cleanup_confirmed(receipt))
 
 
 @unittest.skipUnless(sys.platform == "darwin", "dyld capability is macOS-only")
 class AXSystemImageNativeTests(unittest.TestCase):
     def test_owned_worker_normal_failure_timeout_are_reaped(self):
-        real_run, real_popen = subprocess.run, subprocess.Popen
-        children = []
-        def spawn(*args, **kwargs):
-            child = real_popen(*args, **kwargs); children.append(child); return child
-        catalogs = []
-        with mock.patch.object(IMAGES.subprocess, "Popen", side_effect=spawn):
-            for _ in range(2):
-                catalogs.append(IMAGES.loaded_system_images())
-        self.assertTrue(all(catalog and any(row["basename"] == "libsystem_pthread.dylib" for row in catalog.values()) for catalog in catalogs))
-        self.assertEqual(catalogs[0], catalogs[1])
-        for mode in ("failure", "timeout"):
-            def run(command, **kwargs):
-                code = ("import time;time.sleep(60)" if mode == "timeout" else
-                        "import runpy;d=runpy.run_path(" + repr(str(SOURCE)) + ");"
-                        "d['_worker_entry'].__globals__['_loaded_images']=lambda _:(_ for _ in ()).throw(ValueError('secret'));d['_worker_entry']()")
-                return real_run([sys.executable, "-B", "-c", code], **kwargs)
-            with mock.patch.object(IMAGES.subprocess, "run", side_effect=run), \
-                    mock.patch.object(IMAGES.subprocess, "Popen", side_effect=spawn), \
-                    mock.patch.object(IMAGES, "WORKER_SECONDS", 0.2 if mode == "timeout" else 10):
-                self.assertIsNone(IMAGES.loaded_system_images())
-        self.assertEqual([child.returncode for child in children], [0, 0, 1, -9])
-        for child in children:
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child.pid, 0)
+        real_run, real_popen = IMAGES.ax_process.run_owned, subprocess.Popen
+        leaders, receipts = [], []
+        def spawn(command, **kwargs):
+            child = real_popen(command, **kwargs)
+            if "--supervise" in command:
+                leaders.append(child)
+            return child
+        with tempfile.TemporaryDirectory(prefix="ax-images-native-", dir=IMAGES.WORKER_ROOT) as directory, \
+                mock.patch.object(IMAGES, "WORKER_ROOT", Path(directory)), \
+                mock.patch.object(IMAGES.ax_process.subprocess, "Popen", side_effect=spawn):
+            cleanup = Path(directory) / "cleanup.json"
+            IMAGES.write_worker_cleanup(cleanup, True)
+            for mode in ("normal", "failure", "timeout"):
+                def run(command, log, environment, timeout):
+                    if mode != "normal":
+                        command = [sys.executable, "-B", "-c", "import time;time.sleep(60)" if mode == "timeout" else "raise SystemExit(1)"]
+                    result = real_run(command, log, environment, timeout=timeout)
+                    receipts.append(result)
+                    return result
+                with mock.patch.object(IMAGES.ax_process, "run_owned", side_effect=run), \
+                        mock.patch.object(IMAGES, "WORKER_SECONDS", 0.2 if mode == "timeout" else 10):
+                    catalog = IMAGES.loaded_system_images(cleanup)
+                if mode == "normal":
+                    self.assertTrue(catalog and any(row["basename"] == "libsystem_pthread.dylib" for row in catalog.values()))
+                else:
+                    self.assertIsNone(catalog)
+                self.assertEqual(IMAGES.worker_cleanup_state(cleanup), (True, True))
+                self.assertEqual(list(Path(directory).iterdir()), [cleanup])
+            self.assertEqual([row["status"] for row in receipts], ["completed", "completed", "timeout"])
+            self.assertEqual([row["return_code"] for row in receipts], [0, 1, 124])
+            self.assertTrue(all(row["cleanup"]["complete"] for row in receipts))
+            self.assertEqual(len(leaders), 3)
+            for child in leaders:
+                self.assertIsNotNone(child.returncode)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child.pid, 0)
 
 
 if __name__ == "__main__":

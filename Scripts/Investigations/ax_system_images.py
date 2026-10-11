@@ -10,15 +10,20 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import stat
 import struct
-import subprocess
 import sys
+import tempfile
 import uuid
+import ax_process
 
 IMAGE_LIMIT = 2048
 COMMAND_LIMIT = 65536
 CATALOG_BYTE_LIMIT = 262144
 WORKER_SECONDS = 10
+WORKER_ROOT = Path(__file__).resolve().parents[2] / ".build/Temporary"
+_cleanup_unconfirmed = False
 UUID = r"[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}"
 BASENAME = r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,95}"
 IMAGE_LINE = re.compile(r"\s*(0x[0-9a-fA-F]{1,16}) -\s*(0x[0-9a-fA-F]{1,16})\s+\+?\S+ "
@@ -163,16 +168,17 @@ def _loaded_images(callbacks):
     return result, (appkit, library, state)
 
 
-def _worker_entry():
+def _worker_entry(output):
     callbacks, keepalive = [], None
-    code = 1
+    code, descriptor = 1, None
     try:
         result, keepalive = _loaded_images(callbacks)
         payload = json.dumps(result, separators=(",", ":")).encode() + b"\n"
         if len(payload) > CATALOG_BYTE_LIMIT or keepalive[2]["failed"]:
             raise ValueError("Invalid image inventory")
+        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         while payload:
-            written = os.write(1, payload)
+            written = os.write(descriptor, payload)
             if written <= 0:
                 raise OSError("Incomplete inventory write")
             payload = payload[written:]
@@ -180,18 +186,109 @@ def _worker_entry():
     except BaseException:
         pass
     finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                code = 1
+        if keepalive is not None and keepalive[2]["failed"]:
+            code = 1
         # No Python finalization can dispose a still-registered CFUNCTYPE.
         os._exit(code)
 
 
-def loaded_system_images():
-    """Fresh owned verifier; timeout kills/reaps it before returning unknown."""
+class ImageWorkerCleanupError(RuntimeError):
+    def __init__(self):
+        super().__init__("Image worker exit unconfirmed")
+
+
+class ImageWorkerArtifactError(RuntimeError):
+    def __init__(self):
+        super().__init__("Image worker artifact handling failed")
+
+
+def write_worker_cleanup(path, confirmed, artifacts_cleaned=None):
+    if artifacts_cleaned is None:
+        artifacts_cleaned = confirmed
     try:
-        output = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "--worker"],
-                                capture_output=True, timeout=WORKER_SECONDS)
-        if output.returncode or output.stderr or len(output.stdout) > CATALOG_BYTE_LIMIT:
+        path.write_text(json.dumps({"schema": 2, "cleanup_confirmed": confirmed,
+                                    "artifacts_cleaned": artifacts_cleaned}) + "\n")
+    except OSError as error:
+        raise ImageWorkerArtifactError() from error
+
+
+def worker_cleanup_state(path):
+    if _cleanup_unconfirmed:
+        return False, False
+    if path is None:
+        return True, True
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 128:
+            return False, False
+        with path.open("rb") as stream:
+            payload = stream.read(129)
+        if len(payload) > 128:
+            return False, False
+        value = json.loads(payload)
+        if (type(value) is dict and set(value) == {"schema", "cleanup_confirmed", "artifacts_cleaned"}
+                and type(value["schema"]) is int and value["schema"] == 2
+                and type(value["cleanup_confirmed"]) is bool and type(value["artifacts_cleaned"]) is bool
+                and (not value["artifacts_cleaned"] or value["cleanup_confirmed"])):
+            return value["cleanup_confirmed"], value["artifacts_cleaned"]
+    except (OSError, ValueError):
+        pass
+    return False, False
+
+
+def worker_cleanup_confirmed(path):
+    return worker_cleanup_state(path)[0]
+
+
+def loaded_system_images(cleanup_path=None):
+    """Fresh private group; only confirmed cleanup may degrade to unknown."""
+    global _cleanup_unconfirmed
+    exited, artifacts_cleaned = worker_cleanup_state(cleanup_path)
+    if not exited:
+        raise ImageWorkerCleanupError()
+    if not artifacts_cleaned:
+        raise ImageWorkerArtifactError()
+    try:
+        WORKER_ROOT.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="ax-system-images-", dir=WORKER_ROOT))
+    except OSError:
+        return None  # No process was attempted.
+    confirmed = True  # No process has been attempted yet.
+    try:
+        if cleanup_path is not None:
+            write_worker_cleanup(cleanup_path, False, False)
+        confirmed = False
+        try:
+            run = ax_process.run_owned([sys.executable, "-B", str(Path(__file__).resolve()), "--worker", str(work / "catalog.json")],
+                work / "worker.log", dict(os.environ, PYTHONDONTWRITEBYTECODE="1", TMPDIR=str(work)), timeout=WORKER_SECONDS)
+            confirmed = run["cleanup"]["complete"] is True
+        except Exception as error:
+            # An unexpected executor failure carries no proof of owned exit.
+            raise ImageWorkerCleanupError() from error
+        if cleanup_path is not None and confirmed:
+            write_worker_cleanup(cleanup_path, True, False)
+        try:
+            (work / "process.json").write_text(json.dumps(run) + "\n")
+        except OSError as error:
+            raise (ImageWorkerArtifactError() if confirmed else ImageWorkerCleanupError()) from error
+        if not confirmed:
+            raise ImageWorkerCleanupError()
+        if run["status"] != "completed" or run["return_code"]:
             return None
-        value = json.loads(output.stdout)
+        # run_owned combines stdout/stderr. Keep the catalog separate so even
+        # whitespace on either unexpected stream cannot become valid output.
+        if (work / "worker.log").stat().st_size:
+            return None
+        with (work / "catalog.json").open("rb") as stream:
+            payload = stream.read(CATALOG_BYTE_LIMIT + 1)
+        if len(payload) > CATALOG_BYTE_LIMIT:
+            return None
+        value = json.loads(payload)
         if (type(value) is not dict or set(value) != {"schema", "images"}
                 or type(value["schema"]) is not int or value["schema"] != 1
                 or type(value["images"]) is not list or not 1 <= len(value["images"]) <= IMAGE_LIMIT
@@ -199,11 +296,29 @@ def loaded_system_images():
             return None
         entries = {image["uuid"]: image for image in value["images"]}
         return entries if len(entries) == len(value["images"]) else None
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+    except ImageWorkerCleanupError:
+        _cleanup_unconfirmed = True
+        raise
+    except (OSError, ValueError) as error:
+        if not confirmed:
+            _cleanup_unconfirmed = True
+            raise ImageWorkerCleanupError() from error
         return None
+    finally:
+        if confirmed:
+            original_error = sys.exc_info()[1]
+            try:
+                shutil.rmtree(work)
+                if cleanup_path is not None and original_error is None:
+                    write_worker_cleanup(cleanup_path, True)
+            except (OSError, ImageWorkerArtifactError) as error:
+                # Keep an earlier fixed error/cause; never retry a failed receipt.
+                # A pre-cleanup sidecar already distinguishes exited from cleaned.
+                if original_error is None:
+                    raise ImageWorkerArtifactError() from error
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] != ["--worker"]:
-        raise SystemExit("Only --worker is supported")
-    _worker_entry()
+    if len(sys.argv) != 3 or sys.argv[1] != "--worker":
+        raise SystemExit("Only --worker OUTPUT is supported")
+    _worker_entry(sys.argv[2])

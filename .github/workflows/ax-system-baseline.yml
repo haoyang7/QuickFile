@@ -247,6 +247,7 @@ jobs:
           from ax_probe_report import validate_heap_diagnostics_summary, validate_terminal_snapshot, validation_failure_counts
           from ax_external_receipt import fixture_sources, load_prepared_build, validate_external_receipt, validate_install_gate_state, validate_startup_failures
           from ax_process import run_owned
+          from ax_system_images import ImageWorkerCleanupError, ImageWorkerArtifactError, worker_cleanup_state, write_worker_cleanup
           import hashlib
           from importlib import import_module
           runner = import_module('verify-ax-compatibility')
@@ -472,11 +473,67 @@ jobs:
                       failed = True
                   if terminal_origin:
                       receipt.update(terminal_snapshot_available=False, terminal_snapshot_checks_passed=False)
+                      collection_cleanup = records / 'terminal-image-worker.json'
+                      image_cleanup = 'unconfirmed'
+                      artifact_cleanup = 'unconfirmed'
+                      # A failed sidecar write can leave an older success receipt.
+                      # The runner's terminal stage takes precedence for artifacts;
+                      # it does not establish or revoke proof of process exit.
+                      cleanup, cleanup_errors = None, None
+                      cleanup_file = records / 'process-cleanup.json'
+                      cleanup_stages = {'reader', 'host', 'launch_services', 'external_receipt', 'heap_diagnostics',
+                                        'terminal_snapshot', 'terminal_snapshot_receipt', 'cleanup_receipt',
+                                        'validation_receipt', 'result_receipt'}
+                      try:
+                          if cleanup_file.is_file() and not cleanup_file.is_symlink() and cleanup_file.stat().st_size <= 4096:
+                              with cleanup_file.open('rb') as stream:
+                                  payload = stream.read(4097)
+                              if len(payload) <= 4096:
+                                  cleanup = json.loads(payload)
+                                  errors = cleanup.get('errors') if type(cleanup) is dict else None
+                                  if (type(errors) is list and len(errors) <= 16
+                                          and all(type(stage) is str and stage in cleanup_stages for stage in errors)):
+                                      cleanup_errors = errors
+                      except (OSError, ValueError, TypeError):
+                          pass
+                      if collection_cleanup.exists() or collection_cleanup.is_symlink():
+                          exited, cleaned = worker_cleanup_state(collection_cleanup)
+                          image_cleanup = 'confirmed' if exited else 'unconfirmed'
+                          artifact_cleanup = 'complete' if cleaned else 'failed' if exited else 'unconfirmed'
+                      else:
+                          # Only an explicit runner receipt proves that offline
+                          # analysis was never entered. Absence alone proves no exit.
+                          if cleanup_errors is not None and cleanup.get('processes_exited') is False:
+                              image_cleanup = 'not-run'
+                              artifact_cleanup = 'not-run'
+                      if cleanup_errors is None or 'terminal_snapshot' in cleanup_errors:
+                          artifact_cleanup = 'failed'
+                      gate_cleanup = directory / 'terminal-image-upload-worker.json'
+                      if not process_run['cleanup']['complete']:
+                          image_cleanup = 'unconfirmed'
+                      image_error = (ImageWorkerCleanupError() if image_cleanup == 'unconfirmed' else
+                                     ImageWorkerArtifactError() if artifact_cleanup == 'failed' else None)
+                      if image_error is None and image_cleanup != 'not-run':
+                          try:
+                              write_worker_cleanup(gate_cleanup, True)
+                          except ImageWorkerArtifactError as error:
+                              image_error = error
+                              artifact_cleanup = 'failed'
                       terminal_file = records / 'terminal-snapshot.json'
                       if terminal_file.is_file() and not terminal_file.is_symlink() and terminal_file.stat().st_size <= 65536:
                           try:
                               terminal = json.loads(terminal_file.read_text())
-                              validate_terminal_snapshot(terminal)
+                              if image_cleanup == 'not-run' and (type(terminal) is not dict or terminal.get('analysis_status') != 'not-run'):
+                                  raise ValueError('Unexpected offline analysis')
+                              try:
+                                  validate_terminal_snapshot(terminal, None if image_cleanup == 'not-run' else gate_cleanup, image_error)
+                              except ImageWorkerCleanupError:
+                                  # Validation finished and removed unverifiable
+                                  # optional identities. Preserve the old terminal.
+                                  image_cleanup = 'unconfirmed'
+                                  artifact_cleanup = 'unconfirmed'
+                              except ImageWorkerArtifactError:
+                                  artifact_cleanup = 'failed'
                           except (ValueError, TypeError, KeyError):
                               pass
                           else:
@@ -490,11 +547,17 @@ jobs:
                                           and not row['stack']['unparsed_lines'] for row in rows))
                               receipt.update(terminal_snapshot_available=True, terminal_snapshot=terminal,
                                              terminal_snapshot_checks_passed=usable)
-                      terminal_failed |= not receipt['terminal_snapshot_checks_passed']
+                      receipt['terminal_image_worker_cleanup'] = image_cleanup
+                      receipt['terminal_image_worker_artifact_cleanup'] = artifact_cleanup
+                      terminal_failed |= (not receipt['terminal_snapshot_checks_passed'] or image_cleanup == 'unconfirmed'
+                                          or artifact_cleanup == 'failed')
                   print(json.dumps(receipt, separators=(',', ':')), flush=True)
                   public_summary['trials'].append(receipt)
+                  public_summary['strict_checks_passed'] = not failed
+                  if terminal_origin:
+                      public_summary['terminal_snapshot_checks_passed'] = not terminal_failed
                   summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
-                  if not process_run['cleanup']['complete']:
+                  if not process_run['cleanup']['complete'] or terminal_origin and (image_cleanup == 'unconfirmed' or artifact_cleanup == 'failed'):
                       # Do not contaminate another case when group exit is unknown.
                       raise SystemExit(1)
           public_summary['completed'] = True

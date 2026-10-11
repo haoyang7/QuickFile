@@ -645,6 +645,120 @@ class AXTerminalSnapshotTests(unittest.TestCase):
                 self.assertEqual(identity["reason_counts"][reason], 2 if fresh is None else 1)
                 self.assertEqual(identity["status"], "partial")
 
+    def test_collection_saves_old_terminal_before_fatal_worker_cleanup_and_never_starts_next_helper(self):
+        reports, catalog = self.image_reports()
+        images = REPORT.ax_system_images
+        with mock.patch.object(images, "loaded_system_images", return_value=catalog):
+            baseline = self.summary(reports)
+        for failed_call in (1, 2):
+            with self.subTest(failed_call=failed_call), tempfile.TemporaryDirectory() as directory:
+                records = pathlib.Path(directory)
+                capture = REPORT.empty_terminal_snapshot()
+                capture.update(capture_status="complete", capture_exit_code=0)
+                outputs = [subprocess.CompletedProcess([], 1, text, "") for text in reports]
+                calls = []
+                original_error = images.ImageWorkerCleanupError()
+                def load(path):
+                    calls.append(path)
+                    if len(calls) == failed_call:
+                        images.write_worker_cleanup(path, False)
+                        raise original_error
+                    return catalog
+                with mock.patch.object(REPORT.subprocess, "run", side_effect=outputs), \
+                        mock.patch.object(images, "loaded_system_images", side_effect=load), \
+                        mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), \
+                        self.assertRaises(images.ImageWorkerCleanupError) as raised:
+                    REPORT.collect_terminal_snapshot(records / "terminal.memgraph", records, capture)
+                self.assertIs(raised.exception, original_error)
+                self.assertEqual(len(calls), failed_call)
+                value = json.loads((records / "terminal-snapshot.json").read_text())
+                self.assertEqual(self.without_image_identity(value), self.without_image_identity(baseline))
+                identity = value["root_groups"][0]["other_image_identity"]
+                self.assertEqual(identity["frames"], [])
+                self.assertEqual(identity["reason_counts"]["local_catalog_unavailable"], 2)
+                self.assertFalse(images.worker_cleanup_confirmed(records / "terminal-image-worker.json"))
+
+    def test_collection_artifact_cleanup_failure_saves_safe_old_terminal_and_confirmed_exit(self):
+        reports, catalog = self.image_reports()
+        images = REPORT.ax_system_images
+        with mock.patch.object(images, "loaded_system_images", return_value=catalog):
+            baseline = self.summary(reports)
+        for fail_during_gate in (False, True):
+            with self.subTest(fail_during_gate=fail_during_gate), tempfile.TemporaryDirectory() as directory:
+                records = pathlib.Path(directory)
+                capture = REPORT.empty_terminal_snapshot()
+                capture.update(capture_status="complete", capture_exit_code=0)
+                calls = []
+                def run(command, log, environment, timeout):
+                    calls.append(command)
+                    log.write_text("")
+                    pathlib.Path(command[-1]).write_text(json.dumps({"schema": 1, "images": list(catalog.values())}))
+                    return {"status": "completed", "return_code": 0, "cleanup": {"complete": True}}
+                remove = shutil.rmtree
+                def clean(path):
+                    if len(calls) == (2 if fail_during_gate else 1):
+                        raise PermissionError(13, "/private/secret")
+                    remove(path)
+                with mock.patch.object(images, "WORKER_ROOT", records), \
+                        mock.patch.object(images.ax_process, "run_owned", side_effect=run), \
+                        mock.patch.object(images.shutil, "rmtree", side_effect=clean), \
+                        mock.patch.object(REPORT.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 1, text, "") for text in reports]), \
+                        mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), \
+                        self.assertRaises(images.ImageWorkerArtifactError) as raised:
+                    REPORT.collect_terminal_snapshot(records / "terminal.memgraph", records, capture)
+                self.assertNotIn("private", str(raised.exception))
+                self.assertEqual(len(calls), 2 if fail_during_gate else 1)
+                self.assertEqual(images.worker_cleanup_state(records / "terminal-image-worker.json"), (True, False))
+                self.assertEqual(len(list(records.glob("ax-system-images-*"))), 1)
+                value = json.loads((records / "terminal-snapshot.json").read_text())
+                self.assertEqual(self.without_image_identity(value), self.without_image_identity(baseline))
+                self.assertEqual(value["root_groups"][0]["other_image_identity"]["frames"], [])
+
+    def test_collection_initial_receipt_write_failure_still_saves_terminal_without_retry(self):
+        reports, _ = self.image_reports()
+        images = REPORT.ax_system_images
+        write = pathlib.Path.write_text
+        writes = []
+        def save(path, data, *args, **kwargs):
+            if path.name == "terminal-image-worker.json":
+                writes.append(path)
+                raise PermissionError(13, "/private/secret")
+            return write(path, data, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as directory:
+            records = pathlib.Path(directory)
+            capture = REPORT.empty_terminal_snapshot()
+            capture.update(capture_status="complete", capture_exit_code=0)
+            with mock.patch.object(pathlib.Path, "write_text", new=save), \
+                    mock.patch.object(images, "loaded_system_images") as load, \
+                    mock.patch.object(REPORT.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 1, text, "") for text in reports]), \
+                    mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), self.assertRaises(images.ImageWorkerArtifactError) as raised:
+                REPORT.collect_terminal_snapshot(records / "terminal.memgraph", records, capture)
+            load.assert_not_called()
+            self.assertEqual(len(writes), 1)
+            self.assertNotIn("private", str(raised.exception))
+            value = json.loads((records / "terminal-snapshot.json").read_text())
+            self.assertEqual((value["leak_nodes"], value["leak_bytes"]), (2, 144))
+            self.assertEqual(value["root_groups"][0]["other_image_identity"]["frames"], [])
+
+    def test_unconfirmed_cleanup_never_bypasses_structure_or_symbol_gate(self):
+        reports, catalog = self.image_reports()
+        images = REPORT.ax_system_images
+        with mock.patch.object(images, "loaded_system_images", return_value=catalog):
+            baseline = self.summary(reports)
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = pathlib.Path(directory) / "cleanup.json"
+            images.write_worker_cleanup(receipt, False)
+            for mutation in (lambda value: value.update(private="secret"),
+                             lambda value: value["root_groups"][0]["other_image_identity"]["frames"][0].update(basename="/private/secret"),
+                             lambda value: value["root_groups"][0]["stack"]["frames"][0].update(symbol="/private/secret")):
+                value = json.loads(json.dumps(baseline)); mutation(value)
+                before = json.dumps(value)
+                with mock.patch.object(images, "loaded_system_images") as load, \
+                        mock.patch.object(REPORT, "SystemSymbols", return_value=self.resolver()), self.assertRaises(ValueError):
+                    REPORT.validate_terminal_snapshot(value, receipt)
+                load.assert_not_called()
+                self.assertEqual(json.dumps(value), before)
+
     def test_other_root_images_keep_bounded_failure_reasons_separate_from_stack_coverage(self):
         images = REPORT.ax_system_images
         identifier = "12345678-1234-1234-1234-123456789ABC"
@@ -1975,6 +2089,29 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     self.assertEqual(code, int(failed is not None))
                     self.assertEqual(summary["coverage"], "failed" if failed else "passed")
 
+    def test_image_worker_cleanup_failure_retains_strict_and_primary_errors(self):
+        collect = PROBE.collect_terminal_snapshot
+        def fail_after_saving(graph, records, capture):
+            value = collect(graph, records, capture)
+            self.assertEqual(json.loads((records / "terminal-snapshot.json").read_text()), value)
+            REPORT.ax_system_images.write_worker_cleanup(records / "terminal-image-worker.json",
+                error_type is REPORT.ax_system_images.ImageWorkerArtifactError, False)
+            raise error_type()
+        for error_type, reader_failure in itertools.product(
+                (REPORT.ax_system_images.ImageWorkerCleanupError, REPORT.ax_system_images.ImageWorkerArtifactError), (None, {"reader": "kill"})):
+            with self.subTest(error_type=error_type.__name__, reader_failure=reader_failure), \
+                    mock.patch.object(PROBE, "collect_terminal_snapshot", side_effect=fail_after_saving) as collection:
+                code, summary = self.exercise_runner(failed_scan="registered-10", terminal_origin=True,
+                    external_receipt=True, malloc_scribble="off", cleanup_failure=reader_failure)
+            collection.assert_called_once()
+            self.assertEqual(code, 1)
+            self.assertEqual(summary["coverage"], "failed")
+            self.assertIn("registered-10", [error["stage"] for error in summary["validation_errors"]])
+            self.assertIn("terminal_snapshot", summary["cleanup"]["errors"])
+            self.assertEqual(summary["cleanup"]["primary_exception"], reader_failure is not None)
+            self.assertEqual(sum(error["stage"] == "execution" for error in summary["validation_errors"]), int(reader_failure is not None))
+            self.assertTrue(summary["cleanup"]["processes_exited"])
+
     def test_allocation_tool_failure_does_not_replace_product_exit_code(self):
         for stage in (None, "registered-10"):
             with self.subTest(stage=stage):
@@ -2211,6 +2348,212 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
             self.assertEqual(identity["reason_counts"][reason], 2 if fresh is None else 1)
             self.assertEqual(identity["status"], "partial")
 
+    def test_terminal_worker_unknown_exit_saves_strict_failure_and_blocks_next_case(self):
+        reports, catalog = AXTerminalSnapshotTests.image_reports()
+        images = REPORT.ax_system_images
+        with mock.patch.object(images, "loaded_system_images", return_value=catalog):
+            terminal = AXTerminalSnapshotTests.summary(reports)
+        for failure in ("collection", "fresh", "missing"):
+            def fail(path):
+                images.write_worker_cleanup(path, False)
+                raise images.ImageWorkerCleanupError()
+            with self.subTest(failure=failure), mock.patch.object(images, "loaded_system_images", side_effect=fail) as load:
+                invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                    terminal_origin=True, first_failure="strict", image_cleanup_failure=failure,
+                    first_terminal_change=lambda value: value.update(json.loads(json.dumps(terminal))))
+            self.assertEqual(load.call_count, int(failure == "fresh"))
+            self.assertEqual(invocations, [("off", "control")])
+            self.assertFalse(summary["strict_checks_passed"])
+            first = summary["trials"][0]
+            self.assertEqual(first["return_code"], 1)
+            self.assertEqual(first["validation_failure_counts"]["heap_baseline"], 1)
+            self.assertEqual(first["validation_failure_counts"]["notifications"], 1)
+            self.assertEqual(len(first["scan_totals"]), 6)
+            self.assertTrue(first["terminal_snapshot_checks_passed"])  # Old extraction verdict is unchanged.
+            self.assertFalse(summary["terminal_snapshot_checks_passed"])  # Cleanup is an independent hard failure.
+            self.assertEqual(AXTerminalSnapshotTests.without_image_identity(first["terminal_snapshot"]),
+                             AXTerminalSnapshotTests.without_image_identity(terminal))
+            identity = first["terminal_snapshot"]["root_groups"][0]["other_image_identity"]
+            self.assertEqual(identity["frames"], [])
+            self.assertEqual(identity["reason_counts"]["local_catalog_unavailable"], 2)
+
+    def test_terminal_artifact_failures_keep_confirmed_exit_strict_failure_and_safe_evidence(self):
+        reports, catalog = AXTerminalSnapshotTests.image_reports()
+        images = REPORT.ax_system_images
+        with mock.patch.object(images, "loaded_system_images", return_value=catalog):
+            terminal = AXTerminalSnapshotTests.summary(reports)
+        for failure in ("collection-artifact", "fresh-artifact", "gate-write"):
+            def fail(path):
+                images.write_worker_cleanup(path, True, False)
+                raise images.ImageWorkerArtifactError() from PermissionError(13, "/private/secret")
+            write = pathlib.Path.write_text
+            writes = []
+            def save(path, data, *args, **kwargs):
+                if failure == "gate-write" and path.name == "terminal-image-upload-worker.json":
+                    writes.append(path)
+                    raise PermissionError(13, "/private/secret")
+                return write(path, data, *args, **kwargs)
+            with self.subTest(failure=failure), mock.patch.object(images, "loaded_system_images", side_effect=fail) as load, \
+                    mock.patch.object(pathlib.Path, "write_text", new=save):
+                invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                    terminal_origin=True, first_failure="strict", image_cleanup_failure=failure,
+                    first_terminal_change=lambda value: value.update(json.loads(json.dumps(terminal))))
+            self.assertEqual(load.call_count, int(failure == "fresh-artifact"))
+            self.assertEqual(len(writes), int(failure == "gate-write"))
+            self.assertEqual(invocations, [("off", "control")])
+            self.assertFalse(summary["strict_checks_passed"])
+            first = summary["trials"][0]
+            self.assertEqual(first["terminal_image_worker_cleanup"], "confirmed")
+            self.assertEqual(first["terminal_image_worker_artifact_cleanup"], "failed")
+            self.assertEqual(first["validation_failure_counts"]["heap_baseline"], 1)
+            self.assertEqual(first["validation_failure_counts"]["notifications"], 1)
+            self.assertEqual(len(first["scan_totals"]), 6)
+            self.assertTrue(first["terminal_snapshot_checks_passed"])
+            self.assertFalse(summary["terminal_snapshot_checks_passed"])
+            self.assertEqual(AXTerminalSnapshotTests.without_image_identity(first["terminal_snapshot"]),
+                             AXTerminalSnapshotTests.without_image_identity(terminal))
+            self.assertEqual(first["terminal_snapshot"]["root_groups"][0]["other_image_identity"]["frames"], [])
+
+    def test_collection_stage_overrides_stale_success_before_first_or_fresh_helper(self):
+        reports, catalog = AXTerminalSnapshotTests.image_reports()
+        images = REPORT.ax_system_images
+        for failed_write in (1, 2):
+            with self.subTest(failed_write=failed_write), tempfile.TemporaryDirectory() as directory:
+                records = pathlib.Path(directory)
+                capture = REPORT.empty_terminal_snapshot()
+                capture.update(capture_status="complete", capture_exit_code=0)
+                write = pathlib.Path.write_text
+                attempts = []
+                def save(path, data, *args, **kwargs):
+                    if path.name == "terminal-image-worker.json" and json.loads(data)["cleanup_confirmed"] is False:
+                        attempts.append(path)
+                        if len(attempts) == failed_write:
+                            raise PermissionError(13, "/private/secret")
+                    return write(path, data, *args, **kwargs)
+                def run(command, log, environment, timeout):
+                    log.write_text("")
+                    pathlib.Path(command[-1]).write_text(json.dumps({"schema": 1, "images": list(catalog.values())}))
+                    return {"status": "completed", "return_code": 0, "cleanup": {"complete": True}}
+                with mock.patch.object(images, "WORKER_ROOT", records), \
+                        mock.patch.object(images.ax_process, "run_owned", side_effect=run) as owned, \
+                        mock.patch.object(pathlib.Path, "write_text", new=save), \
+                        mock.patch.object(REPORT.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 1, text, "") for text in reports]), \
+                        mock.patch.object(REPORT, "SystemSymbols", return_value=AXTerminalSnapshotTests.resolver()), \
+                        self.assertRaises(images.ImageWorkerArtifactError) as raised:
+                    REPORT.collect_terminal_snapshot(records / "terminal.memgraph", records, capture)
+                self.assertEqual(owned.call_count, failed_write - 1)
+                self.assertEqual(len(attempts), failed_write)
+                self.assertNotIn("private", str(raised.exception))
+                self.assertEqual(images.worker_cleanup_state(records / "terminal-image-worker.json"), (True, True))
+                self.assertEqual(list(records.glob("ax-system-images-*")), [])
+                terminal = json.loads((records / "terminal-snapshot.json").read_text())
+                self.assertEqual((terminal["leak_nodes"], terminal["leak_bytes"]), (2, 144))
+                # The runner's existing cleanup_step records this fixed stage.
+                # Pass the actual collector files across the persisted boundary.
+                def transfer(destination):
+                    for name in ("terminal-image-worker.json", "terminal-snapshot.json"):
+                        (destination / name).write_bytes((records / name).read_bytes())
+                    PROBE.write_json(destination / "process-cleanup.json",
+                                     {"processes_exited": True, "errors": ["terminal_snapshot"]})
+                    result = json.loads((destination / "result.json").read_text())
+                    result["validation_errors"].append({"stage": "cleanup", "message": "terminal_snapshot"})
+                    PROBE.write_json(destination / "result.json", result)
+                with mock.patch.object(images, "loaded_system_images", return_value=catalog) as upload:
+                    invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                        terminal_origin=True, first_failure="strict", image_cleanup_failure="collection-stage",
+                        first_records_change=transfer)
+                upload.assert_not_called()
+                self.assertEqual(invocations, [("off", "control")])
+                first = summary["trials"][0]
+                self.assertEqual(first["terminal_image_worker_cleanup"], "confirmed")
+                self.assertEqual(first["terminal_image_worker_artifact_cleanup"], "failed")
+                self.assertEqual(first["terminal_snapshot"], terminal)
+                self.assertTrue(first["terminal_snapshot_checks_passed"])
+                self.assertFalse(summary["terminal_snapshot_checks_passed"])
+                self.assertFalse(summary["strict_checks_passed"])
+                self.assertEqual(first["validation_failure_counts"]["heap_baseline"], 1)
+                self.assertEqual(first["validation_failure_counts"]["notifications"], 1)
+                self.assertEqual(first["validation_failure_counts"]["other"], 1)
+                self.assertEqual([scan["label"] for scan in first["scan_totals"]],
+                                 [label for label in REPORT.HEAP_LABELS if label != "added-10"])
+
+    def test_terminal_cleanup_stage_receipt_is_bounded_and_fail_closed(self):
+        reports, catalog = AXTerminalSnapshotTests.image_reports()
+        images = REPORT.ax_system_images
+        with mock.patch.object(images, "loaded_system_images", return_value=catalog):
+            terminal = AXTerminalSnapshotTests.summary(reports)
+        failures = [{"errors": ["terminal_snapshot"]}, None, [], {}, {"errors": None}, {"errors": "terminal_snapshot"},
+                     {"errors": [True]}, {"errors": ["/private/secret"]}, {"errors": [{}]},
+                     {"errors": ["terminal_snapshot"] * 17}, "missing", "oversize", "directory", "symlink"]
+        for cleanup in failures:
+            def change(records):
+                path = records / "process-cleanup.json"
+                if cleanup in ("missing", "directory", "symlink"):
+                    path.unlink()
+                    if cleanup == "directory":
+                        path.mkdir()
+                    elif cleanup == "symlink":
+                        target = records / "private-cleanup.json"
+                        PROBE.write_json(target, {"errors": []})
+                        path.symlink_to(target)
+                elif cleanup == "oversize":
+                    path.write_text(json.dumps({"errors": [], "private": "secret" * 700}))
+                else:
+                    PROBE.write_json(path, cleanup)
+            with self.subTest(cleanup=cleanup), mock.patch.object(images, "loaded_system_images", return_value=catalog) as upload:
+                _, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                    terminal_origin=True, first_failure="strict", image_cleanup_failure="collection-stage",
+                    first_terminal_change=lambda value: value.update(json.loads(json.dumps(terminal))), first_records_change=change)
+            upload.assert_not_called()
+            first = summary["trials"][0]
+            self.assertEqual(first["terminal_image_worker_artifact_cleanup"], "failed")
+            self.assertEqual(AXTerminalSnapshotTests.without_image_identity(first["terminal_snapshot"]),
+                             AXTerminalSnapshotTests.without_image_identity(terminal))
+            self.assertEqual(first["terminal_snapshot"]["root_groups"][0]["other_image_identity"]["frames"], [])
+            self.assertEqual(first["validation_failure_counts"]["heap_baseline"], 1)
+            self.assertEqual(len(first["scan_totals"]), 6)
+
+    def test_terminal_stage_does_not_bypass_structure_gate_or_infer_from_other_errors(self):
+        images = REPORT.ax_system_images
+        with mock.patch.object(images, "loaded_system_images") as load:
+            _, invalid = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                terminal_origin=True, first_failure="strict", image_cleanup_failure="collection-stage",
+                first_terminal_change=lambda value: value.update(private="secret"),
+                first_records_change=lambda records: PROBE.write_json(records / "process-cleanup.json",
+                    {"errors": ["terminal_snapshot"], "processes_exited": True}))
+        load.assert_not_called()
+        self.assertNotIn("terminal_snapshot", invalid["trials"][0])
+        reports, catalog = AXTerminalSnapshotTests.image_reports()
+        with mock.patch.object(images, "loaded_system_images", return_value=catalog):
+            terminal = AXTerminalSnapshotTests.summary(reports)
+        with mock.patch.object(images, "loaded_system_images", return_value=catalog) as load:
+            invocations, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                terminal_origin=True, first_failure="strict",
+                first_terminal_change=lambda value: value.update(terminal),
+                first_records_change=lambda records: PROBE.write_json(records / "process-cleanup.json",
+                    {"errors": ["launch_services"], "processes_exited": True}))
+        load.assert_called_once()
+        self.assertEqual(invocations, [("off", "control"), ("off", "product")])
+        self.assertEqual(summary["trials"][0]["terminal_image_worker_artifact_cleanup"], "complete")
+        self.assertFalse(summary["strict_checks_passed"])
+
+    def test_terminal_worker_unknown_exit_does_not_publish_malformed_old_evidence(self):
+        with mock.patch.object(REPORT.ax_system_images, "loaded_system_images") as load:
+            _, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                terminal_origin=True, first_failure="strict", image_cleanup_failure="collection",
+                first_terminal_change=lambda value: value.update(private="secret"))
+        load.assert_not_called()
+        self.assertNotIn("terminal_snapshot", summary["trials"][0])
+        self.assertEqual(summary["trials"][0]["validation_failure_counts"]["heap_baseline"], 1)
+
+    def test_no_offline_analysis_is_not_reported_as_a_started_worker(self):
+        with mock.patch.object(REPORT.ax_system_images, "loaded_system_images") as load:
+            _, summary = self.run_measurement(scan_mode="live", receipt_mode="external-startup",
+                terminal_origin=True, first_failure="strict", image_cleanup_failure="not-run")
+        load.assert_not_called()
+        self.assertEqual(summary["trials"][0]["terminal_image_worker_cleanup"], "not-run")
+        self.assertTrue(summary["completed"])
+
     def test_terminal_ledger_does_not_turn_omitted_groups_or_strict_failures_into_success(self):
         for groups, failure in ((96, None), (96, "strict"), (128, "terminal-omitted"), (128, "strict")):
             terminal = AXTerminalSnapshotTests.summary(AXTerminalSnapshotTests.many_group_reports(groups))
@@ -2311,7 +2654,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
 
     def run_measurement(self, *, enabled=True, first_failure=None, scan_mode="diagnostic", unexpected_diagnostics=False,
                         first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False, install_control=False,
-                        first_startup_failures=None):
+                        first_startup_failures=None, image_cleanup_failure=None, first_records_change=None):
         script = self.workflow_script("Measure matched cases with strict heap checks")
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
@@ -2377,6 +2720,16 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         test.assertEqual(kwargs["env"]["MallocScribble"], "inherited-secret")
                     records = pathlib.Path(command[command.index("--records-directory") + 1])
                     records.mkdir()
+                    if terminal_origin:
+                        PROBE.write_json(records / "process-cleanup.json", {"processes_exited": True, "errors": []})
+                        # This fake runner explicitly enters offline collection,
+                        # except the case proving a still-live host never did.
+                        if not self.first or image_cleanup_failure not in ("missing", "not-run"):
+                            REPORT.ax_system_images.write_worker_cleanup(records / "terminal-image-worker.json",
+                                not (self.first and image_cleanup_failure == "collection"),
+                                not (self.first and image_cleanup_failure in ("collection", "collection-artifact")))
+                        if self.first and image_cleanup_failure == "not-run":
+                            PROBE.write_json(records / "process-cleanup.json", {"processes_exited": False, "errors": []})
                     if self.first and first_failure == "timeout":
                         return
                     expected = "1" if setting == "on" else "unset"
@@ -2460,6 +2813,8 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         first_scan_change(scans[0])
                     PROBE.write_json(records / "scans.json", scans)
                     result = {"coverage": "passed"}
+                    if terminal_origin and self.first and image_cleanup_failure == "not-run":
+                        PROBE.write_json(records / "terminal-snapshot.json", REPORT.empty_terminal_snapshot())
                     if self.first and first_failure == "strict":
                         result.update(coverage="failed", validation_errors=[{"stage": "registered-10", "message": "/private/secret"},
                             {"stage": "notifications", "message": "/private/secret"}])
@@ -2468,6 +2823,8 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     PROBE.write_json(records / "result.json", result)
                     # Raw records and arbitrary fields must never enter the public artifact.
                     (records / "host.log").write_text("private-raw-host-data")
+                    if self.first and first_records_change:
+                        first_records_change(records)
 
                 def wait(self, timeout):
                     if self.build and first_failure == "build-timeout" and timeout == 180:
@@ -2508,7 +2865,15 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 self.assertEqual(summary["trials"], [])
                 self.assertEqual(invocations, [])
                 return invocations, summary
-            self.assertEqual(result.exception.code, int(first_failure is not None))
+            self.assertEqual(result.exception.code, int(first_failure is not None or image_cleanup_failure is not None))
+            if image_cleanup_failure in ("collection", "fresh", "missing", "collection-artifact", "fresh-artifact", "gate-write", "collection-stage"):
+                self.assertFalse(summary["completed"])
+                self.assertEqual(len(invocations), 1)
+                self.assertEqual(len(summary["trials"]), 1)
+                self.assertEqual(summary["trials"][0]["terminal_image_worker_cleanup"],
+                    "confirmed" if image_cleanup_failure in ("collection-artifact", "fresh-artifact", "gate-write", "collection-stage") else "unconfirmed")
+                self.assertNotIn("secret", output.getvalue() + summary_file.read_text())
+                return invocations, summary
             if first_failure == "cleanup":
                 self.assertFalse(summary["completed"])
                 self.assertEqual(len(invocations), 1)

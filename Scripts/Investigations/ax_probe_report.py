@@ -623,7 +623,10 @@ def terminal_other_images(frames, context, budget):
             reasons["report_uuid_ambiguous"] += 1
         else:
             if "catalog" not in context:
-                context["catalog"] = ax_system_images.loaded_system_images()
+                try:
+                    context["catalog"] = ax_system_images.loaded_system_images(context.get("cleanup_path"))
+                except (ax_system_images.ImageWorkerCleanupError, ax_system_images.ImageWorkerArtifactError) as error:
+                    context["catalog"], context["cleanup_error"] = None, error
             catalog = context["catalog"]
             if catalog is None:
                 reasons["local_catalog_unavailable"] += 1
@@ -636,7 +639,7 @@ def terminal_other_images(frames, context, budget):
             "frames": public, "reason_counts": reasons}
 
 
-def terminal_snapshot_summary(grouped, listed, resolver):
+def terminal_snapshot_summary(grouped, listed, resolver, image_worker_receipt=None, image_worker_error=None):
     """Parse observed leaks v4 grouped/v3 list syntax, without a node-to-root join.
 
     A grouped header owns the stack immediately before its tree. The list view
@@ -644,6 +647,7 @@ def terminal_snapshot_summary(grouped, listed, resolver):
     Unknown formatting fails closed instead of guessing NSXPC-specific syntax.
     """
     result = empty_terminal_snapshot()
+    image_context = {}
     try:
         reports = []
         for text in (grouped, listed):
@@ -710,6 +714,9 @@ def terminal_snapshot_summary(grouped, listed, resolver):
             image_context = {"ranges": ax_system_images.report_images(grouped)}
         except ValueError:
             image_context = {"ranges": None}
+        image_context["cleanup_path"] = image_worker_receipt
+        if image_worker_error is not None:
+            image_context.update(catalog=None, cleanup_error=image_worker_error)
         for root in roots[:TERMINAL_ROOT_LIMIT]:
             frames, unparsed = root.pop("private_stack")
             # Fixed report-label buckets explain the image prefilter, without
@@ -742,6 +749,10 @@ def terminal_snapshot_summary(grouped, listed, resolver):
     except (ValueError, TypeError):
         # No partially interpreted raw text or unsafely associated frames escape.
         result = empty_terminal_snapshot()
+    if "cleanup_error" in image_context:
+        error = image_context["cleanup_error"]
+        error.snapshot = result
+        raise error
     return result
 
 
@@ -763,6 +774,12 @@ def capture_terminal_snapshot(pid, graph):
 def collect_terminal_snapshot(graph, records, capture):
     """Called only after the host exits; bounded tools consume the single graph."""
     result = dict(capture)
+    cleanup_path = records / "terminal-image-worker.json"
+    cleanup_error = None
+    try:
+        ax_system_images.write_worker_cleanup(cleanup_path, True)
+    except ax_system_images.ImageWorkerArtifactError as error:
+        cleanup_error = error
     if result["capture_status"] == "complete":
         deadline = time.monotonic() + TERMINAL_SECONDS
         codes, reports = dict(result["tool_exit_codes"]), {}
@@ -780,7 +797,11 @@ def collect_terminal_snapshot(graph, records, capture):
                     analysis_status = "failed"
                 reports[name] = output.stdout
             if analysis_status == "complete":
-                result.update(terminal_snapshot_summary(reports["grouped"], reports["list"], SystemSymbols()))
+                try:
+                    result.update(terminal_snapshot_summary(reports["grouped"], reports["list"], SystemSymbols(), cleanup_path, cleanup_error))
+                except (ax_system_images.ImageWorkerCleanupError, ax_system_images.ImageWorkerArtifactError) as error:
+                    result.update(error.snapshot)
+                    cleanup_error = error
         except subprocess.TimeoutExpired:
             analysis_status = "timeout"
         except OSError:
@@ -789,12 +810,17 @@ def collect_terminal_snapshot(graph, records, capture):
                       analysis_status=analysis_status, tool_exit_codes=codes)
     result["status"] = ("unavailable" if result["parsing_status"] != "complete" else
                         "complete" if result["stacks_status"] == "complete" else "partial")
-    validate_terminal_snapshot(result)
+    try:
+        validate_terminal_snapshot(result, cleanup_path, cleanup_error)
+    except (ax_system_images.ImageWorkerCleanupError, ax_system_images.ImageWorkerArtifactError) as error:
+        cleanup_error = cleanup_error or error
     (records / "terminal-snapshot.json").write_text(json.dumps(result, indent=2) + "\n")
+    if cleanup_error is not None:
+        raise cleanup_error
     return result
 
 
-def validate_terminal_snapshot(value):
+def validate_terminal_snapshot(value, image_worker_receipt=None, image_worker_error=None):
     """Validate all fields, then prune only unverified image identities in place.
 
     The symbol gate is unchanged. A fresh image catalog failure cannot discard
@@ -930,8 +956,19 @@ def validate_terminal_snapshot(value):
     # Do not repair malformed input. Only after the entire original object has
     # passed validation may this optional evidence be normalized. Both callers
     # publish this same object. One fresh worker serves all roots, even on None.
+    cleanup_error = image_worker_error
+    image_catalog = None
+    exited, artifacts_cleaned = ax_system_images.worker_cleanup_state(image_worker_receipt)
+    if cleanup_error is None and not exited:
+        cleanup_error = ax_system_images.ImageWorkerCleanupError()
+    elif cleanup_error is None and not artifacts_cleaned:
+        cleanup_error = ax_system_images.ImageWorkerArtifactError()
+    if cleanup_error is None and image_identities:
+        try:
+            image_catalog = ax_system_images.loaded_system_images(image_worker_receipt)
+        except (ax_system_images.ImageWorkerCleanupError, ax_system_images.ImageWorkerArtifactError) as error:
+            cleanup_error = error
     if image_identities:
-        image_catalog = ax_system_images.loaded_system_images()
         for identity in image_identities:
             retained = []
             for frame in identity["frames"]:
@@ -944,6 +981,8 @@ def validate_terminal_snapshot(value):
                 else:
                     retained.append(frame)
             identity["frames"] = retained
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def disassemble_symbols(state, work, records):
