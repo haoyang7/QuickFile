@@ -53,7 +53,9 @@ xcodebuild \
 
 ## 安装与使用
 
-1. 核对候选版本、签名和校验和，备份用户数据和现有安装，退出旧版 QuickFile。Community 构建打开 DMG，将 `QuickFile.app` 拖到“应用程序”后推出镜像；证书签名构建将构建目录中的 `Build/Products/Release/QuickFile.app` 安装到 `/Applications`。
+Community DMG 只从 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 对应发布页取得；仅以该页列出的资产、校验和及发布说明声明的验证范围为依据，没有对应发布页时不视为该候选已经发布。
+
+1. 核对候选版本、签名和校验和，备份用户数据和现有安装，退出旧版 QuickFile。Community 打开 DMG 后将 `QuickFile.app` 拖到“应用程序”并推出镜像；证书签名构建安装 `Build/Products/Release/QuickFile.app`。
 2. 启动 QuickFile，在系统扩展设置中启用 Finder 扩展。在主应用选择目标目录，或首次从 Finder 创建时通过系统面板授权。
 3. 在 Finder 文件夹背景右键，选择“新建文件 → Markdown”，确认生成并选中 `未命名.md`。
 4. 升级后核对实际加载的主应用和扩展版本。旧扩展仍在运行时，保存当前工作后重新启动 Finder，再验证菜单。

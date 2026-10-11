@@ -33,6 +33,85 @@ python3 Scripts/verify-community-artifact.py \
 
 校验和用于检查下载字节是否一致，ad-hoc 签名用于检查包的内部完整性；二者不能证明发布者身份。分发页应使用固定 HTTPS 地址并提供对应版本说明与校验和。
 
+## GitHub Releases 发布流程
+
+GitHub Releases 只承载维护者手动发布的 community 候选，不是 CI 产物下载、自动更新或准入判断流程。正式 v0.1 只有在[发布清单](RELEASE_CHECKLIST.md)的全部 P0 已在同一候选上补齐，且没有待测、受阻或不通过时才能发布。实验预发布若保留缺口，维护者必须在候选记录和发布说明中逐项写明并明确接受；这不改变正式版 P0 门槛。`artifact-check.json` 只证明产物层，artifact-only 回执、签名完整或绿色 CI 均不能直接放行。
+
+先固定唯一的源码提交、标签、营销版本和 build；标签必须已经指向该提交，工作区保持干净，DMG 文件名和 `artifact-check.json` 中的版本/build 必须一致：
+
+```bash
+set -euo pipefail
+TAG='v0.1.0'  # use v0.1.0-beta.1 for an experimental prerelease
+# Replace these values with the fixed candidate commit and build.
+COMMIT='REPLACE_WITH_EXACT_40_CHARACTER_COMMIT_SHA'
+VERSION=0.1.0
+BUILD='REPLACE_WITH_EXACT_CFBUNDLEVERSION'
+OUTPUT=.build/Packages/community-candidate
+DMG="QuickFile-community-${VERSION}-${BUILD}.dmg"
+
+test "$(git rev-parse --verify "$COMMIT^{commit}")" = "$COMMIT"
+test "$(git rev-parse --verify "$TAG^{commit}")" = "$COMMIT"
+test "$(gh api "repos/haoyang7/QuickFile/commits/$TAG" --jq .sha)" = "$COMMIT"
+test "$(git rev-parse HEAD)" = "$COMMIT"
+test -z "$(git status --porcelain)"
+./Scripts/build-community.sh --output "$OUTPUT"
+test -z "$(git status --porcelain)"
+test -f "$OUTPUT/$DMG"
+test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$OUTPUT/artifact-check.json")" = "$VERSION"
+test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["build"])' "$OUTPUT/artifact-check.json")" = "$BUILD"
+```
+
+用固定标签创建草稿并一次上传四项资产：
+
+```bash
+# Stable v0.1.0 or a distinct v0.1.0-beta.N experimental prerelease.
+if [[ "$TAG" == 'v0.1.0' ]]; then
+  PRERELEASE_ARGS=()
+  EXPECTED_PRERELEASE=false
+elif [[ "$TAG" =~ ^v0\.1\.0-beta\.[0-9]+$ ]]; then
+  PRERELEASE_ARGS=(--prerelease)
+  EXPECTED_PRERELEASE=true
+else
+  echo "error: use v0.1.0 or a v0.1.0-beta.N tag" >&2
+  exit 2
+fi
+RELEASE_NOTES=.build/Temporary/community-release-notes.md
+test -s "$RELEASE_NOTES"
+gh release create "$TAG" --repo haoyang7/QuickFile --verify-tag --draft \
+  "${PRERELEASE_ARGS[@]}" \
+  --title "QuickFile ${VERSION} community (build ${BUILD})" \
+  --notes-file "$RELEASE_NOTES" \
+  "$OUTPUT/$DMG" "$OUTPUT/$DMG.sha256" \
+  "$OUTPUT/artifact-check.json" "$OUTPUT/INSTALL.txt"
+```
+
+运行上一步前，将准确的草稿说明写入 `.build/Temporary/community-release-notes.md`。说明必须列出：ad-hoc 签名、未公证以及可能需要逐应用批准；没有 Sparkle，升级为手动覆盖安装；本候选实际验收的系统/架构支持范围；以及尚未验收的跨机器启动、Finder 集成、升级、Gatekeeper 或其他具体 P0/P1、系统和卷范围。预期的 macOS 13.0+、Apple Silicon 与 Intel 不能替代当前候选的实测范围。
+
+实验预发布必须使用带 `-beta.N` 的独立标签（例如 `v0.1.0-beta.1`）并在创建草稿时设置 `--prerelease`；不得复用稳定的 `v0.1.0` 标签。发布前还要确认远端 `isPrerelease` 与 `$EXPECTED_PRERELEASE` 一致，最后的 `--draft=false` 只发布已核对的当前类型。
+
+维护者先检查草稿仍处于 draft、资产数量恰为四项，再从远端下载同一组资产复核校验和；校验失败、资产缺失或说明范围不准确时不得发布：
+
+```bash
+test "$(gh release view "$TAG" --repo haoyang7/QuickFile --json isDraft --jq .isDraft)" = true
+test "$(gh release view "$TAG" --repo haoyang7/QuickFile --json assets --jq '.assets | length')" = 4
+test "$(gh release view "$TAG" --repo haoyang7/QuickFile --json isPrerelease --jq .isPrerelease)" = "$EXPECTED_PRERELEASE"
+VERIFY_DIR=$(mktemp -d .build/Temporary/community-release-verify.XXXXXX)
+gh release download "$TAG" --repo haoyang7/QuickFile --dir "$VERIFY_DIR" \
+  --pattern "$DMG" --pattern "$DMG.sha256" \
+  --pattern artifact-check.json --pattern INSTALL.txt
+for asset in "$DMG" "$DMG.sha256" artifact-check.json INSTALL.txt; do
+  test -f "$VERIFY_DIR/$asset"
+  cmp "$OUTPUT/$asset" "$VERIFY_DIR/$asset"
+done
+(cd "$VERIFY_DIR" && shasum -a 256 -c "$DMG.sha256")
+```
+
+维护者确认固定提交、标签、版本/build、四项远端资产、校验和及发布说明均匹配后，才按已核对的类型公开发布：
+
+```bash
+gh release edit "$TAG" --repo haoyang7/QuickFile --draft=false
+```
+
 ## 安装、权限与升级验收
 
 下载后先核对校验和，打开 DMG。备份旧应用及数据，退出旧版，将 `QuickFile.app` 拖到“应用程序”快捷方式，然后推出镜像，从“应用程序”中启动 QuickFile。首次打开可能被 macOS 阻止；确认来源后，按系统提供的“隐私与安全性 → 仍要打开”流程批准这个应用。`xattr -cr` 不是代码签名，也不作为此流程的验收步骤；不要求用户全局关闭 Gatekeeper。
