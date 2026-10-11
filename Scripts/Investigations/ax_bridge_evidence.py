@@ -11,7 +11,7 @@ PUBLIC_LIMIT = 32 * 1024
 REASONS = ("not_ready", "input_invalid", "graph_changed", "trace_unavailable", "references_invalid",
            "candidate_limit", "ambiguous_bridge", "tool_budget", "tool_failed", "deadline",
            "process_exit_unconfirmed", "heap_unavailable", "history_unavailable", "allocation_unknown",
-           "layout_unavailable", "layout_conflict", "slot_unreported")
+           "layout_unavailable", "layout_conflict", "slot_unreported", "syntax_truncated", "syntax_unreplayable")
 STATES = ("complete", "spawn_failed", "timeout", "exit_failed", "output_invalid", "output_limit")
 ADDRESS = r"0x[0-9a-fA-F]{1,16}"
 OBJECT = r"<([^<>\n]+) (" + ADDRESS + r")> \[(\d{1,10})\]"
@@ -19,7 +19,7 @@ OBJECT = r"<([^<>\n]+) (" + ADDRESS + r")> \[(\d{1,10})\]"
 
 def initial_summary(frozen):
     from ax_frozen_nodes import encode_summary as encode_frozen
-    return {"schema": 1, "status": "unavailable", "semantics": "tool-reported",
+    return {"schema": 2, "status": "unavailable", "semantics": "tool-reported",
             "frozen_sha256": hashlib.sha256(encode_frozen(frozen)).hexdigest(),
             "baseline_graph_sha256": (frozen.get("baseline") or {}).get("graph_sha256"),
             "selected_graph_sha256": (frozen.get("selected") or {}).get("graph_sha256"),
@@ -38,7 +38,208 @@ def fail_closed(result, reason):
 
 
 def empty_layout():
-    return {"tool_index": None, "state": "unavailable", "type_bucket": None, "size": None}
+    return {"tool_index": None, "state": "unavailable", "type_bucket": None, "size": None,
+            "parse_error": "not_attempted", "syntax": None}
+
+
+LAYOUT_ERRORS = {
+    message: message.lower().replace(" ", "_") for message in (
+        "Incomplete layout", "Missing layout", "Unbound layout", "Missing contents",
+        "Incomplete incoming references", "Unsupported incoming reference", "Unbound incoming reference",
+        "Unsupported contents", "Unbound slot", "Resized target", "Unavailable source")}
+PARSE_ERRORS = ("none", "not_attempted", "tool_unavailable", "other_parser_error", *LAYOUT_ERRORS.values())
+SYNTAX_LIMIT = 4096
+SYNTAX_LINES = 64
+SYNTAX_TOKENS = 512
+SYNTAX_WORDS = frozenset(("SCANNING", "REFERENCES", "TO", "THIS", "CONTENTS", "Thread", "Region", "Stack",
+                          "offset", "capture", "__strong", "__weak", *(f"x{i}" for i in range(31))))
+SYNTAX_PUNCT = frozenset("<>[]:+-$()")
+SYNTAX_LEX = re.compile(r"[ \t]+|[<>\[\]:+\-$()]|[^ \t<>\[\]:+\-$()\x00-\x1f\x7f]+|[\x00-\x1f\x7f]")
+SYNTAX_STRIDE = 1 << 40
+
+
+def layout_syntax(report, source, target, source_size, tool_index, graph_sha256):
+    """Opaque descriptions and identities; preserve only checked pointer arithmetic."""
+    addresses, opaque = {}, {}
+
+    def identity(table, key):
+        if key not in table:
+            table[key] = len(table) + 1
+        return table[key]
+
+    def private_tokens(text):
+        pending = []
+        for part in re.finditer(ADDRESS + r"|[\s\S]", text):
+            raw = part[0]
+            if re.fullmatch(ADDRESS, raw):
+                token = ["zero", 0] if int(raw, 16) == 0 else ["address", identity(addresses, int(raw, 16))]
+            elif raw in "<>":
+                token = ["literal", raw]
+            elif ord(raw) <= 32 or ord(raw) == 127:
+                token = ["char", ord(raw)]
+            elif raw in "\x85\u2028\u2029":
+                token = ["boundary", 0]
+            elif not raw.isprintable():
+                token = ["nonprintable", 0]
+            else:
+                pending.append(raw)
+                continue
+            if pending:
+                private = "".join(pending)
+                yield ["opaque", identity(opaque, private), len(private)]
+                pending.clear()
+            yield token
+        if pending:
+            private = "".join(pending)
+            yield ["opaque", identity(opaque, private), len(private)]
+
+    doc = {"status": "complete", "tool_index": tool_index, "graph_sha256": graph_sha256,
+           "source": [identity(addresses, source), source_size], "target": identity(addresses, target),
+           "ends_newline": report.endswith("\n"), "lines": []}
+    lines = report[:-1].split("\n") if doc["ends_newline"] else report.split("\n")
+    total = 0
+    for line in lines:
+        if len(doc["lines"]) >= SYNTAX_LINES or len(line) > 16384:
+            doc["status"] = "truncated"
+            break
+        replacements, numbers, slots, thread_numbers = {}, set(), {}, {}
+        # Only structural numeric fields survive. All unrelated decimal text is opaque.
+        header = re.fullmatch(r"REFERENCES TO THIS: (\d{1,10})", line)
+        if header and int(header[1]) <= 1_000_000_000:
+            numbers.add(header.span(1))
+        for obj in re.finditer(OBJECT, line):
+            replacements[obj.start(1)] = (obj.end(1), obj[1])
+            if int(obj[3]) <= 1_000_000_000:
+                numbers.add(obj.span(3))
+        thread = re.fullmatch(r" +Thread ([0-9]{1,10}) +(.*?) +\$([^ ]+)", line)
+        if thread:
+            # Neither real thread numbers nor any part of its display name leaves the report.
+            if int(thread[1]) <= 1_000_000_000:
+                thread_numbers[thread.span(1)] = identity(opaque, ("thread", thread[1]))
+            replacements[thread.start(2)] = (thread.end(2), thread[2])
+        region = re.fullmatch(r" +Region (.+?) (" + ADDRESS + r")(?: --> offset (\d{1,10}))?", line)
+        if region:
+            replacements[region.start(1)] = (region.end(1), region[1])
+            if region[3] is not None and int(region[3]) <= 1_000_000_000:
+                numbers.add(region.span(3))
+        outgoing = re.fullmatch(r"\s+\+(\d{1,10}):\s+(" + ADDRESS + r") --> .+", line)
+        incoming = re.fullmatch(r"\s+" + OBJECT + r"\s+\+(\d{1,10}):\s+(?:[A-Za-z_\[\] .]+\s+)?(" + ADDRESS + r")", line)
+        for match, group in ((outgoing, 1), (incoming, 4)):
+            if match and int(match[group]) <= 1_000_000_000:
+                numbers.add(match.span(group))
+        if outgoing and int(outgoing[1]) <= 1_000_000_000 and int(outgoing[2], 16) == source + int(outgoing[1]):
+            slots[outgoing.span(2)] = ["slot", identity(addresses, source), int(outgoing[1])]
+        if incoming and int(incoming[4]) <= 1_000_000_000 and int(incoming[5], 16) == int(incoming[2], 16) + int(incoming[4]):
+            base = int(incoming[2], 16)
+            slots[incoming.span(5)] = ["slot", identity(addresses, base) if base else 0, int(incoming[4])]
+        tokens, position = [], 0
+        while position < len(line):
+            if position in replacements:
+                end, text = replacements[position]
+                if text:
+                    # Retain rejection-relevant structure, never private display text.
+                    tokens.extend(private_tokens(text))
+                position = end
+                continue
+            match = SYNTAX_LEX.match(line, position)
+            raw = match[0]
+            if match.span() in slots:
+                token = slots[match.span()]
+            elif re.fullmatch(ADDRESS, raw):
+                token = ["zero", 0] if int(raw, 16) == 0 else ["address", identity(addresses, int(raw, 16))]
+            elif match.span() in thread_numbers:
+                token = ["number", thread_numbers[match.span()]]
+            elif match.span() in numbers:
+                token = ["number", int(raw)]
+            elif raw in SYNTAX_WORDS or raw in SYNTAX_PUNCT:
+                token = ["literal", raw]
+            elif set(raw) <= {" ", "\t"}:
+                tokens.extend(["char", ord(char)] for char in raw)
+                position = match.end()
+                continue
+            elif len(raw) == 1 and (ord(raw) < 32 or ord(raw) == 127):
+                token = ["char", ord(raw)]
+            else:
+                tokens.extend(private_tokens(raw))
+                position = match.end()
+                continue
+            tokens.append(token)
+            position = match.end()
+        total += len(tokens)
+        doc["lines"].append(tokens)
+        if total > SYNTAX_TOKENS or len(json.dumps(doc, separators=(",", ":")).encode()) > SYNTAX_LIMIT - 32:
+            doc["lines"].pop()
+            doc["status"] = "truncated"
+            break
+    if doc["status"] == "complete":
+        def outcome(args):
+            try:
+                value = parse_layout(*args)
+                # Descriptions deliberately lose type names; compare structural evidence.
+                return "parsed", value["state"], value["size"]
+            except ValueError as error:
+                return "rejected", LAYOUT_ERRORS.get(str(error), "other_parser_error")
+        if outcome((report, source, target, source_size)) != outcome(decode_layout_syntax(doc)):
+            doc["status"] = "unreplayable"
+    return doc
+
+
+def decode_layout_syntax(doc):
+    """Reconstruct anonymous syntax, never original descriptions or addresses."""
+    def token_text(token):
+        tag = token[0]
+        if tag == "literal":
+            return token[1]
+        if tag == "number":
+            return str(token[1])
+        if tag == "char":
+            return chr(token[1])
+        if tag == "opaque":
+            return "o" * token[2]
+        if tag == "address":
+            return hex(token[1] * SYNTAX_STRIDE)
+        if tag in ("zero", "boundary", "nonprintable"):
+            return {"zero": "0x0", "boundary": "\u2028", "nonprintable": "\u200d"}[tag]
+        return hex(token[1] * SYNTAX_STRIDE + token[2])
+    report = "\n".join("".join(token_text(token) for token in line) for line in doc["lines"])
+    if doc["ends_newline"]:
+        report += "\n"
+    return report, doc["source"][0] * SYNTAX_STRIDE, doc["target"] * SYNTAX_STRIDE, doc["source"][1]
+
+
+def validate_layout_syntax(doc, tool_index, graph_sha256):
+    def require(condition):
+        if not condition:
+            raise ValueError("Invalid anonymous layout syntax")
+    def bounded(value, minimum=0, maximum=1_000_000_000):
+        return type(value) is int and minimum <= value <= maximum
+    require(type(doc) is dict and set(doc) == {"status", "tool_index", "graph_sha256", "source", "target", "ends_newline", "lines"})
+    require(doc["status"] in ("complete", "truncated", "unreplayable") and bounded(doc["tool_index"], 0, 6) and doc["tool_index"] == tool_index and doc["graph_sha256"] == graph_sha256)
+    require(type(doc["source"]) is list and len(doc["source"]) == 2 and type(doc["source"][0]) is int and doc["source"][0] == 1 and bounded(doc["source"][1], 1))
+    require(type(doc["target"]) is int and doc["target"] == 2 and type(doc["ends_newline"]) is bool)
+    require(type(doc["lines"]) is list and len(doc["lines"]) <= SYNTAX_LINES)
+    count = 0
+    for line in doc["lines"]:
+        require(type(line) is list)
+        count += len(line)
+        for token in line:
+            require(type(token) is list and len(token) in (2, 3))
+            tag = token[0]
+            if tag == "literal":
+                require(len(token) == 2 and type(token[1]) is str and token[1] in SYNTAX_WORDS | SYNTAX_PUNCT)
+            elif tag == "char":
+                require(len(token) == 2 and bounded(token[1], 0, 127) and (token[1] <= 32 or token[1] == 127) and token[1] != 10)
+            elif tag == "number":
+                require(len(token) == 2 and bounded(token[1]))
+            elif tag == "address":
+                require(len(token) == 2 and bounded(token[1], 1, 1024))
+            elif tag in ("zero", "boundary", "nonprintable"):
+                require(len(token) == 2 and type(token[1]) is int and token[1] == 0)
+            elif tag == "slot":
+                require(len(token) == 3 and bounded(token[1], 0, 1024) and bounded(token[2]))
+            else:
+                require(tag == "opaque" and len(token) == 3 and bounded(token[1], 1, 1024) and bounded(token[2], 1, 16384))
+    require(count <= SYNTAX_TOKENS and len(json.dumps(doc, separators=(",", ":")).encode()) <= SYNTAX_LIMIT)
 
 
 def parse_layout(report, source, target, source_size):
@@ -269,8 +470,18 @@ def collect(*, frozen, traces, baseline_heap, before_graph, after_graph, tools, 
                 if report is None or inventory is None or source not in inventory:
                     raise ValueError("Unavailable source")
                 layout.update(parse_layout(report, source, target, inventory[source]))
-            except ValueError:
+                layout["parse_error"] = "none"
+            except ValueError as error:
+                layout["parse_error"] = "tool_unavailable" if report is None else LAYOUT_ERRORS.get(str(error), "other_parser_error")
                 fail_closed(result, "layout_unavailable")
+            if report is not None:
+                size = inventory.get(source, 64) if inventory is not None else 64
+                layout["syntax"] = layout_syntax(report, source, target, size, tool_index,
+                                                  result[checkpoint + "_graph_sha256"])
+                if layout["syntax"]["status"] == "truncated":
+                    fail_closed(result, "syntax_truncated")
+                elif layout["syntax"]["status"] == "unreplayable":
+                    fail_closed(result, "syntax_unreplayable")
             if layout["state"] == "unreported":
                 fail_closed(result, "slot_unreported")
             if checkpoint == "baseline" and layout["state"] == "other_allocation":
@@ -289,7 +500,7 @@ def validate_summary(value, frozen):
 
     expected = initial_summary(frozen)
     require(type(value) is dict and set(value) == set(expected))
-    require(type(value["schema"]) is int and value["schema"] == 1 and value["semantics"] == "tool-reported")
+    require(type(value["schema"]) is int and value["schema"] == 2 and value["semantics"] == "tool-reported")
     require(value["status"] in ("complete", "partial", "unavailable", "not_needed"))
     for field in ("frozen_sha256", "baseline_graph_sha256", "selected_graph_sha256", "original_tool_count"):
         require(value[field] == expected[field])
@@ -364,6 +575,31 @@ def validate_summary(value, frozen):
         for checkpoint in ("baseline", "selected"):
             layout = record[checkpoint]
             require(type(layout) is dict and set(layout) == set(empty_layout()))
+            require(layout["parse_error"] in PARSE_ERRORS)
+            syntax = layout["syntax"]
+            if syntax is not None:
+                require(integer(layout["tool_index"]) and layout["tool_index"] < len(value["tools"]) and value["tools"][layout["tool_index"]]["status"] == "complete")
+                validate_layout_syntax(syntax, layout["tool_index"], value[checkpoint + "_graph_sha256"])
+                expected_size = history["before_size" if checkpoint == "baseline" else "after_size"]
+                require(syntax["source"][1] == (expected_size if expected_size is not None else 64))
+                if syntax["status"] == "truncated":
+                    require(value["status"] == "partial" and "syntax_truncated" in value["reasons"])
+                elif syntax["status"] == "unreplayable":
+                    require(value["status"] == "partial" and "syntax_unreplayable" in value["reasons"])
+            if layout["tool_index"] is not None:
+                require(integer(layout["tool_index"]) and layout["tool_index"] < len(value["tools"]))
+                if value["tools"][layout["tool_index"]]["status"] == "complete":
+                    require(syntax is not None and layout["parse_error"] not in ("not_attempted", "tool_unavailable"))
+                else:
+                    require(syntax is None and layout["state"] == "unavailable" and layout["parse_error"] == "tool_unavailable")
+            if layout["state"] not in ("unavailable", "not_present"):
+                require(layout["parse_error"] == "none" and syntax is not None)
+            elif layout["state"] == "not_present":
+                require(layout["parse_error"] == "not_attempted" and syntax is None)
+            else:
+                require(layout["parse_error"] != "none")
+                if layout["parse_error"] not in ("not_attempted", "tool_unavailable"):
+                    require(syntax is not None and "layout_unavailable" in value["reasons"] and value["status"] == "partial")
             require(layout["state"] in ("original_target_address", "other_allocation", "unreported", "unavailable", "not_present"))
             if layout["state"] == "not_present":
                 require(checkpoint == "selected" and layout["tool_index"] is None and history["after_size"] is None)

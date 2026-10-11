@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Investigations"))
 import ax_bridge_evidence as bridge
@@ -92,7 +93,163 @@ class BridgeTests(unittest.TestCase):
 
     def test_new_target_is_only_bucketed(self):
         result, _ = self.collect(tools=FakeTools({("layout", "selected"): layout(NEW, 96)}))
-        self.assertEqual(result["records"][0]["selected"], {"state": "other_allocation", "type_bucket": "unknown", "size": 96, "tool_index": 4})
+        selected = result["records"][0]["selected"]
+        self.assertEqual({key: selected[key] for key in ("state", "type_bucket", "size", "tool_index")},
+                         {"state": "other_allocation", "type_bucket": "unknown", "size": 96, "tool_index": 4})
+
+    def test_anonymous_layout_replays_checked_pointer_arithmetic(self):
+        report = layout().replace("synthetic", "private/path user@example secret_name")
+        doc = bridge.layout_syntax(report, P, M, 64, 3, "a" * 64)
+        bridge.validate_layout_syntax(doc, 3, "a" * 64)
+        self.assertEqual(bridge.parse_layout(*bridge.decode_layout_syntax(doc))["state"], "original_target_address")
+        import json
+        encoded = json.dumps(doc)
+        for secret in ("private", "path", "user@example", "secret_name", hex(P), hex(M), hex(NEW)):
+            self.assertNotIn(secret, encoded)
+        slots = [token for line in doc["lines"] for token in line if token[0] == "slot"]
+        self.assertEqual(len(slots), 2)
+        for broken in (report.replace(f"{P + 40:#x} -->", f"{P + 48:#x} -->"),
+                       report.replace(f"+40: {NEW + 40:#x}", f"+40: {NEW + 48:#x}")):
+            doc = bridge.layout_syntax(broken, P, M, 64, 3, "a" * 64)
+            with self.assertRaises(ValueError):
+                bridge.parse_layout(*bridge.decode_layout_syntax(doc))
+
+    def test_layout_parser_error_codes_and_tool_failures(self):
+        reports = ((layout(contents=False), "missing_contents"),
+                   (layout().replace("CONTENTS:", "CONTENTS:\nunknown"), "unsupported_contents"),
+                   (layout().replace(f"{P + 40:#x} -->", f"{P + 48:#x} -->"), "unbound_slot"))
+        for report, error in reports:
+            result, _ = self.collect(tools=FakeTools({("layout", "selected"): report}))
+            selected = result["records"][0]["selected"]
+            self.assertEqual(selected["parse_error"], error)
+            self.assertEqual(selected["syntax"]["tool_index"], selected["tool_index"])
+            self.assertEqual(selected["syntax"]["graph_sha256"], result["selected_graph_sha256"])
+            self.assertEqual(result["status"], "partial")
+        result, _ = self.collect(tools=FakeTools(fail=4))
+        self.assertEqual(result["records"][0]["selected"]["parse_error"], "tool_unavailable")
+        self.assertIsNone(result["records"][0]["selected"]["syntax"])
+
+    def test_syntax_budget_is_explicit_and_preserves_original_evidence(self):
+        # Whitespace is accepted by the parser, but exceeds the anonymous token budget.
+        report = layout().replace("   +40:", " " * 2000 + "+40:")
+        result, frozen = self.collect(tools=FakeTools({("layout", "selected"): report}))
+        selected = result["records"][0]["selected"]
+        self.assertEqual(selected["state"], "original_target_address")
+        self.assertEqual(selected["parse_error"], "none")
+        self.assertEqual(selected["syntax"]["status"], "truncated")
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("syntax_truncated", result["reasons"])
+        self.assertEqual(len(result["tools"]), 5)
+        self.assertEqual(result["records"][0]["history"]["classification"], "same_generation")
+        self.assertLessEqual(len(bridge.encode_summary(result, frozen)), bridge.PUBLIC_LIMIT)
+
+    def test_syntax_validator_rejects_private_text_and_wrong_binding(self):
+        result, frozen = self.collect()
+        for mutation in (lambda d: d.update(tool_index=0), lambda d: d.update(graph_sha256="f" * 64),
+                         lambda d: d.update(source=[3, 64]), lambda d: d.update(source=[1, 96]),
+                         lambda d: d["lines"].append([["literal", "/private/path"]]),
+                         lambda d: d["lines"].append([["address", P]])):
+            bad = copy.deepcopy(result)
+            mutation(bad["records"][0]["baseline"]["syntax"])
+            with self.assertRaises(ValueError):
+                bridge.validate_summary(bad, frozen)
+
+    def test_anonymous_unknown_text_does_not_publish_numbers(self):
+        doc = bridge.layout_syntax(layout() + "private/path[987654] +765432: account 654321\n", P, M, 64, 3, "a" * 64)
+        bridge.validate_layout_syntax(doc, 3, "a" * 64)
+        for line in doc["lines"]:
+            for token in line:
+                self.assertNotIn(token, (["number", 987654], ["number", 765432], ["number", 654321]))
+
+    def test_anonymous_region_preserves_embedded_and_zero_addresses(self):
+        incoming = f"   <synthetic {NEW:#x}> [64]    +40: {NEW + 40:#x}"
+        for root in ("Region Stack 0x3000 0x4000", "Region Stack synthetic 0x0"):
+            report = layout().replace(incoming, "   " + root)
+            with self.assertRaises(ValueError) as original:
+                bridge.parse_layout(report, P, M, 64)
+            doc = bridge.layout_syntax(report, P, M, 64, 3, "a" * 64)
+            bridge.validate_layout_syntax(doc, 3, "a" * 64)
+            self.assertEqual(doc["status"], "complete")
+            with self.assertRaises(ValueError) as replay:
+                bridge.parse_layout(*bridge.decode_layout_syntax(doc))
+            self.assertEqual(str(original.exception), str(replay.exception))
+        # Zero is not forbidden by the existing heap-object incoming grammar.
+        # Its verified +40 arithmetic must remain intact when preserving zero.
+        report = layout().replace(incoming, "   <synthetic 0x0> [64]    +40: 0x28")
+        doc = bridge.layout_syntax(report, P, M, 64, 3, "a" * 64)
+        bridge.validate_layout_syntax(doc, 3, "a" * 64)
+        self.assertEqual(bridge.parse_layout(report, P, M, 64), bridge.parse_layout(*bridge.decode_layout_syntax(doc)))
+
+    def test_anonymous_unicode_rejection_conditions_survive(self):
+        incoming = f"   <synthetic {NEW:#x}> [64]    +40: {NEW + 40:#x}"
+        for char in ("\u200d", "\u2028", "\u2029", "\x85", "\u00a0", "\x0b", "\r"):
+            for root in (f"Thread 1 worker{char}name $x25", f"Region Stack worker{char}name 0x4000"):
+                with self.subTest(char=repr(char), kind=root.split()[0]):
+                    report = layout().replace(incoming, "   " + root)
+                    with self.assertRaises(ValueError) as original:
+                        bridge.parse_layout(report, P, M, 64)
+                    doc = bridge.layout_syntax(report, P, M, 64, 3, "a" * 64)
+                    bridge.validate_layout_syntax(doc, 3, "a" * 64)
+                    self.assertEqual(doc["status"], "complete")
+                    with self.assertRaises(ValueError) as replay:
+                        bridge.parse_layout(*bridge.decode_layout_syntax(doc))
+                    self.assertEqual(str(original.exception), str(replay.exception))
+
+    def test_anonymous_empty_thread_description_remains_rejected(self):
+        report = layout().replace(f"   <synthetic {NEW:#x}> [64]    +40: {NEW + 40:#x}", "   Thread 1  $x25")
+        with self.assertRaises(ValueError):
+            bridge.parse_layout(report, P, M, 64)
+        doc = bridge.layout_syntax(report, P, M, 64, 3, "a" * 64)
+        bridge.validate_layout_syntax(doc, 3, "a" * 64)
+        with self.assertRaises(ValueError):
+            bridge.parse_layout(*bridge.decode_layout_syntax(doc))
+
+    def test_region_angle_brackets_preserve_rejection(self):
+        incoming = f"   <synthetic {NEW:#x}> [64]    +40: {NEW + 40:#x}"
+        report = layout().replace(incoming, "   Region Stack <private_name> 0x4000")
+        with self.assertRaises(ValueError) as original:
+            bridge.parse_layout(report, P, M, 64)
+        doc = bridge.layout_syntax(report, P, M, 64, 3, "a" * 64)
+        bridge.validate_layout_syntax(doc, 3, "a" * 64)
+        self.assertEqual(doc["status"], "complete")
+        with self.assertRaises(ValueError) as replay:
+            bridge.parse_layout(*bridge.decode_layout_syntax(doc))
+        self.assertEqual(str(original.exception), str(replay.exception))
+
+    def test_shortened_private_address_marks_syntax_unreplayable(self):
+        incoming = f"   <synthetic {NEW:#x}> [64]    +40: {NEW + 40:#x}"
+        root = "   Thread 1 " + "a" * 1010 + "0x123456789abcdef0 $x25"
+        report = layout().replace(incoming, root)
+        result, frozen = self.collect(tools=FakeTools({("layout", "selected"): report}))
+        selected = result["records"][0]["selected"]
+        self.assertEqual(selected["parse_error"], "unsupported_incoming_reference")
+        self.assertEqual(selected["syntax"]["status"], "unreplayable")
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("syntax_unreplayable", result["reasons"])
+        self.assertEqual(len(result["tools"]), 5)
+        self.assertEqual(result["records"][0]["history"]["classification"], "same_generation")
+        self.assertLessEqual(len(bridge.encode_summary(result, frozen)), bridge.PUBLIC_LIMIT)
+
+    def test_future_structural_distortion_is_detected(self):
+        original_decode = bridge.decode_layout_syntax
+
+        def distorted(doc):
+            report, source, target, size = original_decode(doc)
+            report = report.replace(f"{target:#x}> [48]", f"{target + 8:#x}> [96]")
+            return report, source, target, size
+
+        with patch.object(bridge, "decode_layout_syntax", side_effect=distorted):
+            result, _ = self.collect()
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("syntax_unreplayable", result["reasons"])
+        for checkpoint in ("baseline", "selected"):
+            evidence = result["records"][0][checkpoint]
+            self.assertEqual(evidence["syntax"]["status"], "unreplayable")
+            self.assertEqual(evidence["state"], "original_target_address")
+            self.assertEqual(evidence["parse_error"], "none")
+        # Only the explicitly anonymized type bucket is exempt from comparison.
+        doc = bridge.layout_syntax(layout().replace("synthetic", "NSXPCConnection"), P, M, 64, 3, "a" * 64)
+        self.assertEqual(doc["status"], "complete")
 
     def test_conflicting_baseline_slot_cannot_be_complete(self):
         result, frozen = self.collect(tools=FakeTools({('layout', 'baseline'): layout(NEW, 96)}))
