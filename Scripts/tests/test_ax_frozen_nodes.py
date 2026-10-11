@@ -480,6 +480,102 @@ class ReferenceTests(unittest.TestCase):
         zero = NODES.parse_trace_graph(trace(0x1000, 48, 0), 0x1000, 48)
         self.assertEqual((zero["roots"], zero["edges"]), (0, []))
 
+    @staticmethod
+    def slot_trace(target=0x1000, description="Private Root Kind", offset=16, slot=0x1000):
+        prefix = trace(target, 48, 1).split("    1 <", 1)[0]
+        return (prefix + f"    1 <private-type {target:#x}> [48]\n"
+                f"      1 <{description}> +{offset}: __strong {slot:#x}\n")
+
+    def test_addressless_root_uses_private_slot_identity_and_public_unknown_bucket(self):
+        for description in ("Swift Metadata", "Swift metadata", "Swift HeapGenericLocalVariable", "Unlisted Private Type"):
+            graph = NODES.parse_trace_graph(self.slot_trace(description=description), 0x1000, 48)
+            slot = ("metadata-slot", 0x1000)
+            self.assertEqual(set(graph["members"]), {0x1000, slot})
+            self.assertEqual((graph["members"][slot]["size"], graph["members"][slot]["region"]), (0, "other"))
+            self.assertEqual(graph["edges"], [{"source": slot, "target": 0x1000, "label": "__strong", "relation": "reverse_reference"}])
+            value = NODES.initial_summary()
+            builder = NODES.References(value, [0x1000])
+            view = NODES.reference_view(0, "baseline", "trace")
+            builder.add(graph, view)
+            self.assertNotEqual(builder.ids[slot], builder.ids[0x1000])
+            published = next(node for node in value["references"]["nodes"] if node["id"] == builder.ids[slot])
+            self.assertEqual((published["type"], published["size"], published["region"]), ("unknown", 0, "other"))
+            output = NODES.encode_summary(value).decode()
+            for private in (description, "slot_binding", "0x1000", "metadata-slot"):
+                self.assertNotIn(private, output)
+        for offset in (0, NODES.INTEGER_LIMIT):
+            NODES.parse_trace_graph(self.slot_trace(offset=offset), 0x1000, 48)
+
+    def test_addressless_roots_keep_mixed_and_repeated_path_counts(self):
+        mixed = self.slot_trace().replace("Found 1 root", "Found 2 root").replace("    1 <private-type", "    2 <private-type")
+        mixed += "      1 Region Stack private 0x9000\n"
+        graph = NODES.parse_trace_graph(mixed, 0x1000, 48)
+        self.assertEqual((graph["roots"], len(graph["edges"])), (2, 2))
+        prefix = trace(0x1000, 48, 2).split("    2 <", 1)[0]
+        branch = ("      1 <PrivateReferrer 0x2000> [48] +8: __strong 0x2008\n"
+                  "        1 <Private Root Kind> +16: __strong 0x7000\n")
+        text = prefix + "    2 <private-type 0x1000> [48]\n" + branch * 2
+        graph = NODES.parse_trace_graph(text, 0x1000, 48)
+        self.assertEqual((graph["roots"], len(graph["members"]), len(graph["edges"])), (2, 3, 2))
+        for changed in (
+            text.replace("<Private Root Kind>", "<Different Private Type>", 1),
+            text.replace("+16:", "+24:", 1),
+            text.replace(branch, branch.replace("0x2000", "0x3000").replace("0x2008", "0x3008"), 1),
+        ):
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, "Conflicting trace object"):
+                NODES.parse_trace_graph(changed, 0x1000, 48)
+
+    def test_addressless_root_rejects_other_shapes_nonleaves_and_bad_bindings(self):
+        text = self.slot_trace()
+        for changed in (
+            text.replace("<Private Root Kind>", "<>"), text.replace("<Private Root Kind>", "<   >"),
+            text.replace("<Private Root Kind>", "<" + "X" * 1025 + ">"),
+            text.replace("<Private Root Kind>", "<Private\tKind>"),
+            text.replace("<Private Root Kind>", "<Private\x00Kind>"),
+            text.replace("<Private Root Kind>", "<Private 0x1000>"),
+            text.replace("<Private Root Kind>", "<Private<Type>>"),
+            text.replace("+16:", "+1000000001:"), text.replace("+16:", "+00000000000:"),
+            text.replace("+16:", "-16:"), text.replace("+16:", "+opaque:"),
+            text.replace("__strong 0x1000", "__strong 0x0"),
+            text.replace("__strong", "__weak"), text.replace("__strong", "privateLabel"),
+            text.replace("__strong", "__strong [capture]"),
+            text.replace("      1 <Private", "      2 <Private"),
+            text.replace("      1 <Private", "       1 <Private"),
+            text.replace("Found 1 root", "Found 0 root"),
+            text.replace("    1 <private-type 0x1000> [48]\n", ""),
+            text + "        1 Region Stack private 0x9000\n",
+            text.rstrip() + " --> offset 8\n", text + "unparsed\n",
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                NODES.parse_trace_graph(changed, 0x1000, 48)
+
+    def test_slot_binding_conflicts_across_views_fail_without_public_mutation(self):
+        value = NODES.initial_summary()
+        builder = NODES.References(value, [0x1000, 0x2000])
+        graph = NODES.parse_trace_graph(self.slot_trace(), 0x1000, 48)
+        builder.add(graph, NODES.reference_view(0, "baseline", "trace"))
+        before = copy.deepcopy(value)
+        for text, target in ((self.slot_trace(offset=24), 0x1000),
+                             (self.slot_trace(description="Other Kind"), 0x1000),
+                             (self.slot_trace(target=0x2000), 0x2000)):
+            changed = NODES.parse_trace_graph(text, target, 48)
+            with self.assertRaisesRegex(ValueError, "Conflicting trace object"):
+                builder.add(changed, NODES.reference_view(1, "baseline", "trace"))
+            self.assertEqual(value, before)
+        changed = NODES.parse_trace_graph(self.slot_trace(offset=24), 0x1000, 48)
+        builder.add(changed, NODES.reference_view(0, "selected", "trace"))
+
+    def test_slot_roots_pass_full_schema_without_changing_leak_root_classification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory))
+            case.failures[("trace", "baseline")] = self.slot_trace(target=0x2000)
+            value = case.compare(first_strict_growth=True)
+        self.assertEqual(value["status"], "complete")
+        self.assertEqual(value["nodes"][0]["selected_tree"]["root_kind"], "cycle")
+        self.assertEqual(value["nodes"][0]["baseline_external_roots"], 1)
+        self.assertTrue(any(node["region"] == "other" and node["size"] == 0 for node in value["references"]["nodes"]))
+        NODES.validate_summary(value)
+
     def test_shared_ids_do_not_claim_allocation_identity_or_discard_baseline_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             value = Case(Path(directory)).compare()

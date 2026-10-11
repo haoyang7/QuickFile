@@ -118,7 +118,7 @@ class ParserEvidenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 E.validate_evidence(collector.value)
 
-    def test_addressless_root_offsets_do_not_authorize_unknown_roots(self):
+    def test_addressless_root_replay_preserves_slot_without_inventing_base(self):
         text = trace(0x1000, 48, 1).split("    1 <", 1)[0]
         text += ("    1 <__NSMallocBlock__ 0x1000> [48]\n"
                  "      1 <Swift metadata> +216: __strong 0x70d8\n")
@@ -126,13 +126,21 @@ class ParserEvidenceTests(unittest.TestCase):
         replay, _, target = E.decode_document(doc)
         self.assertIn("<Swift metadata> +216: __strong", replay)
         self.assertNotIn("0x70d8", replay)
-        with self.assertRaisesRegex(ValueError, "Unsupported reverse object"):
-            NODES.parse_trace_graph(replay, *target)
+        graph = NODES.parse_trace_graph(replay, *target)
+        slot, = (key for key in graph["members"] if type(key) is tuple)
+        self.assertEqual(slot[0], "metadata-slot")
+        self.assertEqual(graph["members"][slot]["slot_binding"], ("Swift metadata", 216, target[0]))
+        self.assertEqual(set(graph["members"]), {target[0], slot})
         for label in ("PrivateClass PrivateOwner", "/Swift/metadata", "Swift PrivateOwner"):
             _, unknown = self.capture(text.replace("Swift metadata", label), target=(0x1000, 48))
             replay, _, _ = E.decode_document(unknown)
             self.assertNotIn("Private", replay)
             self.assertNotIn("/", replay)
+            self.assertEqual(NODES.parse_trace_graph(replay, *target)["roots"], 1)
+        _, invalid = self.capture(text.replace("__strong", "privateOwnership"), target=(0x1000, 48))
+        replay, _, target = E.decode_document(invalid)
+        with self.assertRaisesRegex(ValueError, "Unsupported reverse object"):
+            NODES.parse_trace_graph(replay, *target)
 
     def test_successful_baseline_trace_retains_reviewed_allocation_syntax(self):
         text = trace(0x1000, 48, 1).split("    1 <", 1)[0]

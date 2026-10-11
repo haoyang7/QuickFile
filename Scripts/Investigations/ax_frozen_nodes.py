@@ -330,8 +330,22 @@ def parse_trace_graph(report, address, size):
             raise ValueError("Invalid trace paths")
         while stack and indent <= stack[-1]["indent"]:
             close()
-        label = "unlabeled"
-        if text.startswith("Region "):
+        if stack and stack[-1]["leaf_only"]:
+            raise ValueError("Invalid reverse nesting")
+        label, leaf_only = "unlabeled", False
+        slot_root = re.fullmatch(r"<([^<>\r\n\t]{1,1024})> +\+(\d{1,10}): +__strong +(" + ADDRESS + r")", text)
+        if slot_root:
+            description, offset, slot = slot_root[1], int(slot_root[2]), int(slot_root[3], 16)
+            if (not description.strip() or not description.isprintable() or re.search(r"\b" + ADDRESS + r"\b", description)
+                    or not integer(offset) or not slot or paths != 1 or not stack):
+                raise ValueError("Unsupported reverse object")
+            # The tool omits the base and size of this root. Its identity is the
+            # reported reference slot, not an inferred heap object or ownership.
+            key = ("metadata-slot", slot)
+            obj = {"address": key, "kind": "unknown", "protocol": "none", "size": 0, "region": "other",
+                   "slot_binding": (description, offset, stack[-1]["address"])}
+            label, terminal, leaf_only = "__strong", True, True
+        elif text.startswith("Region "):
             region = re.fullmatch(r"Region ([^\n]+) (" + ADDRESS + r")(?: --> offset \d+)?", text)
             if not region:
                 raise ValueError("Unsupported region")
@@ -376,7 +390,7 @@ def parse_trace_graph(report, address, size):
             edge = {"source": key, "target": stack[-1]["address"], "label": label, "relation": "reverse_reference"}
             if edge not in edges:
                 edges.append(edge)
-        stack.append({"address": key, "indent": indent, "paths": paths, "children": 0, "terminal": terminal})
+        stack.append({"address": key, "indent": indent, "paths": paths, "children": 0, "terminal": terminal, "leaf_only": leaf_only})
     while stack:
         close()
     if bool(roots) != (top is not None):
@@ -420,6 +434,7 @@ class References:
         self.summary = summary
         self.value = summary["references"]
         self.ids = {address: index for index, address in enumerate(sorted(addresses))}
+        self.slot_bindings = {}
 
     def view(self, candidate, checkpoint, kind):
         return next(view for view in self.value["views"] if
@@ -427,6 +442,9 @@ class References:
 
     def add(self, graph, view):
         checkpoint = view["checkpoint"]
+        slot_bindings = {(checkpoint, key): obj["slot_binding"] for key, obj in graph["members"].items() if "slot_binding" in obj}
+        if any(key in self.slot_bindings and self.slot_bindings[key] != binding for key, binding in slot_bindings.items()):
+            raise ValueError("Conflicting trace object")
         for address in graph["members"]:
             if address not in self.ids:
                 self.ids[address] = len(self.ids)
@@ -469,6 +487,7 @@ class References:
                 if previous["protocol"] == "none": previous["protocol"] = node["protocol"]
                 if previous["tree"] is None: previous["tree"] = node["tree"]
         self.value["edges"].extend(new_edges)
+        self.slot_bindings.update(slot_bindings)
         view.update(status="complete", root=self.ids[graph["root"]], target=self.ids[graph["target"]],
                     nodes=[node["id"] for node in nodes], edges=[self.value["edges"].index(edge) for edge in edges])
 
