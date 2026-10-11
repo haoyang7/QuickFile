@@ -20,7 +20,8 @@ QuickFile 提供实验性的 community 构建流程，不需要 Apple 开发者�
 - 对应 `.sha256` 校验文件
 - `artifact-check.json`：脱敏产物检查收据
 - `INSTALL.txt`：安装与验证范围说明
-- `build-provenance.json`：源码 SHA、Actions run、工具链及上述四项资产的 SHA-256
+
+GitHub Actions 在这四项本地产物之外生成第五项 `build-provenance.json`，记录源码 SHA、Actions run、工具链及四项资产的 SHA-256；本地构建命令不会生成这份 GitHub 来源收据。
 
 DMG 使用系统 `hdiutil` 创建 HFS+ / UDZO 镜像，不需要额外打包依赖。检查包括镜像内部校验、挂载后 App 的逐架构签名与完整文件清单、安装快捷方式及输入未改动。挂载不打开 Finder 或运行应用；卸载失败或挂载状态不明时不交付，保留独立 `.build/Temporary/community-dmg-*/` 中的镜像供恢复，并返回错误。
 
