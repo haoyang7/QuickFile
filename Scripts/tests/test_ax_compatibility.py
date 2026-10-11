@@ -1,5 +1,7 @@
 import pathlib
 import contextlib
+import copy
+import hashlib
 import importlib.util
 import io
 import itertools
@@ -2464,6 +2466,73 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
             self.assertIsNone(trial["frozen_nodes"]["selected_label"])
             self.assertEqual(trial["frozen_node_process_run"]["return_code"], 0)
 
+    def test_parser_failure_evidence_requires_matching_graph_and_successful_tool(self):
+        with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
+            from ax_parser_evidence import Collector
+        value = self.frozen_summary(first_strict_growth=True)
+        value.update(status="partial", reasons=["tree_invalid"],
+                     baseline_roots={"status": "unavailable", "roots": []})
+        collector = Collector()
+        collector.record("tree", "baseline", 7, "0" * 64,
+            "Process 123: 3 leaks for 300 total leaked bytes.\n/private/secret unsupported\n",
+            ValueError("Unsupported tree row"), nodes={0x1000: 100, 0x2000: 100, 0x3000: 100})
+        for failure in (None, "private", "hash", "index", "tool", "label", "graph-changed", "oversized", "symlink", "missing", "exists"):
+            with self.subTest(failure=failure):
+                frozen = copy.deepcopy(value)
+                if failure == "graph-changed":
+                    frozen["reasons"].append("graph_changed")
+                invocations, summary = self.run_measurement(enabled=False, first_strict_growth=True,
+                    first_failure="strict", frozen_summary=frozen,
+                    parser_evidence=collector.value, parser_failure=failure)
+                self.assertEqual(len(invocations), 10)
+                self.assertFalse(summary["strict_checks_passed"])
+                self.assertFalse(summary["frozen_node_checks_passed"])
+                first = summary["trials"][0]
+                self.assertEqual(first["parser_evidence_available"], failure is None)
+                if failure is None:
+                    self.assertEqual(first["parser_evidence"]["documents"], 1)
+
+    def test_parser_artifact_gate_rejects_unbound_modified_and_nonregular_files(self):
+        with mock.patch.object(sys, "path", [str(INVESTIGATIONS), *sys.path]):
+            from ax_parser_evidence import encode_evidence
+        script = self.workflow_script("Gate anonymous parser evidence")
+        payload = encode_evidence({"schema": 1, "status": "complete", "documents": [], "omitted_documents": 0})
+        for failure in (None, "unbound", "modified", "symlink", "directory", "missing", "oversized"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(prefix="ax-parser-gate-") as directory:
+                root = pathlib.Path(directory)
+                name = "parser-evidence-trial-1-control.json"
+                path = root / name
+                path.write_bytes(payload)
+                receipt = {"parser_evidence_available": True, "parser_evidence": {
+                    "file": name, "sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload),
+                    "status": "complete", "documents": 0}}
+                if failure == "unbound":
+                    receipt["parser_evidence_available"] = False
+                if failure == "modified":
+                    path.write_bytes(payload + b" ")
+                if failure in ("symlink", "directory", "missing"):
+                    path.unlink()
+                if failure == "symlink":
+                    target = root / "private.json"
+                    target.write_bytes(payload)
+                    path.symlink_to(target)
+                if failure == "directory":
+                    path.mkdir()
+                    (path / "private.txt").write_text("private")
+                if failure == "oversized":
+                    path.write_bytes(b" " * (2 * 1024 * 1024 + 1))
+                PROBE.write_json(root / "summary.json", {"trials": [receipt]})
+                output = root / "github-output"
+                code = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
+                with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}), \
+                        mock.patch.object(sys, "path", list(sys.path)):
+                    if failure:
+                        with self.assertRaises((SystemExit, ValueError)):
+                            exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        self.assertFalse(output.exists())
+                    else:
+                        exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        self.assertEqual(output.read_text(), "safe=true\n")
     def test_first_strict_growth_complete_diagnostics_preserve_the_original_strict_failure(self):
         for byte_growth in (False, True):
             with self.subTest(byte_growth=byte_growth):
@@ -3117,7 +3186,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False, install_control=False,
                         first_startup_failures=None, image_cleanup_failure=None, first_records_change=None,
                         frozen_control=False, frozen_summary=None, frozen_failure=None, first_strict_growth=False,
-                        first_scans_change=None):
+                        first_scans_change=None, parser_evidence=None, parser_failure=None):
         script = self.workflow_script("Measure matched cases with strict heap checks")
         frozen_analysis = frozen_control or first_strict_growth
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
@@ -3339,6 +3408,30 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if failure != "missing":
                         value = frozen_summary if len(invocations) == 1 and frozen_summary is not None else test.frozen_summary(first_strict_growth=first_strict_growth)
                         PROBE.write_json(records / "frozen-nodes.json", value)
+                    evidence = copy.deepcopy(parser_evidence) if len(invocations) == 1 and parser_evidence is not None else {
+                        "schema": 1, "status": "complete", "documents": [], "omitted_documents": 0}
+                    evidence_path = records / "parser-evidence.json"
+                    parser_error = parser_failure if len(invocations) == 1 else None
+                    if parser_error == "private":
+                        evidence["raw"] = "/private/secret"
+                    if parser_error == "hash":
+                        evidence["documents"][0]["graph_sha256"] = "9" * 64
+                    if parser_error == "index":
+                        evidence["documents"][0]["tool_index"] = 127
+                    if parser_error == "tool":
+                        evidence["documents"][0]["tool_index"] = 0
+                    if parser_error == "label":
+                        evidence["documents"][0]["label"] = "removed-30"
+                    if parser_error == "exists":
+                        (root / "parser-evidence-trial-1-control.json").write_text("existing")
+                    if parser_error == "oversized":
+                        evidence_path.write_bytes(b" " * (2 * 1024 * 1024 + 1))
+                    elif parser_error == "symlink":
+                        target = records / "private-evidence.json"
+                        PROBE.write_json(target, evidence)
+                        evidence_path.symlink_to(target)
+                    elif parser_error != "missing":
+                        PROBE.write_json(evidence_path, evidence)
                     complete = failure != "cleanup"
                     return {"return_code": 125 if not complete else 124 if failure == "timeout" else 0,
                             "command_return_code": None if failure else 0,
@@ -3375,7 +3468,8 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 self.assertEqual(summary["trials"], [])
                 self.assertEqual(invocations, [])
                 return invocations, summary
-            self.assertEqual(result.exception.code, int(first_failure is not None or image_cleanup_failure is not None or frozen_failure is not None))
+            self.assertEqual(result.exception.code, int(first_failure is not None or image_cleanup_failure is not None
+                or frozen_failure is not None or parser_failure is not None))
             if frozen_failure == "cleanup":
                 self.assertFalse(summary["completed"])
                 self.assertFalse(summary["frozen_node_checks_passed"])
@@ -3401,6 +3495,17 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
             self.assertEqual(len(summary["trials"]), 1 if frozen_control else 2 if terminal_origin else 20 if enabled else 10)
             if first_strict_growth:
                 self.assertEqual(frozen_invocations, invocations[1:] if frozen_failure == "host-exit" else invocations)
+            for receipt in summary["trials"]:
+                if receipt.get("parser_evidence_available"):
+                    from ax_parser_evidence import validate_evidence, encode_evidence
+                    record = receipt["parser_evidence"]
+                    contents = (root / record["file"]).read_bytes()
+                    self.assertEqual(record["sha256"], hashlib.sha256(contents).hexdigest())
+                    self.assertEqual(record["bytes"], len(contents))
+                    evidence = json.loads(contents)
+                    validate_evidence(evidence)
+                    self.assertEqual(contents, encode_evidence(evidence))
+                    self.assertNotIn("secret", contents.decode())
             for trial_index, receipt in enumerate(summary["trials"]):
                 self.assertEqual(receipt["scan_mode"], scan_mode)
                 self.assertEqual(receipt["diagnostics_expected"], scan_mode == "diagnostic")

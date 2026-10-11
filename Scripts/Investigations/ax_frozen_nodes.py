@@ -13,6 +13,7 @@ import stat
 import subprocess
 import time
 
+from ax_parser_evidence import Collector, encode_evidence, validate_evidence
 from ax_probe_report import HEAP_LABELS, HEAP_TYPES, allocation_generation, allocation_history, heap_allocations
 
 SECONDS = 90
@@ -770,7 +771,7 @@ class Tools:
         return report
 
 
-def compare(graph_directory, records, first_strict_growth=False):
+def compare(graph_directory, records, first_strict_growth=False, collector=None):
     result = initial_summary()
     deadline = time.monotonic() + SECONDS
     def reason(name):
@@ -814,6 +815,18 @@ def compare(graph_directory, records, first_strict_growth=False):
                 raise EvidenceError("graph_changed")
             result["checked_points"].append({"label": name, "leak_nodes": len(nodes), "leak_bytes": sum(nodes.values())})
             return nodes, kinds
+        def parse_report(tool, name, report, nodes=None, target=None):
+            try:
+                return parse_tree_graph(report, nodes) if tool == "tree" else parse_trace_graph(report, *target)
+            except ValueError as error:
+                if collector is not None:
+                    point = result["baseline"] if name == "baseline" else result["selected"]
+                    collector.record(tool, name, len(result["tools"]) - 1, point["graph_sha256"],
+                                     report, error, nodes=nodes, target=target)
+                raise
+        def tree_report(name, graph, nodes):
+            report = tools.run("tree", name, ["/usr/bin/leaks", "--noContent", "--nosources", str(graph)], (0, 1))
+            return parse_report("tree", name, report, nodes=nodes)
         before_graph = graph_directory / "baseline.memgraph"
         before = attempt("list_invalid", lambda: listing("baseline", before_graph, result["baseline"]))
         if before is None:
@@ -837,8 +850,7 @@ def compare(graph_directory, records, first_strict_growth=False):
             if snapshot(0) != result["baseline"]:
                 raise EvidenceError("graph_changed")
             if first_strict_growth:
-                graph = attempt("tree_invalid", lambda: parse_tree_graph(tools.run("tree", "baseline",
-                    ["/usr/bin/leaks", "--noContent", "--nosources", str(before_graph)], (0, 1)), before[0]))
+                graph = attempt("tree_invalid", lambda: tree_report("baseline", before_graph, before[0]))
                 result["baseline_roots"] = roots_overview(graph) if graph is not None else {"status": "unavailable", "roots": []}
                 if result["baseline_roots"]["status"] == "budget_exceeded": reason("references_budget")
                 if snapshot(0) != result["baseline"]: reason("graph_changed")
@@ -869,8 +881,7 @@ def compare(graph_directory, records, first_strict_growth=False):
                     result["references"]["views"].append(reference_view(index, checkpoint, kind))
         for name, graph, nodes, field, checkpoint in (("baseline", before_graph, old, "baseline_tree", "baseline"),
                                                     (label, after_graph, new, "selected_tree", "selected")):
-            parsed = attempt("tree_invalid", lambda: parse_tree_graph(tools.run("tree", name,
-                ["/usr/bin/leaks", "--noContent", "--nosources", str(graph)], (0, 1)), nodes))
+            parsed = attempt("tree_invalid", lambda: tree_report(name, graph, nodes))
             if checkpoint == "baseline":
                 result["baseline_roots"] = roots_overview(parsed) if parsed is not None else {"status": "unavailable", "roots": []}
                 if result["baseline_roots"]["status"] == "budget_exceeded": reason("references_budget")
@@ -928,7 +939,7 @@ def compare(graph_directory, records, first_strict_growth=False):
                     if report is not None:
                         row[field] = attempt("trace_unavailable", lambda: trace_roots(report, address, size))
                         view = references.view(index, "baseline" if name == "baseline" else "selected", "trace")
-                        attempt("references_invalid", lambda: references.add(parse_trace_graph(report, address, size), view))
+                        attempt("references_invalid", lambda: references.add(parse_report("trace", name, report, target=(address, size)), view))
                 elif name == "baseline" and row["baseline_presence"] == "absent":
                     references.view(index, "baseline", "trace")["status"] = "not_present"
         if snapshot(0) != result["baseline"] or snapshot(selected) != result["selected"]:
@@ -994,7 +1005,8 @@ def main(argv=None):
     parser.add_argument("--records-directory", type=Path, required=True)
     parser.add_argument("--first-strict-growth", action="store_true")
     args = parser.parse_args(argv)
-    result = compare(args.graph_directory, args.records_directory, first_strict_growth=args.first_strict_growth)
+    collector = Collector()
+    result = compare(args.graph_directory, args.records_directory, first_strict_growth=args.first_strict_growth, collector=collector)
     bound_summary(result)
     try:
         validate_summary(result)
@@ -1005,6 +1017,15 @@ def main(argv=None):
     except (OSError, ValueError, TypeError, RecursionError):
         # Never print private tool output, paths, or exception text.
         print("Frozen-node summary unavailable")
+        return 1
+    try:
+        validate_evidence(collector.value)
+        target = args.records_directory / "parser-evidence.json"
+        if target.is_symlink():
+            raise ValueError("Invalid output file")
+        target.write_bytes(encode_evidence(collector.value))
+    except (OSError, ValueError, TypeError, RecursionError):
+        print("Parser evidence unavailable")
         return 1
     print("Frozen-node summary " + result["status"])
     return 0 if result["status"] == "complete" else 1
