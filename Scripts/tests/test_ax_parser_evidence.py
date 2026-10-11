@@ -142,6 +142,46 @@ class ParserEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported reverse object"):
             NODES.parse_trace_graph(replay, *target)
 
+    def test_register_evidence_private_fields_and_stable_complete_replay(self):
+        text = fixtures.ReferenceTests.register_trace(description="Thread_987654  DispatchQueue_77: /Users/private 0xdeadbeef 123456789 (serial)")
+        collector, doc = self.capture(text, target=(0x1000, 48), error=None)
+        replay, _, target = E.decode_document(doc)
+        self.assertIn("1 Thread 1  opaque", replay)
+        self.assertIn(" $x25", replay)
+        self.assertEqual(NODES.parse_trace_graph(replay, *target)["roots"], 1)
+        public = E.encode_evidence(collector.value).decode()
+        for secret in ("987654", "DispatchQueue", "Users", "private", "deadbeef", "123456789"):
+            self.assertNotIn(secret, public)
+        _, second = self.capture(text, target=(0x1000, 48), collector=collector, index=1, error=None)
+        self.assertEqual(doc["lines"], second["lines"])
+        _, third = self.capture(text.replace("Thread 7", "Thread 9"), target=(0x1000, 48), collector=collector, index=2)
+        replay, _, target = E.decode_document(third)
+        self.assertIn("1 Thread 2  opaque", replay)
+        self.assertEqual(NODES.parse_trace_graph(replay, *target)["roots"], 1)
+
+    def test_register_mixed_indirect_replay_preserves_graph_and_path_counts(self):
+        prefix = trace(0x1000, 48, 3).split("    3 <", 1)[0]
+        branch = ("      1 <private-type 0x2000> [48] +8: __strong 0x2008\n"
+                  "        1 Thread 77  Thread_123456  $x25  \n")
+        text = prefix + "    3 <private-type 0x1000> [48]\n" + branch * 2 + "      1 Region Stack private 0x9000\n"
+        _, doc = self.capture(text, target=(0x1000, 48), error=None)
+        replay, _, target = E.decode_document(doc)
+        original = NODES.parse_trace_graph(text, 0x1000, 48)
+        decoded = NODES.parse_trace_graph(replay, *target)
+        self.assertEqual((len(original["members"]), len(original["edges"]), original["roots"]),
+                         (len(decoded["members"]), len(decoded["edges"]), decoded["roots"]))
+        self.assertEqual(doc["status"], "complete")
+
+    def test_register_invalid_and_legacy_opaque_evidence_stay_rejected(self):
+        text = fixtures.ReferenceTests.register_trace(description="private")
+        for changed in (text.replace("$x25", "$x31"), text.replace("Thread 7", "Thread 1000000001"),
+                        text.replace("1 Thread 7  private $x25", "opaque2 opaque3 opaque4  opaque5 $opaque6"),
+                        text.replace("      1 Thread", "      2 Thread")):
+            _, doc = self.capture(changed, target=(0x1000, 48))
+            replay, _, target = E.decode_document(doc)
+            with self.subTest(replay=replay), self.assertRaises(ValueError):
+                NODES.parse_trace_graph(replay, *target)
+
     def test_successful_baseline_trace_retains_reviewed_allocation_syntax(self):
         text = trace(0x1000, 48, 1).split("    1 <", 1)[0]
         text += ("    1 <__NSMallocBlock__ 0x1000> [48]\n"

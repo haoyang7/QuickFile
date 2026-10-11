@@ -13,7 +13,7 @@ import stat
 import subprocess
 import time
 
-from ax_parser_evidence import Collector, encode_evidence, validate_evidence
+from ax_parser_evidence import Collector, encode_evidence, validate_evidence, thread_register
 from ax_evidence_errors import EvidenceError, ExitUnconfirmed
 from ax_probe_report import HEAP_LABELS, HEAP_TYPES, allocation_generation, allocation_history, heap_allocations
 
@@ -324,7 +324,17 @@ def parse_trace_graph(report, address, size):
             raise ValueError("Invalid reverse nesting")
         label, leaf_only, heap_offset = "unlabeled", False, None
         slot_root = re.fullmatch(r"<([^<>\r\n\t]{1,1024})> +\+(\d{1,10}): +__strong +(" + ADDRESS + r")", text)
-        if slot_root:
+        register_root = thread_register(text)
+        if register_root:
+            if paths != 1 or not stack:
+                raise ValueError("Unsupported reverse object")
+            # Report-local thread ordinals identify register slots within a
+            # checkpoint only; they do not identify a thread across snapshots.
+            key = ("thread-register", int(register_root[1]), register_root[5])
+            obj = {"address": key, "kind": "unknown", "protocol": "none", "size": 0, "region": "other",
+                   "slot_binding": (register_root[3], stack[-1]["address"])}
+            terminal, leaf_only = True, True
+        elif slot_root:
             description, offset, slot = slot_root[1], int(slot_root[2]), int(slot_root[3], 16)
             if (not description.strip() or not description.isprintable() or re.search(r"\b" + ADDRESS + r"\b", description)
                     or not integer(offset) or not slot or paths != 1 or not stack):
@@ -440,14 +450,16 @@ class References:
         slot_bindings = {(checkpoint, key): obj["slot_binding"] for key, obj in graph["members"].items() if "slot_binding" in obj}
         if any(key in self.slot_bindings and self.slot_bindings[key] != binding for key, binding in slot_bindings.items()):
             raise ValueError("Conflicting trace object")
-        for address in graph["members"]:
+        identities = {key: (checkpoint, key) if isinstance(key, tuple) and key[0] == "thread-register" else key
+                      for key in graph["members"]}
+        for address in identities.values():
             if address not in self.ids:
                 self.ids[address] = len(self.ids)
-        nodes = [{"id": self.ids[key], "checkpoint": checkpoint,
+        nodes = [{"id": self.ids[identities[key]], "checkpoint": checkpoint,
                   "type": obj["kind"] if obj["kind"] in REFERENCE_TYPES else "unknown",
                   "protocol": obj["protocol"], "size": obj["size"], "region": obj["region"], "tree": obj.get("tree")}
                  for key, obj in graph["members"].items()]
-        edges = [{"checkpoint": checkpoint, "source": self.ids[edge["source"]], "target": self.ids[edge["target"]],
+        edges = [{"checkpoint": checkpoint, "source": self.ids[identities[edge["source"]]], "target": self.ids[identities[edge["target"]]],
                   "relation": edge["relation"], "label": edge["label"], "count": 1} for edge in graph["edges"]]
         unique_edges = []
         for edge in edges:

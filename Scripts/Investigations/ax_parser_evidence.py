@@ -16,7 +16,7 @@ TOKEN_LIMIT = 65536
 IDENTITY_LIMIT = 200000
 INTEGER_LIMIT = 1_000_000_000
 # Only literal, reviewed vocabulary may leave the private report directory.
-WORDS = frozenset(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", " ".join(HEAP_TYPES) + " " + """
+WORDS = frozenset(("Thread", *(f"x{i}" for i in range(31)))) | frozenset(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", " ".join(HEAP_TYPES) + " " + """
 Process leak leaks for total leaked bytes STACK OF INSTANCE INSTANCES ROOT CYCLE LEAK
 BACK TO TOTAL Binary Images Protocol Connection NSXPCInterface xpc_connection_t
  dispatch_mach_t __NSMallocBlock__ CFDictionary Value Storage Key NSSet
@@ -129,13 +129,22 @@ def validate_evidence(value):
     return value
 
 
+def thread_register(text):
+    """Recognize only the bounded ARM64 register terminal syntax."""
+    match = re.fullmatch(r"Thread ([0-9]{1,10})( +)([^\r\n\t]{1,1024}?)( +)\$(x(?:[0-9]|[12][0-9]|30))", text)
+    if (match and int(match[1]) <= INTEGER_LIMIT and match[3].strip()
+            and match[3].isprintable()):
+        return match
+    return None
+
+
 def _numbers(line):
     """Exact lexical contexts, independent of whether a graph parses."""
     spans = set()
     patterns = (
         r"^Process \d+: (\d+) leaks? for (\d+) total leaked bytes\.$",
         r"^STACK OF (\d+) INSTANCES? OF ",
-        r"^[ +!:|]*(\d+) (?=\(|<|0x|Region |Kernel )",
+        r"^[ +!:|]*(\d+) (?=\(|<|0x|Region |Kernel |Thread )",
         r"^Found (\d+) roots? referencing:",
         r"(?:0x[0-9a-fA-F]{1,16}>?) \[(\d+)\]",
         r"\] +\+(\d+):",
@@ -154,7 +163,7 @@ def _numbers(line):
 class Collector:
     def __init__(self):
         self.value = {"schema": 1, "status": "complete", "documents": [], "omitted_documents": 0}
-        self.addresses, self.opaque = {}, {}
+        self.addresses, self.opaque, self.threads = {}, {}, {}
 
     @staticmethod
     def _id(mapping, raw):
@@ -182,6 +191,17 @@ class Collector:
                     doc["status"] = "truncated"
                     break
                 numbers = _numbers(line)
+                # Replace the whole private display field, including any names,
+                # paths, numbers or addresses, only after exact syntax recognition.
+                thread_row = re.fullmatch(r"([ +!:|]+)([0-9]{1,10}) (Thread .+?) *", line)
+                thread = thread_register(thread_row[3]) if thread_row else None
+                replacements = {}
+                if thread:
+                    start = thread_row.start(3)
+                    replacements[start + thread.start(1)] = (
+                        start + thread.end(1), ["number", self._id(self.threads, int(thread[1]))])
+                    replacements[start + thread.start(3)] = (
+                        start + thread.end(3), ["opaque", self._id(self.opaque, thread[3])])
                 pid = re.match(r"^Process (\d+):", line)
                 # Preserve an actual base+offset relation only after private equality checking.
                 slots = {}
@@ -189,9 +209,14 @@ class Collector:
                 if slot and len(slot[2]) <= 10 and int(slot[2]) <= INTEGER_LIMIT and int(slot[1], 16) + int(slot[2]) == int(slot[3], 16):
                     slots[slot.span(3)] = ["slot", self._id(self.addresses, int(slot[1], 16)), int(slot[2])]
                 tokens = []
+                replaced_until = -1
                 for match in LEX.finditer(line):
+                    if match.start() < replaced_until:
+                        continue
                     raw = match[0]
-                    if match.span() in slots:
+                    if match.start() in replacements:
+                        replaced_until, token = replacements[match.start()]
+                    elif match.span() in slots:
                         token = slots[match.span()]
                     elif raw.isspace() and set(raw) <= {" ", "\t"}:
                         # Keep mixed whitespace order rather than expanding to columns.

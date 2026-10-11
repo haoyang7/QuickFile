@@ -5,6 +5,7 @@ import re
 
 from ax_probe_report import HEAP_TYPES, allocation_generation, allocation_history, heap_allocations
 from ax_evidence_errors import EvidenceError, ExitUnconfirmed
+from ax_parser_evidence import thread_register
 
 PUBLIC_LIMIT = 32 * 1024
 REASONS = ("not_ready", "input_invalid", "graph_changed", "trace_unavailable", "references_invalid",
@@ -57,6 +58,14 @@ def parse_layout(report, source, target, source_size):
     if not header or len(prefix) - 1 != int(header[1]):
         raise ValueError("Incomplete incoming references")
     for line in prefix[1:]:
+        thread = re.fullmatch(r" +(Thread .+)", line)
+        if thread and thread_register(thread[1]) is not None:
+            continue
+        region = re.fullmatch(r" +Region ([^\r\n\t<>]{1,1024}?) (" + ADDRESS + r")(?: --> offset (\d{1,10}))?", line)
+        if (region and region[1].strip() and region[1].isprintable()
+                and not re.search(ADDRESS, region[1]) and int(region[2], 16) > 0
+                and (region[3] is None or int(region[3]) <= 1_000_000_000)):
+            continue
         incoming = re.fullmatch(r"\s+" + OBJECT + r"\s+\+(\d{1,10}):\s+(?:[A-Za-z_\[\] .]+\s+)?(" + ADDRESS + r")", line)
         if not incoming:
             raise ValueError("Unsupported incoming reference")

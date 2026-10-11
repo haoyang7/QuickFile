@@ -486,6 +486,79 @@ class ReferenceTests(unittest.TestCase):
         return (prefix + f"    1 <private-type {target:#x}> [48]\n"
                 f"      1 <{description}> +{offset}: __strong {slot:#x}\n")
 
+    @staticmethod
+    def register_trace(target=0x1000, register="x25", description="Thread_987654  DispatchQueue_77: private queue  (serial)"):
+        prefix = trace(target, 48, 1).split("    1 <", 1)[0]
+        return (prefix + f"    1 <private-type {target:#x}> [48]\n"
+                f"      1 Thread 7  {description} ${register}\n")
+
+    def test_register_roots_direct_mixed_and_repeated_indirect_paths(self):
+        for register in ("x0", "x9", "x10", "x29", "x30"):
+            graph = NODES.parse_trace_graph(self.register_trace(register=register), 0x1000, 48)
+            key = ("thread-register", 7, register)
+            self.assertEqual(graph["members"][key]["slot_binding"][1], 0x1000)
+            self.assertEqual(graph["edges"], [{"source": key, "target": 0x1000, "label": "unlabeled", "relation": "reverse_reference"}])
+            self.assertEqual(graph["slots"], [])
+        text = self.register_trace().replace("Found 1 root", "Found 3 root").replace("    1 <", "    3 <")
+        text += "      1 Region Stack private 0x9000\n      1 Thread 7  Thread_987654 $x26\n"
+        graph = NODES.parse_trace_graph(text, 0x1000, 48)
+        self.assertEqual((graph["roots"], len(graph["edges"])), (3, 3))
+        prefix = trace(0x1000, 48, 2).split("    2 <", 1)[0]
+        branch = ("      1 <PrivateReferrer 0x2000> [48] +8: __strong 0x2008\n"
+                  "        1 Thread 7  Thread_987654 $x25\n")
+        text = prefix + "    2 <private-type 0x1000> [48]\n" + branch * 2
+        graph = NODES.parse_trace_graph(text, 0x1000, 48)
+        self.assertEqual((graph["roots"], len(graph["members"]), len(graph["edges"])), (2, 3, 2))
+        changed = text.replace(branch, branch.replace("0x2000", "0x3000").replace("0x2008", "0x3008"), 1)
+        with self.assertRaisesRegex(ValueError, "Conflicting trace object"):
+            NODES.parse_trace_graph(changed, 0x1000, 48)
+
+    def test_register_root_rejects_unknown_syntax_and_invalid_graph(self):
+        text = self.register_trace(description="private")
+        for changed in (
+            *(text.replace("$x25", value) for value in ("$x31", "$sp", "$opaque6", "$X25", "$x01", "$x25 extra", "x25")),
+            *(text.replace("Thread 7", value) for value in ("Thread -1", "Thread 1000000001", "Thread 00000000000", "Thread opaque")),
+            *(text.replace("private", value) for value in ("", "   ", "a\tb", "a\x00b", "a" * 1025)),
+            text.replace("      1 Thread", "      2 Thread"),
+            text.replace("      1 Thread", "       1 Thread"),
+            text.replace("    1 <private-type 0x1000> [48]\n", ""),
+            text.replace("Found 1 root", "Found 2 root"),
+            text + "        1 Region Stack private 0x9000\n",
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                NODES.parse_trace_graph(changed, 0x1000, 48)
+
+    def test_register_root_passes_full_summary_schema(self):
+        temporary_root = Path(__file__).resolve().parents[2] / ".build/Temporary"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ax-register-roots-", dir=temporary_root) as directory:
+            case = Case(Path(directory))
+            case.failures[("trace", "baseline")] = self.register_trace(target=0x2000)
+            value = case.compare(first_strict_growth=True)
+        self.assertEqual(value["status"], "complete")
+        self.assertEqual(value["nodes"][0]["baseline_external_roots"], 1)
+        self.assertEqual(value["nodes"][0]["selected_tree"]["root_kind"], "cycle")
+        NODES.validate_summary(value)
+
+    def test_register_bindings_are_checkpoint_local_and_private(self):
+        value = NODES.initial_summary()
+        builder = NODES.References(value, [0x1000, 0x2000])
+        first = NODES.parse_trace_graph(self.register_trace(), 0x1000, 48)
+        builder.add(first, NODES.reference_view(0, "baseline", "trace"))
+        before = copy.deepcopy(value)
+        for text, target in ((self.register_trace(target=0x2000), 0x2000),
+                             (self.register_trace(description="other"), 0x1000)):
+            changed = NODES.parse_trace_graph(text, target, 48)
+            with self.assertRaisesRegex(ValueError, "Conflicting trace object"):
+                builder.add(changed, NODES.reference_view(1, "baseline", "trace"))
+            self.assertEqual(value, before)
+        builder.add(first, NODES.reference_view(0, "selected", "trace"))
+        roots = [node for node in value["references"]["nodes"] if node["region"] == "other"]
+        self.assertEqual(len({node["id"] for node in roots}), 2)
+        self.assertTrue(all((node["type"], node["size"]) == ("unknown", 0) for node in roots))
+        for secret in ("Thread_987654", "DispatchQueue", "x25", "thread-register", "slot_binding"):
+            self.assertNotIn(secret, NODES.encode_summary(value).decode())
+
     def test_private_heap_slot_keeps_direction_and_checked_offset(self):
         text = trace(0x1000, 48, 1).split("    1 <", 1)[0]
         text += ("    1 <private-type 0x1000> [48]\n"

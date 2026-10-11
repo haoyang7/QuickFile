@@ -171,6 +171,37 @@ class BridgeTests(unittest.TestCase):
         labelled = layout().replace(f"+40: {NEW + 40:#x}", f"+40: [capture] {NEW + 40:#x}")
         self.assertEqual(bridge.parse_layout(labelled, P, M, 64)["state"], "original_target_address")
 
+    def test_layout_thread_and_region_roots_are_only_incoming(self):
+        incoming = ("   Thread 1  Synthetic worker (serial) $x10\n"
+                    "   Thread 1  Synthetic worker (serial) $x25\n"
+                    "   Region Stack thread 1 thread-specific-data key 22 0x4000\n")
+        report = layout().replace("REFERENCES TO THIS: 1", "REFERENCES TO THIS: 3").replace(
+            f"   <synthetic {NEW:#x}> [64]    +40: {NEW + 40:#x}\n", incoming)
+        self.assertEqual(bridge.parse_layout(report, P, M, 64)["state"], "original_target_address")
+        without_slot = report.replace(f"   +40: {P + 40:#x}", f"   +16: {P + 16:#x}")
+        self.assertEqual(bridge.parse_layout(without_slot, P, M, 64),
+                         {"state": "unreported", "type_bucket": None, "size": None})
+        with self.assertRaises(ValueError):
+            bridge.parse_layout(report.split("CONTENTS:")[0], P, M, 64)
+        with self.assertRaises(ValueError):
+            bridge.parse_layout(report.replace("CONTENTS:\n", "CONTENTS:\n" + incoming), P, M, 64)
+
+    def test_layout_root_grammar_bounds(self):
+        incoming = f"   <synthetic {NEW:#x}> [64]    +40: {NEW + 40:#x}"
+        for root in ("Thread 0 worker $x0", "Thread 1000000000 worker $x30",
+                     "Region Stack synthetic 0x4000 --> offset 16"):
+            report = layout().replace(incoming, "   " + root)
+            self.assertEqual(bridge.parse_layout(report, P, M, 64)["state"], "original_target_address")
+        for root in ("Thread 1 worker $x31", "Thread 1 worker $rax", "Thread 1000000001 worker $x10",
+                     "Thread 1 worker\t $x10", "Thread 1 worker\x01 $x10", "Thread 1  $x10",
+                     "Thread 1 " + "w" * 1025 + " $x10", "Thread 1 worker $x10 extra",
+                     "Region Stack synthetic", "Region Stack synthetic 0x4000junk",
+                     "Region Stack synthetic 0x4000 extra", "Region Stack\tworker 0x4000",
+                     "Region Stack worker\x01 0x4000", "Region Stack 0x3000 0x4000",
+                     "Region Stack synthetic 0x4000 --> offset 1000000001", "Unknown root 0x4000"):
+            with self.subTest(root=root), self.assertRaises(ValueError):
+                bridge.parse_layout(layout().replace(incoming, "   " + root), P, M, 64)
+
     def test_missing_history_and_heap_cannot_confirm(self):
         for reports in ({("history", "selected"): "malloc_history Report Version:  2.0\nno stack logs found for 0x1000\n"},
                         {("heap", "selected"): "broken\n"}, {("history", "baseline"): "broken\n"}):
