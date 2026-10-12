@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fixed nine-trial Reader exit investigation. Only summary.json is public.
 
-512 KiB public limit. Roots and reported type net counts do not establish new
+512 KiB public limit; schema 2 uses compact JSON, schema 1 retains indentation.
+Roots and reported type net counts do not establish new
 connections or allocation generations. No graph captures or parser extensions.
 """
 import argparse
@@ -26,6 +27,7 @@ from ax_shadow_campaign import (canonical, fields, groups_projection, integer, r
 
 ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_LIMIT = 512 * 1024
+FINAL_RECEIPT_RESERVE = 64
 RAW_LIMIT = 16 * 1024 * 1024
 RUN_TIMEOUT = 180
 SCHEDULE = (("baseline", 0), ("t20", 20), ("t40", 40), ("t60", 60), ("t80", 80), ("t110", 110))
@@ -347,7 +349,7 @@ def validate_identity(value):
 def validate_summary(value):
     no_floats(value)
     fields(value, ("schema", "identity", "build", "trials", "completed", "strict_checks_passed", "evidence_checks_passed", "temporary_cleanup", "public_limit_bytes"))
-    require(type(value["schema"]) is int and value["schema"] == 1 and value["public_limit_bytes"] == PUBLIC_LIMIT)
+    require(type(value["schema"]) is int and value["schema"] in (1, 2) and value["public_limit_bytes"] == PUBLIC_LIMIT)
     validate_identity(value["identity"])
     require(value["temporary_cleanup"] in ("not-run", "complete", "retained-unconfirmed", "failed"))
     build = value["build"]
@@ -383,16 +385,42 @@ def validate_summary(value):
     cleanup_known = (build is None or build["process_run"]["cleanup"]["complete"]) and all(row["cleanup_confirmed"] for row in value["trials"])
     if value["temporary_cleanup"] == "complete": require(cleanup_known)
     if value["temporary_cleanup"] == "retained-unconfirmed": require(not cleanup_known)
-    require(len(canonical(value)) <= PUBLIC_LIMIT)
+    require(len(public_bytes(value)) <= PUBLIC_LIMIT)
+
+
+def public_bytes(value):
+    if value["schema"] == 1:
+        return canonical(value)
+    require(type(value["schema"]) is int and value["schema"] == 2)
+    return (json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n").encode()
+
+
+def bound_summary(value):
+    """Only optional type composition yields to the public artifact budget."""
+    if len(public_bytes(value)) <= PUBLIC_LIMIT - FINAL_RECEIPT_RESERVE:
+        return
+    require(value["schema"] == 2)
+    for trial in value["trials"]:
+        measurement = trial["measurement"]
+        if measurement is None: continue
+        scans = measurement["scans"]
+        for row in scans:
+            current = row["composition"]
+            totals = (current["total_nodes"], current["total_bytes"]) if current["total_nodes"] is not None else None
+            row["composition"] = composition.empty_grouped("summary_budget", totals)
+        for row in scans:
+            row["baseline_delta"] = composition.composition_delta(scans[0]["composition"], row["composition"])
+    require(len(public_bytes(value)) <= PUBLIC_LIMIT - FINAL_RECEIPT_RESERVE)
 
 
 def encode_summary(value):
     validate_summary(value)
-    return canonical(value)
+    return public_bytes(value)
 
 
 def save_summary(path, value):
     value["completed"], value["strict_checks_passed"], value["evidence_checks_passed"] = conclusions(value)
+    bound_summary(value)
     payload = encode_summary(value)
     temporary = path.with_suffix(".tmp")
     require(not path.is_symlink() and not temporary.is_symlink())
@@ -414,7 +442,7 @@ def campaign(root):
     root.mkdir(parents=True, exist_ok=False, mode=0o700)
     private = root / "private"; private.mkdir(mode=0o700)
     public = root / "summary.json"
-    summary = {"schema": 1, "identity": observed, "build": None, "trials": [], "completed": False,
+    summary = {"schema": 2, "identity": observed, "build": None, "trials": [], "completed": False,
         "strict_checks_passed": False, "evidence_checks_passed": False, "temporary_cleanup": "not-run", "public_limit_bytes": PUBLIC_LIMIT}
     save_summary(public, summary)
     environment = dict(os.environ)
@@ -469,9 +497,18 @@ def campaign(root):
         return 1
     finally:
         if cleanup_known:
+            # Persist every collected trial and preflight the final receipt before
+            # removing private evidence. A budget failure must retain that evidence.
+            try:
+                save_summary(public, summary)
+                summary["temporary_cleanup"] = "complete"
+                encode_summary(summary)
+            except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
+                summary["temporary_cleanup"] = "failed"
+                print("Public summary unavailable; private evidence retained", file=sys.stderr)
+                return 1
             try:
                 shutil.rmtree(private)
-                summary["temporary_cleanup"] = "complete"
             except OSError: summary["temporary_cleanup"] = "failed"
         else: summary["temporary_cleanup"] = "retained-unconfirmed"
         save_summary(public, summary)

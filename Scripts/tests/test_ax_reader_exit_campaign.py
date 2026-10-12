@@ -62,6 +62,60 @@ def external(expected):
 def save(path, value): path.write_bytes(C.canonical(value))
 
 
+def ordinary_composition(scale):
+    # Synthetic shape matching ordinary NSXPC reports: 288/384 total nodes,
+    # thirteen types and twenty-six bounded aggregate-size entries.
+    weights = {"CFDictionary": 1, "CFDictionary (Key Storage)": 1, "CFDictionary (Value Storage)": 1,
+        "NSArray": 30, "NSSet": 30, "NSXPCConnection": 1, "NSXPCInterface": 1, "__NSMallocBlock__": 2,
+        "dispatch_group_t": 1, "dispatch_mach_t": 1, "dispatch_queue_t (serial)": 1, "unknown": 25, "xpc_connection_t": 1}
+    counts = {kind: weight * scale for kind, weight in weights.items()}
+    unresolved = []
+    for kind, count in sorted(counts.items()):
+        for number in (count // 2, count - count // 2):
+            unresolved.append({"type": kind, "count": number, "bytes_min": number * 48, "bytes_max": number * 48,
+                "reason": "multiple_instances" if number > 1 else "rounded_subtree"})
+    nodes = sum(counts.values())
+    value = {"schema": 3, "status": "partial", "counts_status": "complete", "size_bounds": "combined-self-bytes",
+        "failure_stage": None, "failure_fragment": None, "total_nodes": nodes, "total_bytes": nodes * 48,
+        "type_counts": [{"type": kind, "count": count} for kind, count in sorted(counts.items())],
+        "exact_size_histogram": [], "size_unknown_nodes": nodes, "unresolved_sizes": unresolved,
+        "unknown_type_nodes": counts["unknown"], "omitted_nodes": 0, "reasons": ["unknown_type", "size_unresolved"]}
+    C.composition.validate_grouped_composition(value)
+    return value
+
+
+def dense_composition():
+    exact = [{"type": "NSXPCConnection", "size": size, "count": 5} for size in range(1, 31)]
+    unresolved = [{"type": "NSXPCConnection", "count": 3, "bytes_min": 144, "bytes_max": 144,
+        "reason": "multiple_instances"} for _ in range(49)]
+    unresolved[-1].update(count=90, bytes_min=4320, bytes_max=4320)
+    nodes = sum(row["count"] for row in exact + unresolved)
+    size = sum(row["count"] * row["size"] for row in exact) + sum(row["bytes_min"] for row in unresolved)
+    value = {"schema": 3, "status": "partial", "counts_status": "complete", "size_bounds": "combined-self-bytes",
+        "failure_stage": None, "failure_fragment": None, "total_nodes": nodes, "total_bytes": size,
+        "type_counts": [{"type": "NSXPCConnection", "count": nodes}], "exact_size_histogram": exact,
+        "size_unknown_nodes": sum(row["count"] for row in unresolved), "unresolved_sizes": unresolved,
+        "unknown_type_nodes": 0, "omitted_nodes": 0, "reasons": ["size_unresolved"]}
+    C.composition.validate_grouped_composition(value)
+    return value
+
+
+def scaled_measurement(measurement, profile):
+    for index, row in enumerate(measurement["scans"]):
+        comp = ordinary_composition(4 if index % 2 == 0 else 3) if profile == "ordinary" else dense_composition()
+        row["composition"] = comp
+        result = row["result"]
+        result.update(leak_nodes=comp["total_nodes"], leak_bytes=comp["total_bytes"])
+        # Many distinct reported groups exercise optional-composition fallback.
+        tree_sizes = [*range(1, 20), comp["total_nodes"] - sum(range(1, 20))] if profile == "dense" else [comp["total_nodes"]]
+        result["groups"] = sorted([{"root_kind": "leak", "root_type": "NSXPCConnection", "root_instances": 1,
+            "tree_nodes": nodes, "groups": 1} for nodes in tree_sizes],
+            key=lambda group: C.canonical([group[key] for key in ("root_kind", "root_type", "root_instances", "tree_nodes")]))
+    for row in measurement["scans"]:
+        row["baseline_delta"] = C.composition.composition_delta(measurement["scans"][0]["composition"], row["composition"])
+    return measurement
+
+
 def raw_fixture(records, arm="keep", failed=False, clean=True, full=True, kind="NSXPCConnection", partial=False):
     records.mkdir(parents=True, exist_ok=True)
     expected = manifest()["executables"]
@@ -284,7 +338,7 @@ class ProjectionTests(TemporaryTests):
 
 
 class CampaignTests(TemporaryTests):
-    def run_campaign(self, failed=True, failure_index=None, group_failure=False, corrupt_index=None, partial_index=None):
+    def run_campaign(self, failed=True, failure_index=None, group_failure=False, corrupt_index=None, partial_index=None, profile=None):
         self.calls = []
         def owned(command, log, environment, timeout):
             self.calls.append((command, timeout))
@@ -302,7 +356,11 @@ class CampaignTests(TemporaryTests):
                 save(records / "inputs.json", inputs)
             return process(2 if index == partial_index else 1 if failed else 0, complete=not (index == failure_index and group_failure))
         root = self.root / "campaign"
-        with mock.patch.object(C, "identity", side_effect=identity), mock.patch.object(C, "run_owned", side_effect=owned), mock.patch.object(C, "load_prepared_build", return_value=manifest()), contextlib.redirect_stdout(io.StringIO()):
+        project = C.project_trial
+        def projected(*args):
+            value = project(*args)
+            return scaled_measurement(value, profile) if profile is not None else value
+        with mock.patch.object(C, "identity", side_effect=identity), mock.patch.object(C, "run_owned", side_effect=owned), mock.patch.object(C, "load_prepared_build", return_value=manifest()), mock.patch.object(C, "project_trial", side_effect=projected), contextlib.redirect_stdout(io.StringIO()):
             code = C.campaign(root)
         summary = C.read_json(root / "summary.json")
         C.validate_summary(summary)
@@ -326,6 +384,62 @@ class CampaignTests(TemporaryTests):
         code, summary, _ = self.run_campaign(failed=False)
         self.assertEqual(code, 0)
         self.assertTrue(summary["strict_checks_passed"] and summary["evidence_checks_passed"])
+
+    def test_full_scale_compact_campaign_preserves_nine_and_final_cleanup(self):
+        code, summary, root = self.run_campaign(failed=False, profile="ordinary")
+        self.assertEqual(code, 0)
+        self.assertEqual(summary["schema"], 2)
+        self.assertEqual(len(summary["trials"]), 9)
+        self.assertTrue(summary["completed"] and summary["evidence_checks_passed"])
+        self.assertEqual(summary["temporary_cleanup"], "complete")
+        self.assertGreater(len(C.canonical(summary)), C.PUBLIC_LIMIT)
+        self.assertLessEqual(len(C.public_bytes(summary)), C.PUBLIC_LIMIT)
+        self.assertEqual((root / "summary.json").read_bytes(), C.public_bytes(summary))
+        self.assertFalse((root / "private").exists())
+        self.assertEqual(C.main(["--work-directory", str(root), "--validate-public"]), 0)
+        self.assertTrue(all(scan["composition"]["counts_status"] == "complete" for trial in summary["trials"] for scan in trial["measurement"]["scans"]))
+        self.assertEqual(summary["build"]["manifest_sha256"], hashlib.sha256(C.canonical(manifest())).hexdigest())
+
+    def test_composition_budget_fallback_retains_counts_clocks_and_strict(self):
+        code, summary, root = self.run_campaign(failed=False, profile="dense")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(summary["trials"]), 9)
+        self.assertEqual(summary["temporary_cleanup"], "complete")
+        self.assertTrue(summary["strict_checks_passed"] and summary["evidence_checks_passed"])
+        self.assertLessEqual(len(C.public_bytes(summary)), C.PUBLIC_LIMIT)
+        omitted = [scan for trial in summary["trials"] for scan in trial["measurement"]["scans"] if scan["composition"]["reasons"] == ["summary_budget"]]
+        self.assertTrue(omitted)
+        for trial in summary["trials"]:
+            self.assertEqual(trial["strict_verdict"]["status"], "passed")
+            self.assertTrue(trial["measurement"]["timing_valid"])
+            for scan in trial["measurement"]["scans"]:
+                self.assertEqual(scan["result"]["leak_nodes"], 384)
+                self.assertEqual(C.root_count(scan["result"]), 20)
+                self.assertIsNotNone(scan["checkpoint"]["start_ms"])
+                self.assertIsNotNone(scan["scan"]["end_ms"])
+                if scan["composition"]["reasons"] == ["summary_budget"]:
+                    self.assertEqual(scan["composition"]["total_nodes"], scan["result"]["leak_nodes"])
+                    self.assertEqual(scan["baseline_delta"]["status"], "unavailable")
+        self.assertFalse((root / "private").exists())
+        self.assertEqual(C.main(["--work-directory", str(root), "--validate-public"]), 0)
+
+    def test_schema_one_keeps_pretty_wire_and_schema_two_rejects_pretty(self):
+        _, summary, root = self.run_campaign(failed=False)
+        old = copy.deepcopy(summary); old["schema"] = 1
+        save(root / "summary.json", old)
+        self.assertEqual(C.encode_summary(old), C.canonical(old))
+        self.assertEqual(C.main(["--work-directory", str(root), "--validate-public"]), 0)
+        save(root / "summary.json", summary)
+        with self.assertRaises(ValueError): C.main(["--work-directory", str(root), "--validate-public"])
+
+    def test_core_budget_failure_retains_private_before_cleanup(self):
+        errors = io.StringIO()
+        with mock.patch.object(C, "PUBLIC_LIMIT", 18000), contextlib.redirect_stderr(errors):
+            code, summary, root = self.run_campaign(failed=False)
+            self.assertEqual(code, 1)
+            self.assertTrue((root / "private").exists())
+            self.assertIn("private evidence retained", errors.getvalue())
+            self.assertNotEqual(summary["temporary_cleanup"], "complete")
 
     def test_passing_partial_prefix_cannot_make_whole_campaign_strict_pass(self):
         code, summary, root = self.run_campaign(failed=False, partial_index=0)
