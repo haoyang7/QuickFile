@@ -2,11 +2,13 @@
 
 QuickFile 是 macOS Finder 的新建文件工具。支持模板、变量替换、同名自动编号，以及通过系统面板授权目标目录。主应用和 Finder 扩展共享本机模板与授权记录。
 
-项目处于 0.1 开发阶段，最低支持 macOS 13，构建目标为 Apple Silicon 与 Intel Universal。源码、CI 和开发签名构建的可用性不代表正式分发已经验收；发布条件见 [发布清单](RELEASE_CHECKLIST.md)。
+项目处于 0.1 开发阶段，最低部署目标为 macOS 13，构建目标为 Apple Silicon 与 Intel Universal。macOS 13/14 尚未完成实机验收；具体候选的系统、架构和安装验证范围以其发布说明为准。源码、CI 和开发签名构建的可用性不代表正式分发已经验收；发布条件见 [发布清单](RELEASE_CHECKLIST.md)。
 
 ## 普通用户下载与安装
 
 Community DMG 只从 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 对应发布页取得；发布状态以 GitHub Releases 为准，需要核对构建身份时再查看该页的 `build-provenance.json`；没有对应发布页时不视为已经发布。普通安装只需下载 DMG 和对应 `.sha256` 并先核对 SHA-256；`artifact-check.json`、`INSTALL.txt` 和 `build-provenance.json` 是按需查看的收据与说明。随后退出旧版并备份，拖到“应用程序”、推出 DMG，最后从“应用程序”打开。完整的未公证 App 首次打开、Finder 扩展、目录授权、升级和 `xattr` 排障步骤见[安装指南](INSTALLATION.md)。
+
+`v0.1.0-beta.1` 的发布说明记录了从开发签名版本覆盖安装后持续加载的受阻场景，原因尚未确定。签名路线切换的权限与数据迁移未完成验收；已有可用安装的用户应先阅读[升级与恢复](INSTALLATION.md#升级与恢复)，在可恢复的测试环境验证。
 
 ## 构建与测试
 

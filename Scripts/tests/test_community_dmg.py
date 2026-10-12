@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import os
 import plistlib
@@ -46,6 +47,7 @@ class CommunityDMGTests(unittest.TestCase):
         self.partial_attach = False
         self.detach_without_effect = False
         self.inspect_passes = True
+        self.installation_notes = "QuickFile 安装说明\n拖入 Applications，然后推出镜像。\n".encode("utf-8")
 
     def tearDown(self):
         # These are ordinary fixture directories; no real volume was attached.
@@ -106,7 +108,7 @@ class CommunityDMGTests(unittest.TestCase):
 
     def create(self):
         with patch.object(MODULE, "run", side_effect=self.tool), patch.object(MODULE.ARTIFACT, "inspect_artifact", side_effect=self.inspect), patch.object(MODULE.os.path, "ismount", side_effect=lambda path: Path(path) == self.mount and self.mounted):
-            return MODULE.create_dmg(self.app, self.image, self.workspace)
+            return MODULE.create_dmg(self.app, self.image, self.workspace, self.installation_notes)
 
     def assert_clean_failure(self):
         self.assertFalse(self.image.exists())
@@ -115,6 +117,11 @@ class CommunityDMGTests(unittest.TestCase):
 
     def test_success_checks_every_byte_mode_link_and_detaches_before_publication(self):
         before = MODULE.ARTIFACT.tree_manifest(self.app)
+        def verify_visible_instructions():
+            instructions = self.mount / "安装说明.txt"
+            self.assertEqual(instructions.read_bytes(), self.installation_notes)
+            self.assertEqual(instructions.stat().st_mode & 0o777, 0o644)
+        self.after_attach = verify_visible_instructions
         self.after_detach = lambda: self.assertFalse(self.image.exists())
         report = self.create()
         self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
@@ -125,6 +132,8 @@ class CommunityDMGTests(unittest.TestCase):
         self.assertEqual(report["format"], "UDZO")
         self.assertEqual(report["filesystem"], "HFS+")
         self.assertEqual(report["trust"], "ad-hoc/unnotarized")
+        self.assertEqual(report["installation_file"], "安装说明.txt")
+        self.assertEqual(report["installation_sha256"], hashlib.sha256(self.installation_notes).hexdigest())
         self.assertNotIn(str(self.directory), json.dumps(report))
         create = next(command for command in self.commands if command[1] == "create")
         self.assertIn("UDZO", create)
@@ -168,6 +177,23 @@ class CommunityDMGTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "shortcut"):
             self.create()
         self.assert_clean_failure()
+
+    def test_missing_changed_or_nonregular_instructions_detach_and_reject(self):
+        for change in ("missing", "bytes", "symlink", "directory"):
+            with self.subTest(change=change):
+                def tamper():
+                    instructions = self.mount / "安装说明.txt"
+                    instructions.unlink()
+                    if change == "bytes":
+                        instructions.write_bytes(b"x" * len(self.installation_notes))
+                    elif change == "symlink":
+                        instructions.symlink_to(self.workspace / "source" / "安装说明.txt")
+                    elif change == "directory":
+                        instructions.mkdir()
+                self.after_attach = tamper
+                with self.assertRaisesRegex(ValueError, "installation instructions"):
+                    self.create()
+                self.assert_clean_failure()
 
     def test_create_verify_and_attach_failures_clean_confirmed_unmounted_workspace(self):
         for operation in ("create", "verify", "attach"):

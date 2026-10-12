@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import plistlib
@@ -14,6 +15,8 @@ from pathlib import Path
 SPEC = importlib.util.spec_from_file_location("community_dmg_artifact", Path(__file__).with_name("verify-community-artifact.py"))
 ARTIFACT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ARTIFACT)
+
+INSTALLATION_FILENAME = "安装说明.txt"
 
 
 class DMGCleanupError(ValueError):
@@ -91,7 +94,7 @@ def publish_image(source: Path, image: Path) -> None:
         raise
 
 
-def create_dmg(app: Path, image: Path, workspace: Path) -> dict:
+def create_dmg(app: Path, image: Path, workspace: Path, installation_notes: bytes) -> dict:
     """Publish a verified DMG; leave only an empty workspace on normal completion.
 
     On DMGCleanupError, preserve workspace: community.dmg, mount and a small
@@ -121,6 +124,9 @@ def create_dmg(app: Path, image: Path, workspace: Path) -> dict:
         if ARTIFACT.tree_manifest(copied) != manifest:
             raise ValueError("DMG staging changed application bytes, modes or symlinks")
         (source / "Applications").symlink_to("/Applications")
+        instructions = source / INSTALLATION_FILENAME
+        instructions.write_bytes(installation_notes)
+        instructions.chmod(0o644)
         run([
             "/usr/bin/hdiutil", "create", "-srcfolder", str(source), "-format", "UDZO", "-fs", "HFS+",
             "-volname", "QuickFile Community", str(private_image),
@@ -147,6 +153,11 @@ def create_dmg(app: Path, image: Path, workspace: Path) -> dict:
             applications = mount / "Applications"
             if not applications.is_symlink() or os.readlink(applications) != "/Applications":
                 raise ValueError("mounted DMG Applications shortcut has an unexpected target")
+            mounted_instructions = mount / INSTALLATION_FILENAME
+            if (mounted_instructions.is_symlink() or not mounted_instructions.is_file()
+                    or mounted_instructions.stat().st_size != len(installation_notes)
+                    or mounted_instructions.read_bytes() != installation_notes):
+                raise ValueError("mounted DMG installation instructions differ from the delivery text")
             if ARTIFACT.tree_manifest(app) != manifest:
                 raise ValueError("DMG input application changed during image creation")
         finally:
@@ -159,6 +170,8 @@ def create_dmg(app: Path, image: Path, workspace: Path) -> dict:
             "trust": "ad-hoc/unnotarized", "hdiutil_verify": "pass", "readonly_mount": "pass",
             "mounted_manifest": "matches all input bytes, modes and symlinks", "mounted_artifact_verdict": "pass",
             "applications_link": "/Applications", "input_unchanged": True,
+            "installation_file": INSTALLATION_FILENAME,
+            "installation_sha256": hashlib.sha256(installation_notes).hexdigest(),
             "cleanup": "own image detached; private image, source and mount removed",
             "unproven": ["cross-machine launch", "Finder integration", "upgrades", "Gatekeeper acceptance"],
         }

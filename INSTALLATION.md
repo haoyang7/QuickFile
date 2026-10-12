@@ -2,6 +2,8 @@
 
 本指南适用于 GitHub Releases 对应发布页中的 Community DMG。当前实验候选的发布状态以对应发布页为准；如需核对版本、内部 build、源码提交和工作流身份，再查看其中的 `build-provenance.json`。没有对应发布页时，不视为可下载发布。Community 采用 ad-hoc 签名、未经 Apple 公证，不含 Sparkle，升级采用手动覆盖安装。
 
+`v0.1.0-beta.1` 的[发布说明](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.1)记录了从开发签名版本覆盖安装后模板和 Finder 交接队列持续加载的受阻场景，原因尚未确定。干净安装、Community 版本间升级和签名路线切换须分别验收。已有可用安装时，先阅读下文的“升级与恢复”，保留可用旧版和数据备份，在可恢复的测试环境验证。
+
 ## 下载与核对
 
 只从 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 的同一发布页下载匹配资产。普通安装只需要下面前两项；其余三项是按需查看的说明与收据：
@@ -9,7 +11,7 @@
 - `QuickFile-<tag>.dmg`，当前候选示例为 `QuickFile-v0.1.0-beta.1.dmg`（`<tag>` 本身包含 `v`）
 - 对应的 `.sha256` 文件
 - `artifact-check.json`（按需）
-- `INSTALL.txt`（按需）
+- `INSTALL.txt`（按需；镜像中若有 `安装说明.txt`，也可直接打开阅读）
 - `build-provenance.json`（按需）
 
 `build-provenance.json` 记录源码 SHA、Actions run、工具链和前四项资产的 SHA-256。按需查看时，它用于确认下载资产属于同一次构建，不替代签名、公证或完整实机验收。
@@ -53,6 +55,12 @@ xattr -dr com.apple.quarantine /Applications/QuickFile.app
 
 ## 升级与恢复
 
-Community 没有在线更新或 Sparkle 自动安装。升级时先备份并退出旧版，再按同一校验、拖拽、推出和首次打开流程覆盖安装；打开后在“关于”中核对版本/build，重新确认 Finder 扩展实际加载的是当前 `/Applications/QuickFile.app`，再验证模板、目录授权和 Finder 创建。若系统拒绝启动或扩展未响应，保留提示原文并停止该项验收，不通过重签、注册修复或关闭安全功能掩盖失败。
+Community 没有在线更新或 Sparkle 自动安装。先确认旧版与新版的分发路线、版本/build 和发布说明。开发签名或 Developer ID 版本切换到 Community 涉及签名身份变化，不能套用同一路线的升级结果；旧模板可读取、书签可用及 App Group 访问都需要重新验证。
+
+升级时先备份并退出旧版，再按同一校验、拖拽、推出和首次打开流程覆盖安装；打开后在“关于”中核对版本/build，重新确认 Finder 扩展实际加载的是当前 `/Applications/QuickFile.app`，再验证模板、目录授权和 Finder 创建。若系统拒绝启动、持续加载或扩展未响应，保留提示原文并停止该项验收，不通过重签、注册修复或关闭安全功能掩盖失败。
+
+持续加载时记录 macOS 完整版本、芯片架构、升级前后的版本/build 与分发路线，以及模板、授权交接队列和 Finder 菜单各自的表现和等待时长。加载未完成不能视为模板或授权已丢失；不要删除 App Group 数据、恢复默认模板或反复授权来尝试解除等待。移除隔离属性不能作为共享容器或偏好读取已恢复的证据。
+
+需要回退时，退出当前版，使用安装前保留的原 App 备份恢复应用，保留现有模板、授权和恢复文件。仅恢复旧 App 不等于系统权限或数据状态已经恢复；重新核对实际加载的扩展、模板读取、授权交接和测试目录中的 Finder 创建。若旧版仍持续加载，保留数据和备份并停止反复覆盖安装，按发布页的反馈入口报告上述信息；不要上传原始书签或未经脱敏的系统日志。
 
 跨机器启动、完整 Finder 矩阵、默认安全设置干净机器、Mac 重启/注销、完整内存与残余 AX 内存归因仍按[发布清单](RELEASE_CHECKLIST.md)分别验收。产物收据只说明文件和包层检查结果，不能代替这些实测。
