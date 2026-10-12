@@ -40,7 +40,172 @@ def compare_live(case):
     return value
 
 
+NATIVE_DIAGNOSTIC_WORDS = {word.lower(): word for word in (
+    "fullStackHistory", "MallocStackLogging", "MallocStackLoggingNoCompact", "MallocStackLoggingLite", "MSL",
+    "compact", "noncompact", "non-compact", "lite", "mode", "supported", "support", "supports", "unsupported",
+    "not", "no", "never", "only", "enable", "enabled", "enabling", "disable", "disabled", "stack", "logging", "history",
+    "requires", "require", "required", "with", "when", "without", "using", "used", "must", "cannot", "available",
+    "unavailable", "allowed", "is", "are", "be", "to", "for", "and", "or", "because", "in", "a", "the", "this",
+    "current", "full", "malloc", "allocation", "allocations", "freed", "record", "records", "recording", "process", "error", "fatal",
+    "option", "options", "use", "instead", "can", "could", "unable", "failed", "version", "set", "setting", "settings",
+    "environment", "variable", "variables", "legacy", "normal", "uncompacted", "all", "free",
+    "does", "doesn't", "don't", "isn't", "aren't", "can't", "won't", "couldn't", "wasn't", "weren't", "didn't")}
+
+
+def native_diagnostic_clues(output):
+    """Ordered whitelist words only; these lexical hints do not establish cause."""
+    words = []
+    payload = output.encode("utf-8") if isinstance(output, str) else output
+    truncated = len(payload) > 65536
+    bounded = payload[:65536]
+    if truncated and bounded and not bounded[-1:].isspace():
+        # A clipped unknown word must not become a complete whitelist word.
+        prefix = bounded.rsplit(None, 1)
+        bounded = prefix[0] if len(prefix) == 2 else b""
+    for raw in bounded.split():
+        try:
+            word = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # Dropping invalid bytes could turn an unknown token into a clue.
+            continue
+        word = word.replace("’", "'").strip(".,:;!?()[]{}'\"`").removeprefix("--")
+        # Reject paths, addresses, process IDs, and unknown attached text. Only
+        # the named malloc settings may carry the literal =0 / =1 suffix.
+        setting = re.fullmatch(r"(MallocStackLogging(?:NoCompact|Lite)?)(?:=[01])?", word, re.I)
+        if setting:
+            word = setting[1]
+        if word.lower() not in NATIVE_DIAGNOSTIC_WORDS:
+            continue
+        if len(words) == 64:
+            truncated = True
+            break
+        words.append(NATIVE_DIAGNOSTIC_WORDS[word.lower()])
+    return {"status": "recognized" if words else "unknown", "words": words, "truncated": truncated}
+
+
+def native_capture_comparison(pid, work):
+    """One owned process, unchanged malloc settings, full history first."""
+    cases = []
+    for full in (True, False):
+        graph = work / ("baseline.memgraph" if full else "current-history.memgraph")
+        if full:
+            captured = NODES.capture_live_point(pid, "baseline", work, work, time.monotonic())
+            status, code = captured["status"], captured["exit_code"]
+            log = work / "baseline-capture.txt"
+            diagnostic = ""
+            if log.is_file():
+                with log.open("rb") as stream:
+                    diagnostic = stream.read(65537)
+        else:
+            try:
+                captured = subprocess.run(["leaks", "--noContent", "--fullStacks", f"--outputGraph={graph}", str(pid)],
+                                          capture_output=True, text=True, timeout=60)
+                code = captured.returncode
+                status = "complete" if code in (0, 1) and graph.is_file() else "failed"
+                diagnostic = captured.stdout + "\n" + captured.stderr
+            except subprocess.TimeoutExpired:
+                status, code, diagnostic = "timeout", None, ""
+            except OSError:
+                status, code, diagnostic = "failed", None, ""
+        row = {"case": "full_stack_history" if full else "current_stack_history", "capture_status": status,
+               "capture_exit_code": code, "graph_created": graph.is_file(),
+               "capture_clues": native_diagnostic_clues(diagnostic) if status != "complete" else None,
+               "history_status": "not_attempted", "history_exit_code": None, "history_clues": None}
+        if status == "complete":
+            try:
+                history = subprocess.run(["malloc_history", "--allEvents", "--fullStacks", str(graph)],
+                                         capture_output=True, text=True, timeout=60)
+                row["history_exit_code"] = history.returncode
+                row["history_status"] = ("readable" if re.search(r"^ALLOC ", history.stdout, re.M) else "no_allocations") if history.returncode == 0 else "failed"
+                if row["history_status"] == "failed":
+                    row["history_clues"] = native_diagnostic_clues(history.stdout + "\n" + history.stderr)
+            except subprocess.TimeoutExpired:
+                row["history_status"] = "timeout"
+            except OSError:
+                row["history_status"] = "io_error"
+        cases.append(row)
+    return {"schema": 1, "scope": "owned-native-capture-comparison", "same_process": True,
+            "malloc_settings": {"MallocStackLogging": "1", "MallocStackLoggingNoCompact": "1"},
+            "cases": cases}
+
+
 class AXLiveAttributionTests(unittest.TestCase):
+    def test_native_diagnostic_clues_are_ordered_bounded_whitelist_words(self):
+        self.assertEqual(native_diagnostic_clues(
+            "leaks[123]: ERROR: --fullStackHistory is only supported with MallocStackLoggingNoCompact=1.\n"
+            "/private/compact C:\\Users\\lite 0x1234 123 private-fullStackHistory --history=/private/path"),
+            {"status": "recognized", "words": ["error", "fullStackHistory", "is", "only", "supported", "with",
+                                                   "MallocStackLoggingNoCompact"], "truncated": False})
+        self.assertEqual(native_diagnostic_clues("unknown-private-message /private/history 0x1234 9876"),
+                         {"status": "unknown", "words": [], "truncated": False})
+        self.assertEqual(native_diagnostic_clues("lite mode doesn’t support `--fullStackHistory`.")["words"],
+                         ["lite", "mode", "doesn't", "support", "fullStackHistory"])
+        limited = native_diagnostic_clues("not " * 65)
+        self.assertEqual(limited, {"status": "recognized", "words": ["not"] * 64, "truncated": True})
+        self.assertEqual(native_diagnostic_clues("x" * 65536 + " fullStackHistory"),
+                         {"status": "unknown", "words": [], "truncated": True})
+
+    def test_native_diagnostic_clues_preserve_negation(self):
+        for diagnostic, expected in (
+            ("No stack history available", ["no", "stack", "history", "available"]),
+            ("fullStackHistory is never supported", ["fullStackHistory", "is", "never", "supported"]),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(native_diagnostic_clues(diagnostic),
+                                 {"status": "recognized", "words": expected, "truncated": False})
+
+    def test_native_diagnostic_clues_limit_bytes_and_discard_incomplete_tokens(self):
+        unicode_output = "no " + "é" * 33000 + " stack history"
+        self.assertEqual(len(unicode_output.encode("utf-8")), 66017)
+        self.assertEqual(native_diagnostic_clues(unicode_output),
+                         {"status": "recognized", "words": ["no"], "truncated": True})
+        for output in (
+            b"x " * 32766 + b"only_suffix",
+            b"x" * 65531 + b" not\xe2\x80\x99suffix",
+        ):
+            with self.subTest(length=len(output)):
+                self.assertEqual(native_diagnostic_clues(output),
+                                 {"status": "unknown", "words": [], "truncated": True})
+        self.assertEqual(native_diagnostic_clues(b"not\xff never"),
+                         {"status": "recognized", "words": ["never"], "truncated": False})
+        self.assertEqual(native_diagnostic_clues(b"x" * 65533 + b" no"),
+                         {"status": "recognized", "words": ["no"], "truncated": False})
+
+    def test_native_control_runs_after_full_history_failure_and_preserves_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            pid = 9876
+            def full_capture(actual_pid, label, graphs, records, completed):
+                self.assertEqual((actual_pid, label, graphs, records), (pid, "baseline", work, work))
+                (work / "baseline-capture.txt").write_text("fullStackHistory requires MallocStackLoggingNoCompact; "
+                                                          "compact mode not supported. /private/user 0x1234")
+                return {"status": "failed", "exit_code": 255}
+            commands = []
+            def run(command, **kwargs):
+                commands.append(command)
+                if command[0] == "leaks":
+                    self.assertEqual(command, ["leaks", "--noContent", "--fullStacks",
+                                               f"--outputGraph={work / 'current-history.memgraph'}", str(pid)])
+                    (work / "current-history.memgraph").write_bytes(b"owned graph")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                self.assertEqual(command, ["malloc_history", "--allEvents", "--fullStacks", str(work / "current-history.memgraph")])
+                return subprocess.CompletedProcess(command, 0, "ALLOC 0x1234 private stack\n", "")
+            with mock.patch.object(NODES, "capture_live_point", side_effect=full_capture), \
+                    mock.patch.object(subprocess, "run", side_effect=run):
+                result = native_capture_comparison(pid, work)
+            full, control = result["cases"]
+            self.assertEqual((full["capture_status"], full["capture_exit_code"], full["graph_created"], full["history_status"]),
+                             ("failed", 255, False, "not_attempted"))
+            self.assertEqual(full["capture_clues"]["words"],
+                ["fullStackHistory", "requires", "MallocStackLoggingNoCompact", "compact", "mode", "not", "supported"])
+            self.assertEqual((control["capture_status"], control["capture_exit_code"], control["history_status"]),
+                             ("complete", 0, "readable"))
+            self.assertEqual(len(commands), 2)
+            self.assertTrue(result["same_process"])
+            encoded = json.dumps(result)
+            for private in ("/private", "0x1234", "9876", directory):
+                self.assertNotIn(private, encoded)
+
     @unittest.skipUnless(sys.platform == "darwin" and os.environ.get("QUICKFILE_AX_LIVE_CAPTURE_SMOKE") == "1",
                          "Explicit native live-capture investigation only")
     def test_native_live_capture_cli(self):
@@ -61,7 +226,7 @@ class AXLiveAttributionTests(unittest.TestCase):
                     try:
                         return subprocess.run(command, capture_output=True, text=True, timeout=60)
                     except (OSError, subprocess.TimeoutExpired):
-                        self.fail("Owned CLI test tool did not complete")
+                        raise self.failureException("Owned CLI test tool did not complete") from None
                 self.assertEqual(run(["xcrun", "clang", "-O0", "-g", str(source), "-o", str(executable)]).returncode, 0,
                                  "Owned CLI fixture compilation failed")
                 self.assertEqual(run(["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(executable)]).returncode, 0,
@@ -81,13 +246,7 @@ class AXLiveAttributionTests(unittest.TestCase):
                         original = run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(process.pid)])
                         self.assertIn(original.returncode, (0, 1), NODES.capture_error_signals(original.stdout + original.stderr))
                         (work / "baseline-live.stdout.txt").write_text(original.stdout)
-                        captured = NODES.capture_live_point(process.pid, "baseline", work, work, time.monotonic())
-                        self.assertEqual(captured["status"], "complete", captured)
-                        self.assertGreater((work / "baseline.memgraph").stat().st_size, 0)
-                        self.assertEqual(captured["graph_sha256"], NODES.graph_hash(work / "baseline.memgraph"))
-                        history = run(["malloc_history", "--allEvents", "--fullStacks", str(work / "baseline.memgraph")])
-                        self.assertEqual(history.returncode, 0, "Owned capture history could not be read")
-                        self.assertTrue(re.search(r"^ALLOC ", history.stdout, re.M), "Owned capture has no allocation history")
+                        comparison = native_capture_comparison(process.pid, work)
                     finally:
                         try:
                             process.communicate("\n", timeout=5)
@@ -95,6 +254,12 @@ class AXLiveAttributionTests(unittest.TestCase):
                             process.kill()
                             process.communicate(timeout=5)
                         self.assertIsNotNone(process.returncode, "Owned CLI fixture did not exit")
+                    print(json.dumps(comparison, separators=(",", ":")), flush=True)
+                    # The successful control must never replace a failed full-
+                    # history contract. Assert only after both captures/cleanup.
+                    full = comparison["cases"][0]
+                    self.assertEqual(full["capture_status"], "complete", full)
+                    self.assertEqual(full["history_status"], "readable", full)
         finally:
             if not any(root.iterdir()):
                 root.rmdir()
