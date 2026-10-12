@@ -128,16 +128,19 @@ AX 读取权限由实际 reader 可执行文件检查；不匹配映像或缺权
 
 Xcode 的 macOS App 构建会添加 Launch Services 注册步骤，文件回收不能证明注册状态已恢复。CI 临时 runner 没有日常安装版；本机验证结束后须按 [临时产物回收约定](CONTRIBUTING.md#临时产物回收) 恢复日常 App 与 Finder 扩展的实际加载身份，并在清理后验收真实 Finder 菜单。自检脚本的清理收据只记录本轮文件回收结果。
 
-每个 macOS job 只上传两份从有限字段生成的 synthetic CI JSON 回执，不读取或导出 xcresult 内容：
+每个 macOS job 上传三份从有限字段生成的 synthetic CI JSON 回执，不读取或导出 xcresult 内容：
 
 - `identity.json`：实际 checkout SHA、event SHA、workflow SHA、PR head/base SHA（适用时），run/attempt 链接、job、预期与实际 OS/架构/工具身份
 - `verification.json`：身份/工具/脚本/原生步骤的 outcome、上传前 job 状态、原生命令退出码、两个结果 bundle 是否存在，以及实际 XcodeGen 版本
+- `ax-evidence.json`：原六点严格 AX 扫描的有界脱敏摘要，以及严格失败后可用的终点图诊断；未执行、能力跳过、缺失和不完整状态分别保留
 
-这些回执不声明测试数量或断言详情，也不是签名、实机、安装、性能或发布验收。PR 的 checkout 通常是临时合并提交，不应拿 PR head SHA 替代。最终 job 结论仍以 Actions 为准：`job_before_upload` 不能证明上传步骤本身成功。
+身份与 verification 回执不声明测试数量或断言详情；AX 回执只保留有限扫描判定标签与脱敏诊断。三份回执都不是签名、实机、安装、性能或发布验收。PR 的 checkout 通常是临时合并提交，不应拿 PR head SHA 替代。最终 job 结论仍以 Actions 为准：`job_before_upload` 不能证明上传步骤本身成功。
 
-上传前校验严格字段/类型、文件名白名单、无符号链接且每文件不超过 16 KiB；两份文件合计最多 32 KiB。`upload-artifact` 固定官方 v7.0.1 的完整提交 SHA，路径逐个列出，不使用 glob。artifact 名含 job、OS、架构、Xcode、run ID 与 attempt，不覆盖旧 artifact，只保留 7 天。身份校验、测试或构建失败后仍用 `always()` 生成脱敏回执，并保持原 job 失败；若 checkout/Python 初始化失败、作业被硬终止或上传服务失败，可能没有回执，不得解释为验证通过。
+上传前校验严格字段/类型、精确文件名白名单、无符号链接及硬链接，并用同一文件描述符有界读取。`identity.json` 与 `verification.json` 各不超过 16 KiB；`ax-evidence.json` 独立上限为 256 KiB，三份合计最多 288 KiB。`upload-artifact` 固定官方 v7.0.1 的完整提交 SHA，路径逐个列出，不使用 glob。artifact 名含 job、OS、架构、Xcode、run ID 与 attempt，不覆盖旧 artifact，只保留 7 天。身份校验、测试或构建失败后仍用 `always()` 生成脱敏回执，并保持原 job 失败；若 checkout/Python 初始化失败、作业被硬终止或上传服务失败，可能没有回执，不得解释为验证通过。
 
-原始 `.xcresult` 留在 runner 本地，随托管 runner 回收；不上传原始 trace、测试附件/消息、完整日志、整个 `.build`/DerivedData、证书、profile、环境变量 dump、书签或用户数据。新增或修改回执逻辑后应检查生成的两份回执与 Actions 日志、确认身份/退出码/失败路径，再判断是否需要另行设计经过审查的数值型 xcresult 摘要；不能直接扩大为原包上传。
+`run-scripts` 将原脚本测试命令的 AX 记录目录绑定为本 job 独占的 `ax-records/`，由原 runner 独占创建，命令结束后直接收集证据，不重跑失败测试。原失败退出码始终保留；原命令成功但必要 AX 证据缺失或不完整仍失败。collector 出错使用固定 `unavailable` 摘要；脚本步骤未执行时，`finish` 生成明确的 `not_attempted` 摘要。原始 `groupByType` 输出不包含完整地址；严格失败后的单张终点图晚于原六点扫描，不是 baseline 或 first-growth 快照，不能提供分配 generation 或跨图 diff，也不改变原严格扫描、门禁、malloc 配置或发布验收声明。原始 AX 记录和内存图只留在 runner，不上传。
+
+原始 `.xcresult` 留在 runner 本地，随托管 runner 回收；不上传原始 trace、测试附件/消息、完整日志、整个 `.build`/DerivedData、证书、profile、环境变量 dump、书签或用户数据。新增或修改回执逻辑后应检查生成的三份回执与 Actions 日志、确认身份/退出码/失败路径，再判断是否需要另行设计经过审查的数值型 xcresult 摘要；不能直接扩大为原包上传。
 
 上述验证工作流只需要 `contents: read`，checkout 不保留凭据，不使用 secrets，不配置证书/profile，只上传验证收据，不发布 App/ZIP；Community DMG 的五项分发产物按前述独立流程上传。各流程不引入自托管或付费大 runner。fork/untrusted PR 使用原有 `pull_request` 权限边界，不使用 `pull_request_target`。主 CI 的 PR 入口没有工作流级路径过滤，文档跳过由总门禁明确判定；其它工作流保留各自触发范围。工作流未启动或整体取消不等于门禁通过，仍须核对当前提交的 required check 终态。
 

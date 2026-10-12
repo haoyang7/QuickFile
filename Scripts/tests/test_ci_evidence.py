@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -27,7 +28,7 @@ def environment(base):
                 GITHUB_SHA="b" * 40, WORKFLOW_SHA="c" * 40, PR_HEAD_SHA="d" * 40, PR_BASE_SHA="e" * 40,
                 RUNNER_TEMP=str(base), GITHUB_OUTPUT=str(base / "github-output"),
                 GITHUB_STEP_SUMMARY=str(base / "github-summary"), IDENTITY_OUTCOME="success", TOOLS_OUTCOME="success",
-                SCRIPTS_OUTCOME="success", NATIVE_OUTCOME="success", JOB_STATUS="success", PRIVATE_ENV="NEVER-UPLOAD-ME")
+                SCRIPTS_OUTCOME="skipped", NATIVE_OUTCOME="success", JOB_STATUS="success", PRIVATE_ENV="NEVER-UPLOAD-ME")
 
 
 def actual():
@@ -37,8 +38,15 @@ def actual():
 
 
 class CIEvidenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        directory = PROJECT / ".build" / "Temporary"
+        directory.mkdir(parents=True, exist_ok=True)
+        cls.suite_temporary = tempfile.TemporaryDirectory(prefix="ci-failure-wiring-", dir=directory)
+        cls.addClassCleanup(cls.suite_temporary.cleanup)
+
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(dir=self.suite_temporary.name)
         self.addCleanup(self.temporary.cleanup)
         # /var -> /private/var on macOS is a normal system alias; use canonical fixtures.
         self.base = Path(self.temporary.name).resolve()
@@ -62,6 +70,156 @@ class CIEvidenceTests(unittest.TestCase):
     def finish(self, root):
         with patch.object(MODULE, "optional_tool", return_value="Version: 2.46.0"):
             return MODULE.finish(root, self.env)
+
+    def collector(self, status="complete", failure=None):
+        def collect(records):
+            self.assertEqual(records.name, "ax-records")
+            self.assertEqual((records / "command-ran").read_text(), "1")
+            if failure:
+                raise failure
+            return {"status": status}
+
+        def validate(payload):
+            if set(payload) != {"status"} or payload["status"] not in {"complete", "partial", "unsupported", "not_attempted", "unavailable"}:
+                raise ValueError("invalid mock summary")
+
+        return SimpleNamespace(PUBLIC_LIMIT=262144, collect=collect, validate_public=validate,
+                               empty=lambda status: {"status": status})
+
+    def scripts(self, root, code=0):
+        program = "\n".join([
+            "import os; from pathlib import Path",
+            "assert os.environ['QUICKFILE_AX_CI_FAILURE_EVIDENCE'] == '1'",
+            "p=Path(os.environ['QUICKFILE_AX_TEST_RECORDS'])",
+            "assert not p.exists(); p.mkdir(mode=0o700, exist_ok=False)",
+            "(p/'command-ran').write_text('1')",
+            f"raise SystemExit({code})",
+        ])
+        return MODULE.run_scripts(root, [sys.executable, "-c", program])
+
+    def test_scripts_failure_is_not_rerun_or_overridden_by_collector_failure(self):
+        for status, failure in (("complete", None), ("partial", None), ("unavailable", RuntimeError("PRIVATE-SECRET"))):
+            _, root, _ = self.initialize()
+            with self.subTest(status=status), patch.object(MODULE, "ax_module", return_value=self.collector(status, failure)):
+                self.assertEqual(self.scripts(root, code=65), 65)
+                self.assertEqual(MODULE.read_json(root / "upload" / "ax-evidence.json"), {"status": status})
+                self.assertEqual(list((root / "ax-records").iterdir()), [root / "ax-records" / "command-ran"])
+                with self.assertRaises(ValueError):
+                    self.scripts(root, code=65)
+            self.assertNotIn("PRIVATE-SECRET", (root / "upload" / "ax-evidence.json").read_text())
+
+    def test_scripts_success_requires_complete_or_explicit_unsupported_evidence(self):
+        for status, expected in (("complete", 0), ("unsupported", 0), ("partial", 1), ("not_attempted", 1), ("unavailable", 1)):
+            _, root, _ = self.initialize()
+            with self.subTest(status=status), patch.object(MODULE, "ax_module", return_value=self.collector(status)):
+                self.assertEqual(self.scripts(root), expected)
+
+    def test_scripts_rejects_invalid_identity_root_and_preexisting_records(self):
+        _, root, _ = self.initialize(dict(actual(), xcode="26.6"))
+        with self.assertRaises(ValueError):
+            self.scripts(root)
+        _, root, _ = self.initialize()
+        with self.assertRaises(ValueError):
+            MODULE.run_scripts("relative", [sys.executable, "-c", "raise SystemExit(0)"])
+        for kind, name in (("directory", "ax-records"), ("symlink", "ax-records"), ("directory", "ax-records-copy-lifetime")):
+            records = root / name
+            if kind == "directory":
+                records.mkdir()
+            else:
+                records.symlink_to(self.base, target_is_directory=True)
+            with self.subTest(kind=kind), self.assertRaises((ValueError, FileExistsError)):
+                self.scripts(root)
+            if kind == "directory":
+                records.rmdir()
+            else:
+                records.unlink()
+
+    def test_scripts_launch_failure_leaves_unavailable_evidence_and_exit_127(self):
+        _, root, _ = self.initialize()
+        with patch.object(MODULE, "ax_module", return_value=self.collector(failure=RuntimeError("PRIVATE-SECRET"))):
+            self.assertEqual(MODULE.run_scripts(root, [str(self.base / "missing-command")]), 127)
+        self.assertEqual(MODULE.read_json(root / "upload" / "ax-evidence.json"), {"status": "unavailable"})
+
+    def test_evidence_write_error_preserves_script_failure_and_finish_marks_unavailable(self):
+        _, root, _ = self.initialize()
+        write = MODULE.write_json
+
+        def fail_ax(path, *args, **kwargs):
+            if path.name == "ax-evidence.json":
+                raise OSError("PRIVATE-SECRET")
+            return write(path, *args, **kwargs)
+
+        with patch.object(MODULE, "ax_module", return_value=self.collector()), patch.object(MODULE, "write_json", side_effect=fail_ax):
+            self.assertEqual(self.scripts(root, code=65), 65)
+        self.native(root)
+        self.env["SCRIPTS_OUTCOME"] = "failure"
+        self.assertEqual(self.finish(root), 0)
+        module = MODULE.ax_module()
+        self.assertEqual(MODULE.read_json(root / "upload" / "ax-evidence.json", module.PUBLIC_LIMIT), module.empty(status="unavailable"))
+
+    def test_cli_preserves_actual_failure_and_rejects_success_with_missing_ax_records(self):
+        for code, expected in ((65, 65), (0, 1)):
+            _, root, _ = self.initialize()
+            result = subprocess.run([sys.executable, str(SCRIPT), "run-scripts", str(root), "--", sys.executable,
+                                     "-c", f"raise SystemExit({code})"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, expected)
+            module = MODULE.ax_module()
+            payload = MODULE.read_json(root / "upload" / "ax-evidence.json", module.PUBLIC_LIMIT)
+            module.validate_public(payload)
+            self.assertIn(payload["status"], {"partial", "unavailable"})
+            self.assertNotIn(str(self.base), json.dumps(payload))
+
+    def test_finish_skipped_scripts_produces_not_attempted_and_success_cannot_use_it(self):
+        for outcome, expected in (("skipped", 0), ("failure", 0), ("success", 1)):
+            _, root, _ = self.initialize()
+            self.native(root)
+            self.env["SCRIPTS_OUTCOME"] = outcome
+            self.assertEqual(self.finish(root), expected)
+            module = MODULE.ax_module()
+            self.assertEqual(MODULE.read_json(root / "upload" / "ax-evidence.json", module.PUBLIC_LIMIT), module.empty(status="not_attempted"))
+            MODULE.check_upload(root)
+
+    def test_ax_file_has_separate_bound_but_does_not_relax_existing_receipts(self):
+        _, root, _ = self.initialize()
+        self.native(root)
+        self.finish(root)
+        target = root / "upload" / "ax-evidence.json"
+        module = MODULE.ax_module()
+        original = target.read_bytes()
+        target.write_bytes(original + b" " * MODULE.MAX_FILE_BYTES)
+        MODULE.check_upload(root)
+        with self.assertRaises(ValueError):
+            MODULE.read_json(target)
+        target.write_bytes(original + b" " * module.PUBLIC_LIMIT)
+        with self.assertRaises(ValueError):
+            MODULE.check_upload(root)
+        target.write_bytes(original)
+        payload = json.loads(original)
+        payload["private_path"] = "PRIVATE-SECRET"
+        target.write_text(json.dumps(payload))
+        with self.assertRaises(ValueError):
+            MODULE.check_upload(root)
+        target.write_bytes(original)
+        os.link(target, self.base / "linked-ax.json")
+        with self.assertRaises(ValueError):
+            MODULE.check_upload(root)
+
+    def test_ax_upload_rejects_symlink_fifo_and_duplicate_keys(self):
+        for kind in ("symlink", "fifo", "duplicate"):
+            _, root, _ = self.initialize()
+            self.native(root)
+            self.finish(root)
+            target = root / "upload" / "ax-evidence.json"
+            original = target.read_text()
+            target.unlink()
+            if kind == "symlink":
+                target.symlink_to(root / "upload" / "identity.json")
+            elif kind == "fifo":
+                os.mkfifo(target)
+            else:
+                target.write_text('{"status":"PRIVATE-SECRET",' + original.lstrip()[1:])
+            with self.subTest(kind=kind), self.assertRaises((ValueError, OSError)):
+                MODULE.check_upload(root)
 
     def test_runner_temp_platform_alias_is_canonicalized_before_new_child_creation(self):
         private_var = self.base / "private" / "var"
@@ -431,6 +589,8 @@ class CIWorkflowContractTests(unittest.TestCase):
             self.assertIn("persist-credentials: false", text)
             self.assertIn("shasum --algorithm 256 --check", text)
             self.assertIn("python3 -m unittest discover -s Scripts/tests -v", text)
+            self.assertIn('run: python3 Scripts/ci-evidence.py run-scripts "$CI_EVIDENCE_ROOT" -- python3 -m unittest discover -s Scripts/tests -v', text)
+            self.assertIn('id: scripts\n        env:\n          CI_EVIDENCE_ROOT: ${{ steps.identity.outputs.root }}', text)
             self.assertIn("./Scripts/verify-release-readiness.sh", text)
             self.assertLess(text.index("run: python3 Scripts/ci-evidence.py initialize"), text.index("      - name: Install XcodeGen"))
             self.assertIn("DEVELOPER_DIR: ${{ matrix.developer_directory }}", text)
@@ -446,12 +606,18 @@ class CIWorkflowContractTests(unittest.TestCase):
             self.assertIn("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1", text)
             path_block = text.split("          path: |\n")[1].split("          retention-days:")[0]
             self.assertEqual(path_block.splitlines(), ["            ${{ steps.identity.outputs.root }}/upload/identity.json",
-                                                     "            ${{ steps.identity.outputs.root }}/upload/verification.json"])
+                                                     "            ${{ steps.identity.outputs.root }}/upload/verification.json",
+                                                     "            ${{ steps.identity.outputs.root }}/upload/ax-evidence.json"])
             self.assertIn("retention-days: 7", text)
             self.assertIn("if-no-files-found: error", text)
             self.assertIn("include-hidden-files: false", text)
             self.assertIn("overwrite: false", text)
             self.assertNotIn("*", path_block)
+
+    def test_linux_script_command_is_not_wrapped(self):
+        linux = self.main.split("  scripts:\n", 1)[1].split("  macos:\n", 1)[0]
+        self.assertIn("run: python3 -m unittest discover -s Scripts/tests -v", linux)
+        self.assertNotIn("run-scripts", linux)
 
     def test_native_script_requests_separate_fresh_result_bundles(self):
         text = (PROJECT / "Scripts" / "verify-release-readiness.sh").read_text()

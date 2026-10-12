@@ -6,6 +6,7 @@ This is provenance for one CI job, not signed release or real-device evidence.
 """
 
 import argparse
+import importlib
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ import sys
 import tempfile
 
 MAX_FILE_BYTES = 16 * 1024
-UPLOAD_FILES = frozenset({"identity.json", "verification.json"})
+UPLOAD_FILES = frozenset({"identity.json", "verification.json", "ax-evidence.json"})
 VERSION = r"[0-9]{1,3}(?:\.[0-9]{1,4}){1,3}"
 SHA = r"[0-9a-f]{40}"
 APPLE_BUILD = r"[0-9]{2}[A-Z][0-9]{1,5}[a-z]?"
@@ -55,9 +56,10 @@ def no_symlinks(path):
         raise ValueError("symlink in evidence path")
 
 
-def write_json(path, payload):
-    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
-    if len(data) > MAX_FILE_BYTES:
+def write_json(path, payload, limit=MAX_FILE_BYTES, compact=False):
+    data = (json.dumps(payload, indent=None if compact else 2, sort_keys=True,
+                       separators=(",", ":") if compact else None) + "\n").encode()
+    if len(data) > limit:
         raise ValueError("receipt exceeds size limit")
     no_symlinks(path)
     # Exclusive creation prevents stale evidence reuse and accidental overwrite.
@@ -74,22 +76,22 @@ def unique_object(pairs):
     return result
 
 
-def read_json(path):
+def read_json(path, limit=MAX_FILE_BYTES):
     no_symlinks(path)
     # Bind validation and bounded reads to the same descriptor. O_NOFOLLOW
     # rejects a raced leaf symlink; O_NONBLOCK avoids blocking on a raced FIFO.
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_FILE_BYTES:
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
             raise ValueError("invalid receipt file")
         data = bytearray()
-        while len(data) <= MAX_FILE_BYTES:
-            chunk = os.read(descriptor, MAX_FILE_BYTES + 1 - len(data))
+        while len(data) <= limit:
+            chunk = os.read(descriptor, limit + 1 - len(data))
             if not chunk:
                 break
             data.extend(chunk)
-            if len(data) > MAX_FILE_BYTES:
+            if len(data) > limit:
                 raise ValueError("receipt exceeds size limit")
         return json.loads(data.decode("utf-8"), object_pairs_hook=unique_object)
     finally:
@@ -221,6 +223,56 @@ def run_native(root, command):
     return code if code else (0 if all(bundles.values()) else 1)
 
 
+def ax_module():
+    directory = str(Path(__file__).resolve().parent / "Investigations")
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    return importlib.import_module("ax_ci_failure")
+
+
+def run_scripts(root, command):
+    root = Path(root)
+    if not root.is_absolute() or ".." in root.parts or "\n" in str(root) or "\r" in str(root):
+        raise ValueError("invalid evidence root")
+    no_symlinks(root)
+    identity = read_json(root / "upload" / "identity.json")
+    validate_identity(identity)
+    if identity["identity_verified"] is not True:
+        raise ValueError("script verification requires validated identity")
+    evidence = root / "upload" / "ax-evidence.json"
+    if evidence.exists() or evidence.is_symlink():
+        raise ValueError("AX evidence already exists")
+    records = root / "ax-records"
+    for directory in (records, root / "ax-records-copy-lifetime"):
+        if directory.exists() or directory.is_symlink():
+            raise ValueError("AX record directory already exists")
+    module = ax_module()
+    # The runner creates the leaf record directories exclusively itself.
+    write_json(root / "scripts-start.json", {"attempted": True})
+    env = dict(os.environ, QUICKFILE_AX_TEST_RECORDS=str(records), QUICKFILE_AX_CI_FAILURE_EVIDENCE="1")
+    try:
+        code = subprocess.run(command, env=env, check=False).returncode
+        code = 128 - code if code < 0 else code
+    except OSError:
+        code = 127
+    try:
+        no_symlinks(records)
+        payload = module.collect(records)
+        module.validate_public(payload)
+        write_json(evidence, payload, module.PUBLIC_LIMIT, compact=True)
+    except Exception:
+        # Collector errors can contain raw addresses or paths. Publish only the
+        # fixed unavailable shape, and preserve the command's original failure.
+        try:
+            payload = module.empty(status="unavailable")
+            module.validate_public(payload)
+            write_json(evidence, payload, module.PUBLIC_LIMIT, compact=True)
+        except Exception:
+            print("error: sanitized AX evidence could not be written", file=sys.stderr)
+            return code if code else 1
+    return code if code else (0 if payload["status"] in {"complete", "unsupported"} else 1)
+
+
 def validate_identity(payload):
     if set(payload) != {"schema_version", "scope", "expected", "actual", "source", "identity_verified"}:
         raise ValueError("unexpected identity fields")
@@ -288,12 +340,20 @@ def check_upload(root):
         raise ValueError("upload directory is not the exact file allowlist")
     validate_identity(read_json(directory / "identity.json"))
     validate_verification(read_json(directory / "verification.json"))
+    module = ax_module()
+    module.validate_public(read_json(directory / "ax-evidence.json", module.PUBLIC_LIMIT))
 
 
 def finish(root, env):
     root = Path(root)
     identity = read_json(root / "upload" / "identity.json")
     validate_identity(identity)
+    module = ax_module()
+    ax_file = root / "upload" / "ax-evidence.json"
+    if not ax_file.exists() and not ax_file.is_symlink():
+        started = root / "scripts-start.json"
+        status = "unavailable" if started.exists() or started.is_symlink() else "not_attempted"
+        write_json(ax_file, module.empty(status=status), module.PUBLIC_LIMIT, compact=True)
     native_file = root / "native-exit.json"
     native = read_json(native_file) if native_file.exists() else None
     version_output = optional_tool(["xcodegen", "version"], rf"(?:Version: )?{VERSION}")
@@ -314,10 +374,12 @@ def finish(root, env):
             stream.write(f"- {key}: `{source[key]}`\n")
         stream.write(f"- Actual macOS / architecture / Xcode: `{actual['macos_version']}` / `{actual['architecture']}` / `{actual['xcode']}` (build `{actual['xcode_build']}`)\n")
         stream.write(f"- Step outcomes before upload: `{json.dumps(outcomes, sort_keys=True)}`\n")
-        stream.write("\nOnly bounded identity/verification JSON receipts are retained for 7 days. Raw xcresult, workspace/user paths, test names, messages and attachments are not uploaded.\n")
+        stream.write("\nOnly bounded identity/verification and sanitized AX JSON receipts are retained for 7 days. Raw xcresult, AX records, workspace/user paths, test names, messages and attachments are not uploaded.\n")
         stream.write("\nScope: script tests, native Swift tests, unsigned Universal build and bundle/security checks. Remaining gates: signed installation, Finder interaction, memory/recovery, real latency, hardware and storage environments.\n")
     # Missing/mismatched evidence must not make a nominally green job credible.
     if outcomes["native"] == "success" and (native is None or native["exit_code"] != 0 or not all(native["result_bundles_present"].values())):
+        return 1
+    if outcomes["scripts"] == "success" and read_json(ax_file, module.PUBLIC_LIMIT)["status"] not in {"complete", "unsupported"}:
         return 1
     return 0
 
@@ -328,9 +390,10 @@ def main():
     commands.add_parser("initialize")
     prepare = commands.add_parser("prepare-results")
     prepare.add_argument("directory")
-    run = commands.add_parser("run-native")
-    run.add_argument("root")
-    run.add_argument("command", nargs=argparse.REMAINDER)
+    for name in ("run-native", "run-scripts"):
+        run = commands.add_parser(name)
+        run.add_argument("root")
+        run.add_argument("command", nargs=argparse.REMAINDER)
     for name in ("finish", "check-upload"):
         commands.add_parser(name).add_argument("root")
     args = parser.parse_args()
@@ -339,11 +402,11 @@ def main():
             return initialize(os.environ)
         if args.action == "prepare-results":
             print(prepare_results(args.directory))
-        elif args.action == "run-native":
+        elif args.action in {"run-native", "run-scripts"}:
             command = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not command:
-                raise ValueError("missing native command")
-            return run_native(args.root, command)
+                raise ValueError("missing verification command")
+            return (run_native if args.action == "run-native" else run_scripts)(args.root, command)
         elif args.action == "finish":
             return finish(args.root, os.environ)
         else:

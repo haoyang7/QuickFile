@@ -1390,7 +1390,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         terminal_origin=False, terminal_timeout=False, empty_control_mode=None,
                         cleanup_failure=None, ls_failure=False, install_gate=None, invalid_install_gate=None,
                         startup_error=None, hash_io_failure=None, live_attribution=False, live_capture_failure=None,
-                        reference_validation=False, reference_idle=False):
+                        reference_validation=False, reference_idle=False, ci_failure_evidence=False,
+                        ci_capture_failed=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -1505,10 +1506,14 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                                 raise subprocess.TimeoutExpired("auxiliary capture", 60)
                             if live_capture_failure == "failed":
                                 return subprocess.CompletedProcess(command, 2, "", "private failure")
-                        if terminal_origin:
+                        if terminal_origin or ci_failure_evidence:
                             self.assertEqual(scanned, scan_labels)
                             self.assertEqual(processes[0].poll(), None)
                             self.assertEqual(processes[1].poll(), 0)
+                            if ci_failure_evidence:
+                                self.assertEqual(_kwargs["timeout"], 15)
+                                if ci_capture_failed:
+                                    return subprocess.CompletedProcess(command, 2, "", "private capture failure")
                             if terminal_timeout:
                                 raise subprocess.TimeoutExpired("terminal capture", 60)
                         pathlib.Path(capture.split("=", 1)[1]).touch()
@@ -1609,6 +1614,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.append("--heap-control")
             if copy_lifetime:
                 arguments.append("--copy-lifetime")
+            if ci_failure_evidence:
+                arguments.append("--ci-failure-evidence")
             if malloc_scribble:
                 arguments.extend(["--malloc-scribble", malloc_scribble])
             if terminal_origin:
@@ -1827,6 +1834,18 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertFalse(any(command[0] == "heap" for command in commands))
                 for scan_command in (command for command in commands if command[0] == "leaks" and not any(arg.startswith("--outputGraph=") for arg in command)):
                     self.assertEqual(scan_command, ["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", "1234"])
+                if ci_failure_evidence:
+                    captured = json.loads((records / "failure-capture.json").read_text())
+                    expected = "failed" if ci_capture_failed else "timeout" if terminal_timeout else "complete"
+                    self.assertEqual(captured["status"], expected if failed_scan else "not_attempted")
+                    captures = [command for command in commands if any(arg.startswith("--outputGraph=") for arg in command)]
+                    self.assertEqual(len(captures), int(failed_scan is not None))
+                    if failed_scan:
+                        self.assertEqual(captured["after_label"], "observer-exited")
+                        self.assertEqual(captured["graph_sha256"], None if terminal_timeout or ci_capture_failed else hashlib.sha256(b"").hexdigest())
+                    for row in scans:
+                        payload = (records / (row["label"] + "-original.stdout.txt")).read_bytes()
+                        self.assertEqual(row["stdout_sha256"], hashlib.sha256(payload).hexdigest())
                 if live_attribution:
                     captures = json.loads((records / "live-captures.json").read_text())
                     self.assertEqual([row["label"] for row in captures], ["baseline"] + ([failed_scan] if failed_scan else []))
@@ -2000,6 +2019,37 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                      ["probe", "--work-directory", "unused", "--records-directory", "unused-records", "--reference-idle"]]
         for arguments in variants:
             with self.subTest(arguments=arguments), mock.patch.object(sys, "argv", arguments), \
+                    mock.patch.object(PROBE.subprocess, "run") as run, mock.patch.object(PROBE.subprocess, "Popen") as spawn, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as outcome:
+                PROBE.main()
+            self.assertEqual(outcome.exception.code, 2)
+            run.assert_not_called()
+            spawn.assert_not_called()
+
+    def test_ci_failure_capture_follows_original_scans_and_preserves_failure(self):
+        for failure, timeout in itertools.product((None, "registered-10", "removed-20"), (False, True)):
+            with self.subTest(failure=failure, timeout=timeout):
+                code, result = self.exercise_runner(ci_failure_evidence=True, failed_scan=failure,
+                                                    terminal_timeout=timeout)
+                self.assertEqual(code, int(failure is not None))
+                self.assertEqual(len(result["scans"]), 6)
+                self.assertEqual(result["notifications"], 60)
+                self.assertTrue(result["cleanup"]["processes_exited"])
+
+    def test_ci_capture_tool_failure_keeps_original_strict_failure_and_cleanup(self):
+        code, result = self.exercise_runner(ci_failure_evidence=True, failed_scan="removed-20", ci_capture_failed=True)
+        self.assertEqual(code, 1)
+        self.assertEqual([row["stage"] for row in result["validation_errors"]], ["removed-20"])
+        self.assertEqual(len(result["scans"]), 6)
+        self.assertEqual(result["notifications"], 60)
+        self.assertTrue(result["cleanup"]["processes_exited"])
+
+    def test_ci_failure_capture_rejects_measurement_mode_conflicts_before_launch(self):
+        base = ["probe", "--work-directory", "unused", "--records-directory", "unused-records", "--ci-failure-evidence"]
+        for extra in (["--system-baseline"], ["--heap-diagnostics"], ["--copy-lifetime"],
+                      ["--live-attribution"], ["--malloc-scribble", "off"], ["--empty-control-mode", "pure-appkit"],
+                      ["--terminal-origin"], ["--prepare-external-fixture"]):
+            with self.subTest(extra=extra), mock.patch.object(sys, "argv", base + extra), \
                     mock.patch.object(PROBE.subprocess, "run") as run, mock.patch.object(PROBE.subprocess, "Popen") as spawn, \
                     contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as outcome:
                 PROBE.main()
@@ -4082,6 +4132,8 @@ class AXCompatibilityCopyTests(unittest.TestCase):
             ]
             if copy_lifetime:
                 arguments.append("--copy-lifetime")
+            if not copy_lifetime and os.environ.get("QUICKFILE_AX_CI_FAILURE_EVIDENCE") == "1":
+                arguments.append("--ci-failure-evidence")
             result = subprocess.run(arguments, capture_output=True, text=True, timeout=300)
             if result.returncode == 77:
                 self.skipTest("AX notification coverage unavailable: " + result.stdout.strip())

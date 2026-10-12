@@ -15,6 +15,7 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -175,6 +176,7 @@ def main():
     parser.add_argument("--empty-control-mode", choices=("patched", "pure-appkit"), help="Explicit empty-control build/measurement; pure-appkit excludes the production AX implementation; measurement requires external startup receipts, MallocScribble off and --heap-control")
     parser.add_argument("--terminal-origin", action="store_true", help="Capture one later heap graph after all six live scans; requires external startup receipts and MallocScribble off")
     parser.add_argument("--live-attribution", action="store_true", help="Keep six ordinary live scans and compact logging; capture auxiliary graphs after baseline and first node/byte growth; captures change later timing")
+    parser.add_argument("--ci-failure-evidence", action="store_true", help="Retain original ordinary stdout and capture one later graph only after all six strict scans complete with a failure; no baseline graph or address diff")
     parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
@@ -184,6 +186,12 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.ci_failure_evidence and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
+            args.reference_validation, args.reference_idle, args.malloc_scribble, args.empty_control_mode,
+            args.install_gate, args.prepare_external_fixture, args.prepare_install_gate_fixture,
+            args.external_startup_receipt, args.prepared_fixture_directory, args.terminal_origin,
+            args.live_attribution, args.copy_lifetime, args.read_only, args.ownership_trace, args.balance_copies)):
+        parser.error("--ci-failure-evidence requires independent ordinary product measurement")
     if args.reference_validation and (not args.heap_diagnostics or not args.external_startup_receipt
             or args.malloc_scribble != "off" or args.install_gate or args.terminal_origin or args.live_attribution
             or args.empty_control_mode not in (None, "pure-appkit")
@@ -247,6 +255,9 @@ def main():
     work.relative_to(ROOT / ".build/Temporary")
     work.mkdir(parents=True, exist_ok=False)
     records.mkdir(parents=True, exist_ok=False)
+    if args.ci_failure_evidence:
+        write_json(records / "failure-capture.json", {"status": "not_attempted", "exit_code": None,
+                   "after_label": None, "graph_sha256": None})
     state = work / "state"
     state.mkdir()
     graphs = work / "heap"
@@ -402,6 +413,8 @@ def main():
             receipt.update(mode="copy-lifetime", instrumented=True)
         if args.empty_control_mode:
             receipt["empty_control_mode"] = args.empty_control_mode
+        if args.ci_failure_evidence:
+            write_json(records / "result.json", receipt)
         print(json.dumps(receipt))
         return 77
     environment.update(MallocStackLogging="1", MallocStackLoggingNoCompact="1")
@@ -533,11 +546,15 @@ def main():
                                     capture_output=True, text=True, timeout=60)
             completed = time.monotonic() if args.live_attribution else None
             (records / f"{label}-leaks.txt").write_text(result.stdout + result.stderr)
+            if args.ci_failure_evidence:
+                (records / f"{label}-original.stdout.txt").write_bytes(result.stdout.encode())
             match = re.search(r"(\d+) leaks for (\d+) total leaked bytes", result.stdout)
             entry = {"label": label, "host": host_state, "exit_code": result.returncode,
                      "leak_nodes": int(match[1]) if match else None, "leak_bytes": int(match[2]) if match else None,
                      "destroyed_notification_stack_present": "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification" in result.stdout}
             entry["groups"] = leak_groups(result.stdout)
+            if args.ci_failure_evidence:
+                entry["stdout_sha256"] = hashlib.sha256(result.stdout.encode()).hexdigest()
             entry["unclassified_nodes"] = int(match[1]) - sum(group["tree_nodes"] or 0 for group in entry["groups"]) if match else None
             entry["scan_duration_seconds"] = round(time.monotonic() - started, 3)
             entry["since_observer_exit_seconds"] = round(started - observer_exited, 3) if observer_exited is not None else None
@@ -705,6 +722,25 @@ def main():
                            "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
                            "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX groups and no increase over the non-AX startup baseline; not an installed-app or VoiceOver test"}
+            if args.ci_failure_evidence and validation_errors:
+                # Every original strict scan and notification check is finished.
+                # This later graph cannot identify baseline allocations or turn
+                # the original grouped reports into an address-level difference.
+                graph = records / "terminal.memgraph"
+                captured = capture_terminal_snapshot(host.pid, graph, timeout=15)
+                failure_capture = {"status": captured["capture_status"],
+                    "exit_code": captured["capture_exit_code"], "after_label": "observer-exited",
+                    "graph_sha256": None}
+                if failure_capture["status"] == "complete":
+                    try:
+                        graph_info = graph.lstat()
+                        if not stat.S_ISREG(graph_info.st_mode) or graph_info.st_size > 256 * 1024 * 1024:
+                            raise ValueError("Failure graph exceeds the bounded input limit")
+                        with graph.open("rb") as stream:
+                            failure_capture["graph_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+                    except (OSError, ValueError):
+                        failure_capture["status"] = "failed"
+                write_json(records / "failure-capture.json", failure_capture)
             if args.external_startup_receipt:
                 validate("external-startup-complete", finish_external_receipt)
                 summary["receipt_mode"] = "external-startup"
