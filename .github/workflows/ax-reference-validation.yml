@@ -37,7 +37,8 @@ jobs:
           import json, os
           value = json.loads(os.environ['AX_REFERENCE_INPUTS'])
           flags = ('ax_causal_probe', 'heap_diagnostics', 'malloc_scribble', 'terminal_origin',
-              'live_attribution', 'install_gate_control', 'pure_appkit_control', 'frozen_control')
+              'live_attribution', 'install_gate_control', 'pure_appkit_control', 'frozen_control',
+              'settled_baseline_shadow')
           assert type(value) is dict and set(value) <= set(flags) | {'reference_validation', 'scan_mode', 'receipt_mode'}
           assert all(value.get(key, False) is False for key in flags)
           assert value.get('reference_validation', True) is True

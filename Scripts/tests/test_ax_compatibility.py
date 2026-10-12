@@ -1378,6 +1378,89 @@ class AXInstallGateTests(unittest.TestCase):
                 path.write_bytes(original)
 
 
+class AXSettledBaselineShadowTests(unittest.TestCase):
+    def exercise(self, counts, timeout=False):
+        temporary_root = ROOT / ".build/Temporary"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ax-shadow-", dir=temporary_root) as directory:
+            root = pathlib.Path(directory)
+            shadow = PROBE.SettledBaselineShadow(root, root / "graphs")
+            clock = [0.0]
+            def now():
+                return clock[0]
+            def sleep(seconds):
+                clock[0] += seconds
+            host = {key: 0 for key in ("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")}
+            reader = {key: 0 for key in ("buttons", "registrations", "notifications", "all_notifications", "unmatched_notifications", "tracked_buttons")}
+            reader["target_notification_counts"] = []
+            (root / "baseline-original.stdout.txt").write_bytes(b"baseline")
+            baseline = {"label": "baseline", "host": host, "stdout_sha256": hashlib.sha256(b"baseline").hexdigest()}
+            def capture(pid, graph, timeout):
+                graph.write_bytes(b"graph")
+                return {"capture_status": "complete", "capture_exit_code": 0}
+            sequence = iter(counts)
+            def scan(command, **kwargs):
+                self.assertLessEqual(kwargs["timeout"], 5)
+                if timeout:
+                    clock[0] += kwargs["timeout"]
+                    raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                n = next(sequence)
+                return subprocess.CompletedProcess(command, 1,
+                    f"{n} leaks for {n * 100} total leaked bytes.\nSTACK OF {n} INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n  {n} ({n * 100} bytes) ROOT CYCLE: NSXPCConnection\n", "")
+            with mock.patch.object(PROBE.time, "monotonic", side_effect=now), \
+                    mock.patch.object(PROBE.time, "sleep", side_effect=sleep), \
+                    mock.patch.object(PROBE, "capture_terminal_snapshot", side_effect=capture), \
+                    mock.patch.object(PROBE.subprocess, "run", side_effect=scan):
+                shadow.settle(123, baseline, lambda timeout: dict(host), reader)
+            for before, after in zip(shadow.data["probes"], shadow.data["probes"][1:]):
+                self.assertGreaterEqual(after["start_monotonic"] - before["end_monotonic"], 2)
+            self.assertLessEqual(clock[0], 15)
+            return shadow.data
+
+    def test_two_roots_are_valid_and_growth_requires_a_new_equal_pair(self):
+        self.assertEqual(self.exercise([2, 2])["chosen_index"], 1)
+        self.assertEqual(self.exercise([2, 3, 3])["chosen_index"], 2)
+
+    def test_probe_budget_and_timeout_do_not_select_candidate(self):
+        for data in (self.exercise([1, 2, 3, 4, 5, 6]), self.exercise([], timeout=True)):
+            self.assertEqual(data["status"], "not_settled")
+            self.assertIsNone(data["chosen_index"])
+            self.assertEqual(len(data["captures"]), 1)
+
+    def test_original_baseline_classification_cannot_be_hidden_by_candidate(self):
+        temporary_root = ROOT / ".build/Temporary"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        for invalid in ("unclassified_nodes", "destroyed_notification_stack_present", "root_type"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory(prefix="ax-shadow-", dir=temporary_root) as directory:
+                root = pathlib.Path(directory)
+                shadow = PROBE.SettledBaselineShadow(root, root / "graphs")
+                candidate = {"label": "candidate", "leak_nodes": 3, "leak_bytes": 300,
+                    "unclassified_nodes": 0, "destroyed_notification_stack_present": False,
+                    "groups": [{"root_type": "NSXPCConnection", "root_instances": 3}]}
+                baseline = {**candidate, "label": "baseline"}
+                if invalid == "root_type":
+                    baseline["groups"] = [{"root_type": "Unexpected", "root_instances": 3}]
+                else:
+                    baseline[invalid] = 1 if invalid == "unclassified_nodes" else True
+                scans = [baseline] + [{**candidate, "label": str(index)} for index in range(5)]
+                shadow.data.update(chosen_index=0, probes=[candidate])
+                shadow.finish(scans, [{"stage": "baseline", "message": "classification failed"}], False)
+                self.assertEqual(shadow.data["original_strict_verdict"], "failed")
+                self.assertEqual(shadow.data["candidate_hypothetical_verdict"], "failed")
+
+    def test_conflicting_cli_modes_fail_before_launch(self):
+        base = ["probe", "--work-directory", "/unused", "--records-directory", "/unused-records", "--settled-baseline-shadow",
+                "--external-startup-receipt", "--prepared-fixture-directory", "/unused-prepared", "--malloc-scribble", "off"]
+        for flag in ("--heap-diagnostics", "--reference-validation", "--live-attribution", "--terminal-origin", "--copy-lifetime",
+                     "--system-baseline", "--ci-failure-evidence", "--read-only", "--prepare-external-fixture", "--reference-idle"):
+            with self.subTest(flag=flag), mock.patch.object(sys, "argv", base + [flag]), \
+                    mock.patch.object(PROBE.subprocess, "Popen") as launched, contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as error:
+                PROBE.main()
+            self.assertEqual(error.exception.code, 2)
+            launched.assert_not_called()
+
+
 class AXCompatibilityLifecycleTests(unittest.TestCase):
     """Inject process/scan results while exercising the real runner protocol."""
 
@@ -1391,7 +1474,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         cleanup_failure=None, ls_failure=False, install_gate=None, invalid_install_gate=None,
                         startup_error=None, hash_io_failure=None, live_attribution=False, live_capture_failure=None,
                         reference_validation=False, reference_idle=False, ci_failure_evidence=False,
-                        ci_capture_failed=False):
+                        ci_capture_failed=False, settled_shadow=False, shadow_capture_failed=False, shadow_timeout=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -1499,6 +1582,17 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     capture = next((value for value in command if value.startswith("--outputGraph=")), None)
                     if capture:
                         self.assertEqual("--fullStackHistory" in command, heap_diagnostics)
+                        if settled_shadow:
+                            self.assertLessEqual(_kwargs["timeout"], 5)
+                            label = pathlib.Path(capture.split("=", 1)[1]).stem
+                            if label != "auxiliary-late":
+                                self.assertEqual(scanned, ["baseline"])
+                                self.assertEqual(host_state["allocatedButtons"], 0)
+                                self.assertEqual(host_state["compensations"], 0)
+                            else:
+                                self.assertEqual(scanned, scan_labels)
+                            if shadow_capture_failed:
+                                return subprocess.CompletedProcess(command, 2, "", "private capture failure")
                         if live_attribution:
                             self.assertIn(scanned[-1], ("baseline", failed_scan))
                             self.assertEqual(pathlib.Path(capture.split("=", 1)[1]).stem, scanned[-1])
@@ -1526,6 +1620,16 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         if unavailable_cohorts:
                             return subprocess.CompletedProcess(command, 1, AXHeapDiagnosticTests.report(), "")
                         return subprocess.CompletedProcess(command, 0, "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
+                    if settled_shadow and _kwargs["timeout"] <= 5:
+                        if shadow_timeout:
+                            raise subprocess.TimeoutExpired(command, _kwargs["timeout"])
+                        self.assertEqual(scanned, ["baseline"])
+                        self.assertEqual(host_state["allocatedButtons"], 0)
+                        self.assertEqual(host_state["compensations"], 0)
+                        return subprocess.CompletedProcess(command, 1,
+                            "Process 1234: 287 leaks for 18768 total leaked bytes.\n"
+                            "STACK OF 3 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
+                            "  287 (18768 bytes) ROOT CYCLE: NSXPCConnection\n", "")
                     label = scan_labels[len(scanned)]
                     scanned.append(label)
                     protocol.append(("scan", label))
@@ -1539,7 +1643,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                               f"  {nodes} ({size} bytes) ROOT CYCLE: NSXPCConnection\n")
                 return subprocess.CompletedProcess(command, 1 if command[0] == "leaks" else 0, output, "")
 
-            def wait_json(path, predicate, _processes):
+            def wait_json(path, predicate, _processes, **kwargs):
                 if path.name == "reader-ready.json":
                     command = json.loads((state / "reader-command.json").read_text())
                     receipt = {"sequence": command["sequence"], "buttons": host_state["buttons"],
@@ -1620,6 +1724,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.extend(["--malloc-scribble", malloc_scribble])
             if terminal_origin:
                 arguments.append("--terminal-origin")
+            if settled_shadow:
+                arguments.append("--settled-baseline-shadow")
             if live_attribution:
                 arguments.append("--live-attribution")
             if reference_validation:
@@ -1698,6 +1804,28 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     propagated_hash_error = error
                     exit_code = 1
             summary = json.loads((records / "result.json").read_text())
+            if settled_shadow:
+                receipt = json.loads((records / "settled-baseline-shadow.json").read_text())
+                self.assertEqual(scanned, scan_labels)
+                self.assertEqual(len(scanned), 6)
+                self.assertEqual(receipt["status"], "not_settled" if shadow_timeout else "observed-stable")
+                self.assertEqual(receipt["chosen_index"], None if shadow_timeout else 1)
+                self.assertEqual(len(receipt["captures"]), 2 if shadow_timeout else 3)
+                self.assertLessEqual(receipt["baseline_finished_monotonic"], receipt["settling_started_monotonic"])
+                self.assertLessEqual(receipt["settling_started_monotonic"], receipt["captures"][0]["start_monotonic"])
+                for capture in receipt["captures"][:-1]:
+                    self.assertLessEqual(capture["end_monotonic"], receipt["first_measurement_cycle_monotonic"])
+                self.assertLessEqual(receipt["first_measurement_cycle_monotonic"], receipt["last_original_scan_finished_monotonic"])
+                self.assertLessEqual(receipt["last_original_scan_finished_monotonic"], receipt["captures"][-1]["start_monotonic"])
+                self.assertEqual(receipt["original_strict_verdict"], "failed" if failed_scan or invalid_notifications or insufficient_compensation else "passed")
+                self.assertEqual(receipt["candidate_hypothetical_verdict"], "unavailable" if shadow_capture_failed or shadow_timeout else "failed" if invalid_notifications or insufficient_compensation else "passed")
+                self.assertEqual(receipt["environments"]["host"]["MallocStackLogging"], "1")
+                self.assertEqual(receipt["environments"]["host"]["MallocStackLoggingNoCompact"], "1")
+                for row in json.loads((records / "scans.json").read_text()):
+                    self.assertEqual(row["stdout_sha256"], hashlib.sha256((records / (row["label"] + "-original.stdout.txt")).read_bytes()).hexdigest())
+                self.assertTrue(summary["cleanup"]["processes_exited"])
+                if reference_idle:
+                    self.assertEqual([p for p in protocol if p[0] == "observe"], [("observe", 1)])
             self.assertEqual([call.args[0] for call in startup_reads.call_args_list],
                              [process.pid for process in processes] if external_receipt else [])
             if isinstance(startup_error, ValueError):
@@ -1882,6 +2010,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     ("command", "checkpoint"), ("scan", "observer-exited")]
                 if reference_idle:
                     expected_protocol = [item for item in expected_protocol if item[0] != "observe" or item[1] == 1]
+                if settled_shadow:
+                    expected_protocol[3:3] = [("command", "checkpoint")] * (1 if shadow_timeout else 2)
                 self.assertEqual(protocol, expected_protocol)
             if reference_validation:
                 receipt = json.loads((records / "reference-validation-input.json").read_text())
@@ -2056,6 +2186,28 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             self.assertEqual(outcome.exception.code, 2)
             run.assert_not_called()
             spawn.assert_not_called()
+
+    def test_settled_shadow_preserves_original_strict_failure_and_cleanup(self):
+        for failure, capture_failure in itertools.product((None, "registered-10"), (False, True)):
+            with self.subTest(failure=failure, capture_failure=capture_failure):
+                code, summary = self.exercise_runner(malloc_scribble="off", external_receipt=True,
+                    settled_shadow=True, failed_scan=failure, shadow_capture_failed=capture_failure)
+                self.assertEqual(code, int(failure is not None))
+                self.assertEqual(summary["baseline_leak_nodes"], 280)
+
+    def test_settled_shadow_timeout_retains_strict_failure(self):
+        code, _ = self.exercise_runner(malloc_scribble="off", external_receipt=True,
+            settled_shadow=True, failed_scan="registered-10", shadow_timeout=True)
+        self.assertEqual(code, 1)
+
+    def test_settled_shadow_hypothesis_requires_notifications_and_compensation(self):
+        for kwargs in ({"invalid_notifications": True}, {"insufficient_compensation": True}):
+            code, _ = self.exercise_runner(malloc_scribble="off", external_receipt=True, settled_shadow=True, **kwargs)
+            self.assertEqual(code, 1)
+
+    def test_settled_shadow_pure_idle_queries_only_once(self):
+        self.exercise_runner(malloc_scribble="off", external_receipt=True,
+            heap_control=True, empty_control_mode="pure-appkit", settled_shadow=True, reference_idle=True)
 
     def test_live_attribution_keeps_six_original_scans_and_strict_failures(self):
         for control, failure, capture_failure in itertools.product((False, True), (None, "registered-10", "removed-20"), (None, "timeout", "failed")):

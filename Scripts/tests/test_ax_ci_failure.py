@@ -92,6 +92,47 @@ class FailureEvidenceTests(unittest.TestCase):
         for private in ("0x1000", "private account", "private stack", str(self.root), "host"):
             self.assertNotIn(private, evidence.encoded(value).decode())
 
+    def valid_grouped_scans(self):
+        self.scans.clear()
+        for index, label in enumerate(evidence.LABELS):
+            nodes, size = (1, 48) if index == 0 else (2, 96)
+            report = (f"Process 123: {nodes} leaks for {size} total leaked bytes.\n\n"
+                "STACK OF 1 INSTANCE OF 'ROOT LEAK: NSXPCConnection':\n"
+                "0 synthetic 0x1234 synthetic_function + 0\n====\n"
+                f"    {nodes} ({size} bytes) ROOT LEAK: NSXPCConnection\n"
+                + ("       1 (48 bytes) NSString\n" if index else ""))
+            self.add_scan(label, report)
+        self.write("scans.json", self.scans)
+
+    def test_schema_two_composition_and_signed_deltas_supplement_strict_result(self):
+        self.valid_grouped_scans()
+        value = self.collect()
+        self.assertEqual((value["schema"], value["status"], value["original_verdict"]), (2, "complete", "failed"))
+        self.assertTrue(all(row["composition"]["status"] == "complete" for row in value["original_scans"]))
+        self.assertEqual(value["composition_deltas"][0]["delta"]["changes"], [{"type": "NSString", "count_delta": 1}])
+        self.assertEqual(value["composition_deltas"][0]["delta"]["generation"], "unknown")
+        value["composition_deltas"][0]["delta"]["changes"][0]["count_delta"] = True
+        with self.assertRaises(ValueError): evidence.validate_public(value)
+
+    def test_unsupported_composition_keeps_original_evidence_complete(self):
+        # The old synthetic ungrouped-address format is deliberately not guessed
+        # as groupByType syntax. Its preexisting scan evidence remains valid.
+        value = self.collect()
+        self.assertEqual(value["status"], "complete")
+        self.assertTrue(all(row["composition"]["status"] == "unavailable" for row in value["original_scans"]))
+        self.assertTrue(all(row["delta"]["status"] == "unavailable" for row in value["composition_deltas"]))
+
+    def test_supplemental_composition_budget_does_not_replace_strict_verdict(self):
+        self.valid_grouped_scans()
+        value = self.collect()
+        budget = len(evidence.encoded(value)) - 100
+        with mock.patch.object(evidence, "PUBLIC_LIMIT", budget):
+            evidence.bound_compositions(value)
+            evidence.validate_public(value)
+        self.assertEqual((value["status"], value["original_verdict"]), ("complete", "failed"))
+        self.assertTrue(all(row["composition"]["reasons"] == ["summary_budget"] for row in value["original_scans"]))
+        self.assertEqual(value["strict_growth_labels"], list(evidence.LABELS[1:]))
+
     def test_missing_later_scans_keeps_earlier_failure(self):
         self.write("scans.json", self.scans[:2])
         value = self.collect()
@@ -203,6 +244,8 @@ class FailureEvidenceTests(unittest.TestCase):
         self.assertEqual(terminal["nodes"][1]["parent"], 0)
         self.assertEqual(terminal["back_edges"][0]["target"], 0)
         self.assertEqual((terminal["identity"], terminal["generation"]), ("snapshot-local", "unknown"))
+        self.assertEqual((terminal["histogram"]["total_nodes"], terminal["histogram"]["total_bytes"]), (2, 112))
+        self.assertEqual(terminal["histogram"]["buckets"], [{"type": "NSString", "size": 48, "count": 1}, {"type": "NSString", "size": 64, "count": 1}])
         self.assertNotIn("0x", evidence.encoded(terminal).decode())
 
     def test_terminal_tree_mismatch_preserves_list_counts(self):

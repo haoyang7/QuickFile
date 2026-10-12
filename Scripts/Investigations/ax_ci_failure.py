@@ -17,6 +17,7 @@ import tempfile
 import time
 
 import ax_frozen_nodes as frozen
+import ax_composition as composition
 from ax_evidence_errors import EvidenceError, ExitUnconfirmed
 from ax_probe_report import HEAP_LABELS, leak_groups
 from ax_process import run_owned
@@ -46,7 +47,7 @@ def empty_scan(label):
             "recorded_stdout_sha256": None, "exit_code": None, "leak_nodes": None, "leak_bytes": None,
             "unclassified_nodes": None, "root_instances": None, "destroyed_notification_stack_present": None,
             "unexpected_roots": None, "groups": [], "omitted_groups": 0, "omitted_root_instances": 0,
-            "omitted_tree_nodes": 0, "reasons": []}
+            "omitted_tree_nodes": 0, "composition": composition.empty_grouped(), "reasons": []}
 
 
 def empty_terminal():
@@ -54,16 +55,17 @@ def empty_terminal():
             "generation": "unknown", "ownership": "not-established", "capture_status": "not_attempted",
             "capture_exit_code": None, "graph_sha256": None, "leak_nodes": None, "leak_bytes": None,
             "nodes": [], "back_edges": [], "omitted_nodes": 0, "omitted_edges": 0, "tools": [],
-            "process_cleanup_confirmed": True, "reasons": []}
+            "process_cleanup_confirmed": True, "histogram": composition.empty_histogram(), "reasons": []}
 
 
 def empty(status="not_attempted"):
     if status not in ("not_attempted", "unavailable"):
         raise ValueError("Invalid empty evidence status")
-    return {"schema": 1, "status": status, "original_verdict": "unknown", "unsupported_reason": None,
+    scans = [empty_scan(label) for label in LABELS]
+    return {"schema": 2, "status": status, "original_verdict": "unknown", "unsupported_reason": None,
             "original_address_coverage": "unavailable", "generation": "unknown", "inputs_sha256": None,
             "fixture_cleanup_confirmed": None, "process_cleanup_confirmed": True,
-            "original_scans": [empty_scan(label) for label in LABELS], "strict_growth_labels": [],
+            "original_scans": scans, "strict_growth_labels": [], "composition_deltas": composition_deltas(scans),
             "strict_failure_labels": [], "terminal": empty_terminal(), "reasons": []}
 
 
@@ -105,6 +107,7 @@ def scan_summary(label, entry, raw):
         value["recorded_stdout_sha256"] = entry["stdout_sha256"]
     try:
         report = raw.decode("utf-8")
+        value["composition"] = composition.grouped_composition(report)
         nodes, size = frozen.totals(report)
         groups = leak_groups(report)
         if len(re.findall(r"^STACK OF ", report, re.M)) != len(groups):
@@ -145,6 +148,23 @@ def scan_summary(label, entry, raw):
     except (UnicodeError, ValueError, TypeError, KeyError, OverflowError):
         fail(value, "scan_invalid")
     return value
+
+
+def composition_deltas(scans):
+    def matched(row):
+        return row["composition"] if row["binding"] == "matched" else composition.empty_grouped()
+    return [{"label": row["label"], "delta": composition.composition_delta(matched(scans[0]), matched(row))} for row in scans[1:]]
+
+
+def bound_compositions(value):
+    """Supplemental size limits cannot weaken or fail the original evidence."""
+    value["composition_deltas"] = composition_deltas(value["original_scans"])
+    if len(encoded(value)) > PUBLIC_LIMIT:
+        for row in value["original_scans"]:
+            row["composition"] = composition.empty_grouped("summary_budget")
+        if value["terminal"]["histogram"]["status"] != "unavailable":
+            value["terminal"]["histogram"] = composition.empty_histogram("summary_budget")
+        value["composition_deltas"] = composition_deltas(value["original_scans"])
 
 
 def verdict_labels(scans):
@@ -226,6 +246,7 @@ def terminal_snapshot(records, private, deadline):
             for address, obj in sorted(parsed["members"].items())]
         value["back_edges"] = [{"source": ids[edge["source"]], "target": ids[edge["target"]], "label": edge["label"]}
                                for edge in parsed["back_edges"]]
+        value["histogram"] = composition.histogram_nodes(value["nodes"])
         if graph_hash(graph, deadline) != value["graph_sha256"]:
             raise EvidenceError("graph_changed")
     except ExitUnconfirmed:
@@ -237,6 +258,7 @@ def terminal_snapshot(records, private, deadline):
         fail(value, "graph_unavailable")
     if value["status"] != "complete":
         value["nodes"], value["back_edges"] = [], []
+        value["histogram"] = composition.empty_histogram()
         value["omitted_nodes"] = value["leak_nodes"] or 0
     return value
 
@@ -350,6 +372,7 @@ def collect(records):
         value["process_cleanup_confirmed"] = confirmed and terminal["process_cleanup_confirmed"]
     else:
         fail(value, "capture_missing")
+    bound_compositions(value)
     validate_public(value)
     return value
 
@@ -407,6 +430,11 @@ def validate_terminal(value):
             ancestors.add(node["id"])
         require(edge["target"] in ancestors)
     require(sum(node["parent"] is not None for node in value["nodes"]) + len(value["back_edges"]) <= EDGE_LIMIT)
+    composition.validate_histogram(value["histogram"])
+    if value["histogram"]["status"] != "unavailable":
+        require(value["histogram"] == composition.histogram_nodes(value["nodes"]))
+    elif value["status"] == "complete":
+        require(value["histogram"]["reasons"] == ["summary_budget"])
     if value["nodes"]:
         require(value["leak_nodes"] == len(value["nodes"]) and value["leak_bytes"] == sum(node["size"] for node in value["nodes"]) and value["omitted_nodes"] == 0)
     if value["status"] == "complete":
@@ -422,7 +450,7 @@ def validate_public(value):
     def require(ok):
         if not ok: raise ValueError("Invalid bounded ordinary AX evidence")
     require(type(value) is dict and set(value) == set(empty()))
-    require(type(value["schema"]) is int and value["schema"] == 1 and value["original_address_coverage"] == "unavailable" and value["generation"] == "unknown")
+    require(type(value["schema"]) is int and value["schema"] == 2 and value["original_address_coverage"] == "unavailable" and value["generation"] == "unknown")
     require(value["status"] in ("not_attempted", "unavailable", "unsupported", "partial", "complete"))
     require(value["original_verdict"] in ("unknown", "passed", "failed", "unsupported"))
     require(value["unsupported_reason"] is None or value["unsupported_reason"] in UNSUPPORTED)
@@ -434,6 +462,9 @@ def validate_public(value):
     for label, row in zip(LABELS, value["original_scans"]):
         require(type(row) is dict and set(row) == set(empty_scan(label)) and row["label"] == label)
         require(row["status"] in ("unavailable", "partial", "complete") and row["binding"] in ("unavailable", "matched", "mismatch"))
+        composition.validate_grouped_composition(row["composition"])
+        if row["composition"]["counts_status"] == "complete":
+            require(row["composition"]["total_nodes"] == row["leak_nodes"] and row["composition"]["total_bytes"] == row["leak_bytes"])
         for key in ("stdout_sha256", "recorded_stdout_sha256"): require(row[key] is None or sha(row[key]))
         require(row["exit_code"] is None or type(row["exit_code"]) is int and -255 <= row["exit_code"] <= 255)
         for key in ("leak_nodes", "leak_bytes", "unclassified_nodes", "root_instances"): require(row[key] is None or integer(row[key]))
@@ -457,6 +488,11 @@ def validate_public(value):
         if row["status"] == "complete": require(not row["reasons"])
         if row["status"] == "partial": require(bool(row["reasons"]))
     require((value["strict_growth_labels"], value["strict_failure_labels"]) == verdict_labels(value["original_scans"]))
+    require(value["composition_deltas"] == composition_deltas(value["original_scans"]))
+    for entry, row in zip(value["composition_deltas"], value["original_scans"][1:]):
+        before, after = (point["composition"] if point["binding"] == "matched" else composition.empty_grouped()
+                         for point in (value["original_scans"][0], row))
+        composition.validate_composition_delta(entry["delta"], before, after)
     if value["original_verdict"] == "passed" and value["strict_failure_labels"]:
         require(value["status"] == "partial" and "result_mismatch" in value["reasons"])
     validate_terminal(value["terminal"])

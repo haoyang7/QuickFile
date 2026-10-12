@@ -1,0 +1,74 @@
+name: AX settled baseline shadow
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      dispatch_inputs:
+        description: 'Original dispatcher inputs for rejecting mixed investigation modes'
+        type: string
+        required: false
+        default: '{}'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ax-settled-baseline-shadow-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  shadow:
+    name: Bounded baseline shadow controls (macOS 26 arm64)
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - name: Reject mixed investigation requests
+        env:
+          AX_SHADOW_INPUTS: ${{ inputs.dispatch_inputs || '{}' }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          value = json.loads(os.environ['AX_SHADOW_INPUTS'])
+          flags = ('ax_causal_probe', 'heap_diagnostics', 'malloc_scribble', 'terminal_origin',
+              'live_attribution', 'install_gate_control', 'pure_appkit_control', 'frozen_control',
+              'reference_validation')
+          assert type(value) is dict and set(value) <= set(flags) | {'settled_baseline_shadow', 'scan_mode', 'receipt_mode'}
+          assert all(value.get(key, False) is False for key in flags)
+          assert value.get('settled_baseline_shadow', True) is True
+          assert value.get('scan_mode', 'diagnostic') == 'diagnostic'
+          assert value.get('receipt_mode', 'internal') == 'internal'
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Run one bounded shadow campaign
+        run: >-
+          python3 Scripts/Investigations/ax_shadow_campaign.py
+          --work-directory .build/Temporary/ax-settled-baseline-shadow/campaign
+      - name: Validate the public artifact independently
+        id: public-evidence
+        if: always()
+        run: |
+          python3 Scripts/Investigations/ax_shadow_campaign.py --validate-public \
+            --work-directory .build/Temporary/ax-settled-baseline-shadow/campaign
+          echo 'safe=true' >> "$GITHUB_OUTPUT"
+      - name: Retain bounded anonymous shadow evidence for 7 days
+        if: always() && steps.public-evidence.outputs.safe == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ax-settled-baseline-shadow-summary
+          path: .build/Temporary/ax-settled-baseline-shadow/campaign/summary.json
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: true # Only the exact allowlisted summary under .build.
+          overwrite: false
