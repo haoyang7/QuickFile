@@ -1389,7 +1389,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         malloc_scribble=None, invalid_allocator=None, external_receipt=False, binary_drift=False,
                         terminal_origin=False, terminal_timeout=False, empty_control_mode=None,
                         cleanup_failure=None, ls_failure=False, install_gate=None, invalid_install_gate=None,
-                        startup_error=None, hash_io_failure=None):
+                        startup_error=None, hash_io_failure=None, live_attribution=False, live_capture_failure=None):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -1493,7 +1493,14 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 elif command[0] == "leaks":
                     capture = next((value for value in command if value.startswith("--outputGraph=")), None)
                     if capture:
-                        self.assertEqual("--fullStackHistory" in command, heap_diagnostics)
+                        self.assertEqual("--fullStackHistory" in command, heap_diagnostics or live_attribution)
+                        if live_attribution:
+                            self.assertIn(scanned[-1], ("baseline", failed_scan))
+                            self.assertEqual(pathlib.Path(capture.split("=", 1)[1]).stem, scanned[-1])
+                            if live_capture_failure == "timeout":
+                                raise subprocess.TimeoutExpired("auxiliary capture", 60)
+                            if live_capture_failure == "failed":
+                                return subprocess.CompletedProcess(command, 2, "", "private failure")
                         if terminal_origin:
                             self.assertEqual(scanned, scan_labels)
                             self.assertEqual(processes[0].poll(), None)
@@ -1602,6 +1609,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.extend(["--malloc-scribble", malloc_scribble])
             if terminal_origin:
                 arguments.append("--terminal-origin")
+            if live_attribution:
+                arguments.append("--live-attribution")
             if install_gate:
                 arguments.extend(["--install-gate", install_gate])
             if empty_control_mode:
@@ -1805,10 +1814,17 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                                  0 if terminal_timeout else 2)
             else:
                 self.assertFalse((records / "heap-diagnostics.json").exists())
-                self.assertFalse((work / "heap").exists())
+                self.assertEqual((work / "heap").exists(), live_attribution)
                 self.assertFalse(any(command[0] == "heap" for command in commands))
-                for scan_command in (command for command in commands if command[0] == "leaks"):
+                for scan_command in (command for command in commands if command[0] == "leaks" and not any(arg.startswith("--outputGraph=") for arg in command)):
                     self.assertEqual(scan_command, ["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", "1234"])
+                if live_attribution:
+                    captures = json.loads((records / "live-captures.json").read_text())
+                    self.assertEqual([row["label"] for row in captures], ["baseline"] + ([failed_scan] if failed_scan else []))
+                    self.assertEqual(len(scan_labels), 6)
+                    for row in captures:
+                        self.assertEqual(row["status"], live_capture_failure or "complete")
+                        self.assertEqual(row["stdout_sha256"], hashlib.sha256((records / (row["label"] + "-live.stdout.txt")).read_bytes()).hexdigest())
             if not copy_lifetime:
                 self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
                 self.assertEqual(scans[-1]["host"]["destroyedButtons"], 0 if heap_control else 30)
@@ -1938,6 +1954,33 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 malloc_scribble="off", heap_control=True, heap_diagnostics=True, binary_drift=True)
             self.assertEqual(code, 1)
             self.assertEqual([row["stage"] for row in result["validation_errors"]], ["external-startup-final"])
+
+    def test_live_attribution_keeps_six_original_scans_and_strict_failures(self):
+        for control, failure, capture_failure in itertools.product((False, True), (None, "registered-10", "removed-20"), (None, "timeout", "failed")):
+            with self.subTest(control=control, failure=failure, capture_failure=capture_failure):
+                code, result = self.exercise_runner(external_receipt=True, malloc_scribble="off", heap_control=control,
+                    live_attribution=True, failed_scan=failure, live_capture_failure=capture_failure)
+                self.assertEqual(code, int(failure is not None))
+                self.assertEqual(result["scan_mode"], "live")
+                self.assertTrue(result["live_attribution"])
+
+    def test_live_attribution_rejects_conflicting_cli_before_launch(self):
+        base = ["probe", "--work-directory", "unused", "--records-directory", "unused-records",
+                "--live-attribution", "--external-startup-receipt",
+                "--prepared-fixture-directory", "unused-prepared", "--malloc-scribble", "off"]
+        variants = [["--heap-diagnostics"], ["--terminal-origin"], ["--install-gate", "installed"],
+                    ["--empty-control-mode", "patched"], ["--prepare-external-fixture"],
+                    ["--prepare-install-gate-fixture"], ["--system-baseline"], ["--copy-lifetime"],
+                    ["--ownership-trace"], ["--read-only"], ["--malloc-scribble", "on"]]
+        for extra in variants:
+            with self.subTest(extra=extra), mock.patch.object(sys, "argv", base + extra), \
+                    mock.patch.object(PROBE.subprocess, "run") as run, \
+                    mock.patch.object(PROBE.subprocess, "Popen") as spawn, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as outcome:
+                PROBE.main()
+            self.assertEqual(outcome.exception.code, 2)
+            run.assert_not_called()
+            spawn.assert_not_called()
 
     def test_external_frozen_scans_require_the_complete_install_gate_contract(self):
         valid = ["probe", "--work-directory", "unused", "--records-directory", "unused-records",
@@ -2357,6 +2400,21 @@ class AXTerminalCacheIdentityTests(unittest.TestCase):
 
 
 class AXMallocScribbleWorkflowTests(unittest.TestCase):
+    @classmethod
+    def live_summary(cls):
+        value = cls.frozen_summary(first_strict_growth=True)
+        labels = [label for label in REPORT.HEAP_LABELS if label != "added-10"]
+        source_hash = hashlib.sha256(b"Process 123: 3 leaks for 300 total leaked bytes.\n").hexdigest()
+        value.update(schema=3, selection="live-no-growth",
+            live_scans=[{"label": label, "leak_nodes": 3, "leak_bytes": 300,
+                         "stdout_sha256": source_hash} for label in labels],
+            live_captures=[{"label": "baseline", "status": "complete", "exit_code": 0,
+                            "after_scan_ms": 3, "duration_ms": 20, "stdout_sha256": source_hash,
+                            "graph_sha256": value["baseline"]["graph_sha256"]}])
+        value["checked_points"] = value["checked_points"][:1]
+        value["tools"] = [value["tools"][0], value["tools"][-1]]
+        return value
+
     @staticmethod
     def frozen_summary(*, first_strict_growth=False, selected_label=None, byte_growth=False, new_nodes=1):
         if selected_label is not None:
@@ -2397,6 +2455,54 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
         block = workflow.split(f"      - name: {step}\n", 1)[1]
         script = block.split("          python3 - <<'PY'\n", 1)[1].split("          PY\n", 1)[0]
         return "\n".join(line[10:] for line in script.splitlines())
+
+    def test_live_attribution_identity_requires_explicit_defaults_and_two_ordinary_cases(self):
+        script = self.workflow_script("Verify investigation identity")
+        environment = {"AX_LIVE_ATTRIBUTION": "true", "AX_FROZEN_CONTROL": "false", "AX_SCAN_MODE": "diagnostic",
+                       "AX_RECEIPT_MODE": "internal", "AX_TERMINAL_ORIGIN": "false", "MALLOC_SCRIBBLE_EXPERIMENT": "false",
+                       "AX_HEAP_DIAGNOSTICS": "false", "CAUSAL_PROBE": "false",
+                       "AX_PURE_APPKIT_CONTROL": "false", "AX_INSTALL_GATE_CONTROL": "false"}
+        outputs = {('sw_vers', '-productVersion'): '26.6.2', ('sw_vers', '-buildVersion'): '25G83',
+                   ('uname', '-m'): 'arm64', ('xcodebuild', '-version'): 'Xcode 26.3\nBuild version 17C529',
+                   ('git', 'rev-parse', 'HEAD'): '1' * 40}
+        variants = [None, ("AX_SCAN_MODE", "live"), ("AX_RECEIPT_MODE", "external-startup")]
+        variants += [(key, "true") for key in ("AX_TERMINAL_ORIGIN", "MALLOC_SCRIBBLE_EXPERIMENT",
+            "AX_HEAP_DIAGNOSTICS", "CAUSAL_PROBE", "AX_PURE_APPKIT_CONTROL", "AX_INSTALL_GATE_CONTROL", "AX_FROZEN_CONTROL")]
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory) / "records"
+                code = script.replace("pathlib.Path('.build/Temporary/ax-heap-diagnostics')", f"pathlib.Path({str(root)!r})")
+                with mock.patch.dict(os.environ, environment | (dict([variant]) if variant else {})), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        mock.patch.object(subprocess, "check_output", side_effect=lambda command, **_: outputs[tuple(command)]) as query:
+                    if variant:
+                        with self.assertRaises(AssertionError):
+                            exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        query.assert_not_called()
+                    else:
+                        exec(compile(code, "ax-system-baseline.yml", "exec"), {})
+                        summary = json.loads((root / "summary.json").read_text())
+                        self.assertEqual(summary["expected_trials"], 2)
+                        self.assertTrue(summary["identity"]["live_attribution"])
+                        self.assertEqual(summary["identity"]["scan_mode"], "live")
+                        self.assertEqual(summary["identity"]["receipt_mode"], "external-startup")
+
+    def test_live_attribution_workflow_binds_evidence_and_preserves_strict_failures(self):
+        for failure in (None, "strict", "stdout", "capture", "private", "host-exit", "missing", "cleanup", "timeout"):
+            with self.subTest(failure=failure):
+                value = self.live_summary()
+                if failure == "private":
+                    value["live_captures"][0]["raw"] = "secret"
+                invocations, summary = self.run_measurement(enabled=False, scan_mode="live", receipt_mode="external-startup",
+                    live_attribution=True, frozen_summary=value,
+                    first_failure="strict" if failure == "strict" else None,
+                    frozen_failure=failure if failure not in (None, "strict") else None)
+                self.assertEqual(invocations, [("off", "control")] if failure == "cleanup" else [("off", "control"), ("off", "product")])
+                self.assertEqual(summary["strict_checks_passed"], failure != "strict")
+                self.assertEqual(summary["frozen_node_checks_passed"], failure in (None, "strict"))
+                if failure in (None, "strict"):
+                    self.assertTrue(summary["trials"][0]["frozen_nodes_available"])
+                    self.assertEqual(summary["trials"][0]["frozen_nodes"]["schema"], 3)
 
     def test_frozen_control_rejects_conflicting_modes_before_starting_tools(self):
         script = self.workflow_script("Verify investigation identity")
@@ -3322,14 +3428,19 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         first_scan_change=None, receipt_mode="internal", terminal_origin=False, first_terminal_change=None, pure_control=False, install_control=False,
                         first_startup_failures=None, image_cleanup_failure=None, first_records_change=None,
                         frozen_control=False, frozen_summary=None, frozen_failure=None, first_strict_growth=False,
-                        first_scans_change=None, parser_evidence=None, parser_failure=None, bridge_failure=None):
+                        first_scans_change=None, parser_evidence=None, parser_failure=None, bridge_failure=None,
+                        live_attribution=False):
         script = self.workflow_script("Measure matched cases with strict heap checks")
-        frozen_analysis = frozen_control or first_strict_growth
+        frozen_analysis = frozen_control or first_strict_growth or live_attribution
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
             summary_file = root / "summary.json"
             PROBE.write_json(summary_file, {"identity": {"scan_mode": scan_mode, "receipt_mode": receipt_mode, "terminal_origin": terminal_origin}, "trials": [], "completed": False,
-                                           "expected_trials": 1 if frozen_control else 2 if terminal_origin else 20 if enabled else 10})
+                                           "expected_trials": 1 if frozen_control else 2 if terminal_origin or live_attribution else 20 if enabled else 10})
+            if live_attribution:
+                value = json.loads(summary_file.read_text())
+                value["identity"]["live_attribution"] = True
+                PROBE.write_json(summary_file, value)
             if frozen_control:
                 value = json.loads(summary_file.read_text())
                 value["identity"]["frozen_control"] = True
@@ -3380,6 +3491,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         return
                     test.assertEqual("--external-startup-receipt" in command, receipt_mode == "external-startup")
                     test.assertEqual("--terminal-origin" in command, terminal_origin)
+                    test.assertEqual("--live-attribution" in command, live_attribution)
                     setting = command[command.index("--malloc-scribble") + 1] if "--malloc-scribble" in command else None
                     mode = "control" if "--heap-control" in command else "product"
                     if pure_control:
@@ -3495,6 +3607,10 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if self.first and first_scans_change:
                         first_scans_change(scans)
                     PROBE.write_json(records / "scans.json", scans)
+                    if live_attribution:
+                        for label in labels:
+                            (records / (label + "-live.stdout.txt")).write_text("Process 123: 3 leaks for 300 total leaked bytes.\n")
+                        PROBE.write_json(records / "live-captures.json", test.live_summary()["live_captures"])
                     result = {"coverage": "passed"}
                     if terminal_origin and self.first and image_cleanup_failure == "not-run":
                         PROBE.write_json(records / "terminal-snapshot.json", REPORT.empty_terminal_snapshot())
@@ -3523,6 +3639,7 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     test.assertTrue(frozen_analysis)
                     test.assertEqual(timeout, 120)
                     test.assertEqual("--first-strict-growth" in command, first_strict_growth)
+                    test.assertEqual("--live-pair" in command, live_attribution)
                     test.assertIn("--bridge-evidence", command)
                     test.assertNotIn("MallocScribble", environment)
                     frozen_invocations.append(invocations[-1])
@@ -3531,19 +3648,26 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     else:
                         test.assertLessEqual(len(invocations), 10)
                         test.assertIn(invocations[-1], (("off", "installed"), ("off", "preflight-only")) if install_control
+                                      else (("off", "control"), ("off", "product")) if live_attribution
                                       else ((None, "control"), (None, "product")))
                     saved = json.loads(summary_file.read_text())
                     test.assertEqual(len(saved["trials"]), len(invocations))
                     test.assertEqual(saved["strict_checks_passed"], first_failure is None)
                     test.assertEqual(saved["trials"][-1]["mode"], invocations[-1][1])
                     test.assertNotIn("frozen_node_process_run", saved["trials"][-1])
-                    test.assertEqual([scan["label"] for scan in saved["trials"][-1]["scan_totals"]], list(REPORT.HEAP_LABELS))
+                    test.assertEqual([scan["label"] for scan in saved["trials"][-1]["scan_totals"]],
+                        [label for label in REPORT.HEAP_LABELS if not live_attribution or label != "added-10"])
                     records = pathlib.Path(command[command.index("--records-directory") + 1])
                     test.assertIs(json.loads((records / "process-cleanup.json").read_text())["processes_exited"], True)
                     test.assertTrue(saved["trials"][-1]["process_run"]["cleanup"]["complete"])
                     test.assertEqual(pathlib.Path(command[command.index("--graph-directory") + 1]), records.parent / "fixture/heap")
                     failure = frozen_failure if len(invocations) == 1 else None
-                    value = frozen_summary if len(invocations) == 1 and frozen_summary is not None else test.frozen_summary(first_strict_growth=first_strict_growth)
+                    value = (frozen_summary if len(invocations) == 1 and frozen_summary is not None else
+                             test.live_summary() if live_attribution else test.frozen_summary(first_strict_growth=first_strict_growth))
+                    if live_attribution and failure == "stdout":
+                        (records / "removed-30-live.stdout.txt").write_text("changed original stdout")
+                    if live_attribution and failure == "capture":
+                        (records / "live-captures.json").write_text("[]")
                     if failure != "missing":
                         PROBE.write_json(records / "frozen-nodes.json", value)
                     from ax_bridge_evidence import initial_summary as bridge_summary, fail_closed as bridge_failed
@@ -3661,8 +3785,8 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                 return invocations, summary
             self.assertEqual(summary["strict_checks_passed"], first_failure is None or first_failure.startswith("terminal"))
             self.assertTrue(summary["completed"])
-            self.assertEqual(len(summary["trials"]), 1 if frozen_control else 2 if terminal_origin else 20 if enabled else 10)
-            if first_strict_growth:
+            self.assertEqual(len(summary["trials"]), 1 if frozen_control else 2 if terminal_origin or live_attribution else 20 if enabled else 10)
+            if first_strict_growth or live_attribution:
                 self.assertEqual(frozen_invocations, invocations[1:] if frozen_failure == "host-exit" else invocations)
             for receipt in summary["trials"]:
                 if receipt.get("parser_evidence_available"):

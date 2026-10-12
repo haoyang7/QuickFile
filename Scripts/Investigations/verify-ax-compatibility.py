@@ -172,6 +172,7 @@ def main():
     parser.add_argument("--prepared-fixture-directory", type=Path)
     parser.add_argument("--empty-control-mode", choices=("patched", "pure-appkit"), help="Explicit empty-control build/measurement; pure-appkit excludes the production AX implementation; measurement requires external startup receipts, MallocScribble off and --heap-control")
     parser.add_argument("--terminal-origin", action="store_true", help="Capture one later heap graph after all six live scans; requires external startup receipts and MallocScribble off")
+    parser.add_argument("--live-attribution", action="store_true", help="Keep six ordinary live scans and compact logging; capture auxiliary graphs after baseline and first node/byte growth; captures change later timing")
     parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
@@ -181,6 +182,10 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.live_attribution and (not args.external_startup_receipt or args.malloc_scribble != "off"
+            or args.heap_diagnostics or args.terminal_origin or args.install_gate or args.empty_control_mode
+            or args.prepare_external_fixture or args.prepare_install_gate_fixture):
+        parser.error("--live-attribution requires ordinary prepared external off/live measurement")
     if args.prepare_install_gate_fixture:
         if args.install_gate or args.empty_control_mode:
             parser.error("Install-gate preparation cannot select a measurement or empty-control build mode")
@@ -235,7 +240,7 @@ def main():
     state = work / "state"
     state.mkdir()
     graphs = work / "heap"
-    if args.heap_diagnostics or args.terminal_origin:
+    if args.heap_diagnostics or args.terminal_origin or args.live_attribution:
         graphs.mkdir()
     app = work / "AXCompatibilityFixture.app"
     executable = app / "Contents/MacOS/AXCompatibilityFixture"
@@ -403,6 +408,7 @@ def main():
     observer_exited = None
     sequence = reader_sequence = 0
     terminal_snapshot = empty_terminal_snapshot() if args.terminal_origin else None
+    live_captures = []
     with (records / "host.log").open("w") as host_log, (records / "reader.log").open("w") as reader_log:
         def validate(stage, validator, *values):
             # Assertion failures must not discard later lifecycle evidence. They
@@ -498,6 +504,7 @@ def main():
                 target = str(graph)
             result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", target],
                                     capture_output=True, text=True, timeout=60)
+            completed = time.monotonic() if args.live_attribution else None
             (records / f"{label}-leaks.txt").write_text(result.stdout + result.stderr)
             match = re.search(r"(\d+) leaks for (\d+) total leaked bytes", result.stdout)
             entry = {"label": label, "host": host_state, "exit_code": result.returncode,
@@ -513,6 +520,15 @@ def main():
                 raise RuntimeError(f"Full-heap scan was unavailable: {entry}")
             if not args.system_baseline:
                 validate(label, validate_product_scan, entry, results[0] if label != "baseline" else None)
+            if args.live_attribution:
+                # Preserve original stdout separately from stderr for binding.
+                # No auxiliary capture precedes the ordinary baseline scan.
+                (records / (label + "-live.stdout.txt")).write_text(result.stdout)
+                growth = label != "baseline" and any(entry[key] > results[0][key] for key in ("leak_nodes", "leak_bytes"))
+                if label == "baseline" or growth and len(live_captures) == 1:
+                    from ax_frozen_nodes import capture_live_point
+                    live_captures.append(capture_live_point(host.pid, label, graphs, records, completed))
+                    write_json(records / "live-captures.json", live_captures)
 
         try:
             host = subprocess.Popen([str(executable), str(state), *host_arguments], env=environment, stdout=host_log, stderr=host_log)
@@ -672,6 +688,8 @@ def main():
                 summary["install_gate"] = args.install_gate
                 summary["product_compensation_enabled"] = args.install_gate == "installed"
                 summary["scope"] += "; install-gate empty control; no product destruction coverage"
+            if args.live_attribution:
+                summary["live_attribution"] = True
             if validation_errors:
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors

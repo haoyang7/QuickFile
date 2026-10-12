@@ -391,7 +391,7 @@ def collect(*, frozen, traces, baseline_heap, before_graph, after_graph, tools, 
     result["tools"] = tools.summary["tools"]
     if frozen.get("status") != "complete":
         return fail_closed(result, "not_ready")
-    if frozen.get("selection") in ("no-strict-growth", "no-new-leak"):
+    if frozen.get("selection") in ("no-strict-growth", "no-new-leak", "live-no-growth"):
         result["status"] = "not_needed"
         return result
     if frozen.get("selected") is None or baseline_heap is None:
@@ -656,7 +656,7 @@ def validate_summary(value, frozen):
         require(all(record["baseline"]["state"] == "original_target_address" for record in value["records"]))
     elif value["status"] == "not_needed":
         require(frozen["status"] == "complete" and not value["records"] and not value["tools"] and not value["reasons"] and value["omitted_sources"] == 0)
-        if frozen["selection"] not in ("no-strict-growth", "no-new-leak"):
+        if frozen["selection"] not in ("no-strict-growth", "no-new-leak", "live-no-growth"):
             require(frozen.get("selected") is not None and not frozen.get("omitted_candidates"))
             for index, candidate in enumerate(frozen["nodes"]):
                 if candidate["baseline_presence"] != "absent":
