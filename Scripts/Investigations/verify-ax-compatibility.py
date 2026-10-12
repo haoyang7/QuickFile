@@ -23,7 +23,7 @@ from ax_probe_report import (capture_terminal_snapshot, collect_heap_diagnostics
                              disassemble_symbols, empty_terminal_snapshot, leak_groups)
 from ax_external_receipt import (EXECUTABLES, FIXTURE_SOURCES, INSTALL_ENV, INSTALL_MODES, STARTUP_STAGES, StartupReceiptError,
                                  fixture_hashes, fixture_sources, load_prepared_fixture, startup_failure,
-                                 owned_child_receipt, require_fixture_hashes, validate_empty_control_build,
+                                 owned_child_receipt, read_procargs, require_fixture_hashes, validate_empty_control_build,
                                  validate_external_receipt, validate_install_gate_build, validate_install_gate_state)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -163,6 +163,8 @@ def main():
     parser.add_argument("--records-directory", required=True, type=Path)
     parser.add_argument("--system-baseline", action="store_true")
     parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; product or install-gate controls only")
+    parser.add_argument("--reference-validation", action="store_true", help="Explicit full-history frozen reference investigation using prepared external off fixtures; separate from ordinary CI")
+    parser.add_argument("--reference-idle", action="store_true", help="Pure AppKit empty reference control: after the initial empty AX query, skip subsequent AX queries while retaining all seven heap checkpoints")
     parser.add_argument("--heap-control", action="store_true", help="Match the selected product scan checkpoints with an empty window and no target buttons; requires --heap-diagnostics or --malloc-scribble")
     parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; uses ordinary live scans unless --heap-diagnostics is selected")
     parser.add_argument("--prepare-external-fixture", action="store_true", help="Build host/reader once without running them; ordinary binaries unless --empty-control-mode is explicit")
@@ -182,6 +184,14 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.reference_validation and (not args.heap_diagnostics or not args.external_startup_receipt
+            or args.malloc_scribble != "off" or args.install_gate or args.terminal_origin or args.live_attribution
+            or args.empty_control_mode not in (None, "pure-appkit")
+            or args.prepare_external_fixture or args.prepare_install_gate_fixture):
+        parser.error("--reference-validation requires independent prepared external off frozen measurement")
+    if args.reference_idle and (not args.reference_validation or not args.heap_control
+            or args.empty_control_mode != "pure-appkit"):
+        parser.error("--reference-idle requires a pure AppKit empty reference control")
     if args.live_attribution and (not args.external_startup_receipt or args.malloc_scribble != "off"
             or args.heap_diagnostics or args.terminal_origin or args.install_gate or args.empty_control_mode
             or args.prepare_external_fixture or args.prepare_install_gate_fixture):
@@ -202,7 +212,7 @@ def main():
             args.expected_appkit_uuid, args.expected_corefoundation_uuid, args.terminal_origin)):
         parser.error("--prepare-external-fixture requires an independent fixture build")
     if args.external_startup_receipt and (not args.malloc_scribble or not args.prepared_fixture_directory
-            or (args.heap_diagnostics and not args.install_gate)
+            or (args.heap_diagnostics and not (args.install_gate or args.reference_validation))
             or any((args.system_baseline, args.copy_lifetime, args.read_only,
                     args.ownership_trace, args.balance_copies, args.expected_appkit_uuid, args.expected_corefoundation_uuid))):
         parser.error("external startup receipts require a prepared fixture; frozen scans require --install-gate")
@@ -399,6 +409,13 @@ def main():
         # Full frozen histories must preserve free/reallocation generations.
         # MallocStackLogging would take precedence over NoCompact if both were set.
         environment.pop("MallocStackLogging")
+    if args.reference_validation:
+        # This independent frozen protocol also pins the reader environment.
+        # Ordinary measurements retain their existing logging configuration.
+        reader_environment.pop("MallocStackLogging", None)
+        reader_environment["MallocStackLoggingNoCompact"] = "1"
+    reference_environment = {}
+    checkpoint_windows = []
     results = []
     validation_errors = []
     checkpoints = []
@@ -466,6 +483,13 @@ def main():
             allocator_receipt[role] = value["malloc_scribble"]
             write_json(records / "external-startup.json", external_receipt)
             write_json(records / "malloc-scribble.json", allocator_receipt)
+            if args.reference_validation:
+                _, _, actual = read_procargs(process.pid)
+                if (process.poll() is not None or actual.get(b"PATH") != os.fsencode(child_environment["PATH"])
+                        or actual.get(b"MallocStackLogging") is not None
+                        or actual.get(b"MallocStackLoggingNoCompact") != b"1"):
+                    raise RuntimeError("Reference fixture full-history startup environment was not confirmed")
+                reference_environment[role] = {"malloc_stack_logging": "unset", "malloc_stack_logging_no_compact": "1"}
 
         def finish_external_receipt():
             for directory, reason in ((prepared, "prepared_hash"), (work, "working_hash")):
@@ -499,6 +523,9 @@ def main():
                 (graphs / f"{label}-capture.txt").write_text(capture.stdout + capture.stderr)
                 if capture.returncode not in (0, 1) or not graph.is_file():
                     raise RuntimeError("Diagnostic heap graph capture was unavailable")
+                if args.reference_validation:
+                    checkpoint_windows.append({"label": label, "phase": label,
+                        "start_monotonic": started, "end_monotonic": time.monotonic()})
                 # --outputGraph suppresses the text report. Decode that same
                 # snapshot offline; do not sample the live heap a second time.
                 target = str(graph)
@@ -564,7 +591,7 @@ def main():
                     # Split button construction from the first AX subscription;
                     # this remains subject to the original empty-window baseline.
                     scan("added-10", added)
-                observed = observe()
+                observed = warmed if args.reference_idle else observe()
                 if not args.heap_control and (observed["buttons"] != 10 or observed["registrations"] != expected_registrations):
                     raise RuntimeError(f"AX registrations incomplete: {observed}")
                 if not args.system_baseline and cycle == 1:
@@ -572,7 +599,8 @@ def main():
                     # or destroying any target button before the first scan.
                     scan("registered-10", command("checkpoint"))
                 removed = command("checkpoint" if args.heap_control else "remove")
-                observe()
+                if not args.reference_idle:
+                    observe()
                 if not args.heap_control and removed["destroyedButtons"] != cycle * 10:
                     raise RuntimeError(f"Buttons did not deallocate: {removed}")
                 checkpoint_keys = (("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")
@@ -690,6 +718,16 @@ def main():
                 summary["scope"] += "; install-gate empty control; no product destruction coverage"
             if args.live_attribution:
                 summary["live_attribution"] = True
+            if args.reference_validation:
+                if set(reference_environment) != {"host", "reader"}:
+                    raise RuntimeError("Reference environment receipt is incomplete")
+                summary["reference_validation"] = True
+                summary["reader_mode"] = "initial-query-only" if args.reference_idle else "subscribed"
+                summary["scope"] += "; independent frozen full-history reference investigation; not ordinary CI parity"
+                write_json(records / "reference-validation-input.json", {"schema": 1,
+                    "history_mode": "full-no-compact", "malloc_stack_logging": "unset",
+                    "malloc_stack_logging_no_compact": "1", "environments": reference_environment,
+                    "checkpoint_windows": checkpoint_windows})
             if validation_errors:
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors

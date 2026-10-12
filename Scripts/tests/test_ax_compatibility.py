@@ -1389,7 +1389,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         malloc_scribble=None, invalid_allocator=None, external_receipt=False, binary_drift=False,
                         terminal_origin=False, terminal_timeout=False, empty_control_mode=None,
                         cleanup_failure=None, ls_failure=False, install_gate=None, invalid_install_gate=None,
-                        startup_error=None, hash_io_failure=None, live_attribution=False, live_capture_failure=None):
+                        startup_error=None, hash_io_failure=None, live_attribution=False, live_capture_failure=None,
+                        reference_validation=False, reference_idle=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -1437,11 +1438,14 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         assert ("MallocScribble" in self.environment) == (malloc_scribble == "on")
                         if malloc_scribble == "on":
                             assert self.environment["MallocScribble"] == "1"
-                        if self.is_reader:
+                        if self.is_reader and not reference_validation:
                             for key in ("MallocStackLogging", "MallocStackLoggingNoCompact"):
                                 assert self.environment.get(key) == os.environ.get(key)
                     elif self.is_reader:
                         assert self.environment is None
+                    if reference_validation:
+                        assert self.environment.get("MallocStackLogging") is None
+                        assert self.environment["MallocStackLoggingNoCompact"] == "1"
                     if not self.is_reader:
                         environment = _kwargs["env"]
                         assert environment["MallocStackLoggingNoCompact"] == "1"
@@ -1522,7 +1526,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     protocol.append(("scan", label))
                     if label in ("added-10", "registered-10"):
                         reader_command = json.loads((state / "reader-command.json").read_text())
-                        self.assertEqual(reader_command["sequence"], 2 if label == "registered-10" else 1)
+                        self.assertEqual(reader_command["sequence"], 2 if label == "registered-10" and not reference_idle else 1)
                         self.assertEqual(host_state["destroyedButtons"], 0)
                     nodes, size = (287, 18_768) if label == failed_scan else (280, 18_416)
                     output = (f"Process 1234: {nodes} leaks for {size} total leaked bytes.\n"
@@ -1611,6 +1615,10 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.append("--terminal-origin")
             if live_attribution:
                 arguments.append("--live-attribution")
+            if reference_validation:
+                arguments.append("--reference-validation")
+            if reference_idle:
+                arguments.append("--reference-idle")
             if install_gate:
                 arguments.extend(["--install-gate", install_gate])
             if empty_control_mode:
@@ -1655,6 +1663,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     PROBE.write_json(prepared / "fixture-build.json", AXInstallGateTests.manifest(EXTERNAL.fixture_hashes(prepared)))
                 arguments.extend(["--external-startup-receipt", "--prepared-fixture-directory", str(prepared)])
             with mock.patch.object(EXTERNAL, "read_procargs", side_effect=startup_metadata) as startup_reads, \
+                    mock.patch.object(PROBE, "read_procargs", side_effect=startup_metadata), \
                     mock.patch.object(PROBE, "require_fixture_hashes", side_effect=require_fixture_hashes), \
                     mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
                     mock.patch.object(PROBE.subprocess, "run", side_effect=run), \
@@ -1844,14 +1853,24 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertEqual(registered["host"]["destroyedButtons"], 0)
             if not system_baseline and not copy_lifetime:
                 add, remove = ("checkpoint", "checkpoint") if heap_control else ("add", "remove")
-                self.assertEqual(protocol, [
+                expected_protocol = [
                     ("observe", 1), ("command", "checkpoint"), ("scan", "baseline"),
                     ("command", add), *([("scan", "added-10")] if heap_diagnostics else []), ("observe", 2),
                     ("command", "checkpoint"), ("scan", "registered-10"),
                     ("command", remove), ("observe", 3), ("scan", "removed-10"),
                     ("command", add), ("observe", 4), ("command", remove), ("observe", 5), ("scan", "removed-20"),
                     ("command", add), ("observe", 6), ("command", remove), ("observe", 7), ("scan", "removed-30"),
-                    ("command", "checkpoint"), ("scan", "observer-exited")])
+                    ("command", "checkpoint"), ("scan", "observer-exited")]
+                if reference_idle:
+                    expected_protocol = [item for item in expected_protocol if item[0] != "observe" or item[1] == 1]
+                self.assertEqual(protocol, expected_protocol)
+            if reference_validation:
+                receipt = json.loads((records / "reference-validation-input.json").read_text())
+                self.assertEqual([row["label"] for row in receipt["checkpoint_windows"]], list(REPORT.HEAP_LABELS))
+                self.assertTrue(all(row["end_monotonic"] >= row["start_monotonic"] for row in receipt["checkpoint_windows"]))
+                self.assertEqual(receipt["environments"], dict.fromkeys(("host", "reader"), {
+                    "malloc_stack_logging": "unset", "malloc_stack_logging_no_compact": "1"}))
+                self.assertEqual(summary["reader_mode"], "initial-query-only" if reference_idle else "subscribed")
             if heap_diagnostics or malloc_scribble:
                 self.assertEqual(summary["mode"], "heap-control" if heap_control else "product")
                 self.assertEqual(summary["scan_mode"], "diagnostic" if heap_diagnostics else "live")
@@ -1954,6 +1973,39 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 malloc_scribble="off", heap_control=True, heap_diagnostics=True, binary_drift=True)
             self.assertEqual(code, 1)
             self.assertEqual([row["stage"] for row in result["validation_errors"]], ["external-startup-final"])
+
+    def test_reference_cases_keep_seven_scans_and_each_strict_failure(self):
+        cases = ((False, None, False), (True, None, False),
+                 (True, "pure-appkit", False), (True, "pure-appkit", True))
+        for (control, empty, idle), failure in itertools.product(cases, (None, "added-10", "registered-10", "removed-20")):
+            with self.subTest(control=control, empty=empty, idle=idle, failure=failure):
+                code, result = self.exercise_runner(external_receipt=True, malloc_scribble="off",
+                    heap_diagnostics=True, heap_control=control, empty_control_mode=empty,
+                    reference_validation=True, reference_idle=idle, failed_scan=failure)
+                self.assertEqual(code, int(failure is not None))
+                self.assertEqual([scan["label"] for scan in result["scans"]], list(REPORT.HEAP_LABELS))
+                self.assertEqual(result["reader_mode"], "initial-query-only" if idle else "subscribed")
+                if failure:
+                    self.assertEqual([row["stage"] for row in result["validation_errors"]], [failure])
+
+    def test_reference_modes_reject_conflicts_before_process_launch(self):
+        base = ["probe", "--work-directory", "unused", "--records-directory", "unused-records",
+            "--reference-validation", "--heap-diagnostics", "--external-startup-receipt",
+            "--prepared-fixture-directory", "unused-prepared", "--malloc-scribble", "off"]
+        variants = [base + extra for extra in (["--live-attribution"], ["--install-gate", "installed"],
+            ["--empty-control-mode", "patched"], ["--reference-idle"], ["--terminal-origin"],
+            ["--prepare-external-fixture"], ["--reference-idle", "--heap-control"],
+            ["--reference-idle", "--empty-control-mode", "pure-appkit"])]
+        variants += [[item for item in base if item != "--heap-diagnostics"],
+                     ["probe", "--work-directory", "unused", "--records-directory", "unused-records", "--reference-idle"]]
+        for arguments in variants:
+            with self.subTest(arguments=arguments), mock.patch.object(sys, "argv", arguments), \
+                    mock.patch.object(PROBE.subprocess, "run") as run, mock.patch.object(PROBE.subprocess, "Popen") as spawn, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as outcome:
+                PROBE.main()
+            self.assertEqual(outcome.exception.code, 2)
+            run.assert_not_called()
+            spawn.assert_not_called()
 
     def test_live_attribution_keeps_six_original_scans_and_strict_failures(self):
         for control, failure, capture_failure in itertools.product((False, True), (None, "registered-10", "removed-20"), (None, "timeout", "failed")):
