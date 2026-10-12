@@ -2,6 +2,7 @@
 import copy
 import hashlib
 from pathlib import Path
+import re
 import sys
 import unittest
 from unittest import mock
@@ -113,6 +114,58 @@ class CompositionTests(unittest.TestCase):
         payload = composition.encoded(value).decode()
         for secret in ("PrivateCustomerType", "0x1234", "synthetic_function", "Process", "synthetic-image"):
             self.assertNotIn(secret, payload)
+
+    def test_observed_anonymous_objc_origin_shape_can_be_replayed_privately(self):
+        # The reported bytes and names are opaque: this replays only the origin
+        # grammar from a diagnostic fragment, not an equivalent complete tree.
+        line = "                225 (opaque5.opaque6) opaque7 in -[NSXPCInterface opaque8:opaque9:]"
+        fragment = composition._failure_fragment([line])
+        decoded, _, _ = composition.parser_evidence.decode_document(fragment["evidence"]["documents"][0])
+        for row in (line, decoded.rstrip("\n")):
+            name = re.fullmatch(r" +225 \([^()]+\) (.+)", row)[1]
+            self.assertEqual(composition._name(name), name)
+            self.assertNotIn(name, composition.TYPES)
+
+    def test_objc_origin_stays_unknown_and_preserves_type_counts_and_exact_bytes(self):
+        for sign in ("-", "+"):
+            origin = f"PrivateAllocator in {sign}[NSXPCInterface privateSelector:privateArgument:]"
+            value = self.parse(array_report().replace("CFData", origin))
+            self.assertEqual(value["type_counts"], [{"type": "NSMutableArray", "count": 1},
+                {"type": "NSMutableArray (Storage)", "count": 1}, {"type": "unknown", "count": 1}])
+            self.assertEqual(value["exact_size_histogram"], [{"type": "NSMutableArray", "size": 48, "count": 1},
+                {"type": "NSMutableArray (Storage)", "size": 16, "count": 1}, {"type": "unknown", "size": 80, "count": 1}])
+            self.assertEqual((value["counts_status"], value["reasons"], value["failure_fragment"]),
+                             ("complete", ["unknown_type"], None))
+            for private in ("PrivateAllocator", "NSXPCInterface", "privateSelector", "privateArgument"):
+                self.assertNotIn(private, composition.encoded(value).decode())
+            self.assertLessEqual(len(composition.encoded(value)), composition.PUBLIC_LIMIT)
+
+    def test_objc_origin_aggregate_never_divides_subtree_bytes_into_instance_sizes(self):
+        value = self.parse(grouped(226, 10848,
+            "    226 (10848 bytes) ROOT LEAK: NSMutableArray\n"
+            "       225 (10800 bytes) PrivateAllocator in -[PrivateClass privateSelector:]"))
+        self.assertEqual(value["type_counts"], [{"type": "NSMutableArray", "count": 1}, {"type": "unknown", "count": 225}])
+        self.assertEqual(value["exact_size_histogram"], [{"type": "NSMutableArray", "size": 48, "count": 1}])
+        self.assertEqual(value["unresolved_sizes"], [{"type": "unknown", "count": 225,
+            "bytes_min": 10800, "bytes_max": 10800, "reason": "multiple_instances"}])
+        self.assertEqual((value["unknown_type_nodes"], value["size_unknown_nodes"]), (225, 225))
+
+    def test_objc_origin_allowance_rejects_unobserved_syntax_addresses_and_bad_geometry(self):
+        valid = "PrivateAllocator in -[PrivateClass privateSelector:privateArgument:]"
+        invalid_names = (
+            valid + " suffix", valid[:-1], valid.replace("PrivateAllocator", "allocator/path"),
+            valid.replace("-[", "["), valid.replace("privateSelector:", "privateSelector::"),
+            valid.replace("privateArgument:", "privateArgument"), valid.replace("PrivateClass", "0xdeadbeef"),
+            valid.replace("privateSelector", "a" * 257), valid + " --> NSString", valid + "\t",
+            "PrivateClass privateSelector:", "PrivateAllocator in -[PrivateClass privateSelector]",
+        )
+        for name in invalid_names:
+            with self.subTest(name=name):
+                value = self.parse(array_report().replace("CFData", name))
+                self.assertEqual((value["counts_status"], value["reasons"]), ("unavailable", ["invalid_report"]))
+                self.assertLessEqual(len(composition.encoded(value)), composition.PUBLIC_LIMIT)
+        report = array_report().replace("CFData", valid).replace("          1 (80", "           1 (80")
+        self.assertEqual(self.parse(report)["failure_stage"], "tree_shape")
 
     def test_full_grammar_rejects_prefix_duplicate_headers_unparsed_and_bad_counts(self):
         valid = array_report()

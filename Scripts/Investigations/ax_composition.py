@@ -155,7 +155,12 @@ def _name(text, stage=None):
     if text.startswith("<") and text.endswith(">"):
         text = text[1:-1]
     require(0 < len(text) <= 256 and text == text.strip() and text.isprintable(), stage)
-    require(not re.search(r"0x[0-9a-fA-F]+|[<>\[\]:|]", text) and "-->" not in text, stage)
+    require(not re.search(r"0x[0-9a-fA-F]+", text) and "-->" not in text, stage)
+    # Observed grouped origin labels include an Objective-C allocation site.
+    # This private description is not an object type; publication still uses TYPES.
+    origin = re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]* in [+-]\[[A-Za-z_][A-Za-z_0-9]* "
+                          r"(?:[A-Za-z_][A-Za-z_0-9]*:)+\]", text)
+    require(origin is not None or not re.search(r"[<>\[\]:|]", text), stage)
     return text
 
 
