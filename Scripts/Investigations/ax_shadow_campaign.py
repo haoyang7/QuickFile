@@ -38,6 +38,7 @@ POLICY = {'max_probes': 6, 'min_interval_seconds': 2, 'deadline_seconds': 15,
           'comparison': 'counts-bytes-root-kind-type-instances-tree-nodes', 'size_histogram_compared': False}
 ENVIRONMENT = {'host': {'MallocStackLogging': '1', 'MallocStackLoggingNoCompact': '1', 'MallocScribble': 'unset'},
                'reader': dict.fromkeys(('MallocStackLogging', 'MallocStackLoggingNoCompact', 'MallocScribble'), 'unset')}
+PROJECTION_REASONS = ('none', 'environment', 'policy', 'probe', 'capture', 'timing', 'binding', 'verdict', 'invalid')
 TIME_KEYS = ('baseline_finished', 'settling_started', 'first_measurement_cycle', 'last_original_scan_finished')
 ERRORS = ('graph_directory_failed', 'receipt_write_failed', 'environment_unavailable', 'capture_failed',
           'settling_failed', 'not_settled', 'stdout_write_failed')
@@ -129,6 +130,13 @@ def fits(row, baseline):
     return classification_passed(row) and all(row[key] <= baseline[key] for key in ('leak_nodes', 'leak_bytes')) and root_count(row) <= root_count(baseline)
 
 
+def candidate_index(probes):
+    return next((i for i in range(1, len(probes))
+                 if all(classification_passed(probes[j]['scan']) and probes[j]['within_settling_deadline'] for j in (i - 1, i))
+                 and signature(probes[i]['scan']) == signature(probes[i - 1]['scan'])
+                 and probes[i]['signature_sha256'] == probes[i - 1]['signature_sha256']), None)
+
+
 def validate_scan(row, label):
     fields(row, ('label', 'leak_nodes', 'leak_bytes', 'unclassified_nodes', 'destroyed_notification_stack_present',
                  'exit_code', 'stdout_sha256', 'groups'))
@@ -204,18 +212,36 @@ def finite_time(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
+class ShadowProjectionError(ValueError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__('Invalid bounded AX shadow evidence')
+
+
 def project_shadow(records, measurement, process, expected, case):
+    stage = ['invalid']
+    try:
+        return _project_shadow(records, measurement, process, expected, case, stage)
+    except (ValueError, OSError, TypeError, KeyError, RuntimeError, UnicodeError):
+        raise ShadowProjectionError(stage[0]) from None
+
+
+def _project_shadow(records, measurement, process, expected, case, stage):
     raw = read_json(records / 'settled-baseline-shadow.json')
+    stage[0] = 'policy'
     require(type(raw.get('schema')) is int and raw['schema'] == 1 and raw.get('settling_policy') == POLICY and canonical(raw['settling_policy']) == canonical(POLICY))
     require(raw.get('timing_perturbed') is True and raw.get('original_parity') is False)
     require(raw.get('logging_mode') == 'compact' and raw.get('history_mode') == 'current-stacks')
+    stage[0] = 'environment'
     validate_external_receipt(read_json(records / 'external-startup.json', 16384), 'off', expected)
     require(raw.get('environments') == ENVIRONMENT)
+    stage[0] = 'policy'
     observer = 'initial-query-only' if case == 'pure-appkit-idle' else 'ordinary'
     require(raw.get('observer_query_policy') == observer)
     require(type(raw.get('errors')) is list and len(raw['errors']) <= 32 and all(error in ERRORS for error in raw['errors']))
     probes, captures = raw.get('probes'), raw.get('captures')
     require(type(probes) is list and len(probes) <= 6 and type(captures) is list and len(captures) <= 3)
+    stage[0] = 'timing'
     markers = {key: raw.get(key + '_monotonic') for key in TIME_KEYS}
     require(all(value is None or finite_time(value) for value in markers.values()))
     times = [row.get('start_monotonic') for row in probes + captures] + [value for value in markers.values() if value is not None]
@@ -227,39 +253,46 @@ def project_shadow(records, measurement, process, expected, case):
         return {'start_elapsed_ms': round((start - origin) * 1000), 'end_elapsed_ms': round((end - origin) * 1000)}
     public_probes = []
     for index, row in enumerate(probes):
+        stage[0] = 'probe'
         require(type(row.get('index')) is int and row['index'] == index and row.get('label') == 'shadow-probe-' + str(index))
         require(row.get('host_activity_zero') is True)
         require(type(row.get('host')) is dict and all(type(row['host'].get(key)) is int and row['host'][key] == 0 for key in HOST_KEYS))
         require(type(row.get('reader_warm')) is dict and all(type(row['reader_warm'].get(key)) is int and row['reader_warm'][key] == 0 for key in READER_KEYS) and row['reader_warm'].get('target_notification_counts') == [])
         raw_signature = (row['leak_nodes'], row['leak_bytes'], sorted((g['root_kind'], g['root_type'], g['root_instances'], g['tree_nodes']) for g in row['groups']))
-        public_probes.append({'index': index, 'scan': project_scan(row, records), 'host_activity_zero': True,
-                              'reader_warm_zero': True, 'signature_sha256': hashlib.sha256(canonical(raw_signature)).hexdigest(), **window(row)})
-        require(row['end_monotonic'] - row['start_monotonic'] <= 5)
+        stage[0] = 'binding'
+        scan = project_scan(row, records)
+        stage[0] = 'timing'
+        public_probes.append({'index': index, 'scan': scan, 'host_activity_zero': True,
+                              'reader_warm_zero': True, 'within_settling_deadline': row['end_monotonic'] < markers['settling_started'] + 15, 'signature_sha256': hashlib.sha256(canonical(raw_signature)).hexdigest(), **window(row)})
         if index:
             require(row['start_monotonic'] - probes[index - 1]['end_monotonic'] >= 2)
-    chosen = next((index for index in range(1, len(public_probes)) if classification_passed(public_probes[index]['scan']) and classification_passed(public_probes[index - 1]['scan']) and signature(public_probes[index]['scan']) == signature(public_probes[index - 1]['scan']) and public_probes[index]['signature_sha256'] == public_probes[index - 1]['signature_sha256']), None)
+    chosen = candidate_index(public_probes)
     require(raw.get('chosen_index') == chosen and (raw.get('chosen_index') is None or type(raw['chosen_index']) is int))
     require(raw.get('status') == ('observed-stable' if chosen is not None else 'not_settled'))
-    if probes:
-        require(markers['settling_started'] is not None and probes[-1]['end_monotonic'] - markers['settling_started'] < 15)
     sources = {row['label']: row for row in measurement['original_scans']}
     sources.update({row['scan']['label']: row['scan'] for row in public_probes})
     public_captures = []
     for row in captures:
+        stage[0] = 'capture'
         label = row.get('label')
         require(label in CAPTURES and label not in [item['label'] for item in public_captures])
         source_label = row.get('source_label')
         require(source_label in sources)
         source = sources[source_label]
+        stage[0] = 'binding'
         require(row.get('source_stdout_sha256') == source['stdout_sha256'] and all(row.get(key) == source[key] for key in ('leak_nodes', 'leak_bytes')))
         require(groups_projection(row.get('groups')) == source['groups'])
+        stage[0] = 'capture'
         if label == CAPTURES[0]: require(source_label == 'baseline')
         if label == CAPTURES[1]:
             require(chosen is not None and source_label == 'shadow-probe-' + str(chosen))
-            require(markers['settling_started'] is not None and row['end_monotonic'] - markers['settling_started'] < 15)
-        if label != CAPTURES[2]: require(row.get('host_activity_zero') is True)
+        host_zero = row.get('host_activity_zero')
+        require(host_zero is None or type(host_zero) is bool)
         require(row.get('status') in ('complete', 'failed'))
         require(row.get('exit_code') is None or type(row['exit_code']) is int and -127 <= row['exit_code'] <= 255)
+        capture_status = row.get('capture_status', 'complete' if row['status'] == 'complete' else 'failed')
+        require(capture_status in ('complete', 'timeout', 'failed'))
+        require(row['status'] != 'complete' or capture_status == 'complete')
         graph_verified = False
         if row['status'] == 'complete':
             require(row.get('graph_file') == label + '.memgraph' and digest(row.get('graph_sha256')) and integer(row.get('graph_bytes'), GRAPH_LIMIT) and row['graph_bytes'] > 0)
@@ -267,23 +300,26 @@ def project_shadow(records, measurement, process, expected, case):
                 graph_verified = file_hash(records / 'shadow' / (label + '.memgraph'), GRAPH_LIMIT) == row['graph_sha256']
             except (OSError, ValueError):
                 pass
-        public_captures.append({'label': label, 'status': row['status'], 'graph_sha256': row.get('graph_sha256'), 'graph_binding_verified': graph_verified,
+        public_captures.append({'label': label, 'status': row['status'], 'capture_status': capture_status, 'graph_sha256': row.get('graph_sha256'), 'graph_binding_verified': graph_verified,
                                 'source_label': source_label, 'source_stdout_sha256': source['stdout_sha256'],
-                                'exit_code': row['exit_code'], 'host_activity_zero': label != CAPTURES[2],
+                                'exit_code': row['exit_code'], 'host_activity_zero': host_zero,
                                 'endpoint': 'observer-exited' if label == CAPTURES[2] and source_label == 'observer-exited' else 'earlier-scan' if label == CAPTURES[2] else 'zero-target-idle',
                                 **window(row)})
+    stage[0] = 'binding'
     result = read_json(records / 'result.json')
     require(result.get('settled_baseline_shadow') is True and result.get('scan_mode') == 'live'
             and result.get('mode') == ('product' if case == CASES[0] else 'heap-control')
             and result.get('reader_mode') == ('initial-query-only' if case == CASES[-1] else 'subscribed'))
-    shadow = {'schema': 1, 'timing_markers': {key: None if value is None else round((value - origin) * 1000) for key, value in markers.items()}, 'timing_evidence': False, 'settling_policy': POLICY, 'status': raw['status'], 'chosen_index': chosen,
+    shadow = {'schema': 1, 'elapsed_time_resolution_ms': 1, 'timing_markers': {key: None if value is None else round((value - origin) * 1000) for key, value in markers.items()}, 'timing_evidence': False, 'settling_policy': POLICY, 'status': raw['status'], 'chosen_index': chosen,
               'probes': public_probes, 'captures': public_captures, 'errors': raw['errors'],
               'environments': raw['environments'], 'observer_query_policy': observer,
               'timing_perturbed': True, 'original_parity': False, 'logging_mode': 'compact', 'history_mode': 'current-stacks',
               'original_strict_verdict': strict_verdict(measurement, process), 'candidate_hypothetical_verdict': 'unavailable'}
     shadow['timing_evidence'] = timing_complete(shadow)
     shadow['candidate_hypothetical_verdict'] = hypothetical(measurement, shadow)
+    stage[0] = 'verdict'
     require(raw.get('original_strict_verdict') == shadow['original_strict_verdict'] and raw.get('candidate_hypothetical_verdict') == shadow['candidate_hypothetical_verdict'])
+    stage[0] = 'invalid'
     validate_shadow(shadow, measurement, process, case)
     return shadow
 
@@ -297,13 +333,18 @@ def timing_complete(value):
     if not baseline <= settling <= captures[CAPTURES[0]]['start_elapsed_ms']: return False
     if not first <= last <= captures[CAPTURES[2]]['start_elapsed_ms']: return False
     if captures[CAPTURES[2]]['endpoint'] != 'observer-exited': return False
-    return all(row['end_elapsed_ms'] <= first for label, row in captures.items() if label != CAPTURES[2])
+    if any(row['end_elapsed_ms'] > first or row['host_activity_zero'] is not True for label, row in captures.items() if label != CAPTURES[2]): return False
+    # Rounded time differences have at most 1 ms uncertainty. Boundary values
+    # retain the exact probe predicate but cannot prove strict timing evidence.
+    if any(not row['within_settling_deadline'] or row['end_elapsed_ms'] - row['start_elapsed_ms'] >= 5000 or row['end_elapsed_ms'] - settling >= 14999 for row in value['probes']): return False
+    return all(row['end_elapsed_ms'] - settling < 14999 for label, row in captures.items() if label != CAPTURES[2])
 
 
 def validate_shadow(value, measurement, process, case):
-    fields(value, ('schema', 'timing_markers', 'timing_evidence', 'settling_policy', 'status', 'chosen_index', 'probes', 'captures', 'errors', 'environments', 'observer_query_policy',
+    fields(value, ('schema', 'elapsed_time_resolution_ms', 'timing_markers', 'timing_evidence', 'settling_policy', 'status', 'chosen_index', 'probes', 'captures', 'errors', 'environments', 'observer_query_policy',
                    'timing_perturbed', 'original_parity', 'logging_mode', 'history_mode', 'original_strict_verdict', 'candidate_hypothetical_verdict'))
     require(type(value['schema']) is int and value['schema'] == 1)
+    require(type(value['elapsed_time_resolution_ms']) is int and value['elapsed_time_resolution_ms'] == 1)
     require(value['settling_policy'] == POLICY and canonical(value['settling_policy']) == canonical(POLICY))
     require(value['timing_perturbed'] is True and value['original_parity'] is False and value['logging_mode'] == 'compact' and value['history_mode'] == 'current-stacks')
     require(value['environments'] == ENVIRONMENT and value['observer_query_policy'] == ('initial-query-only' if case == CASES[-1] else 'ordinary'))
@@ -319,16 +360,21 @@ def validate_shadow(value, measurement, process, case):
     def window(row, maximum=45000):
         require(all(integer(row[key], maximum) for key in ('start_elapsed_ms', 'end_elapsed_ms')) and row['start_elapsed_ms'] <= row['end_elapsed_ms'])
     for index, row in enumerate(probes):
-        fields(row, ('index', 'scan', 'host_activity_zero', 'reader_warm_zero', 'signature_sha256', 'start_elapsed_ms', 'end_elapsed_ms'))
+        fields(row, ('index', 'scan', 'host_activity_zero', 'reader_warm_zero', 'within_settling_deadline', 'signature_sha256', 'start_elapsed_ms', 'end_elapsed_ms'))
         require(type(row['index']) is int and row['index'] == index and row['host_activity_zero'] is True and row['reader_warm_zero'] is True and digest(row['signature_sha256']))
         validate_scan(row['scan'], 'shadow-probe-' + str(index))
         if not classification_passed(row['scan']):
             require(index == len(probes) - 1 and value['chosen_index'] is None and 'settling_failed' in value['errors'])
         window(row, 330000)
-        require(value['timing_markers']['settling_started'] is not None and row['end_elapsed_ms'] - value['timing_markers']['settling_started'] <= 15000)
-        require(row['end_elapsed_ms'] - row['start_elapsed_ms'] <= 5000)
+        require(value['timing_markers']['settling_started'] is not None)
+        require(type(row['within_settling_deadline']) is bool)
+        elapsed = row['end_elapsed_ms'] - markers['settling_started']
+        if elapsed < 14999: require(row['within_settling_deadline'])
+        if elapsed > 15001: require(not row['within_settling_deadline'])
+        if not row['within_settling_deadline']:
+            require(index == len(probes) - 1 and value['chosen_index'] is None and 'not_settled' in value['errors'])
         if index: require(row['start_elapsed_ms'] - probes[index - 1]['end_elapsed_ms'] >= 2000)
-    chosen = next((i for i in range(1, len(probes)) if classification_passed(probes[i]['scan']) and classification_passed(probes[i - 1]['scan']) and signature(probes[i]['scan']) == signature(probes[i - 1]['scan']) and probes[i]['signature_sha256'] == probes[i - 1]['signature_sha256']), None)
+    chosen = candidate_index(probes)
     require((value['chosen_index'] is None or type(value['chosen_index']) is int) and value['chosen_index'] == chosen)
     require(value['status'] == ('not_settled' if chosen is None else 'observed-stable'))
     if chosen is not None: require(chosen == len(probes) - 1)
@@ -337,7 +383,7 @@ def validate_shadow(value, measurement, process, case):
     sources.update({row['scan']['label']: row['scan'] for row in probes})
     seen = []
     for row in value['captures']:
-        fields(row, ('label', 'status', 'graph_sha256', 'graph_binding_verified', 'source_label', 'source_stdout_sha256', 'exit_code', 'host_activity_zero', 'endpoint', 'start_elapsed_ms', 'end_elapsed_ms'))
+        fields(row, ('label', 'status', 'capture_status', 'graph_sha256', 'graph_binding_verified', 'source_label', 'source_stdout_sha256', 'exit_code', 'host_activity_zero', 'endpoint', 'start_elapsed_ms', 'end_elapsed_ms'))
         label = row['label']
         require(label in CAPTURES and label not in seen and [CAPTURES.index(x) for x in seen] == sorted(CAPTURES.index(x) for x in seen))
         seen.append(label)
@@ -347,7 +393,9 @@ def validate_shadow(value, measurement, process, case):
         require(type(row['graph_binding_verified']) is bool and (not row['graph_binding_verified'] or row['status'] == 'complete'))
         require(row['exit_code'] is None or type(row['exit_code']) is int and -127 <= row['exit_code'] <= 255)
         window(row, 330000)
-        require(row['host_activity_zero'] is (label != CAPTURES[2]))
+        require(row['capture_status'] in ('complete', 'timeout', 'failed') and (row['status'] != 'complete' or row['capture_status'] == 'complete'))
+        require(row['host_activity_zero'] is None or type(row['host_activity_zero']) is bool)
+        if label == CAPTURES[2]: require(row['host_activity_zero'] is None or row['host_activity_zero'] is False)
         require(row['endpoint'] == ('observer-exited' if label == CAPTURES[2] and row['source_label'] == 'observer-exited' else 'earlier-scan' if label == CAPTURES[2] else 'zero-target-idle'))
         if label != CAPTURES[2] and markers['first_measurement_cycle'] is not None: require(row['end_elapsed_ms'] <= markers['first_measurement_cycle'])
         if label == CAPTURES[2] and markers['last_original_scan_finished'] is not None: require(markers['last_original_scan_finished'] <= row['start_elapsed_ms'])
@@ -355,7 +403,7 @@ def validate_shadow(value, measurement, process, case):
             if markers['baseline_finished'] is not None and markers['settling_started'] is not None: require(markers['baseline_finished'] <= markers['settling_started'] <= row['start_elapsed_ms'])
             require(row['source_label'] == 'baseline' and (not probes or row['end_elapsed_ms'] <= probes[0]['start_elapsed_ms']))
         if label == CAPTURES[1]:
-            require(chosen is not None and row['source_label'] == 'shadow-probe-' + str(chosen) and row['start_elapsed_ms'] >= probes[chosen]['end_elapsed_ms'] and row['end_elapsed_ms'] - value['timing_markers']['settling_started'] <= 15000)
+            require(chosen is not None and row['source_label'] == 'shadow-probe-' + str(chosen) and row['start_elapsed_ms'] >= probes[chosen]['end_elapsed_ms'])
     require(value['original_strict_verdict'] == strict_verdict(measurement, process))
     require(value['candidate_hypothetical_verdict'] == hypothetical(measurement, value))
 
@@ -491,7 +539,7 @@ def evidence_passed(case):
 
 def validate_summary(value):
     fields(value, ('schema', 'identity', 'builds', 'cases', 'completed', 'strict_checks_passed', 'evidence_checks_passed', 'temporary_cleanup'))
-    require(type(value['schema']) is int and value['schema'] == 1)
+    require(type(value['schema']) is int and value['schema'] == 2)
     identity = value['identity']
     fields(identity, ('checkout_sha', 'macos', 'os_build', 'architecture', 'xcode', 'scan_mode', 'history_mode'))
     require(type(identity['checkout_sha']) is str and re.fullmatch(r'[0-9a-f]{40}', identity['checkout_sha']) is not None)
@@ -515,12 +563,13 @@ def validate_summary(value):
     cases = value['cases']
     require(type(cases) is list and len(cases) <= 4)
     for index, case in enumerate(cases):
-        fields(case, ('name', 'process_run', 'measurement', 'shadow', 'offline_process_run', 'offline', 'offline_cleanup', 'fixture_cleanup_confirmed',
+        fields(case, ('name', 'process_run', 'measurement', 'shadow', 'shadow_projection_reason', 'offline_process_run', 'offline', 'offline_cleanup', 'fixture_cleanup_confirmed',
                       'strict_checks_passed', 'evidence_checks_passed', 'cleanup_confirmed'))
         require(case['name'] == CASES[index])
         require(all(type(case[key]) is bool for key in ('fixture_cleanup_confirmed', 'strict_checks_passed', 'evidence_checks_passed', 'cleanup_confirmed')))
         validate_process(case['process_run'])
         if case['measurement'] is not None: validate_measurement(case['measurement'])
+        require(case['shadow_projection_reason'] in PROJECTION_REASONS and (case['shadow'] is not None) == (case['shadow_projection_reason'] == 'none'))
         if case['shadow'] is not None:
             require(case['measurement'] is not None)
             validate_shadow(case['shadow'], case['measurement'], case['process_run'], case['name'])
@@ -572,7 +621,7 @@ def campaign(root):
     private = root / 'private'
     private.mkdir(mode=0o700)
     public = root / 'summary.json'
-    summary = {'schema': 1, 'identity': observed_identity, 'builds': {}, 'cases': [], 'completed': False,
+    summary = {'schema': 2, 'identity': observed_identity, 'builds': {}, 'cases': [], 'completed': False,
                'strict_checks_passed': False, 'evidence_checks_passed': False, 'temporary_cleanup': 'not-run'}
     save_summary(public, summary)
     environment = dict(os.environ)
@@ -605,7 +654,7 @@ def campaign(root):
                 '--prepared-fixture-directory', str(directory), '--work-directory', str(case_root / 'fixture'), '--records-directory', str(records),
                 *(['--heap-control'] if name != CASES[0] else []), *(['--empty-control-mode', mode] if mode == 'pure-appkit' else []),
                 *(['--reference-idle'] if name == CASES[-1] else [])], case_root / 'measurement.log', environment, timeout=330)
-            case = {'name': name, 'process_run': process, 'measurement': None, 'shadow': None, 'offline_process_run': None,
+            case = {'name': name, 'process_run': process, 'measurement': None, 'shadow': None, 'shadow_projection_reason': 'invalid', 'offline_process_run': None,
                     'offline': None, 'offline_cleanup': None, 'fixture_cleanup_confirmed': False, 'strict_checks_passed': False, 'evidence_checks_passed': False,
                     'cleanup_confirmed': False}
             summary['cases'].append(case)
@@ -621,7 +670,9 @@ def campaign(root):
             if case['measurement'] is not None:
                 try:
                     case['shadow'] = project_shadow(records, case['measurement'], process, hashes, name)
-                except (ValueError, OSError, TypeError, KeyError, RuntimeError, UnicodeError): pass
+                    case['shadow_projection_reason'] = 'none'
+                except ShadowProjectionError as error:
+                    case['shadow_projection_reason'] = error.reason
             # A failed diagnostic projection is not evidence of a live process.
             # Every fully exited case gets its independent bounded offline worker.
             if cleanup_confirmed:

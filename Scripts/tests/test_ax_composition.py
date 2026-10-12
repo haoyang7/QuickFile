@@ -3,6 +3,7 @@ import copy
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "Investigations"))
@@ -68,6 +69,41 @@ class CompositionTests(unittest.TestCase):
         report = "Process 123: 5 leaks for 272 total leaked bytes.\n" + body + "\n"
         self.assertEqual(self.parse(report)["type_counts"], value["type_counts"])
 
+    def test_observed_grouped_cycle_markers_on_descendants_are_not_extra_roots(self):
+        # Structure observed in an owned native leaks --groupByType report.
+        # Its rounded top label cannot provide an exact individual size.
+        body = ("    3 (1.12K) ROOT CYCLE: calloc in make_cycle\n"
+                "       2 (768 bytes) ROOT CYCLE: calloc in make_cycle\n"
+                "          1 (256 bytes) ROOT CYCLE: calloc in make_cycle\n"
+                "             CYCLE BACK TO calloc in make_cycle")
+        report = grouped(3, 1152, body, kind="calloc in make_cycle", marker="ROOT CYCLE")
+        value = self.parse(report)
+        self.assertEqual(value["counts_status"], "complete")
+        self.assertEqual(value["type_counts"], [{"type": "unknown", "count": 3}])
+        self.assertEqual(value["exact_size_histogram"], [{"type": "unknown", "size": 256, "count": 1},
+                                                      {"type": "unknown", "size": 512, "count": 1}])
+        self.assertEqual(value["unresolved_sizes"], [{"type": "unknown", "count": 1,
+            "bytes_min": 1, "bytes_max": 384, "reason": "rounded_subtree"}])
+        self.assertEqual((value["size_unknown_nodes"], value["omitted_nodes"]), (1, 0))
+        self.assertEqual(value["reasons"], ["unknown_type", "size_unresolved"])
+        for invalid in (report.replace("1 INSTANCES", "3 INSTANCES"),
+                        report.replace("       2 (768 bytes) ROOT CYCLE", "       2 (768 bytes) ROOT LEAK"),
+                        report.replace("CYCLE BACK TO calloc in make_cycle", "CYCLE BACK TO unrelated")):
+            with self.subTest(report=invalid):
+                self.assertEqual(self.parse(invalid)["reasons"], ["invalid_report"])
+
+    def test_nested_cycle_marker_after_reference_label_preserves_type_and_byte_counts(self):
+        # Mac26 anonymous tree evidence confirms this reference/marker order.
+        body = ("    3 (528 bytes) ROOT CYCLE: NSXPCConnection\n"
+                "       2 (368 bytes) _connection --> ROOT CYCLE: xpc_connection_t\n"
+                "          1 (48 bytes) ROOT CYCLE: __NSMallocBlock__\n"
+                "             __strong [capture] --> CYCLE BACK TO NSXPCConnection")
+        value = self.parse(grouped(3, 528, body, kind="NSXPCConnection", marker="ROOT CYCLE"))
+        self.assertEqual(value["status"], "complete")
+        self.assertEqual(value["type_counts"], [{"type": "NSXPCConnection", "count": 1},
+            {"type": "__NSMallocBlock__", "count": 1}, {"type": "xpc_connection_t", "count": 1}])
+        self.assertEqual(sum(row["size"] * row["count"] for row in value["exact_size_histogram"]), 528)
+
     def test_unknown_names_are_bucketed_and_private_material_never_published(self):
         text = grouped(1, 48, "    1 (48 bytes) ROOT LEAK: PrivateCustomerType", kind="PrivateCustomerType")
         value = self.parse(text)
@@ -91,6 +127,34 @@ class CompositionTests(unittest.TestCase):
                 value = self.parse(text)
                 self.assertEqual((value["status"], value["counts_status"]), ("unavailable", "unavailable"))
                 self.assertEqual(value["type_counts"], [])
+
+    def test_failure_stage_is_fixed_and_identifies_rejected_structure(self):
+        valid = array_report()
+        reports = {
+            "header": valid.replace("====", "missing boundary"),
+            "tree_shape": valid.replace("          1 (80", "           1 (80"),
+            "child_marker": valid.replace("2 (96 bytes) NSMutableArray", "2 (96 bytes) ROOT LEAK: NSMutableArray"),
+            "backref": valid + "             CYCLE BACK TO unknown_target\n",
+            "byte_bounds": valid.replace("1 (80 bytes)", "1 (145 bytes)"),
+            "totals": valid.replace("3 leaks for", "4 leaks for"),
+        }
+        for stage, report in reports.items():
+            with self.subTest(stage=stage):
+                value = self.parse(report)
+                self.assertEqual((value["schema"], value["failure_stage"], value["reasons"]),
+                                 (2, stage, ["invalid_report"]))
+                self.assertEqual(value["type_counts"], [])
+                for invalid in (None, "private/path", "0x1234", 42):
+                    bad = copy.deepcopy(value); bad["failure_stage"] = invalid
+                    with self.assertRaises(ValueError): composition.validate_grouped_composition(bad)
+        with mock.patch.object(composition, "RAW_LIMIT", 1):
+            self.assertEqual(self.parse(valid)["failure_stage"], "budget")
+        nodes = self.parse("Process 123: 513 leaks for 513 total leaked bytes.\n")
+        self.assertEqual((nodes["reasons"], nodes["failure_stage"]), (["node_budget"], "budget"))
+        for value in (self.parse(valid), composition.empty_grouped(), composition.empty_grouped("summary_budget")):
+            self.assertIsNone(value["failure_stage"])
+            value["failure_stage"] = "header"
+            with self.assertRaises(ValueError): composition.validate_grouped_composition(value)
 
     def test_count_byte_and_budget_conservation(self):
         reports = [grouped(1, size, f"    1 ({size} bytes) ROOT LEAK: NSString", kind="NSString", frame=size)

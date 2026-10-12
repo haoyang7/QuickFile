@@ -50,7 +50,7 @@ def manifest(mode):
 
 
 def initial():
-    return {'schema': 1, 'identity': {'checkout_sha': 'a' * 40, 'macos': '26.0.1', 'os_build': '25A354', 'architecture': 'arm64',
+    return {'schema': 2, 'identity': {'checkout_sha': 'a' * 40, 'macos': '26.0.1', 'os_build': '25A354', 'architecture': 'arm64',
         'xcode': '26.3', 'scan_mode': 'settled-baseline-shadow', 'history_mode': 'current-stacks'}, 'builds': {}, 'cases': [],
         'completed': False, 'strict_checks_passed': False, 'evidence_checks_passed': False, 'temporary_cleanup': 'not-run'}
 
@@ -106,7 +106,7 @@ class TemporaryTests(unittest.TestCase):
             (graphs / (label + '.memgraph')).write_bytes(data)
             captures.append({'label': label, 'status': 'complete', 'graph_sha256': hashlib.sha256(data).hexdigest(), 'exit_code': 0,
                 'graph_file': label + '.memgraph', 'graph_bytes': len(data), 'source_label': source['label'], 'source_stdout_sha256': source['stdout_sha256'],
-                'leak_nodes': source['leak_nodes'], 'leak_bytes': source['leak_bytes'], 'groups': source['groups'], 'host_activity_zero': True,
+                'leak_nodes': source['leak_nodes'], 'leak_bytes': source['leak_bytes'], 'groups': source['groups'], 'host_activity_zero': label != C.CAPTURES[2],
                 'start_monotonic': start, 'end_monotonic': end})
         if capture_failure:
             captures[1].update(status='failed', graph_sha256=None)
@@ -141,7 +141,7 @@ class ProjectionTests(TemporaryTests):
             lambda r: r['environments']['host'].update(MallocStackLoggingNoCompact='unset'),
             lambda r: r['probes'][1].update(start_monotonic=102.),
             lambda r: r['probes'][1]['host'].update(buttons=1), lambda r: r['probes'][0]['reader_warm'].update(registrations=1),
-            lambda r: r['captures'][1].update(end_monotonic=116.), lambda r: r.update(chosen_index=0),
+            lambda r: r.update(chosen_index=0),
             lambda r: r.update(first_measurement_cycle_monotonic=102.)]
         for mutation in mutations:
             changed = copy.deepcopy(raw); mutation(changed)
@@ -208,6 +208,115 @@ class ProjectionTests(TemporaryTests):
         self.assertEqual(shadow['probes'][0]['scan']['groups'][0]['root_type'], 'unknown')
         self.assertIsNone(shadow['chosen_index'])
         self.assertEqual(shadow['candidate_hypothetical_verdict'], 'unavailable')
+
+
+    def test_candidate_timeout_after_deadline_keeps_receipt_and_fails_timing(self):
+        _, _, raw = self.fixture()
+        raw['captures'][0].update(end_monotonic=105.2, status='failed', capture_status='timeout', graph_sha256=None)
+        raw['probes'][0].update(start_monotonic=108., end_monotonic=111.)
+        raw['probes'][1].update(start_monotonic=113., end_monotonic=114.95)
+        raw['captures'][1].update(start_monotonic=114.96, end_monotonic=115.11, status='failed', capture_status='timeout', graph_sha256=None)
+        raw.update(errors=['capture_failed', 'capture_failed'], candidate_hypothetical_verdict='unavailable', first_measurement_cycle_monotonic=116.)
+        self.save('settled-baseline-shadow.json', raw)
+        measurement, shadow = self.project()
+        self.assertEqual(len(measurement['original_scans']), 6)
+        self.assertEqual(shadow['chosen_index'], 1)
+        self.assertFalse(shadow['timing_evidence'])
+        self.assertEqual(shadow['captures'][1]['capture_status'], 'timeout')
+        self.assertGreater(shadow['captures'][1]['end_elapsed_ms'] - shadow['timing_markers']['settling_started'], 15000)
+        C.validate_shadow(shadow, measurement, process(), C.CASES[0])
+
+    def test_last_poll_after_deadline_does_not_become_stable_candidate(self):
+        _, _, raw = self.fixture()
+        raw['probes'][0].update(start_monotonic=108., end_monotonic=111.)
+        raw['probes'][1].update(start_monotonic=113., end_monotonic=115.11)
+        raw.update(status='not_settled', chosen_index=None, errors=['not_settled'], candidate_hypothetical_verdict='unavailable', first_measurement_cycle_monotonic=116.)
+        raw['captures'] = [row for row in raw['captures'] if row['label'] != C.CAPTURES[1]]
+        self.save('settled-baseline-shadow.json', raw)
+        measurement, shadow = self.project()
+        self.assertIsNone(shadow['chosen_index'])
+        self.assertFalse(shadow['timing_evidence'])
+        self.assertEqual(len(shadow['probes']), 2)
+        self.assertEqual(len(measurement['original_scans']), 6)
+        self.assertEqual(shadow['candidate_hypothetical_verdict'], 'unavailable')
+
+    def test_failed_early_capture_keeps_unknown_host_activity(self):
+        _, _, raw = self.fixture()
+        raw['captures'][0].update(status='failed', capture_status='failed', graph_sha256=None, host_activity_zero=None)
+        raw.update(errors=['capture_failed'], candidate_hypothetical_verdict='unavailable')
+        self.save('settled-baseline-shadow.json', raw)
+        _, shadow = self.project()
+        self.assertIsNone(shadow['captures'][0]['host_activity_zero'])
+        self.assertFalse(shadow['timing_evidence'])
+
+    def test_successful_export_with_failed_graph_verification_preserves_status(self):
+        _, _, raw = self.fixture()
+        raw['captures'][1].update(status='failed', capture_status='complete', graph_sha256=None)
+        raw.update(errors=['capture_failed'], candidate_hypothetical_verdict='unavailable')
+        self.save('settled-baseline-shadow.json', raw)
+        _, shadow = self.project()
+        self.assertEqual(shadow['captures'][1]['status'], 'failed')
+        self.assertEqual(shadow['captures'][1]['capture_status'], 'complete')
+        self.assertFalse(shadow['captures'][1]['graph_binding_verified'])
+
+    def test_fixed_projection_stage_reports_binding_environment_policy(self):
+        _, _, raw = self.fixture()
+        mutations = [('environment', lambda r: r['environments']['host'].update(MallocStackLogging='other')),
+                     ('binding', lambda r: r['captures'][0].update(source_stdout_sha256='a' * 64)),
+                     ('policy', lambda r: r.update(logging_mode='private-string'))]
+        for reason, mutation in mutations:
+            changed = copy.deepcopy(raw); mutation(changed)
+            self.save('settled-baseline-shadow.json', changed)
+            with self.assertRaises(C.ShadowProjectionError) as failure: self.project()
+            self.assertEqual(failure.exception.reason, reason)
+            self.assertNotIn('private-string', str(failure.exception))
+
+
+    def test_probe_before_deadline_by_submillisecond_keeps_true_candidate(self):
+        _, _, raw = self.fixture()
+        raw['probes'][0].update(start_monotonic=108., end_monotonic=111.)
+        raw['probes'][1].update(start_monotonic=113., end_monotonic=115.0996)
+        raw['captures'][1].update(start_monotonic=115.0997, end_monotonic=115.1005, status='failed', capture_status='timeout', graph_sha256=None)
+        raw.update(errors=['capture_failed'], candidate_hypothetical_verdict='unavailable', first_measurement_cycle_monotonic=116.)
+        self.save('settled-baseline-shadow.json', raw)
+        measurement, shadow = self.project()
+        last = shadow['probes'][-1]
+        self.assertEqual(last['end_elapsed_ms'] - shadow['timing_markers']['settling_started'], 15000)
+        self.assertTrue(last['within_settling_deadline'])
+        self.assertEqual(shadow['chosen_index'], 1)
+        self.assertFalse(shadow['timing_evidence'])
+        self.assertEqual(shadow['elapsed_time_resolution_ms'], 1)
+        C.validate_shadow(shadow, measurement, process(), C.CASES[0])
+
+    def test_probe_after_deadline_by_submillisecond_keeps_no_candidate(self):
+        _, _, raw = self.fixture()
+        raw['probes'][0].update(start_monotonic=108., end_monotonic=111.)
+        raw['probes'][1].update(start_monotonic=113., end_monotonic=115.1004)
+        raw['captures'] = [row for row in raw['captures'] if row['label'] != C.CAPTURES[1]]
+        raw.update(status='not_settled', chosen_index=None, errors=['not_settled'], candidate_hypothetical_verdict='unavailable', first_measurement_cycle_monotonic=116.)
+        self.save('settled-baseline-shadow.json', raw)
+        measurement, shadow = self.project()
+        last = shadow['probes'][-1]
+        self.assertEqual(last['end_elapsed_ms'] - shadow['timing_markers']['settling_started'], 15000)
+        self.assertFalse(last['within_settling_deadline'])
+        self.assertIsNone(shadow['chosen_index'])
+        self.assertFalse(shadow['timing_evidence'])
+        C.validate_shadow(shadow, measurement, process(), C.CASES[0])
+
+    def test_exact_deadline_bit_rejects_clear_public_time_conflicts(self):
+        self.fixture()
+        measurement, shadow = self.project()
+        changed = copy.deepcopy(shadow)
+        changed['probes'][0]['within_settling_deadline'] = False
+        changed['timing_evidence'] = False
+        with self.assertRaises(ValueError): C.validate_shadow(changed, measurement, process(), C.CASES[0])
+        changed = copy.deepcopy(shadow)
+        changed['probes'][-1]['end_elapsed_ms'] = changed['timing_markers']['settling_started'] + 15002
+        changed['captures'][1]['start_elapsed_ms'] = changed['probes'][-1]['end_elapsed_ms']
+        changed['captures'][1]['end_elapsed_ms'] = changed['captures'][1]['start_elapsed_ms']
+        changed['timing_markers']['first_measurement_cycle'] = changed['captures'][1]['end_elapsed_ms']
+        changed['timing_evidence'] = False
+        with self.assertRaises(ValueError): C.validate_shadow(changed, measurement, process(), C.CASES[0])
 
 
 class HistogramTests(TemporaryTests):
@@ -280,7 +389,7 @@ class PublicTests(TemporaryTests):
                     'snapshot': snapshot(2 if label == C.CAPTURES[0] else 3), 'counts_binding': 'totals-match'})
                 for tool in ('list', 'tree'): offline['tools'].append({'tool': tool, 'label': label, 'status': 'complete', 'return_code': 0, 'cleanup_confirmed': True})
             offline['diffs'] = {'initial_to_late': C.histogram_diff(snapshot(2), snapshot(3)), 'candidate_to_late': C.histogram_diff(snapshot(3), snapshot(3))}
-            value['cases'].append({'name': name, 'process_run': process(), 'measurement': copy.deepcopy(measurement), 'shadow': sh,
+            value['cases'].append({'name': name, 'process_run': process(), 'measurement': copy.deepcopy(measurement), 'shadow': sh, 'shadow_projection_reason': 'none',
                 'offline_process_run': process(0), 'offline': offline, 'offline_cleanup': {key: offline[key] for key in ('tools', 'process_cleanup_confirmed')}, 'fixture_cleanup_confirmed': True, 'strict_checks_passed': False, 'evidence_checks_passed': True, 'cleanup_confirmed': True})
         value.update(completed=True, evidence_checks_passed=True)
         C.validate_summary(value)
@@ -308,6 +417,10 @@ class PublicTests(TemporaryTests):
         with self.assertRaises(ValueError): C.main(['--validate-public', '--work-directory', str(self.root)])
         public.unlink(); os.link(original, public)
         with self.assertRaises(ValueError): C.read_json(public)
+    def test_previous_campaign_schema_is_rejected(self):
+        value = initial(); value['schema'] = 1
+        with self.assertRaises(ValueError): C.validate_summary(value)
+
     def test_unknown_fields_wrong_numbers_and_privacy_strings_rejected(self):
         for mutate in (lambda v: v.update(message='private'), lambda v: v.update(schema=True), lambda v: v['identity'].update(checkout_sha='secret'), lambda v: v['identity'].update(history_mode='full-no-compact')):
             value = initial(); mutate(value)
@@ -470,6 +583,7 @@ class CampaignTests(TemporaryTests):
         self.assertEqual(sum('--offline' in command for command, _ in calls), 4)
         for case in value['cases']:
             self.assertIsNone(case['shadow'])
+            self.assertEqual(case['shadow_projection_reason'], 'environment')
             self.assertIsNone(case['offline'])
             self.assertEqual(case['offline_cleanup'], {'process_cleanup_confirmed': True, 'tools': []})
             self.assertEqual(len(case['measurement']['original_scans']), 6)

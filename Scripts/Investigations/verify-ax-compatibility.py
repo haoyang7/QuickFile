@@ -204,6 +204,7 @@ class SettledBaselineShadow:
 
     def capture(self, label, entry, timeout=5):
         row = {"label": label, "status": "failed", "graph_sha256": None,
+               "capture_status": "failed", "host_activity_zero": False if label == "auxiliary-late" else None,
                "exit_code": None, "source_label": entry.get("label"), "source_stdout_sha256": entry.get("stdout_sha256"),
                "leak_nodes": entry.get("leak_nodes"), "leak_bytes": entry.get("leak_bytes"),
                "groups": entry.get("groups"), "counts_binding": "requires-offline-verification",
@@ -226,6 +227,7 @@ class SettledBaselineShadow:
             graph = self.graphs / (label + ".memgraph")
             value = capture_terminal_snapshot(self.pid, graph, timeout=min(5, timeout))
             row["exit_code"] = value["capture_exit_code"]
+            row["capture_status"] = value["capture_status"]
             if value["capture_status"] != "complete":
                 raise RuntimeError("capture unavailable")
             info = graph.lstat()

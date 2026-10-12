@@ -47,9 +47,9 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 侧录最多 56 次工具调用、180 秒、128 KiB 公共摘要，另行绑定原 frozen/bridge 摘要和七张图的哈希；不占用或扩大原诊断预算。campaign 使用独立进程组，逐例保留严格退出码及证据完整度；已知严格失败仍采集后续对照，进程回收无法确认则停止。上传前独立校验固定字段、枚举、数量、嵌套摘要和总字节上限，仅上传匿名 `summary.json`；原始地址、路径、完整栈、启动元数据、堆图和日志保留在私有临时目录，不上传。确认所有进程退出后回收本轮 App、缓存和原始临时产物；回收失败保持非零结果。该工作流只用于归因，完整侧录不等于产品泄漏已排除或正式版放行。
 
-独立 `AX settled baseline shadow` 手动工作流在 macOS 26 arm64 执行一次四组影子实验：产品动作、带补丁空窗口、纯 AppKit 空窗口、只进行初始 AX 查询的纯 AppKit 空窗口。普通严格基线及六点判定保留；候选基线的假设判定单独记录，不能覆盖原失败。host 保持普通 compact 配置（`MallocStackLogging=1`、`MallocStackLoggingNoCompact=1`），reader 的两个键未设置，双方 `MallocScribble` 未设置；必须从实际子进程启动元数据核验。影子模式额外观测改变后续时序，不能声称与未扰动的普通 CI 等价。
+独立 `AX settled baseline shadow` 手动工作流（也可由 `AX system baseline` 的 `settled_baseline_shadow=true` 转发）在 macOS 26 arm64 执行一次四组影子实验：产品动作、带补丁空窗口、纯 AppKit 空窗口、只进行初始 AX 查询的纯 AppKit 空窗口。普通严格基线及六点判定保留；候选基线的假设判定单独记录，不能覆盖原失败。host 保持普通 compact 配置（`MallocStackLogging=1`、`MallocStackLoggingNoCompact=1`），reader 的两个键未设置，双方 `MallocScribble` 未设置；必须从实际子进程启动元数据核验。影子模式额外观测改变后续时序，不能声称与未扰动的普通 CI 等价。
 
-影子候选只在零目标、零补偿阶段观测，最多六次、总期限 15 秒、单工具最多 5 秒，相邻观测间隔至少两秒。连续两次节点、字节和根组签名相等只是 `observed-stable`，未比较完整尺寸直方图，也不证明永久稳定；两根状态可以成为候选，不要求第三根出现。超时或观测失败明确保留 `not_settled` / 不可判定。单调时钟记录原基线结束、稳定观测开始、首个测量循环开始和最后原扫描结束，公开摘要只保留相对区间，以核对前期采图早于目标动作、晚期采图晚于原六点。
+影子候选只在零目标、零补偿阶段观测，最多六次、总期限 15 秒、单工具最多 5 秒，相邻观测间隔至少两秒。连续两次节点、字节和根组签名相等只是 `observed-stable`，未比较完整尺寸直方图，也不证明永久稳定；两根状态可以成为候选，不要求第三根出现。超时或观测失败明确保留 `not_settled` / 不可判定。公共 campaign schema 2 保留 `capture_status=timeout|failed|complete`、未核验的早期活动状态和固定的投影失败阶段；合法的截止时间耗尽不能丢弃原观测或成为有效候选。公开毫秒区间的舍入不确定性须与精确截止判定区分。单调时钟记录原基线结束、稳定观测开始、首个测量循环开始和最后原扫描结束，公开摘要只保留相对区间，以核对前期采图早于目标动作、晚期采图晚于原六点。
 
 最多保留初始、候选、晚期三张辅助 current-stack 图。夹具退出后，在同一图上交叉核对完整 list/tree、哈希、精确类型与 malloc size 的有界直方图，公开前后带正负桶的成分差集、节点及字节守恒、`unknown` 和遗漏状态。图与前一原扫描的总数相等只称 `totals-match`，不证明对象同一；初始辅助图晚于原 baseline，不能据此恢复原 baseline 的地址或分配代次。数值分桶无遗漏时，未知类型仍以 `unknown` 参与差集，并用 `type_coverage=includes-unknown` 标记命名缺口；数值完整不代表类型已识别。每例离线最多六次工具调用、45 秒，总进程限时 60 秒；单份公共摘要上限 512 KiB。所有地址、原图和完整日志留在 runner，确认进程退出后回收。原严格失败、证据失败与假设结果分别记录；上传独立校验后的单份摘要，不放宽主 CI 或发布门槛。
 
@@ -139,6 +139,8 @@ Xcode 的 macOS App 构建会添加 Launch Services 注册步骤，文件回收�
 - `identity.json`：实际 checkout SHA、event SHA、workflow SHA、PR head/base SHA（适用时），run/attempt 链接、job、预期与实际 OS/架构/工具身份
 - `verification.json`：身份/工具/脚本/原生步骤的 outcome、上传前 job 状态、原生命令退出码、两个结果 bundle 是否存在，以及实际 XcodeGen 版本
 - `ax-evidence.json`：schema 2 保留原六点严格 AX 扫描、各点有界类型成分、带正负计数的成分差集，以及严格失败后可用的终点图和精确尺寸直方图；未执行、能力跳过、缺失和不完整状态分别保留
+
+类型成分子摘要使用 schema 2；无法解析时以固定 `failure_stage` 定位失败阶段，不输出原始行或类型名。真实报告的子层 `ROOT CYCLE` 标记不新增根或节点，层级与计数仍由缩进及子树守恒核对。
 
 身份与 verification 回执不声明测试数量或断言详情；AX 回执只保留有限扫描判定标签与脱敏诊断。三份回执都不是签名、实机、安装、性能或发布验收。PR 的 checkout 通常是临时合并提交，不应拿 PR head SHA 替代。最终 job 结论仍以 Actions 为准：`job_before_upload` 不能证明上传步骤本身成功。
 

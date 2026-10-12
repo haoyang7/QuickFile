@@ -12,14 +12,23 @@ RAW_LIMIT = 16 * 1024 * 1024
 TYPES = frozen.REFERENCE_TYPES
 REASONS = ("not_available", "invalid_report", "node_budget", "bucket_budget", "summary_budget",
            "unknown_type", "size_unresolved")
+FAILURE_STAGES = ("header", "tree_shape", "child_marker", "backref", "byte_bounds", "totals", "budget")
+
+
+class _GroupedError(ValueError):
+    def __init__(self, stage):
+        super().__init__("Invalid grouped composition")
+        self.stage = stage
 
 
 def encoded(value):
     return json.dumps(value, separators=(",", ":")).encode()
 
 
-def require(condition):
+def require(condition, stage=None):
     if not condition:
+        if stage is not None:
+            raise _GroupedError(stage)
         raise ValueError("Invalid bounded composition")
 
 
@@ -96,19 +105,23 @@ def buckets(rows):
     require(keys == sorted(set(keys)))
 
 
-def empty_grouped(reason="not_available", totals=None):
-    return {"schema": 1, "status": "unavailable", "counts_status": "unavailable",
-            "size_bounds": "combined-self-bytes",
+def empty_grouped(reason="not_available", totals=None, failure_stage=None):
+    require(reason in ("not_available", "invalid_report", "node_budget", "summary_budget"))
+    if reason == "node_budget": failure_stage = "budget"
+    require(failure_stage in FAILURE_STAGES if reason == "invalid_report" else
+            failure_stage == ("budget" if reason == "node_budget" else None))
+    return {"schema": 2, "status": "unavailable", "counts_status": "unavailable",
+            "size_bounds": "combined-self-bytes", "failure_stage": failure_stage,
             "total_nodes": totals[0] if totals else None, "total_bytes": totals[1] if totals else None,
             "type_counts": [], "exact_size_histogram": [], "size_unknown_nodes": 0, "unresolved_sizes": [],
             "unknown_type_nodes": 0, "omitted_nodes": totals[0] if totals else 0, "reasons": [reason]}
 
 
-def _name(text):
+def _name(text, stage=None):
     if text.startswith("<") and text.endswith(">"):
         text = text[1:-1]
-    require(0 < len(text) <= 256 and text == text.strip() and text.isprintable())
-    require(not re.search(r"0x[0-9a-fA-F]+|[<>\[\]:|]", text) and "-->" not in text)
+    require(0 < len(text) <= 256 and text == text.strip() and text.isprintable(), stage)
+    require(not re.search(r"0x[0-9a-fA-F]+|[<>\[\]:|]", text) and "-->" not in text, stage)
     return text
 
 
@@ -116,11 +129,11 @@ def _byte_range(text, count, total):
     exact = re.fullmatch(r"(\d{1,10}) bytes?", text)
     if exact:
         size = int(exact[1])
-        require(count <= size <= total)
+        require(count <= size <= total, "byte_bounds")
         return size, size
     # The rounding/scale convention is not proven by a grouped label. Retain a
     # conservative interval bounded by the whole-report exact byte total.
-    require(re.fullmatch(r"\d{1,10}(?:\.\d{1,4})?[KMGT](?:B)?", text) is not None)
+    require(re.fullmatch(r"\d{1,10}(?:\.\d{1,4})?[KMGT](?:B)?", text) is not None, "byte_bounds")
     return count, total
 
 
@@ -135,11 +148,12 @@ def _group_tree(lines, instances, marker, header_name, total_bytes):
         own = row["count"] - sum(child["count"] for child in row["children"])
         low = max(own, row["bytes"][0] - sum(child["bytes"][1] for child in row["children"]))
         high = row["bytes"][1] - sum(child["bytes"][0] for child in row["children"])
-        require(low <= high)
+        require(low <= high, "byte_bounds")
         if row["name"] is None:
-            require(own == 0 and low <= 0 <= high)
+            require(own == 0, "totals")
+            require(low <= 0 <= high, "byte_bounds")
         else:
-            require(own > 0)
+            require(own > 0, "totals")
             output.append((row["name"] if row["name"] in TYPES else "unknown", own, low, high))
             row["own"] = own
 
@@ -158,9 +172,9 @@ def _group_tree(lines, instances, marker, header_name, total_bytes):
             edge, text = text.split(" --> ", 1)
             require(re.fullmatch(frozen.EDGE_NAME, edge) is not None)
         if text.startswith("CYCLE BACK TO "):
-            require(count is None and stack and indent == stack[-1]["indent"] + 3)
-            target = _name(text[len("CYCLE BACK TO "):])
-            require(any(row["name"] == target for row in stack))
+            require(count is None and stack and indent == stack[-1]["indent"] + 3, "backref")
+            target = _name(text[len("CYCLE BACK TO "):], "backref")
+            require(any(row["name"] == target for row in stack), "backref")
             continue  # Back references are not additional allocated nodes.
         require(count is not None and 0 < int(count) <= NODE_LIMIT)
         row_marker = None
@@ -173,12 +187,15 @@ def _group_tree(lines, instances, marker, header_name, total_bytes):
         if aggregate:
             require(total_row is None and not stack and not roots and row_marker is None)
         elif not stack or stack[-1]["name"] is None:
-            require(row_marker is not None and (marker is None or (row_marker, name) == (marker, header_name)))
+            require(row_marker is not None and (marker is None or (row_marker, name) == (marker, header_name)), "header")
             if total_row is not None:
                 require(indent == total_row["indent"] + 2 and (not separated or separator_pending))
             separator_pending = False
         else:
-            require(row_marker is None and indent == stack[-1]["indent"] + 3)
+            # leaks repeats ROOT CYCLE on members within an existing cycle.
+            # Indentation still determines ancestry; the marker adds no root.
+            require(row_marker in (None, "ROOT CYCLE"), "child_marker")
+            require(indent == stack[-1]["indent"] + 3)
         row = {"indent": indent, "name": name, "count": int(count), "bytes": _byte_range(byte_text, int(count), total_bytes), "children": []}
         if stack:
             stack[-1]["children"].append(row)
@@ -187,19 +204,24 @@ def _group_tree(lines, instances, marker, header_name, total_bytes):
         stack.append(row)
     require(not separator_pending)
     while stack: close()
-    require(roots and (instances is None or sum(root["own"] for root in roots) == instances))
+    require(roots and (instances is None or sum(root["own"] for root in roots) == instances), "totals")
     if total_row is not None:
-        require(total_row["count"] == sum(root["count"] for root in roots))
+        require(total_row["count"] == sum(root["count"] for root in roots), "totals")
     return output, roots
 
 
 def grouped_composition(report):
     """Decode full grouped trees; subtract direct child subtrees before counting."""
     totals = None
+    stage = "header"
     try:
-        require(type(report) is str and len(report.encode()) <= RAW_LIMIT)
+        require(type(report) is str)
+        stage = "budget"
+        require(len(report.encode()) <= RAW_LIMIT)
+        stage = "totals"
         totals = frozen.totals(report)
         if totals[0] > NODE_LIMIT: return empty_grouped("node_budget", totals)
+        stage = "header"
         body = report.split("Binary Images:", 1)[0]
         total = re.search(r"^Process \d+: \d+ leaks? for \d+ total leaked bytes\.$", body, re.M)
         require(total is not None)
@@ -211,6 +233,7 @@ def grouped_composition(report):
         if headers:
             require(not body[:headers[0].start()].strip())
             for index, header in enumerate(headers):
+                stage = "header"
                 block = body[header.end():headers[index + 1].start() if index + 1 < len(headers) else len(body)]
                 require(block.count("\n====\n") == 1)
                 frames, tree = block.split("\n====\n")
@@ -221,14 +244,18 @@ def grouped_composition(report):
                 require(len(set(indices)) == len(indices) and indices in (sorted(indices), sorted(indices, reverse=True)))
                 key = (header[0], tuple(frame_rows), tuple(line for line in tree.splitlines() if line.strip()))
                 require(key not in seen); seen.add(key)
-                group, group_roots = _group_tree(tree.splitlines(), int(header[1]), header[2], _name(header[3]), totals[1])
+                header_name = _name(header[3])
+                stage = "tree_shape"
+                group, group_roots = _group_tree(tree.splitlines(), int(header[1]), header[2], header_name, totals[1])
                 rows.extend(group); roots.extend(group_roots)
         elif body.strip():
+            stage = "tree_shape"
             lines = [line for line in body.splitlines() if line.strip()]
             require(re.fullmatch(r" *\d+ \([^)]+\) << TOTAL >>", lines[0]) is not None)
             rows, roots = _group_tree(lines, None, None, None, totals[1])
         else:
-            require(totals == (0, 0))
+            require(totals == (0, 0), "totals")
+        stage = "totals"
         require(sum(root["count"] for root in roots) == totals[0])
         require(sum(root["bytes"][0] for root in roots) <= totals[1] <= sum(root["bytes"][1] for root in roots))
         require(sum(count for _, count, _, _ in rows) == totals[0])
@@ -245,8 +272,8 @@ def grouped_composition(report):
         omitted = sum(row["count"] for row in exact_rows[BUCKET_LIMIT:]) + sum(row["count"] for row in unresolved[BUCKET_LIMIT:])
         unknown_sizes = sum(row["count"] for row in kept_unresolved)
         reasons = (["unknown_type"] if types["unknown"] else []) + (["size_unresolved"] if unresolved else []) + (["bucket_budget"] if omitted else [])
-        value = {"schema": 1, "status": "partial" if reasons else "complete", "counts_status": "complete",
-            "size_bounds": "combined-self-bytes",
+        value = {"schema": 2, "status": "partial" if reasons else "complete", "counts_status": "complete",
+            "size_bounds": "combined-self-bytes", "failure_stage": None,
             "total_nodes": totals[0], "total_bytes": totals[1], "type_counts": [{"type": kind, "count": count} for kind, count in sorted(types.items()) if count],
             "exact_size_histogram": kept_exact, "size_unknown_nodes": unknown_sizes, "unresolved_sizes": kept_unresolved,
             "unknown_type_nodes": types["unknown"], "omitted_nodes": omitted, "reasons": reasons}
@@ -255,22 +282,23 @@ def grouped_composition(report):
             value["reasons"].append("summary_budget")
         validate_grouped_composition(value)
         return value
-    except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
-        return empty_grouped("invalid_report", totals)
+    except (ValueError, TypeError, KeyError, RecursionError, OverflowError) as exc:
+        return empty_grouped("invalid_report", totals, exc.stage if isinstance(exc, _GroupedError) else stage)
 
 
 def validate_grouped_composition(value):
     require(type(value) is dict and set(value) == set(empty_grouped()))
-    require(type(value["schema"]) is int and value["schema"] == 1 and value["status"] in ("complete", "partial", "unavailable"))
+    require(type(value["schema"]) is int and value["schema"] == 2 and value["status"] in ("complete", "partial", "unavailable"))
     require(value["counts_status"] in ("complete", "unavailable"))
     require(value["size_bounds"] == "combined-self-bytes")
     require(type(value["reasons"]) is list and len(value["reasons"]) == len(set(value["reasons"])) and all(r in REASONS for r in value["reasons"]))
     if value["counts_status"] == "unavailable":
         totals = (value["total_nodes"], value["total_bytes"]) if value["total_nodes"] is not None else None
         require(totals is None and value["total_bytes"] is None or totals is not None and all(integer(n) for n in totals))
-        require(len(value["reasons"]) == 1 and value == empty_grouped(value["reasons"][0], totals))
+        require(len(value["reasons"]) == 1 and value == empty_grouped(value["reasons"][0], totals, value["failure_stage"]))
         return
     require(value["status"] in ("complete", "partial"))
+    require(value["failure_stage"] is None)
     require(integer(value["total_nodes"]) and value["total_nodes"] <= NODE_LIMIT and integer(value["total_bytes"]))
     require(type(value["type_counts"]) is list and len(value["type_counts"]) <= len(TYPES))
     names = []

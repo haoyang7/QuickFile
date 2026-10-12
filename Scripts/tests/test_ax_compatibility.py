@@ -1379,6 +1379,28 @@ class AXInstallGateTests(unittest.TestCase):
 
 
 class AXSettledBaselineShadowTests(unittest.TestCase):
+    def test_capture_timeout_and_unverified_early_activity_are_retained(self):
+        temporary_root = ROOT / ".build/Temporary"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="ax-shadow-capture-", dir=temporary_root) as directory:
+            root = pathlib.Path(directory)
+            shadow = PROBE.SettledBaselineShadow(root, root / "graphs")
+            shadow.pid = 123
+            (root / "baseline-original.stdout.txt").write_bytes(b"baseline")
+            source = {"label": "baseline", "host": {key: 0 for key in ("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")},
+                      "stdout_sha256": hashlib.sha256(b"baseline").hexdigest()}
+            shadow.capture("auxiliary-original-baseline", source, timeout=0)
+            first = shadow.data["captures"][-1]
+            self.assertEqual(first["status"], "failed")
+            self.assertIsNone(first["host_activity_zero"])
+            with mock.patch.object(PROBE, "capture_terminal_snapshot", return_value={"capture_status": "timeout", "capture_exit_code": None}):
+                shadow.capture("auxiliary-original-baseline", source)
+            second = shadow.data["captures"][-1]
+            self.assertEqual(second["status"], "failed")
+            self.assertEqual(second["capture_status"], "timeout")
+            self.assertTrue(second["host_activity_zero"])
+            self.assertIsNone(second["graph_sha256"])
+
     def exercise(self, counts, timeout=False):
         temporary_root = ROOT / ".build/Temporary"
         temporary_root.mkdir(parents=True, exist_ok=True)
