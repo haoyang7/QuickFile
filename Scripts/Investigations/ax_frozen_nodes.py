@@ -28,6 +28,8 @@ REASONS = ("input_invalid", "graph_changed", "list_invalid", "tree_invalid",
            "candidate_limit", "tool_failed", "deadline", "process_exit_unconfirmed", "artifact_failed", "summary_budget",
            "references_invalid", "references_budget", "compact_history", "live_snapshot_mismatch")
 LIVE_LABELS = tuple(label for label in HEAP_LABELS if label != "added-10")
+CAPTURE_ERROR_SIGNALS = ("task_port", "permission", "stack_history", "option", "file_io",
+                         "graph_missing", "timeout", "io_error", "unclassified")
 TOOL_KINDS = ("list", "tree", "heap", "heap_diff", "history", "trace")
 TOOL_STATES = ("complete", "spawn_failed", "timeout", "exit_failed", "output_invalid", "output_limit")
 REFERENCE_NODES = 512
@@ -522,13 +524,25 @@ def initial_summary():
             "omitted_candidates": 0, "nodes": [], "tools": [], "reasons": [], "process_cleanup_confirmed": True}
 
 
+def capture_error_signals(output):
+    """Fixed lexical hints from a failed tool, not a root-cause assertion."""
+    patterns = (
+        ("task_port", r"mach port.*not valid|cannot examine process|task_for_pid|task port"),
+        ("permission", r"permission denied|operation not permitted|not authorized|access denied"),
+        ("stack_history", r"fullStackHistory|MallocStackLogging|stack logging|stack history"),
+        ("option", r"unrecognized option|unknown option|illegal option|invalid option|usage: leaks"),
+        ("file_io", r"no such file or directory|read.only file system|no space left|could not (?:open|create)|cannot (?:open|create)|unable to (?:open|create)"),
+    )
+    return [name for name, pattern in patterns if re.search(pattern, output, re.I)] or ["unclassified"]
+
+
 def capture_live_point(pid, label, graphs, records, completed):
     """A later auxiliary capture, never the ordinary live scan itself."""
     started = time.monotonic()
     row = {"label": label, "status": "failed", "exit_code": None,
            "after_scan_ms": round((started - completed) * 1000), "duration_ms": 0,
            "stdout_sha256": hashlib.sha256(read_bytes(records / (label + "-live.stdout.txt"))).hexdigest(),
-           "graph_sha256": None}
+           "graph_sha256": None, "error_signals": []}
     graph = graphs / (label + ".memgraph")
     try:
         run = subprocess.run(["leaks", "--noContent", "--fullStacks", "--fullStackHistory",
@@ -537,10 +551,12 @@ def capture_live_point(pid, label, graphs, records, completed):
         row["exit_code"] = run.returncode
         if run.returncode in (0, 1) and graph.is_file():
             row.update(status="complete", graph_sha256=graph_hash(graph))
+        else:
+            row["error_signals"] = capture_error_signals(run.stdout + "\n" + run.stderr) if run.returncode not in (0, 1) else ["graph_missing"]
     except subprocess.TimeoutExpired:
-        row["status"] = "timeout"
-    except OSError:
-        pass
+        row.update(status="timeout", error_signals=["timeout"])
+    except (OSError, ValueError):
+        row["error_signals"] = ["io_error"]
     row["duration_ms"] = round((time.monotonic() - started) * 1000)
     return row
 
@@ -564,13 +580,20 @@ def validate_live_evidence(scans, captures):
     labels = ("baseline", selected) if selected else ("baseline",)
     require(type(captures) is list and len(captures) == len(labels))
     for label, row in zip(labels, captures):
-        require(type(row) is dict and set(row) == {"label", "status", "exit_code", "after_scan_ms", "duration_ms", "stdout_sha256", "graph_sha256"})
+        fields = {"label", "status", "exit_code", "after_scan_ms", "duration_ms", "stdout_sha256", "graph_sha256"}
+        # Accept receipts produced before fixed error signals were introduced.
+        require(type(row) is dict and set(row) in (fields, fields | {"error_signals"}))
         require(row["label"] == label and row["status"] in ("complete", "failed", "timeout"))
         require(row["exit_code"] is None or type(row["exit_code"]) is int and -255 <= row["exit_code"] <= 255)
         require(all(integer(row[key]) and row[key] <= 120000 for key in ("after_scan_ms", "duration_ms")))
         require(row["stdout_sha256"] == next(s["stdout_sha256"] for s in scans if s["label"] == label))
         require(row["graph_sha256"] is None or digest(row["graph_sha256"]))
         require(row["status"] != "complete" or row["exit_code"] in (0, 1) and digest(row["graph_sha256"]))
+        if "error_signals" in row:
+            signals = row["error_signals"]
+            require(type(signals) is list and len(signals) <= len(CAPTURE_ERROR_SIGNALS))
+            require(all(type(signal) is str and signal in CAPTURE_ERROR_SIGNALS for signal in signals))
+            require(len(set(signals)) == len(signals) and bool(signals) == (row["status"] != "complete"))
 
 
 def validate_summary(value):

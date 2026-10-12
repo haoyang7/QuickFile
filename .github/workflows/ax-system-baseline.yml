@@ -197,6 +197,7 @@ jobs:
         with:
           python-version: '3.13'
       - name: Verify investigation identity
+        id: ax_identity
         run: |
           python3 - <<'PY'
           import json, os, pathlib, re, subprocess
@@ -271,6 +272,8 @@ jobs:
           print(json.dumps(identity))
           PY
       - name: Measure matched cases with strict heap checks
+        id: ax_measure
+        if: steps.ax_identity.outcome == 'success'
         run: |
           python3 - <<'PY'
           import json, os, pathlib, re, sys
@@ -335,6 +338,7 @@ jobs:
           terminal_failed = False
           frozen_failed = False
           bridge_failed = False
+          smoke_cleanup_confirmations = []
           for trial in range(1, 2 if terminal_origin or frozen_control or live_attribution else 6):
               # Reverse both factors between groups to expose order effects.
               modes = ('control', 'product') if trial % 2 else ('product', 'control')
@@ -750,6 +754,14 @@ jobs:
                       public_summary['bridge_checks_passed'] = not bridge_failed
                       summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
                   print(json.dumps(receipt, separators=(',', ':')), flush=True)
+                  if live_attribution:
+                      smoke_cleanup_confirmations.append(
+                          process_run['cleanup']['complete'] is True and processes_exited
+                          and receipt.get('frozen_node_process_run', {}).get('cleanup', {}).get('complete') is True
+                          and receipt.get('frozen_nodes', {}).get('process_cleanup_confirmed') is True
+                          and all(tool['cleanup_confirmed'] is True for tool in receipt['frozen_nodes']['tools'])
+                          and receipt.get('bridge_evidence', {}).get('process_cleanup_confirmed') is True
+                          and all(tool['cleanup_confirmed'] is True for tool in receipt['bridge_evidence']['tools']))
                   if not process_run['cleanup']['complete'] or not frozen_cleanup_complete or not bridge_cleanup_complete or terminal_origin and (image_cleanup == 'unconfirmed' or artifact_cleanup == 'failed'):
                       # Do not contaminate another case when group exit is unknown.
                       raise SystemExit(1)
@@ -761,8 +773,19 @@ jobs:
               public_summary['frozen_node_checks_passed'] = not frozen_failed
               public_summary['bridge_checks_passed'] = not bridge_failed
           summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+          # A strict/capture failure may still be diagnosed, but incomplete
+          # process evidence must never authorize another native process.
+          if live_attribution and len(smoke_cleanup_confirmations) == 2 and all(smoke_cleanup_confirmations):
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('smoke_safe=true\n')
           raise SystemExit(1 if failed or terminal_failed or frozen_failed or bridge_failed else 0)
           PY
+      - name: Verify live capture CLI with an owned process
+        if: always() && inputs.live_attribution && steps.ax_identity.outcome == 'success' && steps.ax_measure.outputs.smoke_safe == 'true'
+        env:
+          QUICKFILE_AX_LIVE_CAPTURE_SMOKE: '1'
+          QUICKFILE_AX_LIVE_CAPTURE_DIRECTORY: .build/Temporary/ax-heap-diagnostics/cli-smoke
+        run: python3 -m unittest discover -s Scripts/tests -p 'test_ax_live_attribution.py' -k native_live_capture_cli -v
       - name: Upload bounded diagnostic summary
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -41,6 +41,8 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 `live_attribution=true` 单独运行一对同构建的空白对照与产品路径；其他输入须保持默认值。此入口内部采用普通 live 扫描和原来的两个 malloc 栈记录变量，在原始 baseline 与首次节点或字节增长扫描结束后，各追加一张旁路图，最多两张。六次原始扫描、严格判定及失败结果保留，离线分析在子进程退出后进行。摘要分别绑定原始 stdout 和后采集图的哈希、计数及采集间隔；计数不符明确标为 partial，计数相同也不证明对象集合相同。旁路采集会改变后续时序，不能与无旁路运行等同；compact 日志中的已有地址不能证明分配代次，未知代次继续报告 unknown。此模式用于调查，不能凭诊断结果解除普通 CI 的失败。
 
+旁路采图失败时，仅公开固定的错误词法提示，不将其称为根因。身份验证成功、测量及离线工具的进程清理均确认后，才运行额外的自有进程 CLI 检查，验证当前系统工具能否生成并读取包含分配历史的堆图；此检查位于原测量之后，不会覆盖原失败。
+
 `receipt_mode=internal` 是默认回执路径，在夹具中编译额外的环境读取代码。`receipt_mode=external-startup` 要求 `malloc_scribble=true`、`scan_mode=live`、`heap_diagnostics=false` 和 `ax_causal_probe=false`：只构建一次普通 host/reader，不定义 `QUICKFILE_AX_MALLOC_RECEIPT`，将同一签名 App 和 reader 按字节复制到 20 个独立 case。准备清单绑定当前夹具源码哈希；每次复制、实际子进程启动检查、测量完成和子进程退出后均校验两个可执行文件的 SHA-256，工作流再次对照统一构建哈希。这里保证本轮 off/on 和 control/product 复用相同字节，不宣称与另一个 CI job 的独立构建逐字节相同。
 
 外部回执只读取本轮持有的实际 `Popen` 子进程，通过 `KERN_PROCARGS2` 核验启动 executable 路径对应的文件、前后存活、非空且匹配的已知 `PATH`，再确认 `MallocScribble` 为 unset 或 `1`。不可读取、空环境、解析异常、身份或哈希不匹配均失败；仅公开字面状态、布尔和哈希，不导出环境内容。这是启动元数据与磁盘文件核验，不是当前 `getenv`、进程映射字节或对象所有权证明；其他进程和其他系统映像的环境可见性不能从 owned fixture 推广。Darwin 的环境访问限制见 [XNU sysctl_procargsx](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c)。

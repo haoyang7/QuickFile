@@ -2504,6 +2504,50 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     self.assertTrue(summary["trials"][0]["frozen_nodes_available"])
                     self.assertEqual(summary["trials"][0]["frozen_nodes"]["schema"], 3)
 
+    def test_native_smoke_requires_identity_and_explicit_cleanup_output(self):
+        workflow = (ROOT / ".github/workflows/ax-system-baseline.yml").read_text()
+        identity = workflow.split("      - name: Verify investigation identity\n", 1)[1].split("      - name:", 1)[0]
+        measurement = workflow.split("      - name: Measure matched cases with strict heap checks\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("id: ax_identity", identity)
+        self.assertIn("id: ax_measure", measurement)
+        self.assertIn("if: steps.ax_identity.outcome == 'success'", measurement)
+        native = workflow.split("      - name: Verify live capture CLI with an owned process\n", 1)[1].split("      - name:", 1)[0]
+        condition = next(line.strip()[4:] for line in native.splitlines() if line.strip().startswith("if: "))
+        for live, identity_outcome, smoke_output in itertools.product((False, True), ("success", "failure", "skipped"), ("", "false", "true")):
+            expression = condition.replace("always()", "True").replace("inputs.live_attribution", repr(live))
+            expression = expression.replace("steps.ax_identity.outcome", repr(identity_outcome))
+            expression = expression.replace("steps.ax_measure.outputs.smoke_safe", repr(smoke_output)).replace("&&", "and")
+            self.assertEqual(eval(expression, {"__builtins__": {}}),
+                             live and identity_outcome == "success" and smoke_output == "true")
+
+    def test_native_smoke_cleanup_output_is_independent_of_strict_and_capture_verdicts(self):
+        for failure in (None, "strict", "capture-tool", "host-exit", "missing", "cleanup", "node-inner-cleanup", "node-tool-cleanup",
+                        "runner-cleanup", "bridge-cleanup", "bridge-missing", "build", "build-timeout", "prepared-manifest"):
+            with self.subTest(failure=failure):
+                value = self.live_summary()
+                options = {}
+                if failure in ("strict", "build", "build-timeout", "prepared-manifest"):
+                    options["first_failure"] = failure
+                elif failure == "runner-cleanup":
+                    options["first_failure"] = "cleanup"
+                elif failure in ("bridge-cleanup", "bridge-missing"):
+                    options["bridge_failure"] = failure.removeprefix("bridge-")
+                elif failure:
+                    options["frozen_failure"] = failure
+                if failure == "capture-tool":
+                    value.update(status="unavailable", selection=None, baseline=None, checked_points=[], tools=[],
+                                 baseline_roots={"status": "not_requested", "roots": []}, reasons=["input_invalid"])
+                    value["live_captures"][0].update(status="failed", exit_code=255, graph_sha256=None,
+                                                    error_signals=["unclassified"])
+                elif failure == "node-inner-cleanup":
+                    value.update(status="partial", process_cleanup_confirmed=False, reasons=["process_exit_unconfirmed"])
+                elif failure == "node-tool-cleanup":
+                    value.update(status="partial", reasons=["process_exit_unconfirmed"])
+                    value["tools"][0].update(status="timeout", return_code=None, cleanup_confirmed=False)
+                self.run_measurement(enabled=False, scan_mode="live", receipt_mode="external-startup",
+                    live_attribution=True, frozen_summary=value,
+                    expected_smoke_safe=failure in (None, "strict", "capture-tool"), **options)
+
     def test_frozen_control_rejects_conflicting_modes_before_starting_tools(self):
         script = self.workflow_script("Verify investigation identity")
         environment = {"AX_FROZEN_CONTROL": "true", "AX_SCAN_MODE": "diagnostic", "AX_RECEIPT_MODE": "internal",
@@ -3429,12 +3473,13 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         first_startup_failures=None, image_cleanup_failure=None, first_records_change=None,
                         frozen_control=False, frozen_summary=None, frozen_failure=None, first_strict_growth=False,
                         first_scans_change=None, parser_evidence=None, parser_failure=None, bridge_failure=None,
-                        live_attribution=False):
+                        live_attribution=False, expected_smoke_safe=None):
         script = self.workflow_script("Measure matched cases with strict heap checks")
         frozen_analysis = frozen_control or first_strict_growth or live_attribution
         with tempfile.TemporaryDirectory(prefix="ax-workflow-") as directory:
             root = pathlib.Path(directory)
             summary_file = root / "summary.json"
+            github_output = root / "github-output.txt"
             PROBE.write_json(summary_file, {"identity": {"scan_mode": scan_mode, "receipt_mode": receipt_mode, "terminal_origin": terminal_origin}, "trials": [], "completed": False,
                                            "expected_trials": 1 if frozen_control else 2 if terminal_origin or live_attribution else 20 if enabled else 10})
             if live_attribution:
@@ -3488,6 +3533,8 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         if install_control:
                             test.assertIn("--prepare-install-gate-fixture", command)
                             PROBE.write_json(prepared / "fixture-build.json", AXInstallGateTests.manifest(EXTERNAL.fixture_hashes(prepared)))
+                        if first_failure == "prepared-manifest":
+                            (prepared / "fixture-build.json").unlink()
                         return
                     test.assertEqual("--external-startup-receipt" in command, receipt_mode == "external-startup")
                     test.assertEqual("--terminal-origin" in command, terminal_origin)
@@ -3610,7 +3657,8 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                     if live_attribution:
                         for label in labels:
                             (records / (label + "-live.stdout.txt")).write_text("Process 123: 3 leaks for 300 total leaked bytes.\n")
-                        PROBE.write_json(records / "live-captures.json", test.live_summary()["live_captures"])
+                        captures = frozen_summary if self.first and frozen_summary is not None else test.live_summary()
+                        PROBE.write_json(records / "live-captures.json", captures["live_captures"])
                     result = {"coverage": "passed"}
                     if terminal_origin and self.first and image_cleanup_failure == "not-run":
                         PROBE.write_json(records / "terminal-snapshot.json", REPORT.empty_terminal_snapshot())
@@ -3739,14 +3787,24 @@ class AXMallocScribbleWorkflowTests(unittest.TestCase):
                         "leader_reaped": True, "group_signal": "sent", "group_inspection": "exited" if complete else "running"}}
 
             with mock.patch.dict(os.environ, {"MALLOC_SCRIBBLE_EXPERIMENT": "true" if enabled else "false",
-                                              "MallocScribble": "inherited-secret"}), \
+                                              "MallocScribble": "inherited-secret", "GITHUB_OUTPUT": str(github_output)}), \
                     mock.patch.dict(sys.modules, {"verify-ax-compatibility": PROBE}), \
                     mock.patch.object(sys, "path", list(sys.path)), \
                     mock.patch.object(PROCESSES, "run_owned", side_effect=run_owned), \
                     mock.patch.object(REPORT, "SystemSymbols", return_value=AXTerminalSnapshotTests.resolver()), \
-                    contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit) as result:
+                    contextlib.redirect_stdout(io.StringIO()) as output, \
+                    self.assertRaises((OSError, RuntimeError) if first_failure == "prepared-manifest" else SystemExit) as result:
                 exec(compile(script, "ax-system-baseline.yml", "exec"), {})
+            smoke_output = github_output.read_text() if github_output.exists() else ""
+            if expected_smoke_safe is not None:
+                self.assertEqual(smoke_output, "smoke_safe=true\n" if expected_smoke_safe else "")
+            if not live_attribution:
+                self.assertEqual(smoke_output, "")
             summary = json.loads(summary_file.read_text())
+            if first_failure == "prepared-manifest":
+                self.assertEqual(invocations, [])
+                self.assertFalse(summary["completed"])
+                return invocations, summary
             self.assertEqual(len(builds), 2 if pure_control and first_failure not in ("build", "build-timeout") else int(receipt_mode == "external-startup"))
             if first_failure in ("build", "build-timeout"):
                 self.assertEqual(result.exception.code, 1)

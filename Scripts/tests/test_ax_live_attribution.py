@@ -1,9 +1,14 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
+import plistlib
+import re
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -36,6 +41,88 @@ def compare_live(case):
 
 
 class AXLiveAttributionTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin" and os.environ.get("QUICKFILE_AX_LIVE_CAPTURE_SMOKE") == "1",
+                         "Explicit native live-capture investigation only")
+    def test_native_live_capture_cli(self):
+        """Exercise the installed leaks binary, including its actual graph output."""
+        root = Path(os.environ.get("QUICKFILE_AX_LIVE_CAPTURE_DIRECTORY",
+                    Path(__file__).resolve().parents[2] / ".build/Temporary/ax-live-capture-cli"))
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(dir=root, prefix="owned-") as directory:
+                work = Path(directory)
+                source, executable = work / "owned.c", work / "owned"
+                source.write_text('#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n'
+                    'int main(void) { void *p = malloc(128); memset(p, 0x55, 128); free(p); '
+                    'puts("ready"); fflush(stdout); return getchar() == EOF; }\n')
+                entitlements = work / "debug.plist"
+                entitlements.write_bytes(plistlib.dumps({"com.apple.security.get-task-allow": True}))
+                def run(command):
+                    try:
+                        return subprocess.run(command, capture_output=True, text=True, timeout=60)
+                    except (OSError, subprocess.TimeoutExpired):
+                        self.fail("Owned CLI test tool did not complete")
+                self.assertEqual(run(["xcrun", "clang", "-O0", "-g", str(source), "-o", str(executable)]).returncode, 0,
+                                 "Owned CLI fixture compilation failed")
+                self.assertEqual(run(["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(executable)]).returncode, 0,
+                                 "Owned CLI fixture signing failed")
+                environment = dict(os.environ)
+                for key in ("MallocScribble", "MallocPreScribble", "MallocNanoZone", "MallocGuardEdges", "DYLD_INSERT_LIBRARIES"):
+                    environment.pop(key, None)
+                environment.update(MallocStackLogging="1", MallocStackLoggingNoCompact="1")
+                with (work / "host.stderr.txt").open("w") as errors:
+                    process = subprocess.Popen([str(executable)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                               stderr=errors, text=True, env=environment)
+                    try:
+                        # Wait for the owned fixture without blocking forever on stdout.
+                        import select
+                        self.assertTrue(select.select([process.stdout], [], [], 5)[0], "Owned CLI fixture did not become ready")
+                        self.assertEqual(process.stdout.readline().strip(), "ready", "Owned CLI fixture failed before readiness")
+                        original = run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(process.pid)])
+                        self.assertIn(original.returncode, (0, 1), NODES.capture_error_signals(original.stdout + original.stderr))
+                        (work / "baseline-live.stdout.txt").write_text(original.stdout)
+                        captured = NODES.capture_live_point(process.pid, "baseline", work, work, time.monotonic())
+                        self.assertEqual(captured["status"], "complete", captured)
+                        self.assertGreater((work / "baseline.memgraph").stat().st_size, 0)
+                        self.assertEqual(captured["graph_sha256"], NODES.graph_hash(work / "baseline.memgraph"))
+                        history = run(["malloc_history", "--allEvents", "--fullStacks", str(work / "baseline.memgraph")])
+                        self.assertEqual(history.returncode, 0, "Owned capture history could not be read")
+                        self.assertTrue(re.search(r"^ALLOC ", history.stdout, re.M), "Owned capture has no allocation history")
+                    finally:
+                        try:
+                            process.communicate("\n", timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.communicate(timeout=5)
+                        self.assertIsNotNone(process.returncode, "Owned CLI fixture did not exit")
+        finally:
+            if not any(root.iterdir()):
+                root.rmdir()
+
+    def test_failed_tool_exports_only_fixed_error_signals_and_accepts_old_receipts(self):
+        cases = (
+            ("leaks[123]: leaks cannot examine process 456 (owned) for unknown reasons; try sudo.\n"
+             "leaks[123]: [fatal] mach port for process 0 not valid", ["task_port"]),
+            ("unrecognized option --private; Usage: leaks --fullStackHistory", ["stack_history", "option"]),
+            ("Unable to create /private/secret.memgraph: Permission denied", ["permission", "file_io"]),
+            ("private path, address 0x1234 and an unrecognized diagnostic", ["unclassified"]),
+        )
+        for text, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(NODES.capture_error_signals(text), expected)
+        with tempfile.TemporaryDirectory() as directory:
+            case = Case(Path(directory), {}, {}, first=2)
+            prepare_live(case)
+            value = compare_live(case)
+            original = copy.deepcopy(value)
+            value["live_captures"][0]["error_signals"] = []
+            NODES.validate_summary(value)
+            NODES.validate_summary(original)
+            for signals in (["private failure"], ["task_port"], ["option", "option"], "timeout"):
+                value["live_captures"][0]["error_signals"] = signals
+                with self.assertRaises(ValueError):
+                    NODES.validate_summary(value)
+
     def test_only_first_original_growth_is_selected_and_compact_identity_stays_unknown(self):
         for mode in ("heap-control", "product"):
             for label in NODES.LIVE_LABELS[1:]:
