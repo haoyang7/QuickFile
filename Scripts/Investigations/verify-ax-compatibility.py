@@ -162,13 +162,13 @@ def main():
     parser.add_argument("--work-directory", required=True, type=Path)
     parser.add_argument("--records-directory", required=True, type=Path)
     parser.add_argument("--system-baseline", action="store_true")
-    parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; compensation-enabled modes only")
+    parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; product or install-gate controls only")
     parser.add_argument("--heap-control", action="store_true", help="Match the selected product scan checkpoints with an empty window and no target buttons; requires --heap-diagnostics or --malloc-scribble")
     parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; uses ordinary live scans unless --heap-diagnostics is selected")
     parser.add_argument("--prepare-external-fixture", action="store_true", help="Build host/reader once without running them; ordinary binaries unless --empty-control-mode is explicit")
     parser.add_argument("--prepare-install-gate-fixture", action="store_true", help="Prepare one diagnostic host/reader build for both install-gate modes")
-    parser.add_argument("--install-gate", choices=INSTALL_MODES, help="Use the prepared install-gate fixture; requires external off/live empty control")
-    parser.add_argument("--external-startup-receipt", action="store_true", help="Read owned child startup metadata outside the ordinary fixture; requires live MallocScribble and a prepared fixture")
+    parser.add_argument("--install-gate", choices=INSTALL_MODES, help="Use the prepared external off empty control; live by default, frozen with --heap-diagnostics")
+    parser.add_argument("--external-startup-receipt", action="store_true", help="Read owned child startup metadata from a prepared fixture; frozen scans require --install-gate")
     parser.add_argument("--prepared-fixture-directory", type=Path)
     parser.add_argument("--empty-control-mode", choices=("patched", "pure-appkit"), help="Explicit empty-control build/measurement; pure-appkit excludes the production AX implementation; measurement requires external startup receipts, MallocScribble off and --heap-control")
     parser.add_argument("--terminal-origin", action="store_true", help="Capture one later heap graph after all six live scans; requires external startup receipts and MallocScribble off")
@@ -187,7 +187,7 @@ def main():
         args.prepare_external_fixture = True
     if args.install_gate and (args.prepare_external_fixture or args.empty_control_mode or args.terminal_origin
             or not args.heap_control or not args.external_startup_receipt or args.malloc_scribble != "off"):
-        parser.error("--install-gate requires the prepared external off/live empty control")
+        parser.error("--install-gate requires the prepared external off empty control")
     if args.empty_control_mode and not args.prepare_external_fixture and (
             not args.heap_control or not args.external_startup_receipt or args.malloc_scribble != "off" or args.terminal_origin):
         parser.error("--empty-control-mode requires an independent preparation or external off/live heap control without a terminal graph")
@@ -197,9 +197,10 @@ def main():
             args.expected_appkit_uuid, args.expected_corefoundation_uuid, args.terminal_origin)):
         parser.error("--prepare-external-fixture requires an independent fixture build")
     if args.external_startup_receipt and (not args.malloc_scribble or not args.prepared_fixture_directory
-            or any((args.system_baseline, args.heap_diagnostics, args.copy_lifetime, args.read_only,
+            or (args.heap_diagnostics and not args.install_gate)
+            or any((args.system_baseline, args.copy_lifetime, args.read_only,
                     args.ownership_trace, args.balance_copies, args.expected_appkit_uuid, args.expected_corefoundation_uuid))):
-        parser.error("external startup receipts require live MallocScribble and a prepared fixture")
+        parser.error("external startup receipts require a prepared fixture; frozen scans require --install-gate")
     if args.prepared_fixture_directory and not args.external_startup_receipt:
         parser.error("--prepared-fixture-directory requires --external-startup-receipt")
     if args.terminal_origin and (not args.external_startup_receipt or args.malloc_scribble != "off"):
