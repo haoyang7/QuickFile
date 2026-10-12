@@ -38,7 +38,7 @@ jobs:
           value = json.loads(os.environ['AX_SHADOW_INPUTS'])
           flags = ('ax_causal_probe', 'heap_diagnostics', 'malloc_scribble', 'terminal_origin',
               'live_attribution', 'install_gate_control', 'pure_appkit_control', 'frozen_control',
-              'reference_validation')
+              'reference_validation', 'reader_exit_control')
           assert type(value) is dict and set(value) <= set(flags) | {'settled_baseline_shadow', 'scan_mode', 'receipt_mode'}
           assert all(value.get(key, False) is False for key in flags)
           assert value.get('settled_baseline_shadow', True) is True

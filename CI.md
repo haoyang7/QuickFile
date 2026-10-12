@@ -55,6 +55,10 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 live 旁路图只请求当前存活分配的栈，不要求 `--fullStackHistory`；普通 malloc 记录设置、六次原始扫描及严格阈值不变。图中的当前分配栈不能证明已释放对象的历史或跨扫描分配代次，冻结调查仍使用独立的完整历史协议。
 
+独立 [AX Reader exit controls](.github/workflows/ax-reader-exit.yml) 手动工作流（也可由 `AX system baseline` 的 `reader_exit_control=true` 转发）执行预先固定的九次普通 live 调查。同一 ordinary host/reader 构建用于三个 block；顺序依次为 `keep/early/late`、`early/late/keep`、`late/keep/early`，每例均启动新进程，不因增长选择性重跑。以唯一一次初始 AX 查询完成为零点，六次 checkpoint 和扫描安排在第 0、20、40、60、80、110 秒；Reader 分别持续运行至最后扫描结束、在第 30 秒请求正常退出、在第 70 秒请求正常退出。各组保持相同扫描次数及 checkpoint 序列；记录 Host 启动、ready、Reader 启动、初始查询、checkpoint、扫描和退出的实际相对时钟。计划时点最大迟到 3 秒，退出同时约束 stop 请求和 wait 返回；wait 返回是已退出的观察上界，不是精确死亡时刻。扫描、checkpoint、退出等待分别限时 12、5、5 秒；时间失配、提前退出和不完整样本保留，不冒充配平。初始查询完成后的日程相同不能自动证明 Host 进程龄相同，归因前须对照各组实际启动及扫描时钟。
+
+这轮的零活动仅指零目标按钮、零目标注册、零目标通知和零补偿；Reader 仍创建原有两个应用级 AXObserver，Host 的 checkpoint 仍执行原布局、显示和回执。初始查询后不再主动查询 AX，补丁和普通 compact 环境保持启用，并核对实际子进程环境及复用二进制哈希。不增加 memgraph、settling 或故障注入，复用已有类型成分解析器。严格分类及相对起始基线的增长判定逐点保留；严格失败不阻止后续样本，清理无法确认则停止。上传前独立验证匿名 `summary.json`，原始 stdout、启动元数据、地址和日志不上传。该调查能检验报告变化与 Reader 退出时点的关系，不能仅由根数量推断新增连接，也不能排除扫描自身或异步初始化的作用；专项实验结果不能覆盖普通 CI 或更改发布门禁。
+
 旁路采图失败时，仅公开固定的错误词法提示，不将其称为根因。身份验证成功、测量及离线工具的进程清理均确认后，才运行额外的自有进程 CLI 检查，验证当前图及其分配栈可读；同进程另记完整历史能力对照，明确区分模式不支持与未知失败。此检查位于原测量之后，不会覆盖原失败，也不在 live 采图失败后自动改用另一套协议。
 
 `receipt_mode=internal` 是默认回执路径，在夹具中编译额外的环境读取代码。`receipt_mode=external-startup` 要求 `malloc_scribble=true`、`scan_mode=live`、`heap_diagnostics=false` 和 `ax_causal_probe=false`：只构建一次普通 host/reader，不定义 `QUICKFILE_AX_MALLOC_RECEIPT`，将同一签名 App 和 reader 按字节复制到 20 个独立 case。准备清单绑定当前夹具源码哈希；每次复制、实际子进程启动检查、测量完成和子进程退出后均校验两个可执行文件的 SHA-256，工作流再次对照统一构建哈希。这里保证本轮 off/on 和 control/product 复用相同字节，不宣称与另一个 CI job 的独立构建逐字节相同。

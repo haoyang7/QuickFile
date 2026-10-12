@@ -483,7 +483,7 @@ class PublicTests(TemporaryTests):
         stop = text.index('          PY', start)
         source = '\n'.join(line[10:] for line in text[start:stop].splitlines())
         flags = ('ax_causal_probe', 'heap_diagnostics', 'malloc_scribble', 'terminal_origin',
-                 'live_attribution', 'install_gate_control', 'pure_appkit_control', 'frozen_control', 'reference_validation')
+                 'live_attribution', 'install_gate_control', 'pure_appkit_control', 'frozen_control', 'reference_validation', 'reader_exit_control')
         defaults = dict.fromkeys(flags, False) | {'settled_baseline_shadow': True, 'scan_mode': 'diagnostic', 'receipt_mode': 'internal'}
         for inputs in ({}, defaults):
             with mock.patch.dict(os.environ, {'AX_SHADOW_INPUTS': json.dumps(inputs)}): exec(compile(source, '<workflow-guard>', 'exec'), {})
