@@ -131,6 +131,8 @@ public final class TemplateStore: @unchecked Sendable {
     private let revisionKey = "templates.revision.v2"
     private static let defaultsMutationLock = NSLock()
     private let cacheLock = NSLock()
+    // Only defaults-only stores use revision snapshots. File-backed stores
+    // retain decoded data solely in the byte-keyed cache below.
     private var cachedRevision: String?
     private var cachedTemplates: [FileTemplate]?
     private var templateLoadGeneration: UInt64 = 0
@@ -263,6 +265,9 @@ public final class TemplateStore: @unchecked Sendable {
             // Normal template reads follow symbolic links; inspect the same target.
             if stat(storageURL.path, &status) == 0 {
                 identity = RecoveryFileIdentity(status)
+                // Existing v2 files carry their own invalidation identity. The
+                // legacy preferences revision must not gate normal file reads.
+                return ChangeToken(revision: nil, fileIdentity: identity)
             } else if errno != ENOENT {
                 throw StoreError.readFailed(NSError(domain: NSPOSIXErrorDomain, code: Int(errno)))
             }
@@ -451,18 +456,21 @@ public final class TemplateStore: @unchecked Sendable {
 
     private func loadTemplates(allowCached: Bool) throws -> [FileTemplate] {
         guard defaults != nil else { throw StoreError.sharedDefaultsUnavailable }
-        let revision = defaults?.string(forKey: revisionKey)
-        if allowCached, let cachedTemplates = cachedTemplates(for: revision) {
-            return cachedTemplates
-        }
         cacheLock.lock()
         templateLoadGeneration &+= 1
         let generation = templateLoadGeneration
         cacheLock.unlock()
 
         if let templates = try loadTemplatesFromFile() {
-            updateCache(templates, revision: revision, expectedLoadGeneration: generation)
             return templates
+        }
+
+        // File-backed reads always establish authority from bytes, with only
+        // decoding cached. Preferences remain necessary for legacy data and
+        // distinguishing first use from a missing saved configuration.
+        let revision = defaults?.string(forKey: revisionKey)
+        if storageURL == nil, allowCached, let cachedTemplates = cachedTemplates(for: revision) {
+            return cachedTemplates
         }
 
         if let templates = try loadLegacyTemplates() {
@@ -1066,7 +1074,7 @@ public final class TemplateStore: @unchecked Sendable {
     private func updateCache(
         _ templates: [FileTemplate], revision: String?, expectedLoadGeneration: UInt64? = nil
     ) {
-        guard cachesReads else { return }
+        guard cachesReads, storageURL == nil else { return }
         cacheLock.lock()
         defer { cacheLock.unlock() }
         if let expectedLoadGeneration {

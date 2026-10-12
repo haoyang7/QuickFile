@@ -8,14 +8,20 @@ Community 分支构建的 artifact 标签由 `project.yml` 唯一营销版本推
 
 [Community DMG](.github/workflows/community-dmg.yml) 独立负责分发包构建：固定事件提交，在 macOS 15 arm64 / Xcode 26.3 / XcodeGen 2.46.0 上生成并检查 ad-hoc Universal DMG，拒绝源码漂移，只上传五项交付文件，保留 14 天。它由版本标签、手动入口或匹配路径的 `codex/**` 分支推送触发，不自动公开 Release。首次手动入口需先让工作流进入默认分支；分支推送可先验证流程。来源记录、下载核对及正式发布步骤见[免费自行分发](COMMUNITY_DISTRIBUTION.md#github-actions-打包)。
 
-[主 CI](.github/workflows/ci.yml) 在 main 的相关代码/配置变更、PR 和手动触发时运行；根目录纯文档修改不自动启动；`Scripts/` 等受监控目录内的文档仍会触发检查。
+[主 CI](.github/workflows/ci.yml) 在 main 的相关代码/配置变更、所有 PR 和手动触发时运行。main push 保留原路径过滤；PR 在作业内分类范围，仅根目录 `*.md` 和 `LICENSE` 的改动跳过 Linux 与 macOS 测试，其它路径（包括子目录文档、截图及未知路径）均执行现有验证。手动触发始终执行完整验证。
+
+PR 范围通过完整 Git 历史中的 base/head 三点 diff 分类，使用 NUL 分隔路径且关闭重命名检测，删除或移出代码目录不会被文档名称掩盖，也不受 GitHub 路径过滤的 300 文件上限影响。SHA 通过环境变量传入，缺失、格式错误或 diff 失败使分类作业失败；测试仍 checkout PR 临时合并提交，分类所用 head SHA 不代替实际测试 SHA。
 
 | 作业 | 环境 | 验证 |
 | --- | --- | --- |
+| Classify verification scope | Ubuntu 24.04 | 确定完整验证或明确的根文档跳过范围 |
 | Python scripts | Ubuntu 24.04 / Python 3.13 | 发布准备、签名检查脚本的模拟与文件事务测试 |
 | macOS 15 / arm64 | `macos-15` / Xcode 26.3 / XcodeGen 2.46.0 | 脚本测试、原生 Swift 测试、无签名 Universal 构建与 bundle/权限配置自检 |
 | macOS 15 / x86_64 | `macos-15-intel` / 同一工具版本 | 同一测试及自检在 Intel runner 上执行 |
 | macOS 26 / arm64 | `macos-26` / Xcode 26.3 / XcodeGen 2.46.0 | 同一测试及自检；显式选择 26.3，不使用镜像默认 Xcode |
+| CI required | Ubuntu 24.04 | 汇总分类、Linux 与全部 macOS 矩阵的终态 |
+
+稳定总门禁名称为 `CI required`，使用 `always()` 等待上述依赖。代码范围只有分类、Linux 和全部三项 macOS 验证成功才通过；失败、取消、意外跳过或缺失分类输出均失败。根文档范围仅在分类成功且两类测试作业均明确 skipped 时通过，摘要记录“跳过、未测试”，不能将门禁成功写成测试通过。配置 main 的 required status check 时应选此总门禁，避免把允许跳过的单项测试设为必需；工作流文件自身不设置仓库保护，也不能证明线上规则已经启用。
 
 macOS 脚本测试中的授权、创建边界和创建预检三组测试，在同一 Python 进程内共用一次新编译的 debug 模块。每组仍单独编译可执行文件，各场景仍用独立进程和数据目录；完整 UI 夹具编译检查保持独立。共享模块不跨进程缓存，构建失败立即清理，正常退出时回收。
 
@@ -119,7 +125,7 @@ Xcode 的 macOS App 构建会添加 Launch Services 注册步骤，文件回收�
 
 原始 `.xcresult` 留在 runner 本地，随托管 runner 回收；不上传原始 trace、测试附件/消息、完整日志、整个 `.build`/DerivedData、证书、profile、环境变量 dump、书签或用户数据。新增或修改回执逻辑后应检查生成的两份回执与 Actions 日志、确认身份/退出码/失败路径，再判断是否需要另行设计经过审查的数值型 xcresult 摘要；不能直接扩大为原包上传。
 
-上述验证工作流只需要 `contents: read`，checkout 不保留凭据，不使用 secrets，不配置证书/profile，只上传验证收据，不发布 App/ZIP；Community DMG 的五项分发产物按前述独立流程上传。各流程不引入自托管或付费大 runner。fork/untrusted PR 使用原有 `pull_request` 权限边界，不使用 `pull_request_target`。现有路径过滤保留；未来若设置 required checks，必须先解决纯文档 PR 被过滤后永久 Pending 的问题，不能仅凭工作流配置推定仓库已设置 required checks。
+上述验证工作流只需要 `contents: read`，checkout 不保留凭据，不使用 secrets，不配置证书/profile，只上传验证收据，不发布 App/ZIP；Community DMG 的五项分发产物按前述独立流程上传。各流程不引入自托管或付费大 runner。fork/untrusted PR 使用原有 `pull_request` 权限边界，不使用 `pull_request_target`。主 CI 的 PR 入口没有工作流级路径过滤，文档跳过由总门禁明确判定；其它工作流保留各自触发范围。工作流未启动或整体取消不等于门禁通过，仍须核对当前提交的 required check 终态。
 
 ## 本机与远程验证
 
@@ -134,6 +140,6 @@ gh run view <run-id> --json headSha,status,conclusion,jobs
 gh run view <run-id> --log-failed
 ```
 
-触发后必须等待终态，核对 `headSha`、实际 checkout、各 job 及失败日志。PR 检查通常运行临时合并提交；合并前确认 base 没有失配，合并后另核对 main 结果。主 CI 与 macOS 27 兼容性结论分别记录；被路径过滤的改动记为“CI 未触发”。
+触发后必须等待终态，核对 `headSha`、实际 checkout、各 job 及失败日志。PR 检查通常运行临时合并提交；合并前确认 base 没有失配，合并后另核对 main 结果。主 CI 与 macOS 27 兼容性结论分别记录；PR 根文档跳过记为“门禁通过，测试未执行”，main push 等被路径过滤的运行记为“CI 未触发”。
 
 签名、安装、Finder 实机、真实存储和性能验收另见 [开发流程](CONTRIBUTING.md) 与 [发布清单](RELEASE_CHECKLIST.md)。工作流不配置用户证书或 profile，不发布应用。

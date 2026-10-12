@@ -10,12 +10,14 @@ import XCTest
 @MainActor
 final class MemoryLifecycleTests: XCTestCase {
     private var suiteName: String!
-    private var defaults: LifecyclePausedDefaults!
+    private var defaults: UserDefaults!
+    private var fileReads: LifecyclePausedFileReads!
     private var directory: URL!
 
     override func setUpWithError() throws {
         suiteName = "QuickFileTests.MemoryLifecycle.\(UUID().uuidString)"
-        defaults = try XCTUnwrap(LifecyclePausedDefaults(suiteName: suiteName))
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        fileReads = LifecyclePausedFileReads()
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("QuickFileMemoryLifecycle-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -23,7 +25,7 @@ final class MemoryLifecycleTests: XCTestCase {
 
     override func tearDownWithError() throws {
         // This releases a paused read even if an assertion or unwrap failed.
-        defaults?.releaseRead.signal()
+        fileReads?.releaseRead.signal()
         if let suiteName { defaults?.removePersistentDomain(forName: suiteName) }
         if let directory { try FileManager.default.removeItem(at: directory) }
         defaults = nil
@@ -97,17 +99,17 @@ final class MemoryLifecycleTests: XCTestCase {
         )
         weak var weakModel = model
         XCTAssertNotNil(weakModel)
-        defaults.pauseNextRevisionRead()
+        fileReads.pauseNextRead()
         var task: Task<Void, Never>? = Task { [model] in
             _ = await model?.reloadTemplates()
         }
-        let pausedDefaults = defaults!
+        let pausedReads = fileReads!
         let entered = await BackgroundWork.run {
-            pausedDefaults.readStarted.wait(timeout: .now() + 5) == .success
+            pausedReads.readStarted.wait(timeout: .now() + 5) == .success
         }
         XCTAssertTrue(entered)
         if !entered {
-            defaults.releaseRead.signal()
+            fileReads.releaseRead.signal()
             await task?.value
             return
         }
@@ -116,7 +118,7 @@ final class MemoryLifecycleTests: XCTestCase {
         // BackgroundWork is continuation-based and does not cancel a synchronous storage read.
         // This is pending-work retention, not proof of a leak or of cancellation support.
         XCTAssertNotNil(weakModel)
-        defaults.releaseRead.signal()
+        fileReads.releaseRead.signal()
         await task?.value
         task = nil
         await waitForRelease { weakModel == nil }
@@ -171,7 +173,7 @@ final class MemoryLifecycleTests: XCTestCase {
         weak var weakStore = store
         XCTAssertNotNil(weakStore)
         try store!.saveTemplates(makeTemplates(count: 8))
-        defaults.pauseNextRevisionRead()
+        fileReads.pauseNextRead()
         var cache: FinderTemplateCache? = FinderTemplateCache(
             loadForCreation: { [store = store!] in try store.reloadCreationSnapshot(templateID: $0) },
             loadMenuEntries: { [store = store!] in
@@ -181,13 +183,13 @@ final class MemoryLifecycleTests: XCTestCase {
         )
         weak var weakCache = cache
         XCTAssertNotNil(weakCache)
-        let entered = defaults.readStarted.wait(timeout: .now() + 5) == .success
+        let entered = fileReads.readStarted.wait(timeout: .now() + 5) == .success
         XCTAssertTrue(entered)
         cache = nil
         XCTAssertNil(weakCache, "The refresh block and Darwin handler must not own the cache")
-        defaults.releaseRead.signal()
+        fileReads.releaseRead.signal()
         store = nil
-        // Wait for the queue closure to release its store, not merely the overridden defaults read.
+        // Wait for the queue closure to release its store, not merely the paused file read.
         // Teardown must not delete fixture files while the remaining JSON read is still running.
         await waitForRelease { weakStore == nil }
         XCTAssertNil(weakStore)
@@ -232,7 +234,8 @@ final class MemoryLifecycleTests: XCTestCase {
     private func makeTemplateStore() -> TemplateStore {
         TemplateStore(
             defaults: defaults, storageURL: directory.appendingPathComponent("templates.json"),
-            changeNotificationName: "QuickFileTests.MemoryLifecycle.templates.\(suiteName!)"
+            changeNotificationName: "QuickFileTests.MemoryLifecycle.templates.\(suiteName!)",
+            readTemplatesData: { [fileReads = fileReads!] in try fileReads.read($0) }
         )
     }
 
@@ -266,28 +269,27 @@ final class MemoryLifecycleTests: XCTestCase {
     }
 }
 
-private final class LifecyclePausedDefaults: UserDefaults, @unchecked Sendable {
+private final class LifecyclePausedFileReads: @unchecked Sendable {
     let readStarted = DispatchSemaphore(value: 0)
     let releaseRead = DispatchSemaphore(value: 0)
     private let lock = NSLock()
-    private var pauseNextRead = false
+    private var shouldPauseNextRead = false
 
-    func pauseNextRevisionRead() {
+    func pauseNextRead() {
         lock.lock()
-        pauseNextRead = true
+        shouldPauseNextRead = true
         lock.unlock()
     }
 
-    override func string(forKey key: String) -> String? {
+    func read(_ url: URL) throws -> Data {
         lock.lock()
-        let shouldPause = key == "templates.revision.v2" && pauseNextRead
-        if shouldPause { pauseNextRead = false }
+        let shouldPause = shouldPauseNextRead
+        if shouldPause { shouldPauseNextRead = false }
         lock.unlock()
         if shouldPause {
             readStarted.signal()
             _ = releaseRead.wait(timeout: .now() + 10)
         }
-        let value = super.string(forKey: key)
-        return value
+        return try Data(contentsOf: url)
     }
 }
