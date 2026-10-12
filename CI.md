@@ -8,14 +8,20 @@ Community 分支构建的 artifact 标签由 `project.yml` 唯一营销版本推
 
 [Community DMG](.github/workflows/community-dmg.yml) 独立负责分发包构建：固定事件提交，在 macOS 15 arm64 / Xcode 26.3 / XcodeGen 2.46.0 上生成并检查 ad-hoc Universal DMG，拒绝源码漂移，只上传五项交付文件，保留 14 天。它由版本标签、手动入口或匹配路径的 `codex/**` 分支推送触发，不自动公开 Release。首次手动入口需先让工作流进入默认分支；分支推送可先验证流程。来源记录、下载核对及正式发布步骤见[免费自行分发](COMMUNITY_DISTRIBUTION.md#github-actions-打包)。
 
-[主 CI](.github/workflows/ci.yml) 在 main 的相关代码/配置变更、PR 和手动触发时运行；根目录纯文档修改不自动启动；`Scripts/` 等受监控目录内的文档仍会触发检查。
+[主 CI](.github/workflows/ci.yml) 在 main 的相关代码/配置变更、所有 PR 和手动触发时运行。main push 保留原路径过滤；PR 在作业内分类范围，仅根目录 `*.md` 和 `LICENSE` 的改动跳过 Linux 与 macOS 测试，其它路径（包括子目录文档、截图及未知路径）均执行现有验证。手动触发始终执行完整验证。
+
+PR 范围通过完整 Git 历史中的 base/head 三点 diff 分类，使用 NUL 分隔路径且关闭重命名检测，删除或移出代码目录不会被文档名称掩盖，也不受 GitHub 路径过滤的 300 文件上限影响。SHA 通过环境变量传入，缺失、格式错误或 diff 失败使分类作业失败；测试仍 checkout PR 临时合并提交，分类所用 head SHA 不代替实际测试 SHA。
 
 | 作业 | 环境 | 验证 |
 | --- | --- | --- |
+| Classify verification scope | Ubuntu 24.04 | 确定完整验证或明确的根文档跳过范围 |
 | Python scripts | Ubuntu 24.04 / Python 3.13 | 发布准备、签名检查脚本的模拟与文件事务测试 |
 | macOS 15 / arm64 | `macos-15` / Xcode 26.3 / XcodeGen 2.46.0 | 脚本测试、原生 Swift 测试、无签名 Universal 构建与 bundle/权限配置自检 |
 | macOS 15 / x86_64 | `macos-15-intel` / 同一工具版本 | 同一测试及自检在 Intel runner 上执行 |
 | macOS 26 / arm64 | `macos-26` / Xcode 26.3 / XcodeGen 2.46.0 | 同一测试及自检；显式选择 26.3，不使用镜像默认 Xcode |
+| CI required | Ubuntu 24.04 | 汇总分类、Linux 与全部 macOS 矩阵的终态 |
+
+稳定总门禁名称为 `CI required`，使用 `always()` 等待上述依赖。代码范围只有分类、Linux 和全部三项 macOS 验证成功才通过；失败、取消、意外跳过或缺失分类输出均失败。根文档范围仅在分类成功且两类测试作业均明确 skipped 时通过，摘要记录“跳过、未测试”，不能将门禁成功写成测试通过。配置 main 的 required status check 时应选此总门禁，避免把允许跳过的单项测试设为必需；工作流文件自身不设置仓库保护，也不能证明线上规则已经启用。
 
 macOS 脚本测试中的授权、创建边界和创建预检三组测试，在同一 Python 进程内共用一次新编译的 debug 模块。每组仍单独编译可执行文件，各场景仍用独立进程和数据目录；完整 UI 夹具编译检查保持独立。共享模块不跨进程缓存，构建失败立即清理，正常退出时回收。
 
@@ -33,6 +39,12 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 `malloc_scribble=true` 单独启动 macOS 26 配对调查：同一 runner 交替执行 5 组 `MallocScribble` 关闭/开启 × 空白对照/产品路径，共 20 次。关闭时删除继承变量，开启时设置为 `1`，并核对实际宿主与 AX reader 的环境回执。默认 `scan_mode=diagnostic` 保留完整分配历史，离线扫描冻结堆图及额外的 `added-10` 检查点；`scan_mode=live` 使用普通 CI 相同的实时扫描命令、栈记录配置与六个检查点，不采集或声明分配代次诊断。live 模式要求同时开启 `malloc_scribble`。
 
+`live_attribution=true` 单独运行一对同构建的空白对照与产品路径；其他输入须保持默认值。此入口内部采用普通 live 扫描和原来的两个 malloc 栈记录变量，在原始 baseline 与首次节点或字节增长扫描结束后，各追加一张旁路图，最多两张。六次原始扫描、严格判定及失败结果保留，离线分析在子进程退出后进行。摘要分别绑定原始 stdout 和后采集图的哈希、计数及采集间隔；计数不符明确标为 partial，计数相同也不证明对象集合相同。旁路采集会改变后续时序，不能与无旁路运行等同；compact 日志中的已有地址不能证明分配代次，未知代次继续报告 unknown。此模式用于调查，不能凭诊断结果解除普通 CI 的失败。
+
+live 旁路图只请求当前存活分配的栈，不要求 `--fullStackHistory`；普通 malloc 记录设置、六次原始扫描及严格阈值不变。图中的当前分配栈不能证明已释放对象的历史或跨扫描分配代次，冻结调查仍使用独立的完整历史协议。
+
+旁路采图失败时，仅公开固定的错误词法提示，不将其称为根因。身份验证成功、测量及离线工具的进程清理均确认后，才运行额外的自有进程 CLI 检查，验证当前图及其分配栈可读；同进程另记完整历史能力对照，明确区分模式不支持与未知失败。此检查位于原测量之后，不会覆盖原失败，也不在 live 采图失败后自动改用另一套协议。
+
 `receipt_mode=internal` 是默认回执路径，在夹具中编译额外的环境读取代码。`receipt_mode=external-startup` 要求 `malloc_scribble=true`、`scan_mode=live`、`heap_diagnostics=false` 和 `ax_causal_probe=false`：只构建一次普通 host/reader，不定义 `QUICKFILE_AX_MALLOC_RECEIPT`，将同一签名 App 和 reader 按字节复制到 20 个独立 case。准备清单绑定当前夹具源码哈希；每次复制、实际子进程启动检查、测量完成和子进程退出后均校验两个可执行文件的 SHA-256，工作流再次对照统一构建哈希。这里保证本轮 off/on 和 control/product 复用相同字节，不宣称与另一个 CI job 的独立构建逐字节相同。
 
 外部回执只读取本轮持有的实际 `Popen` 子进程，通过 `KERN_PROCARGS2` 核验启动 executable 路径对应的文件、前后存活、非空且匹配的已知 `PATH`，再确认 `MallocScribble` 为 unset 或 `1`。不可读取、空环境、解析异常、身份或哈希不匹配均失败；仅公开字面状态、布尔和哈希，不导出环境内容。这是启动元数据与磁盘文件核验，不是当前 `getenv`、进程映射字节或对象所有权证明；其他进程和其他系统映像的环境可见性不能从 owned fixture 推广。Darwin 的环境访问限制见 [XNU sysctl_procargsx](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c)。
@@ -43,9 +55,11 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 此入口各构建一次两种模式，准备清单 schema 2 分别记录模式、固定源码哈希、链接输入、两个可执行文件 SHA-256 和 `nm` 的生产 AX 符号计数。纯宿主和 reader 必须没有 `QuickFileInstallAXCompatibility` / `QuickFileAX*` 符号；带补丁宿主须保留四个预期生产导出。每个 case 校验清单模式、capabilities 模式与该模式的可执行字节，并沿用外部启动回执；不编译宿主内部 MallocScribble 回执。只在同一模式内要求复用相同字节，两侧构建不同，不能称为同一 binary。新增 capabilities 字段仅存在于两种显式空白构建，普通构建清单和默认流程保持 schema 1。工作流仍只上传受限摘要，不公开本地路径、任意符号或原始 `nm` 输出；结果只能检验此测试宿主中生产补丁链接/安装的影响，不能单凭增长或通过证明对象所有权、分配年龄或排除基线漏报。
 
-`install_gate_control=true` 单独启用安装末端对照，要求其他工作流输入均为默认值。它构建一次带 `QUICKFILE_AX_INSTALL_PROBE` 的 host 和普通 reader，逐例核对同一组可执行文件 SHA-256，然后交替执行五对 `installed` / `preflight-only` 空窗口对照，共 10 cases、60 个原 live 扫描点。两模式均固定 MallocScribble off、external-startup、零目标与零通知，不捕获终点图。gate 仅在所有原安装前置检查以及两份原 IMP 保存之后执行；两模式均保存原/替换 IMP 供比较，`preflight-only` 跳过整个 `class_addMethod` / `method_setImplementation` 路径，`installed` 照常继续。该宏未定义时不包含调查 hook，不改变普通产品路径。
+`install_gate_control=true` 启用安装末端对照，除可显式选择 `heap_diagnostics=true` 外，其他工作流输入须为默认值。它构建一次带 `QUICKFILE_AX_INSTALL_PROBE` 的 host 和普通 reader，逐例核对同一组可执行文件 SHA-256，然后交替执行五对 `installed` / `preflight-only` 空窗口对照。默认共 10 cases、60 个原 live 扫描点，两模式均固定 MallocScribble off、external-startup、零目标与零通知，不捕获终点图。gate 仅在所有原安装前置检查以及两份原 IMP 保存之后执行；两模式均保存原/替换 IMP 供比较，`preflight-only` 跳过整个 `class_addMethod` / `method_setImplementation` 路径，`installed` 照常继续。该宏未定义时不包含调查 hook，不改变普通产品路径。
 
-该入口的构建清单 schema 3 绑定 `install-gate` 模式、源文件哈希、生产对象/宿主的唯一调查宏、reader 无宏及链接输入，不能借用 ordinary 或 pure AppKit 构建。外部启动回执在两个实际 owned PID 上核验 `QUICKFILE_AX_INSTALL_PROBE_MODE` 的固定值；它仍只证明启动元数据。capability 子进程与实际测量宿主分别验收：实际初始 ready 和后续每次 ready 均须显示前置检查已完成、gate 恰好调用一次，以及两个当前 IMP 分别匹配保存值或替换值；公开摘要保留初始和六个扫描点的固定状态，不公开地址。前置检查不支持时两模式都失败，off 不能只凭模式名称通过。严格堆断言及清理失败保留，失败后按既有安全边界收集后续对照。该链接宿主仍包含测试代码和调查回执；结果可比较最后的 IMP 替换路径，不能独自证明泄漏所有权、基线漏报或补丁因果缺陷，也不能与先前不同二进制的 pure 对照直接等同。
+同时选择 `heap_diagnostics=true` 时，入口归一化为 diagnostic/external-startup，每例采集七个冻结快照，严格计数与首次增长对象分析使用对应的同一张图。两模式仍复用同一构建，并保留原退出码、候选省略及清理失败；匿名对象证据按 `installed` / `preflight-only` 命名并绑定摘要。冻结和额外检查点会改变测量时序，结果只用于该模式内配对归因，不能替代 ordinary live 结果或撤销其失败。将对象结论推广到 live 路径时仍需该路径的证据。
+
+该入口的构建清单 schema 3 绑定 `install-gate` 模式、源文件哈希、生产对象/宿主的唯一调查宏、reader 无宏及链接输入，不能借用 ordinary 或 pure AppKit 构建。外部启动回执在两个实际 owned PID 上核验 `QUICKFILE_AX_INSTALL_PROBE_MODE` 的固定值；它仍只证明启动元数据。capability 子进程与实际测量宿主分别验收：实际初始 ready 和后续每次 ready 均须显示前置检查已完成、gate 恰好调用一次，以及两个当前 IMP 分别匹配保存值或替换值；公开摘要保留初始和所有扫描点的固定状态，不公开地址。前置检查不支持时两模式都失败，off 不能只凭模式名称通过。严格堆断言及清理失败保留，失败后按既有安全边界收集后续对照。该链接宿主仍包含测试代码和调查回执；结果可比较最后的 IMP 替换路径，不能独自证明泄漏所有权、基线漏报或补丁因果缺陷，也不能与先前不同二进制的 pure 对照直接等同。
 
 所有 external-startup case 另验收 `startup-failures.json`，公开最多四条按 host、reader、complete、final 排序且阶段唯一的失败记录，仅含固定 `stage`、`reason` 和 `errno`（null 或 0…4095 整数）。原因区分启动身份、sysctl 容量/读取、解析、PATH 可见性、开关值、字节哈希及回执完整性；失败 syscall 的 errno 在返回时立即保存，未知异常仅公开 `unclassified`。摘要缺失、字段/枚举/阶段组合或 errno 类型越界都使工作流失败。原私有错误和固定 category 计数继续保留；一次角色失败可进一步导致 complete/final 两次完整性失败，不能将这些计数视为独立环境读取。成功回执、读取时点和次数、宿主/reader 字节及六点严格扫描不变，不增加重试；回执失败削弱验证范围，不豁免同时观察到的堆增长。
 
@@ -119,7 +133,7 @@ Xcode 的 macOS App 构建会添加 Launch Services 注册步骤，文件回收�
 
 原始 `.xcresult` 留在 runner 本地，随托管 runner 回收；不上传原始 trace、测试附件/消息、完整日志、整个 `.build`/DerivedData、证书、profile、环境变量 dump、书签或用户数据。新增或修改回执逻辑后应检查生成的两份回执与 Actions 日志、确认身份/退出码/失败路径，再判断是否需要另行设计经过审查的数值型 xcresult 摘要；不能直接扩大为原包上传。
 
-上述验证工作流只需要 `contents: read`，checkout 不保留凭据，不使用 secrets，不配置证书/profile，只上传验证收据，不发布 App/ZIP；Community DMG 的五项分发产物按前述独立流程上传。各流程不引入自托管或付费大 runner。fork/untrusted PR 使用原有 `pull_request` 权限边界，不使用 `pull_request_target`。现有路径过滤保留；未来若设置 required checks，必须先解决纯文档 PR 被过滤后永久 Pending 的问题，不能仅凭工作流配置推定仓库已设置 required checks。
+上述验证工作流只需要 `contents: read`，checkout 不保留凭据，不使用 secrets，不配置证书/profile，只上传验证收据，不发布 App/ZIP；Community DMG 的五项分发产物按前述独立流程上传。各流程不引入自托管或付费大 runner。fork/untrusted PR 使用原有 `pull_request` 权限边界，不使用 `pull_request_target`。主 CI 的 PR 入口没有工作流级路径过滤，文档跳过由总门禁明确判定；其它工作流保留各自触发范围。工作流未启动或整体取消不等于门禁通过，仍须核对当前提交的 required check 终态。
 
 ## 本机与远程验证
 
@@ -134,6 +148,6 @@ gh run view <run-id> --json headSha,status,conclusion,jobs
 gh run view <run-id> --log-failed
 ```
 
-触发后必须等待终态，核对 `headSha`、实际 checkout、各 job 及失败日志。PR 检查通常运行临时合并提交；合并前确认 base 没有失配，合并后另核对 main 结果。主 CI 与 macOS 27 兼容性结论分别记录；被路径过滤的改动记为“CI 未触发”。
+触发后必须等待终态，核对 `headSha`、实际 checkout、各 job 及失败日志。PR 检查通常运行临时合并提交；合并前确认 base 没有失配，合并后另核对 main 结果。主 CI 与 macOS 27 兼容性结论分别记录；PR 根文档跳过记为“门禁通过，测试未执行”，main push 等被路径过滤的运行记为“CI 未触发”。
 
 签名、安装、Finder 实机、真实存储和性能验收另见 [开发流程](CONTRIBUTING.md) 与 [发布清单](RELEASE_CHECKLIST.md)。工作流不配置用户证书或 profile，不发布应用。

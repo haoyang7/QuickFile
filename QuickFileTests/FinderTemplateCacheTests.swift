@@ -6,21 +6,23 @@ import CoreFoundation
 
 final class FinderTemplateCacheTests: XCTestCase {
     private var suiteName: String!
-    private var defaults: PausedTemplateDefaults!
+    private var defaults: UserDefaults!
+    private var fileReads: PausedTemplateFileReads!
     private var directoryURL: URL!
     private var storageURL: URL { directoryURL.appendingPathComponent("templates.json") }
     private var notificationName: String { "QuickFileTests.templates.\(suiteName!)" }
 
     override func setUpWithError() throws {
         suiteName = "QuickFileTests.MenuCache.\(UUID())"
-        defaults = try XCTUnwrap(PausedTemplateDefaults(suiteName: suiteName))
+        defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        fileReads = PausedTemplateFileReads()
         directoryURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("QuickFileCache-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
     }
 
     override func tearDownWithError() throws {
-        defaults.releaseRead.signal()
+        fileReads.releaseRead.signal()
         defaults.removePersistentDomain(forName: suiteName)
         try FileManager.default.removeItem(at: directoryURL)
         defaults = nil
@@ -29,9 +31,9 @@ final class FinderTemplateCacheTests: XCTestCase {
     func testColdMenuDoesNotAdvertiseBuiltInsWhileConfigurationIsLoading() throws {
         let store = makeStore()
         try store.saveTemplates([])
-        defaults.pauseNextRevisionRead()
+        fileReads.pauseNextRead()
         let cache = makeCache(store)
-        XCTAssertTrue(waitForSemaphore(defaults.readStarted))
+        XCTAssertTrue(waitForSemaphore(fileReads.readStarted))
 
         XCTAssertEqual(cache.currentSnapshot(), .loading(previous: []))
         XCTAssertTrue(cache.currentEntries().isEmpty)
@@ -41,11 +43,11 @@ final class FinderTemplateCacheTests: XCTestCase {
         let template = FileTemplate(name: "Own template", fileExtension: "txt", content: "own content")
         let store = makeStore()
         try store.saveTemplates([template])
-        defaults.pauseNextRevisionRead()
+        fileReads.pauseNextRead()
         let cache = makeCache(store)
-        XCTAssertTrue(waitForSemaphore(defaults.readStarted))
+        XCTAssertTrue(waitForSemaphore(fileReads.readStarted))
         XCTAssertEqual(cache.currentSnapshot(), .loading(previous: []))
-        let release = defaults.releaseRead
+        let release = fileReads.releaseRead
         DispatchQueue.global().async { release.signal() }
         XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now() + 2), .ready(entries([template])))
     }
@@ -54,13 +56,13 @@ final class FinderTemplateCacheTests: XCTestCase {
         let previous = FileTemplate(name: "Previous", fileExtension: "txt", content: "old")
         let store = makeStore()
         try store.saveTemplates([])
-        defaults.pauseNextRevisionRead()
+        fileReads.pauseNextRead()
         let cache = makeCache(store, initialTemplates: [previous])
-        XCTAssertTrue(waitForSemaphore(defaults.readStarted))
+        XCTAssertTrue(waitForSemaphore(fileReads.readStarted))
         for _ in 0..<10 {
             XCTAssertEqual(cache.menuSnapshot(waitingUntil: .now()), .loading(previous: entries([previous])))
         }
-        defaults.releaseRead.signal()
+        fileReads.releaseRead.signal()
         XCTAssertEqual(waitForReadyEntries(cache, expected: entries([])), entries([]))
     }
 
@@ -116,9 +118,9 @@ final class FinderTemplateCacheTests: XCTestCase {
         let original = FileTemplate(name: "Text", fileExtension: "txt", content: "old")
         let store = makeStore()
         try store.saveTemplates([original])
-        defaults.pauseNextRevisionRead()
+        fileReads.pauseNextRead()
         let cache = makeCache(store, initialTemplates: [original])
-        XCTAssertTrue(waitForSemaphore(defaults.readStarted))
+        XCTAssertTrue(waitForSemaphore(fileReads.readStarted))
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { try cache.templateForCreation(id: $0) },
             performWithAccess: { _, operation in try operation() },
@@ -174,13 +176,14 @@ final class FinderTemplateCacheTests: XCTestCase {
         let cache = makeCache(store)
         XCTAssertEqual(waitForReadyEntries(cache, expected: entries([initial])), entries([initial]))
 
-        defaults.pauseNextRevisionRead()
+        fileReads.pauseNextRead()
         let intermediate = FileTemplate(name: "Intermediate", fileExtension: "txt", content: "one")
-        try store.saveTemplates([intermediate])
-        XCTAssertTrue(waitForSemaphore(defaults.readStarted))
+        // Pause the cache's read, not the writer's authoritative CAS read.
+        try makeStore(pausesReads: false).saveTemplates([intermediate])
+        XCTAssertTrue(waitForSemaphore(fileReads.readStarted))
         let newest = FileTemplate(name: "Newest", fileExtension: "md", content: "two")
         try store.saveTemplates([newest])
-        defaults.releaseRead.signal()
+        fileReads.releaseRead.signal()
 
         XCTAssertEqual(waitForReadyEntries(cache, expected: entries([newest])), entries([newest]))
     }
@@ -275,13 +278,13 @@ final class FinderTemplateCacheTests: XCTestCase {
         updated.content = "new without notification"
         updated.name = "Updated without notification"
         try JSONEncoder().encode([updated]).write(to: storageURL, options: .atomic)
-        defaults.pauseNextRevisionRead()
-        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: defaults.readStarted))
+        fileReads.pauseNextRead()
+        XCTAssertTrue(waitForSemaphoreAfterPolling(cache, semaphore: fileReads.readStarted))
         // The compensation read is paused; menu reads still return the previous ready snapshot.
         for _ in 0..<100 {
             XCTAssertEqual(cache.currentSnapshot(), .ready(entries([original])))
         }
-        defaults.releaseRead.signal()
+        fileReads.releaseRead.signal()
         XCTAssertEqual(waitForReadyEntries(cache, expected: entries([updated])), entries([updated]))
     }
 
@@ -289,9 +292,9 @@ final class FinderTemplateCacheTests: XCTestCase {
         let store = makeStore()
         let original = FileTemplate(name: "Original", fileExtension: "txt", content: "old")
         try store.saveTemplates([original])
-        defaults.pauseNextRevisionRead()
+        fileReads.pauseNextRead()
         let cache = makeCache(store, initialTemplates: [original])
-        XCTAssertTrue(waitForSemaphore(defaults.readStarted))
+        XCTAssertTrue(waitForSemaphore(fileReads.readStarted))
         var updated = original
         updated.content = "new"
         updated.name = "Updated"
@@ -300,7 +303,7 @@ final class FinderTemplateCacheTests: XCTestCase {
         XCTAssertEqual(cache.currentSnapshot(), .ready(entries([updated])))
         // Make the older read fail after the authoritative execution read succeeded.
         try Data("invalid".utf8).write(to: storageURL, options: .atomic)
-        defaults.releaseRead.signal()
+        fileReads.releaseRead.signal()
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         XCTAssertEqual(cache.currentSnapshot(), .ready(entries([updated])))
     }
@@ -722,7 +725,7 @@ final class FinderTemplateCacheTests: XCTestCase {
     ) -> FinderTemplateCache {
         FinderTemplateCache(
             loadForCreation: { try store.reloadCreationSnapshot(templateID: $0) },
-            // These tests pause the revision read to control refresh ordering.
+            // These tests pause the file read to control refresh ordering.
             loadMenuEntries: { FinderMenuModelBuilder().entries(from: try store.reloadTemplates()) },
             changeNotificationName: store.changeNotificationName,
             initialTemplates: initialTemplates,
@@ -730,11 +733,15 @@ final class FinderTemplateCacheTests: XCTestCase {
         )
     }
 
-    private func makeStore() -> TemplateStore {
+    private func makeStore(pausesReads: Bool = true) -> TemplateStore {
         TemplateStore(
             defaults: defaults,
             storageURL: storageURL,
-            changeNotificationName: notificationName
+            changeNotificationName: notificationName,
+            readTemplatesData: { [fileReads = fileReads!] in
+                if pausesReads { return try fileReads.read($0) }
+                return try Data(contentsOf: $0)
+            }
         )
     }
 
@@ -811,28 +818,28 @@ private final class PausedChangeTokenLoader: @unchecked Sendable {
     }
 }
 
-private final class PausedTemplateDefaults: UserDefaults, @unchecked Sendable {
+private final class PausedTemplateFileReads: @unchecked Sendable {
     let readStarted = DispatchSemaphore(value: 0)
     let releaseRead = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var shouldPauseNextRead = false
 
-    func pauseNextRevisionRead() {
+    func pauseNextRead() {
         lock.lock()
         shouldPauseNextRead = true
         lock.unlock()
     }
 
-    override func string(forKey defaultName: String) -> String? {
+    func read(_ url: URL) throws -> Data {
         lock.lock()
-        let shouldPause = defaultName == "templates.revision.v2" && shouldPauseNextRead
+        let shouldPause = shouldPauseNextRead
         if shouldPause { shouldPauseNextRead = false }
         lock.unlock()
         if shouldPause {
             readStarted.signal()
             _ = releaseRead.wait(timeout: .now() + 10)
         }
-        return super.string(forKey: defaultName)
+        return try Data(contentsOf: url)
     }
 }
 

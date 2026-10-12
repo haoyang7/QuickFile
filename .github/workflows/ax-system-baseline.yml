@@ -9,7 +9,7 @@ on:
         required: false
         default: false
       heap_diagnostics:
-        description: 'Compare five macOS 26 empty/product pairs, including references at the first strict node/byte growth'
+        description: 'Freeze five empty/product pairs, or install-gate pairs when selected, with references at first strict node/byte growth'
         type: boolean
         required: false
         default: false
@@ -39,8 +39,13 @@ on:
         type: boolean
         required: false
         default: false
+      live_attribution:
+        description: 'One ordinary off/control and off/product pair; compact logging, six live scans plus later baseline/first-growth graphs; changes later timing; other inputs stay default'
+        type: boolean
+        required: false
+        default: false
       install_gate_control:
-        description: 'Five live off pairs of installed/preflight-only empty controls from one probe build; other inputs must remain defaults'
+        description: 'Five installed/preflight-only empty pairs from one build; live by default, frozen with heap_diagnostics; other inputs stay default'
         required: false
         type: boolean
         default: false
@@ -68,7 +73,7 @@ defaults:
 
 jobs:
   ax-system-probe:
-    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin && !inputs.pure_appkit_control && !inputs.install_gate_control && !inputs.frozen_control }}
+    if: ${{ !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin && !inputs.pure_appkit_control && !inputs.install_gate_control && !inputs.frozen_control && !inputs.live_attribution }}
     name: macOS ${{ matrix.expected_os }} (arm64)
     strategy:
       fail-fast: false
@@ -168,8 +173,8 @@ jobs:
           PY
 
   ax-heap-diagnostics:
-    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin || inputs.pure_appkit_control || inputs.install_gate_control || inputs.frozen_control }}
-    name: macOS 26 ${{ inputs.install_gate_control && 'install gate live' || inputs.pure_appkit_control && 'pure AppKit live' || inputs.scan_mode }} heap comparison (arm64)
+    if: ${{ inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin || inputs.pure_appkit_control || inputs.install_gate_control || inputs.frozen_control || inputs.live_attribution }}
+    name: macOS 26 ${{ inputs.live_attribution && 'live attribution' || inputs.install_gate_control && (inputs.heap_diagnostics && 'install gate frozen' || 'install gate live') || inputs.pure_appkit_control && 'pure AppKit live' || inputs.scan_mode }} heap comparison (arm64)
     runs-on: macos-26
     timeout-minutes: ${{ inputs.malloc_scribble && 70 || inputs.heap_diagnostics && 55 || (inputs.pure_appkit_control || inputs.install_gate_control) && 40 || 35 }}
     env:
@@ -183,6 +188,7 @@ jobs:
       AX_PURE_APPKIT_CONTROL: ${{ inputs.pure_appkit_control }}
       AX_INSTALL_GATE_CONTROL: ${{ inputs.install_gate_control }}
       AX_FROZEN_CONTROL: ${{ inputs.frozen_control }}
+      AX_LIVE_ATTRIBUTION: ${{ inputs.live_attribution }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -191,6 +197,7 @@ jobs:
         with:
           python-version: '3.13'
       - name: Verify investigation identity
+        id: ax_identity
         run: |
           python3 - <<'PY'
           import json, os, pathlib, re, subprocess
@@ -203,6 +210,12 @@ jobs:
           pure_control = os.environ.get('AX_PURE_APPKIT_CONTROL', 'false') == 'true'
           install_control = os.environ.get('AX_INSTALL_GATE_CONTROL', 'false') == 'true'
           frozen_control = os.environ.get('AX_FROZEN_CONTROL', 'false') == 'true'
+          live_attribution = os.environ.get('AX_LIVE_ATTRIBUTION', 'false') == 'true'
+          if live_attribution:
+              assert (scan_mode == 'diagnostic' and receipt_mode == 'internal' and not terminal_origin
+                  and not pure_control and not install_control and not frozen_control
+                  and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == os.environ['AX_HEAP_DIAGNOSTICS'] == 'false'), 'Live attribution requires other inputs at defaults'
+              scan_mode, receipt_mode = 'live', 'external-startup'
           if frozen_control:
               assert (scan_mode == 'diagnostic' and receipt_mode == 'internal' and not terminal_origin
                   and not pure_control and not install_control
@@ -210,13 +223,15 @@ jobs:
           assert not (pure_control and install_control), 'Choose one empty-control investigation'
           if pure_control or install_control:
               assert (scan_mode == 'diagnostic' and receipt_mode == 'internal' and not terminal_origin
-                  and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == os.environ['AX_HEAP_DIAGNOSTICS'] == 'false'), 'Empty-control investigation requires other inputs at defaults'
-              scan_mode, receipt_mode = 'live', 'external-startup'
+                  and os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'false'
+                  and (install_control or os.environ['AX_HEAP_DIAGNOSTICS'] == 'false')), 'Empty controls require defaults except explicit install-gate heap diagnostics'
+              scan_mode = 'diagnostic' if install_control and os.environ['AX_HEAP_DIAGNOSTICS'] == 'true' else 'live'
+              receipt_mode = 'external-startup'
           assert receipt_mode in ('internal', 'external-startup'), 'Unknown receipt mode'
-          assert receipt_mode != 'external-startup' or (scan_mode == 'live' and (pure_control or install_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true')), 'External startup receipts require live MallocScribble'
-          assert receipt_mode != 'external-startup' or os.environ['AX_HEAP_DIAGNOSTICS'] == 'false', 'External startup receipts cannot request frozen diagnostics'
+          assert receipt_mode != 'external-startup' or ((scan_mode == 'live' or install_control) and (pure_control or install_control or live_attribution or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true')), 'External startup receipts require an explicit live investigation or install-gate controls'
+          assert receipt_mode != 'external-startup' or install_control or os.environ['AX_HEAP_DIAGNOSTICS'] == 'false', 'External frozen diagnostics require install-gate controls'
           assert scan_mode in ('diagnostic', 'live'), 'Unknown heap scan mode'
-          assert scan_mode != 'live' or pure_control or install_control or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires malloc_scribble'
+          assert scan_mode != 'live' or pure_control or install_control or live_attribution or os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true', 'Live comparison requires an explicit investigation'
           assert not terminal_origin or (scan_mode == 'live' and receipt_mode == 'external-startup'), 'Terminal origin requires external live comparison'
           version = output('sw_vers', '-productVersion')
           architecture = output('uname', '-m')
@@ -246,15 +261,19 @@ jobs:
               identity['install_gate_control'] = True
           if frozen_control:
               identity['frozen_control'] = True
+          if live_attribution:
+              identity['live_attribution'] = True
           if os.environ['AX_HEAP_DIAGNOSTICS'] == 'true' and not identity['malloc_scribble_experiment']:
               identity['frozen_node_selection'] = 'first-strict-growth'
           root = pathlib.Path('.build/Temporary/ax-heap-diagnostics')
           root.mkdir(parents=True, exist_ok=False)
           (root / 'summary.json').write_text(json.dumps({'identity':identity, 'trials':[], 'completed':False,
-              'expected_trials':1 if frozen_control else 2 if terminal_origin else 20 if identity['malloc_scribble_experiment'] else 10}, indent=2) + '\n')
+              'expected_trials':1 if frozen_control else 2 if terminal_origin or live_attribution else 20 if identity['malloc_scribble_experiment'] else 10}, indent=2) + '\n')
           print(json.dumps(identity))
           PY
       - name: Measure matched cases with strict heap checks
+        id: ax_measure
+        if: steps.ax_identity.outcome == 'success'
         run: |
           python3 - <<'PY'
           import json, os, pathlib, re, sys
@@ -280,9 +299,10 @@ jobs:
           pure_control = public_summary['identity'].get('pure_appkit_control', False)
           install_control = public_summary['identity'].get('install_gate_control', False)
           frozen_control = public_summary['identity'].get('frozen_control', False)
+          live_attribution = public_summary['identity'].get('live_attribution', False)
           first_strict_growth = public_summary['identity'].get('frozen_node_selection') == 'first-strict-growth'
-          frozen_analysis = frozen_control or first_strict_growth
-          assert not first_strict_growth or diagnostics_expected and not external_receipt
+          frozen_analysis = frozen_control or first_strict_growth or live_attribution
+          assert not first_strict_growth or diagnostics_expected and (not external_receipt or install_control)
           scribble_experiment = os.environ['MALLOC_SCRIBBLE_EXPERIMENT'] == 'true'
           fixtures = {}
           if external_receipt:
@@ -318,7 +338,8 @@ jobs:
           terminal_failed = False
           frozen_failed = False
           bridge_failed = False
-          for trial in range(1, 2 if terminal_origin or frozen_control else 6):
+          smoke_cleanup_confirmations = []
+          for trial in range(1, 2 if terminal_origin or frozen_control or live_attribution else 6):
               # Reverse both factors between groups to expose order effects.
               modes = ('control', 'product') if trial % 2 else ('product', 'control')
               if frozen_control:
@@ -327,7 +348,7 @@ jobs:
                   modes = ('patched', 'pure-appkit') if trial % 2 else ('pure-appkit', 'patched')
               if install_control:
                   modes = ('installed', 'preflight-only') if trial % 2 else ('preflight-only', 'installed')
-              settings = ('off',) if terminal_origin or pure_control or install_control else (('off', 'on') if trial % 2 else ('on', 'off')) if scribble_experiment else (None,)
+              settings = ('off',) if terminal_origin or pure_control or install_control or live_attribution else (('off', 'on') if trial % 2 else ('on', 'off')) if scribble_experiment else (None,)
               for scribble, mode in ((setting, mode) for setting in settings for mode in modes):
                   if external_receipt:
                       prepared, expected_hashes = fixtures['install-gate' if install_control else mode if pure_control else 'ordinary']
@@ -347,6 +368,7 @@ jobs:
                       *(['--malloc-scribble', scribble] if scribble else []),
                       *(['--external-startup-receipt', '--prepared-fixture-directory', str(prepared)] if external_receipt else []),
                       *(['--terminal-origin'] if terminal_origin else []),
+                      *(['--live-attribution'] if live_attribution else []),
                       *(['--empty-control-mode', mode] if pure_control else []),
                       *(['--install-gate', mode] if install_control else []),
                       *(['--heap-control'] if mode == 'control' or pure_control or install_control else [])], directory / 'runner.log', environment)
@@ -619,6 +641,7 @@ jobs:
                               '--graph-directory', str(directory / 'fixture/heap'),
                               '--records-directory', str(records),
                               '--bridge-evidence',
+                              *(['--live-pair'] if live_attribution else []),
                               *(['--first-strict-growth'] if first_strict_growth else [])],
                               directory / 'frozen-nodes.log', environment, timeout=120)
                           receipt['frozen_node_process_run'] = node_run
@@ -632,7 +655,19 @@ jobs:
                                       and node_file.stat().st_size <= 131072):
                                   data = json.loads(node_file.read_text())
                                   validate_frozen_nodes(data)
+                                  if live_attribution != (data['schema'] == 3):
+                                      raise ValueError('Unexpected capture schema')
                                   scan_totals = {point['label']: point for point in receipt['scan_totals']}
+                                  if live_attribution:
+                                      if any(any(point[key] != scan_totals[point['label']][key] for key in ('leak_nodes', 'leak_bytes')) for point in data['live_scans']):
+                                          raise ValueError('Auxiliary source scans differ from ordinary measurements')
+                                      for point in data['live_scans']:
+                                          source = records / (point['label'] + '-live.stdout.txt')
+                                          if (source.is_symlink() or source.stat().st_size > 32 * 1024 * 1024
+                                                  or hashlib.sha256(source.read_bytes()).hexdigest() != point['stdout_sha256']):
+                                              raise ValueError('Original live stdout binding failed')
+                                      if json.loads((records / 'live-captures.json').read_text()) != data['live_captures']:
+                                          raise ValueError('Auxiliary capture receipt binding failed')
                                   if first_strict_growth:
                                       growing = [label for label, point in scan_totals.items()
                                           if any(point[key] > scan_totals['baseline'][key]
@@ -643,10 +678,10 @@ jobs:
                                           raise ValueError('Frozen selection differs from first strict node/byte growth')
                                   for label, point in (('baseline', data['baseline']),
                                                        (data['selected_label'], data['selected'])):
-                                      if point is not None and any(point[key] != scan_totals[label][key]
+                                      if not live_attribution and point is not None and any(point[key] != scan_totals[label][key]
                                               for key in ('leak_nodes', 'leak_bytes')):
                                           raise ValueError('Frozen node counts differ from original scans')
-                                  if data['selection'] is not None:
+                                  if not live_attribution and data['selection'] is not None:
                                       labels = list(scan_totals)
                                       preceding = (labels[1:] if data['selection'] in ('no-new-leak', 'no-strict-growth')
                                                    else labels[1:labels.index(data['selected_label'])])
@@ -688,7 +723,7 @@ jobs:
                                               raise ValueError('Baseline trace was not validated')
                                   payload = encode_evidence(evidence)
                                   name = f'parser-evidence-trial-{trial}-{mode}.json'
-                                  if trial not in range(1, 6) or mode not in ('control', 'product'):
+                                  if trial not in range(1, 6) or mode not in (('installed', 'preflight-only') if install_control else ('control', 'product')):
                                       raise ValueError('Unexpected parser evidence destination')
                                   with (root / name).open('xb') as destination:
                                       destination.write(payload)
@@ -719,6 +754,14 @@ jobs:
                       public_summary['bridge_checks_passed'] = not bridge_failed
                       summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
                   print(json.dumps(receipt, separators=(',', ':')), flush=True)
+                  if live_attribution:
+                      smoke_cleanup_confirmations.append(
+                          process_run['cleanup']['complete'] is True and processes_exited
+                          and receipt.get('frozen_node_process_run', {}).get('cleanup', {}).get('complete') is True
+                          and receipt.get('frozen_nodes', {}).get('process_cleanup_confirmed') is True
+                          and all(tool['cleanup_confirmed'] is True for tool in receipt['frozen_nodes']['tools'])
+                          and receipt.get('bridge_evidence', {}).get('process_cleanup_confirmed') is True
+                          and all(tool['cleanup_confirmed'] is True for tool in receipt['bridge_evidence']['tools']))
                   if not process_run['cleanup']['complete'] or not frozen_cleanup_complete or not bridge_cleanup_complete or terminal_origin and (image_cleanup == 'unconfirmed' or artifact_cleanup == 'failed'):
                       # Do not contaminate another case when group exit is unknown.
                       raise SystemExit(1)
@@ -730,8 +773,19 @@ jobs:
               public_summary['frozen_node_checks_passed'] = not frozen_failed
               public_summary['bridge_checks_passed'] = not bridge_failed
           summary_file.write_text(json.dumps(public_summary, indent=2) + '\n')
+          # A strict/capture failure may still be diagnosed, but incomplete
+          # process evidence must never authorize another native process.
+          if live_attribution and len(smoke_cleanup_confirmations) == 2 and all(smoke_cleanup_confirmations):
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('smoke_safe=true\n')
           raise SystemExit(1 if failed or terminal_failed or frozen_failed or bridge_failed else 0)
           PY
+      - name: Verify live capture CLI with an owned process
+        if: always() && inputs.live_attribution && steps.ax_identity.outcome == 'success' && steps.ax_measure.outputs.smoke_safe == 'true'
+        env:
+          QUICKFILE_AX_LIVE_CAPTURE_SMOKE: '1'
+          QUICKFILE_AX_LIVE_CAPTURE_DIRECTORY: .build/Temporary/ax-heap-diagnostics/cli-smoke
+        run: python3 -m unittest discover -s Scripts/tests -p 'test_ax_live_attribution.py' -k native_live_capture_cli -v
       - name: Upload bounded diagnostic summary
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -756,7 +810,7 @@ jobs:
               for case in summary['trials'] if case.get('parser_evidence_available') is True}
           verified = set()
           for trial in range(1, 6):
-              for mode in ('control', 'product'):
+              for mode in ('control', 'product', 'installed', 'preflight-only'):
                   name = f'parser-evidence-trial-{trial}-{mode}.json'
                   path = root / name
                   if not path.exists() and not path.is_symlink():
@@ -793,6 +847,16 @@ jobs:
             .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-4-product.json
             .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-5-control.json
             .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-5-product.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-1-installed.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-1-preflight-only.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-2-installed.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-2-preflight-only.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-3-installed.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-3-preflight-only.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-4-installed.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-4-preflight-only.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-5-installed.json
+            .build/Temporary/ax-heap-diagnostics/parser-evidence-trial-5-preflight-only.json
           if-no-files-found: error
           retention-days: 7
           include-hidden-files: true # Only the exact allowlisted token files under .build.

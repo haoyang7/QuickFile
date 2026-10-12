@@ -411,7 +411,7 @@ class CIWorkflowContractTests(unittest.TestCase):
             ("macos-26", "26", "arm64", "26.3", "/Applications/Xcode_26.3.app/Contents/Developer"),
         ])
         self.assertIn("  pull_request:\n", self.main)
-        self.assertIn("    needs: scripts\n", self.main)
+        self.assertIn("    needs: [changes, scripts]\n", self.main)
 
     def test_preview_is_independent_main_manual_only_and_not_allowed_to_fail(self):
         self.assertEqual(self.rows(self.preview), [("xcode-27", "27", "arm64", "27.0", "/Applications/Xcode_27.0.app/Contents/Developer")])
@@ -424,7 +424,8 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("required", self.preview)
 
     def test_mac_steps_are_identical_and_keep_existing_security_checks(self):
-        self.assertEqual(self.main.rsplit("    steps:\n", 1)[1], self.preview.rsplit("    steps:\n", 1)[1])
+        main_macos = self.main.split("  macos:\n", 1)[1].split("\n  required:\n", 1)[0]
+        self.assertEqual(main_macos.rsplit("    steps:\n", 1)[1].rstrip(), self.preview.rsplit("    steps:\n", 1)[1].rstrip())
         for text in (self.main, self.preview):
             self.assertIn("permissions:\n  contents: read\n", text)
             self.assertIn("persist-credentials: false", text)

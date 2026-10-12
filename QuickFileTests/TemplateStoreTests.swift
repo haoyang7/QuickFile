@@ -220,8 +220,8 @@ final class TemplateStoreTests: XCTestCase {
         })
 
         XCTAssertEqual(try reader.loadTemplates(), firstSave)
-        // Both calls must use the current revision. Caching firstSave with the latest
-        // revision would keep returning firstSave indefinitely, including on this retry.
+        // Both calls must observe the file published after the migration snapshot,
+        // even if that older snapshot was cached after the concurrent save.
         XCTAssertEqual(try reader.loadTemplates(), latestSave)
         XCTAssertEqual(try reader.loadTemplates(), latestSave)
         XCTAssertThrowsError(try reader.saveTemplates([], expectedTemplates: firstSave)) { error in
@@ -281,7 +281,7 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertEqual(try reader.loadTemplates(), legacy)
     }
 
-    func testExecutionReloadReadsFileBeforeRevisionNotificationArrives() throws {
+    func testFileLoadsReadCurrentBytesBeforeRevisionNotificationArrives() throws {
         let storageURL = temporaryDirectory.appendingPathComponent("templates.v2.json")
         let store = TemplateStore(defaults: defaults, storageURL: storageURL)
         let original = FileTemplate(name: "Original", fileExtension: "txt", content: "old")
@@ -290,7 +290,7 @@ final class TemplateStoreTests: XCTestCase {
         updated.isEnabled = false
         try JSONEncoder().encode([updated]).write(to: storageURL, options: .atomic)
 
-        XCTAssertEqual(try store.loadTemplates(), [original])
+        XCTAssertEqual(try store.loadTemplates(), [updated])
         XCTAssertEqual(try store.reloadTemplates(), [updated])
     }
 
@@ -452,6 +452,80 @@ final class TemplateStoreTests: XCTestCase {
         disabled[0].isEnabled = false
         XCTAssertThrowsError(try store.saveTemplates(disabled))
         XCTAssertEqual(try store.reloadTemplates(), templates)
+    }
+
+    func testExistingFileReadsAndTokensNeverConsultPreferences() throws {
+        let tracked = try XCTUnwrap(TemplatePreferencesProbe(suiteName: suiteName))
+        let url = temporaryDirectory.appendingPathComponent("file-first.json")
+        var template = FileTemplate(name: "Current", fileExtension: "txt", content: "first")
+        try JSONEncoder().encode([template]).write(to: url)
+        let io = TemplateStoreIOProbe()
+        let store = TemplateStore(defaults: tracked, storageURL: url,
+            readTemplatesData: { try io.read($0) }, decodeTemplatesData: { try io.decode($0) })
+        let token = try store.changeToken()
+        XCTAssertEqual(try store.loadTemplates(), [template])
+        XCTAssertEqual(try store.loadTemplates(), [template])
+        XCTAssertEqual(try store.reloadTemplates(), [template])
+        XCTAssertEqual(io.counts().reads, 3)
+        XCTAssertEqual(io.counts().decodes, 1)
+        XCTAssertEqual(try store.reloadMenuEntries(), FinderMenuModelBuilder().entries(from: [template]))
+        XCTAssertEqual(try store.reloadCreationSnapshot(templateID: template.id).template, template)
+        XCTAssertEqual(try store.changeToken(), token)
+
+        template.content = "changed without a preferences revision"
+        try JSONEncoder().encode([template]).write(to: url, options: .atomic)
+        XCTAssertNotEqual(try store.changeToken(), token)
+        XCTAssertEqual(try store.loadTemplates(), [template])
+        try Data("corrupt".utf8).write(to: url, options: .atomic)
+        XCTAssertThrowsError(try store.loadTemplates())
+        XCTAssertThrowsError(try store.reloadTemplates())
+        XCTAssertThrowsError(try store.reloadMenuEntries())
+        XCTAssertThrowsError(try store.reloadCreationSnapshot(templateID: template.id))
+        XCTAssertTrue(tracked.readKeys.isEmpty)
+        XCTAssertTrue(tracked.writeKeys.isEmpty)
+    }
+
+    func testMissingFileStillChecksPreferencesAndCannotReuseSavedSnapshot() throws {
+        let tracked = try XCTUnwrap(TemplatePreferencesProbe(suiteName: suiteName))
+        let url = temporaryDirectory.appendingPathComponent("missing.json")
+        let store = TemplateStore(defaults: tracked, storageURL: url)
+        let initialToken = try store.changeToken()
+        XCTAssertEqual(try store.loadTemplates(), BuiltInTemplates.all)
+        XCTAssertTrue(tracked.readKeys.contains("templates.revision.v2"))
+        XCTAssertTrue(tracked.readKeys.contains("templates.v1"))
+        try store.saveTemplates([])
+        try FileManager.default.removeItem(at: url)
+        XCTAssertNotEqual(try store.changeToken(), initialToken)
+        for load in [store.loadTemplates, store.reloadTemplates] {
+            XCTAssertThrowsError(try load()) { error in
+                guard case TemplateStore.StoreError.savedConfigurationMissing = error else {
+                    return XCTFail("Expected missing saved configuration, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testLegacyAndDefaultsOnlyReadsStillConsultPreferences() throws {
+        for usesFile in [false, true] {
+            let tracked = try XCTUnwrap(TemplatePreferencesProbe(suiteName: suiteName))
+            let template = FileTemplate(name: "Legacy", fileExtension: "txt", content: "preserved")
+            tracked.set(try JSONEncoder().encode([template]), forKey: "templates.v1")
+            let url = usesFile ? temporaryDirectory.appendingPathComponent("migrated.json") : nil
+            let store = TemplateStore(defaults: tracked, storageURL: url)
+            XCTAssertEqual(try store.loadTemplates(), [template])
+            XCTAssertTrue(tracked.readKeys.contains("templates.revision.v2"))
+            XCTAssertTrue(tracked.readKeys.contains("templates.v1"))
+            if let url {
+                XCTAssertEqual(try JSONDecoder().decode([FileTemplate].self, from: Data(contentsOf: url)), [template])
+                XCTAssertNil(tracked.object(forKey: "templates.v1"))
+            } else {
+                let token = try store.changeToken()
+                tracked.set("next", forKey: "templates.revision.v2")
+                XCTAssertNotEqual(try store.changeToken(), token)
+                tracked.set(try JSONEncoder().encode([FileTemplate]()), forKey: "templates.v1")
+                XCTAssertEqual(try store.loadTemplates(), [])
+            }
+        }
     }
 
     func testAuthoritativeReloadAlwaysReadsBytesButDecodesUnchangedSmallFileOnce() throws {
@@ -638,9 +712,9 @@ final class TemplateStoreTests: XCTestCase {
             probe.resumeRead.signal()
             wait(for: [finished], timeout: 5)
             XCTAssertEqual(try result.get().get(), [first])
-            XCTAssertEqual(try store.loadTemplates(), [second], "Late A must not roll back the revision cache either")
+            XCTAssertEqual(try store.loadTemplates(), [second], "Late A must not hide the current file")
             XCTAssertEqual(try store.reloadTemplates(), [second])
-            XCTAssertEqual(probe.counts().reads, 3)
+            XCTAssertEqual(probe.counts().reads, 4)
             XCTAssertEqual(probe.counts().decodes, 2, "Late A must not evict B's decode cache for either key type")
         }
     }
@@ -1434,6 +1508,37 @@ private final class PausingTemplateFileManager: FileManager, @unchecked Sendable
             withIntermediateDirectories: createIntermediates,
             attributes: attributes
         )
+    }
+}
+
+// In-memory preferences make every access observable without contacting cfprefsd.
+// These fixtures use the store synchronously; concurrent read tests use the I/O probe below.
+private final class TemplatePreferencesProbe: UserDefaults, @unchecked Sendable {
+    private var values: [String: Any] = [:]
+    private(set) var readKeys: [String] = []
+    private(set) var writeKeys: [String] = []
+
+    override func object(forKey key: String) -> Any? {
+        readKeys.append(key)
+        return values[key]
+    }
+
+    override func string(forKey key: String) -> String? {
+        object(forKey: key) as? String
+    }
+
+    override func data(forKey key: String) -> Data? {
+        object(forKey: key) as? Data
+    }
+
+    override func set(_ value: Any?, forKey key: String) {
+        writeKeys.append(key)
+        values[key] = value
+    }
+
+    override func removeObject(forKey key: String) {
+        writeKeys.append(key)
+        values.removeValue(forKey: key)
     }
 }
 

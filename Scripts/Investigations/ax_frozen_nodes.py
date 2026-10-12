@@ -26,7 +26,10 @@ INTEGER_LIMIT = 1_000_000_000
 REASONS = ("input_invalid", "graph_changed", "list_invalid", "tree_invalid",
            "heap_unavailable", "history_unavailable", "allocation_unknown", "trace_unavailable",
            "candidate_limit", "tool_failed", "deadline", "process_exit_unconfirmed", "artifact_failed", "summary_budget",
-           "references_invalid", "references_budget")
+           "references_invalid", "references_budget", "compact_history", "live_snapshot_mismatch")
+LIVE_LABELS = tuple(label for label in HEAP_LABELS if label != "added-10")
+CAPTURE_ERROR_SIGNALS = ("task_port", "permission", "stack_history", "option", "file_io",
+                         "graph_missing", "timeout", "io_error", "unclassified")
 TOOL_KINDS = ("list", "tree", "heap", "heap_diff", "history", "trace")
 TOOL_STATES = ("complete", "spawn_failed", "timeout", "exit_failed", "output_invalid", "output_limit")
 REFERENCE_NODES = 512
@@ -521,15 +524,94 @@ def initial_summary():
             "omitted_candidates": 0, "nodes": [], "tools": [], "reasons": [], "process_cleanup_confirmed": True}
 
 
+def capture_error_signals(output):
+    """Fixed lexical hints from a failed tool, not a root-cause assertion."""
+    patterns = (
+        ("task_port", r"mach port.*not valid|cannot examine process|task_for_pid|task port"),
+        ("permission", r"permission denied|operation not permitted|not authorized|access denied"),
+        ("stack_history", r"fullStackHistory|MallocStackLogging|stack logging|stack history"),
+        ("option", r"unrecognized option|unknown option|illegal option|invalid option|usage: leaks"),
+        ("file_io", r"no such file or directory|read.only file system|no space left|could not (?:open|create)|cannot (?:open|create)|unable to (?:open|create)"),
+    )
+    return [name for name, pattern in patterns if re.search(pattern, output, re.I)] or ["unclassified"]
+
+
+def capture_live_point(pid, label, graphs, records, completed):
+    """A later current-stack graph; compact histories cannot prove generations."""
+    started = time.monotonic()
+    row = {"label": label, "status": "failed", "exit_code": None,
+           "after_scan_ms": round((started - completed) * 1000), "duration_ms": 0,
+           "stdout_sha256": hashlib.sha256(read_bytes(records / (label + "-live.stdout.txt"))).hexdigest(),
+           "graph_sha256": None, "error_signals": []}
+    graph = graphs / (label + ".memgraph")
+    try:
+        run = subprocess.run(["leaks", "--noContent", "--fullStacks",
+                              f"--outputGraph={graph}", str(pid)], capture_output=True, text=True, timeout=60)
+        (graphs / (label + "-capture.txt")).write_text(run.stdout + run.stderr)
+        row["exit_code"] = run.returncode
+        if run.returncode in (0, 1) and graph.is_file():
+            row.update(status="complete", graph_sha256=graph_hash(graph))
+        else:
+            row["error_signals"] = capture_error_signals(run.stdout + "\n" + run.stderr) if run.returncode not in (0, 1) else ["graph_missing"]
+    except subprocess.TimeoutExpired:
+        row.update(status="timeout", error_signals=["timeout"])
+    except (OSError, ValueError):
+        row["error_signals"] = ["io_error"]
+    row["duration_ms"] = round((time.monotonic() - started) * 1000)
+    return row
+
+
+def first_live_growth(scans):
+    return next((row["label"] for row in scans[1:] if any(row[key] > scans[0][key]
+                for key in ("leak_nodes", "leak_bytes"))), None)
+
+
+def validate_live_evidence(scans, captures):
+    def require(ok):
+        if not ok:
+            raise ValueError("Invalid auxiliary live evidence")
+    def digest(value):
+        return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    require(type(scans) is list and len(scans) == len(LIVE_LABELS))
+    for label, row in zip(LIVE_LABELS, scans):
+        require(type(row) is dict and set(row) == {"label", "leak_nodes", "leak_bytes", "stdout_sha256"})
+        require(row["label"] == label and integer(row["leak_nodes"]) and integer(row["leak_bytes"]) and digest(row["stdout_sha256"]))
+    selected = first_live_growth(scans)
+    labels = ("baseline", selected) if selected else ("baseline",)
+    require(type(captures) is list and len(captures) == len(labels))
+    for label, row in zip(labels, captures):
+        fields = {"label", "status", "exit_code", "after_scan_ms", "duration_ms", "stdout_sha256", "graph_sha256"}
+        # Accept receipts produced before fixed error signals were introduced.
+        require(type(row) is dict and set(row) in (fields, fields | {"error_signals"}))
+        require(row["label"] == label and row["status"] in ("complete", "failed", "timeout"))
+        require(row["exit_code"] is None or type(row["exit_code"]) is int and -255 <= row["exit_code"] <= 255)
+        require(all(integer(row[key]) and row[key] <= 120000 for key in ("after_scan_ms", "duration_ms")))
+        require(row["stdout_sha256"] == next(s["stdout_sha256"] for s in scans if s["label"] == label))
+        require(row["graph_sha256"] is None or digest(row["graph_sha256"]))
+        require(row["status"] != "complete" or row["exit_code"] in (0, 1) and digest(row["graph_sha256"]))
+        if "error_signals" in row:
+            signals = row["error_signals"]
+            require(type(signals) is list and len(signals) <= len(CAPTURE_ERROR_SIGNALS))
+            require(all(type(signal) is str and signal in CAPTURE_ERROR_SIGNALS for signal in signals))
+            require(len(set(signals)) == len(signals) and bool(signals) == (row["status"] != "complete"))
+
+
 def validate_summary(value):
     """Exact public schema: no raw address, type, path, symbol or exception text."""
     def require(condition):
         if not condition:
             raise ValueError("Invalid bounded frozen-node summary")
-    require(type(value) is dict and set(value) == set(initial_summary()))
-    require(type(value["schema"]) is int and value["schema"] == 2)
+    live_pair = type(value) is dict and value.get("schema") == 3
+    require(type(value) is dict and set(value) == set(initial_summary()) | ({"live_scans", "live_captures"} if live_pair else set()))
+    require(type(value["schema"]) is int and value["schema"] in (2, 3))
+    if live_pair:
+        validate_live_evidence(value["live_scans"], value["live_captures"])
+        selected = first_live_growth(value["live_scans"])
+        require(value["selection"] is None or value["selected_label"] == selected)
+        require(value["selection"] in (None, "live-pair" if selected else "live-no-growth"))
     require(value["status"] in ("complete", "partial", "unavailable"))
-    require(value["selection"] in (None, "first-new-leak", "no-new-leak", "first-strict-growth", "no-strict-growth"))
+    require(value["selection"] in ((None, "live-pair", "live-no-growth") if live_pair else
+            (None, "first-new-leak", "no-new-leak", "first-strict-growth", "no-strict-growth")))
     require(value["selected_label"] is None or value["selected_label"] in HEAP_LABELS[1:])
     require(type(value["process_cleanup_confirmed"]) is bool)
     for key in ("baseline", "selected"):
@@ -538,6 +620,11 @@ def validate_summary(value):
             require(type(point) is dict and set(point) == {"leak_nodes", "leak_bytes", "graph_sha256"})
             require(integer(point["leak_nodes"]) and integer(point["leak_bytes"]))
             require(type(point["graph_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", point["graph_sha256"]) is not None)
+            if live_pair:
+                label = "baseline" if key == "baseline" else value["selected_label"]
+                capture = next((row for row in value["live_captures"] if row["label"] == label), None)
+                require(capture is not None and capture["status"] == "complete"
+                        and capture["graph_sha256"] == point["graph_sha256"])
     comparison = value["comparison"]
     if comparison is not None:
         require(type(comparison) is dict and set(comparison) == {"added_nodes", "added_bytes", "removed_nodes", "removed_bytes", "retained_addresses", "resized_addresses"})
@@ -576,6 +663,10 @@ def validate_summary(value):
         history = node["history"]
         require(type(history) is dict and set(history) == {"classification", "before_allocs", "before_frees", "after_allocs", "after_frees", "heap_diff_present"})
         require(history["classification"] in ("preexisting", "new_allocation", "unknown"))
+        if live_pair:
+            # Compaction can erase a free/reallocation pair at the same address.
+            require(history["classification"] != "preexisting")
+            require(history["classification"] != "new_allocation" or node["baseline_presence"] == "absent")
         require(all(history[key] is None or integer(history[key]) for key in ("before_allocs", "before_frees", "after_allocs", "after_frees")))
         require(history["heap_diff_present"] is None or type(history["heap_diff_present"]) is bool)
     require(type(value["tools"]) is list and len(value["tools"]) <= 45)
@@ -589,23 +680,24 @@ def validate_summary(value):
     require(type(value["reasons"]) is list and all(type(reason) is str and reason in REASONS for reason in value["reasons"]))
     require(len(set(value["reasons"])) == len(value["reasons"]))
     require(value["process_cleanup_confirmed"] or "process_exit_unconfirmed" in value["reasons"])
-    if value["selection"] in ("first-new-leak", "first-strict-growth"):
+    if value["selection"] in ("first-new-leak", "first-strict-growth", "live-pair"):
         require(value["selected_label"] is not None and value["baseline"] is not None and value["selected"] is not None)
     else:
         require(value["selected_label"] is None and value["selected"] is None and comparison is None and not value["nodes"] and value["candidate_count"] == 0)
     if value["status"] == "complete":
         require(value["selection"] is not None and value["baseline"] is not None and not value["reasons"] and value["process_cleanup_confirmed"])
         require(all(tool["status"] == "complete" and tool["cleanup_confirmed"] for tool in value["tools"]))
-        labels = HEAP_LABELS
-        if value["selection"] in ("first-new-leak", "first-strict-growth"):
-            labels = HEAP_LABELS[:HEAP_LABELS.index(value["selected_label"]) + 1]
+        labels = tuple(row["label"] for row in value["live_captures"]) if live_pair else HEAP_LABELS
+        if value["selection"] in ("first-new-leak", "first-strict-growth", "live-pair"):
+            if not live_pair:
+                labels = HEAP_LABELS[:HEAP_LABELS.index(value["selected_label"]) + 1]
             require(comparison is not None and bool(value["nodes"]) and value["omitted_candidates"] == 0)
             require(all(node["selected_tree"]["status"] == "mapped" and node["baseline_tree"]["status"] != "unavailable"
                         and node["history"]["classification"] != "unknown" and node["selected_external_roots"] is not None
                         and node["baseline_presence"] in ("present", "absent")
                         and (node["baseline_presence"] != "present" or node["baseline_external_roots"] is not None) for node in value["nodes"]))
         expected_tools = [("list", label) for label in labels]
-        if value["selection"] in ("first-new-leak", "first-strict-growth"):
+        if value["selection"] in ("first-new-leak", "first-strict-growth", "live-pair"):
             selected = value["selected_label"]
             expected_tools += [("tree", "baseline"), ("tree", selected), ("heap", "baseline"),
                                ("heap_diff", selected), ("history", "baseline"), ("history", selected)]
@@ -613,12 +705,17 @@ def validate_summary(value):
                 if node["baseline_presence"] == "present":
                     expected_tools.append(("trace", "baseline"))
                 expected_tools.append(("trace", selected))
-        if value["selection"] == "no-strict-growth":
+        if value["selection"] in ("no-strict-growth", "live-no-growth"):
             expected_tools.append(("tree", "baseline"))
         require([(tool["tool"], tool["label"]) for tool in value["tools"]] == expected_tools)
     else:
         require(bool(value["reasons"]))
     validate_references(value)
+    if live_pair:
+        for point in value["checked_points"]:
+            original = next(row for row in value["live_scans"] if row["label"] == point["label"])
+            if any(point[key] != original[key] for key in ("leak_nodes", "leak_bytes")):
+                require("live_snapshot_mismatch" in value["reasons"])
     require(len(encode_summary(value)) <= PUBLIC_LIMIT)
 
 
@@ -628,11 +725,13 @@ def validate_references(value):
     def require(condition):
         if not condition:
             raise ValueError("Invalid public reference evidence")
+    live_pair = value["schema"] == 3
+    labels = tuple(row["label"] for row in value["live_captures"]) if live_pair else HEAP_LABELS
     points = value["checked_points"]
-    require(type(points) is list and len(points) <= len(HEAP_LABELS))
+    require(type(points) is list and len(points) <= len(labels))
     for index, point in enumerate(points):
         require(type(point) is dict and set(point) == {"label", "leak_nodes", "leak_bytes"})
-        require(point["label"] == HEAP_LABELS[index] and integer(point["leak_nodes"]) and integer(point["leak_bytes"]))
+        require(point["label"] == labels[index] and integer(point["leak_nodes"]) and integer(point["leak_bytes"]))
     if points:
         require(value["baseline"] is not None and all(points[0][key] == value["baseline"][key] for key in ("leak_nodes", "leak_bytes")))
     selection = value["selection"]
@@ -648,7 +747,8 @@ def validate_references(value):
         require(bool(points) and points[-1]["label"] == value["selected_label"])
         require(all(points[-1][key] == value["selected"][key] for key in ("leak_nodes", "leak_bytes")))
     if value["status"] == "complete":
-        labels = HEAP_LABELS[:HEAP_LABELS.index(value["selected_label"]) + 1] if value["selected_label"] else HEAP_LABELS
+        if not live_pair:
+            labels = HEAP_LABELS[:HEAP_LABELS.index(value["selected_label"]) + 1] if value["selected_label"] else HEAP_LABELS
         require([point["label"] for point in points] == list(labels))
         if value["selected"] is not None:
             require(all(points[-1][key] == value["selected"][key] for key in ("leak_nodes", "leak_bytes")))
@@ -763,7 +863,7 @@ def validate_references(value):
         require(bool(refs["views"]) and all(view["status"] in ("complete", "not_leaked", "not_present") for view in refs["views"]))
     if refs["status"] == "not_needed":
         require(not refs["views"] and not refs["nodes"] and not refs["edges"] and not value["nodes"])
-    if value["status"] == "complete" and selection in ("first-new-leak", "first-strict-growth"):
+    if value["status"] == "complete" and selection in ("first-new-leak", "first-strict-growth", "live-pair"):
         require(refs["status"] == "complete")
 
 def encode_summary(value):
@@ -832,7 +932,7 @@ class Tools:
         return report
 
 
-def compare(graph_directory, records, first_strict_growth=False, collector=None, bridge_context=None):
+def compare(graph_directory, records, first_strict_growth=False, collector=None, bridge_context=None, live_pair=False):
     result = initial_summary()
     deadline = time.monotonic() + SECONDS
     if bridge_context is not None:
@@ -855,24 +955,51 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None,
         cleanup = read_json(records / "process-cleanup.json")
         scans = read_json(records / "scans.json")
         fixture = read_json(records / "result.json")
+        labels = LIVE_LABELS if live_pair else HEAP_LABELS
         if (type(cleanup) is not dict or cleanup.get("processes_exited") is not True
-                or type(fixture) is not dict or fixture.get("mode") not in (("heap-control", "product") if first_strict_growth else ("heap-control",)) or fixture.get("scan_mode") != "diagnostic"
-                or type(scans) is not list or len(scans) != len(HEAP_LABELS)):
+                or type(fixture) is not dict or fixture.get("mode") not in (("heap-control", "product") if first_strict_growth or live_pair else ("heap-control",))
+                or fixture.get("scan_mode") != ("live" if live_pair else "diagnostic")
+                or live_pair and fixture.get("live_attribution") is not True
+                or type(scans) is not list or len(scans) != len(labels)):
             raise EvidenceError("input_invalid")
-        for label, point in zip(HEAP_LABELS, scans):
+        for label, point in zip(labels, scans):
             if (type(point) is not dict or point.get("label") != label or not integer(point.get("leak_nodes"))
                     or not integer(point.get("leak_bytes")) or type(point.get("exit_code")) is not int or point["exit_code"] not in (0, 1)):
                 raise EvidenceError("input_invalid")
+        if live_pair:
+            original = []
+            for point in scans:
+                payload = read_bytes(records / (point["label"] + "-live.stdout.txt"))
+                if totals(payload.decode("utf-8")) != (point["leak_nodes"], point["leak_bytes"]):
+                    raise EvidenceError("input_invalid")
+                original.append({key: point[key] for key in ("label", "leak_nodes", "leak_bytes")} |
+                                {"stdout_sha256": hashlib.sha256(payload).hexdigest()})
+            captures = read_json(records / "live-captures.json")
+            validate_live_evidence(original, captures)
+            result.update(schema=3, live_scans=original, live_captures=captures)
+            selected_label = first_live_growth(original)
+            scans = [point for point in scans if point["label"] in ("baseline", selected_label)]
+            labels = tuple(point["label"] for point in scans)
+            if any(row["status"] != "complete" or graph_hash(graph_directory / (row["label"] + ".memgraph")) != row["graph_sha256"] for row in captures):
+                raise EvidenceError("input_invalid")
+        graph_totals = {}
         def snapshot(index):
             point = scans[index]
-            return {"leak_nodes": point["leak_nodes"], "leak_bytes": point["leak_bytes"],
+            nodes, size = graph_totals.get(point["label"], (point["leak_nodes"], point["leak_bytes"]))
+            return {"leak_nodes": nodes, "leak_bytes": size,
                     "graph_sha256": graph_hash(graph_directory / (point["label"] + ".memgraph"))}
         result["baseline"] = snapshot(0)
         tools = Tools(records / "frozen-nodes-private", result, deadline)
         def listing(name, graph, point):
             report = tools.run("list", name, ["/usr/bin/leaks", "--noContent", "--nosources", "--list", str(graph)], (0, 1))
             nodes, kinds = parse_list(report)
-            if (len(nodes), sum(nodes.values())) != (point["leak_nodes"], point["leak_bytes"]):
+            actual = len(nodes), sum(nodes.values())
+            if live_pair:
+                if actual != (point["leak_nodes"], point["leak_bytes"]):
+                    reason("live_snapshot_mismatch")
+                graph_totals[name] = actual
+                point.update(leak_nodes=actual[0], leak_bytes=actual[1])
+            elif actual != (point["leak_nodes"], point["leak_bytes"]):
                 raise ValueError("List/scan mismatch")
             if graph_hash(graph) != point["graph_sha256"]:
                 raise EvidenceError("graph_changed")
@@ -903,7 +1030,7 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None,
         selected, diff_nodes = None, None
         # Absolute lists, not leaks --diffFrom, determine later-reported nodes.
         # An equal total can hide address replacement; size changes also count.
-        for index, label in enumerate(HEAP_LABELS[1:], 1):
+        for index, label in enumerate(labels[1:], 1):
             point = snapshot(index)
             graph = graph_directory / (label + ".memgraph")
             after = attempt("list_invalid", lambda: listing(label, graph, point))
@@ -911,19 +1038,19 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None,
                 return result  # Do not skip an unknown earlier checkpoint.
             changed = {address: size for address, size in after[0].items() if before[0].get(address) != size}
             growth = point["leak_nodes"] > result["baseline"]["leak_nodes"] or point["leak_bytes"] > result["baseline"]["leak_bytes"]
-            if growth if first_strict_growth else changed:
+            if live_pair or (growth if first_strict_growth else changed):
                 selected, diff_nodes = index, changed
-                result.update(selection="first-strict-growth" if first_strict_growth else "first-new-leak", selected_label=label, selected=point)
+                result.update(selection="live-pair" if live_pair else "first-strict-growth" if first_strict_growth else "first-new-leak", selected_label=label, selected=point)
                 break
         if selected is None:
             if snapshot(0) != result["baseline"]:
                 raise EvidenceError("graph_changed")
-            if first_strict_growth:
+            if first_strict_growth or live_pair:
                 graph = attempt("tree_invalid", lambda: tree_report("baseline", before_graph, before[0]))
                 result["baseline_roots"] = roots_overview(graph) if graph is not None else {"status": "unavailable", "roots": []}
                 if result["baseline_roots"]["status"] == "budget_exceeded": reason("references_budget")
                 if snapshot(0) != result["baseline"]: reason("graph_changed")
-            result.update(status="complete", selection="no-strict-growth" if first_strict_growth else "no-new-leak")
+            result.update(status="complete", selection="live-no-growth" if live_pair else "no-strict-growth" if first_strict_growth else "no-new-leak")
             return result
         label = result["selected_label"]
         after_graph = graph_directory / (label + ".memgraph")
@@ -937,6 +1064,9 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None,
         result["omitted_candidates"] = len(diff_nodes) - len(candidates)
         if result["omitted_candidates"]:
             reason("candidate_limit")
+        if live_pair and not candidates:
+            reason("live_snapshot_mismatch")
+            return result
         for index, address in enumerate(candidates):
             result["nodes"].append({"index": index, "type": after[1][address], "size": new[address],
                 "baseline_heap_size": None, "baseline_presence": "unknown", "baseline_tree": empty_tree(), "selected_tree": empty_tree(),
@@ -995,7 +1125,7 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None,
             if baseline_heap is not None and changed_heap is not None:
                 if address not in baseline_heap and changed_heap.get(address) == row["size"]:
                     evidence["classification"] = "new_allocation"
-                elif address in baseline_heap and before_history is not None and after_history is not None:
+                elif address in baseline_heap and before_history is not None and after_history is not None and not live_pair:
                     kind = allocation_generation(before_history[address], after_history[address], baseline_heap[address], row["size"])
                     if kind == "preexisting_nodes" and address not in changed_heap:
                         evidence["classification"] = "preexisting"
@@ -1003,6 +1133,8 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None,
                         evidence["classification"] = "new_allocation"
             if evidence["classification"] == "unknown":
                 reason("allocation_unknown")
+                if live_pair:
+                    reason("compact_history")
             for name, graph, size, field in (("baseline", before_graph, row["baseline_heap_size"], "baseline_external_roots"),
                                            (label, after_graph, row["size"], "selected_external_roots")):
                 if size is not None:
@@ -1031,7 +1163,7 @@ def compare(graph_directory, records, first_strict_growth=False, collector=None,
             refs["status"] = "complete" if all(view["status"] in ("complete", "not_leaked", "not_present") for view in refs["views"]) else "partial"
             if refs["status"] != "complete" and not result["reasons"]: reason("references_invalid")
         if result["reasons"]:
-            result["status"] = "partial" if result["comparison"] is not None or result["selection"] == "no-strict-growth" else "unavailable"
+            result["status"] = "partial" if result["comparison"] is not None or result["selection"] in ("no-strict-growth", "live-no-growth") else "unavailable"
         elif result["selection"] is not None:
             result["status"] = "complete"
         bound_summary(result)
@@ -1096,11 +1228,14 @@ def main(argv=None):
     parser.add_argument("--records-directory", type=Path, required=True)
     parser.add_argument("--first-strict-growth", action="store_true")
     parser.add_argument("--bridge-evidence", action="store_true")
+    parser.add_argument("--live-pair", action="store_true", help="Compare later auxiliary captures; compact histories never certify retained-address generations")
     args = parser.parse_args(argv)
+    if args.live_pair and args.first_strict_growth:
+        parser.error("Choose frozen checkpoints or auxiliary live pair")
     collector = Collector()
     bridge_context = {} if args.bridge_evidence else None
     result = compare(args.graph_directory, args.records_directory, first_strict_growth=args.first_strict_growth,
-                     collector=collector, bridge_context=bridge_context)
+                     collector=collector, bridge_context=bridge_context, live_pair=args.live_pair)
     bound_summary(result)
     try:
         validate_summary(result)

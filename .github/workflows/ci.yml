@@ -14,16 +14,6 @@ on:
       - 'Scripts/**'
       - 'Release/**'
   pull_request:
-    paths:
-      - '.github/workflows/**'
-      - 'project.yml'
-      - 'QuickFile.xcodeproj/**'
-      - 'QuickFileApp/**'
-      - 'FinderExtension/**'
-      - 'Shared/**'
-      - 'QuickFileTests/**'
-      - 'Scripts/**'
-      - 'Release/**'
   workflow_dispatch:
 
 permissions:
@@ -38,8 +28,56 @@ defaults:
     shell: bash
 
 jobs:
+  changes:
+    name: Classify verification scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run_checks: ${{ steps.scope.outputs.run_checks }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: scope
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          run_checks = True
+          if os.environ["GITHUB_EVENT_NAME"] == "pull_request":
+              head = os.environ["PR_HEAD_SHA"]
+              base = os.environ["PR_BASE_SHA"]
+              if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (base, head)):
+                  raise ValueError("PR base/head must be full commit SHAs")
+              # Three-dot PR scope; no rename detection so old code paths also count.
+              changed = subprocess.check_output([
+                  "git", "diff", "--name-only", "--no-renames", "-z", f"{base}...{head}", "--",
+              ]).split(b"\0")
+              paths = [path for path in changed if path]
+              run_checks = any(
+                  not (path == b"LICENSE" or (b"/" not in path and path.endswith(b".md")))
+                  for path in paths
+              )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"run_checks={str(run_checks).lower()}\n")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+              summary.write("### Verification scope\n\n")
+              summary.write("Full Linux and macOS validation required.\n" if run_checks else
+                            "Only root Markdown/LICENSE changes; Linux and macOS tests are skipped, not tested.\n")
+          PY
+
   scripts:
     name: Python scripts (Linux)
+    needs: changes
+    if: needs.changes.outputs.run_checks == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -74,7 +112,8 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.macos_major }} (${{ matrix.architecture }}, Xcode ${{ matrix.xcode_version }})
-    needs: scripts
+    needs: [changes, scripts]
+    if: needs.changes.outputs.run_checks == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -162,3 +201,28 @@ jobs:
           if-no-files-found: error
           include-hidden-files: false
           overwrite: false
+
+  required:
+    name: CI required
+    needs: [changes, scripts, macos]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require successful verification or explicit documentation skip
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          RUN_CHECKS: ${{ needs.changes.outputs.run_checks }}
+          SCRIPTS_RESULT: ${{ needs.scripts.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+        run: |
+          if [[ "$CHANGES_RESULT" == success && "$RUN_CHECKS" == false &&
+                "$SCRIPTS_RESULT" == skipped && "$MACOS_RESULT" == skipped ]]; then
+            printf '%s\n' 'Documentation scope accepted; Linux and macOS tests were skipped, not tested.' >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$CHANGES_RESULT" == success && "$RUN_CHECKS" == true &&
+                  "$SCRIPTS_RESULT" == success && "$MACOS_RESULT" == success ]]; then
+            printf '%s\n' 'Linux script tests and all three macOS validation lanes succeeded.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' 'CI required failed: verification scope or required jobs did not complete successfully.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
