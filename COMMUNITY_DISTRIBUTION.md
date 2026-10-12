@@ -16,14 +16,14 @@ QuickFile 提供实验性的 community 构建流程，不需要 Apple 开发者�
 
 打包脚本拒绝带 profile 或已完成应用签名的输入。`CODE_SIGNING_ALLOWED=NO` 构建可能保留链接器生成的 ad-hoc 标记；仅在它没有 Team、证书、权限、Info 绑定或资源封装时接受。脚本先签扩展、后签宿主，逐架构检查签名、权限、版本与动态库依赖。它不修改输入 App，不覆盖已有输出；DMG 只读挂载复验成功、镜像卸载后才发布本地输出目录，包含：
 
-- `QuickFile-<tag>.dmg`：压缩只读镜像，当前候选对外文件名为 `QuickFile-v0.1.0-beta.1.dmg`，其中 `<tag>` 本身包含 `v`；内含 `QuickFile.app` 及指向 `/Applications` 的快捷方式
+- `QuickFile-<tag>.dmg`：压缩只读镜像，当前候选对外文件名为 `QuickFile-v0.1.0-beta.1.dmg`，其中 `<tag>` 本身包含 `v`；新构建内含 `QuickFile.app`、指向 `/Applications` 的快捷方式及可直接打开的 `安装说明.txt`
 - 对应 `.sha256` 校验文件
 - `artifact-check.json`：脱敏产物检查收据
-- `INSTALL.txt`：安装与验证范围说明
+- `INSTALL.txt`：安装与验证范围说明，与镜像内的 `安装说明.txt` 使用同一份 UTF-8 内容
 
 GitHub Actions 在这四项本地产物之外生成第五项 `build-provenance.json`，记录源码 SHA、Actions run、工具链及四项资产的 SHA-256；本地构建命令不会生成这份 GitHub 来源收据。
 
-DMG 使用系统 `hdiutil` 创建 HFS+ / UDZO 镜像，不需要额外打包依赖。检查包括镜像内部校验、挂载后 App 的逐架构签名与完整文件清单、安装快捷方式及输入未改动。挂载不打开 Finder 或运行应用；卸载失败或挂载状态不明时不交付，保留独立 `.build/Temporary/community-dmg-*/` 中的镜像供恢复，并返回错误。
+DMG 使用系统 `hdiutil` 创建 HFS+ / UDZO 镜像，不需要额外打包依赖。检查包括镜像内部校验、挂载后 App 的逐架构签名与完整文件清单、安装快捷方式、说明文件与交付文本逐字节一致及输入未改动。挂载不打开 Finder 或运行应用；卸载失败或挂载状态不明时不交付，保留独立 `.build/Temporary/community-dmg-*/` 中的镜像供恢复，并返回错误。
 
 Xcode 会注册构建中的临时 App。脚本退出时按路径注销本轮副本，重新登记已有的 `/Applications/QuickFile.app` 及其扩展，再回收构建缓存和中间 App；不切换扩展开关。若注册恢复或回收失败，脚本返回失败并记录残留。私有构建日志及清理收据留在本轮 `.build/Temporary/community-build.*/records/`。脚本不会安装、上传或发布应用。每个新候选仍须递增 build，并保留源码、依赖与工具链记录。
 
@@ -144,6 +144,10 @@ gh release create "$TAG" --repo haoyang7/QuickFile --verify-tag --draft \
 ```
 
 运行上一步前，将准确的草稿说明写入 `.build/Temporary/community-release-notes.md`。说明必须列出：ad-hoc 签名、未公证以及可能需要逐应用批准；没有 Sparkle，升级为手动覆盖安装；本候选实际验收的系统/架构支持范围；以及尚未验收的跨机器启动、Finder 集成、升级、Gatekeeper 或其他具体 P0/P1、系统和卷范围。预期的 macOS 13.0+、Apple Silicon 与 Intel 不能替代当前候选的实测范围。
+
+Release notes 必须直接提供可照做的“下载与安装”步骤：选择本版本 DMG 和对应校验文件、使用实际文件名校验 SHA-256、升级前备份并退出旧版、将 App 拖入“应用程序”后推出镜像、首次打开时的逐应用批准、启用 Finder 扩展、按需授权目录，以及在测试文件夹完成一次创建。需列明本版本的升级限制；涉及 `xattr` 排障时说明适用条件，不能将其写成签名或授予目录权限的方法。用户应能在 Release 页面完成基本安装，不能仅提供安装指南链接。
+
+详细排障和恢复流程链接到 [INSTALLATION.md](INSTALLATION.md)；镜像内的 `安装说明.txt` 和单独交付的 `INSTALL.txt` 保留同源的简短安装指引，作为离线补充。[发布清单](RELEASE_CHECKLIST.md) 留在仓库供维护者逐项验收，Release notes 只汇总本候选的实际结果和缺口。
 
 实验预发布必须使用带 `-beta.N` 的独立标签（例如 `v0.1.0-beta.1`）并在创建草稿时设置 `--prerelease`；不得复用稳定的 `v0.1.0` 标签。发布前还要确认远端 `isPrerelease` 与 `$EXPECTED_PRERELEASE` 一致，最后的 `--draft=false` 只发布已核对的当前类型。
 

@@ -168,28 +168,16 @@ def package(arguments: argparse.Namespace) -> dict:
         delivery = Path(delivery_temporary) / "delivery"
         delivery.mkdir()
         image = delivery / filename
-        # A failed detach must preserve its backing image and workspace, outside
-        # the automatically removed signing and delivery staging directories.
-        image_workspace = Path(tempfile.mkdtemp(prefix="community-dmg-", dir=TEMPORARY))
-        dmg_report = DMG.create_dmg(copied, image, image_workspace)
-        image_workspace.rmdir()
-        if ARTIFACT.tree_manifest(app) != input_manifest:
-            raise ValueError("input bundle changed during packaging")
-        digest = ARTIFACT.sha256(image)
-        shutil.rmtree(copied.parent)
-        for configuration in staging.glob("*.entitlements"):
-            configuration.unlink()
-        report.update({"archive": filename, "archive_sha256": digest, "archive_bytes": image.stat().st_size, "dmg": dmg_report, "cleanup": "DMG detached; temporary signing and image copies removed before publication"})
-        (delivery / (filename + ".sha256")).write_text(digest + "  " + filename + "\n", encoding="utf-8")
-        (delivery / "artifact-check.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        (delivery / "INSTALL.txt").write_text(
+        installation_notes = (
             "QuickFile Community 安装说明\n\n"
             "1. 从可信的 QuickFile 官方 GitHub Release 下载 DMG 和同名 .sha256 文件。\n"
             "   在下载目录中运行下列命令；只有显示 OK 且来源可信时继续：\n"
             f"   shasum -a 256 -c {filename}.sha256\n"
             "2. 升级前备份 QuickFile 数据与旧版本，然后退出 QuickFile。\n"
+            "   先阅读该版本发布说明的已知限制；干净安装、同路线升级和签名路线切换须分别验证。\n"
+            "   从开发签名或 Developer ID 版本切换到 Community 时，不应假定旧权限和数据访问已完成迁移。\n"
             "3. 打开 DMG，将 QuickFile.app 拖入 Applications；升级时确认替换旧版本。\n"
-            "4. 推出磁盘映像，再从 /Applications 启动 QuickFile。\n\n"
+            "4. 关闭安装说明并推出磁盘映像，再从 /Applications 启动 QuickFile。\n\n"
             "此版本采用 ad-hoc 签名，未经 Apple 公证，macOS 可能阻止首次启动。\n"
             "请先尝试系统针对该应用提供的“仍要打开”等逐应用批准流程。\n"
             "确认下载来源可信且 SHA-256 校验通过后，如需移除隔离属性，优先运行：\n"
@@ -200,9 +188,26 @@ def package(arguments: argparse.Namespace) -> dict:
             "在系统设置中启用 QuickFile 的 Finder 扩展，再在应用内验证 Finder 集成。\n"
             "Finder 扩展开关与目录授权是独立步骤；按应用提示授权需要使用的目录。\n"
             "QuickFile 无需“完全磁盘访问”。此版本不自动检查更新，升级需手动下载安装。\n"
-            "产物检查不代表已在干净机器验证启动、Finder 集成或完整权限迁移。\n",
-            encoding="utf-8",
-        )
+            "若模板或授权交接队列持续加载，停止创建验收，保留旧版和数据备份，不删除 App Group 数据。\n"
+            "记录升级前后版本/build、分发路线、macOS 版本和等待时长，按发布页反馈；不要上传书签或私人日志。\n"
+            "回退原 App 后仍须重新验证模板、授权和 Finder 创建；恢复旧二进制不代表完整恢复。\n"
+            "产物检查不代表已在干净机器验证启动、Finder 集成或完整权限迁移。\n"
+        ).encode("utf-8")
+        # A failed detach must preserve its backing image and workspace, outside
+        # the automatically removed signing and delivery staging directories.
+        image_workspace = Path(tempfile.mkdtemp(prefix="community-dmg-", dir=TEMPORARY))
+        dmg_report = DMG.create_dmg(copied, image, image_workspace, installation_notes)
+        image_workspace.rmdir()
+        if ARTIFACT.tree_manifest(app) != input_manifest:
+            raise ValueError("input bundle changed during packaging")
+        digest = ARTIFACT.sha256(image)
+        shutil.rmtree(copied.parent)
+        for configuration in staging.glob("*.entitlements"):
+            configuration.unlink()
+        report.update({"archive": filename, "archive_sha256": digest, "archive_bytes": image.stat().st_size, "dmg": dmg_report, "cleanup": "DMG detached; temporary signing and image copies removed before publication"})
+        (delivery / (filename + ".sha256")).write_text(digest + "  " + filename + "\n", encoding="utf-8")
+        (delivery / "artifact-check.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        (delivery / "INSTALL.txt").write_bytes(installation_notes)
         publish_directory(delivery, output)
     return report
 

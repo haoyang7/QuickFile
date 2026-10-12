@@ -48,9 +48,10 @@ class CommunityPackagingTests(unittest.TestCase):
         else:
             raise AssertionError(command)
 
-    def create_dmg(self, app, image, workspace):
+    def create_dmg(self, app, image, workspace, installation_notes):
         self.assertEqual(self.inspect(app)["verdict"], "pass")
         self.assertTrue(workspace.is_relative_to(self.workspaces))
+        self.dmg_instructions = installation_notes
         image.write_bytes(b"mock verified dmg bytes")
         return {"image": image.name, "image_sha256": MODULE.ARTIFACT.sha256(image), "image_bytes": image.stat().st_size, "mounted_artifact_verdict": "pass", "cleanup": "own image detached; private image, source and mount removed"}
 
@@ -105,6 +106,7 @@ class CommunityPackagingTests(unittest.TestCase):
                 self.assertEqual(receipt["dmg"]["image"], filename)
                 self.assertEqual(receipt["version"], "0.1.0")
                 self.assertEqual(receipt["build"], "70")
+                self.assertEqual((self.output / "INSTALL.txt").read_bytes(), self.dmg_instructions)
                 instructions = (self.output / "INSTALL.txt").read_text()
                 self.assertIn(f"shasum -a 256 -c {filename}.sha256", instructions)
                 self.assertIn("xattr -dr com.apple.quarantine /Applications/QuickFile.app", instructions)
@@ -128,7 +130,7 @@ class CommunityPackagingTests(unittest.TestCase):
     def test_dmg_failure_does_not_publish_and_preserves_recovery_workspace(self):
         before = MODULE.ARTIFACT.tree_manifest(self.app)
         recovery = []
-        def fails(app, image, workspace):
+        def fails(app, image, workspace, installation_notes):
             recovery.append(workspace)
             (workspace / "community.dmg").write_bytes(b"preserve for detach recovery")
             raise ValueError("DMG detach failed")
@@ -201,8 +203,8 @@ class CommunityPackagingTests(unittest.TestCase):
         self.assert_clean()
 
     def test_source_changed_during_dmg_creation_is_not_published(self):
-        def changes(app, image, workspace):
-            report = self.create_dmg(app, image, workspace)
+        def changes(app, image, workspace, installation_notes):
+            report = self.create_dmg(app, image, workspace, installation_notes)
             binary = self.app / "Contents/MacOS/QuickFile"
             binary.write_bytes(binary.read_bytes() + b"changed")
             return report
@@ -222,8 +224,8 @@ class CommunityPackagingTests(unittest.TestCase):
         self.assert_clean()
 
     def test_output_created_during_preparation_is_never_overwritten(self):
-        def racing(app, image, workspace):
-            report = self.create_dmg(app, image, workspace)
+        def racing(app, image, workspace, installation_notes):
+            report = self.create_dmg(app, image, workspace, installation_notes)
             self.output.mkdir()
             (self.output / "other-owner").write_text("keep")
             return report
