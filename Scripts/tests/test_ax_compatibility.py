@@ -1380,7 +1380,7 @@ class AXInstallGateTests(unittest.TestCase):
 
 class AXSettledBaselineShadowTests(unittest.TestCase):
     def test_capture_timeout_and_unverified_early_activity_are_retained(self):
-        temporary_root = ROOT / ".build/Temporary"
+        temporary_root = ROOT / ".build/Temporary/ax-composition-shadow-20261012"
         temporary_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="ax-shadow-capture-", dir=temporary_root) as directory:
             root = pathlib.Path(directory)
@@ -1389,20 +1389,23 @@ class AXSettledBaselineShadowTests(unittest.TestCase):
             (root / "baseline-original.stdout.txt").write_bytes(b"baseline")
             source = {"label": "baseline", "host": {key: 0 for key in ("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")},
                       "stdout_sha256": hashlib.sha256(b"baseline").hexdigest()}
-            shadow.capture("auxiliary-original-baseline", source, timeout=0)
+            shadow.capture("auxiliary-original-baseline", {**source, "stdout_sha256": "mismatch"})
             first = shadow.data["captures"][-1]
             self.assertEqual(first["status"], "failed")
             self.assertIsNone(first["host_activity_zero"])
-            with mock.patch.object(PROBE, "capture_terminal_snapshot", return_value={"capture_status": "timeout", "capture_exit_code": None}):
+            with mock.patch.object(PROBE, "capture_terminal_snapshot", return_value={"capture_status": "timeout", "capture_exit_code": None}) as capture, \
+                    mock.patch.object(PROBE.time, "monotonic", side_effect=[0, 15.1]):
                 shadow.capture("auxiliary-original-baseline", source)
+            self.assertEqual(capture.call_args.kwargs["timeout"], 15)
             second = shadow.data["captures"][-1]
             self.assertEqual(second["status"], "failed")
             self.assertEqual(second["capture_status"], "timeout")
+            self.assertEqual(second["end_monotonic"] - second["start_monotonic"], 15.1)
             self.assertTrue(second["host_activity_zero"])
             self.assertIsNone(second["graph_sha256"])
 
-    def exercise(self, counts, timeout=False):
-        temporary_root = ROOT / ".build/Temporary"
+    def exercise(self, counts, timeout=False, capture_seconds=0, probe_seconds=0, include_late=False):
+        temporary_root = ROOT / ".build/Temporary/ax-composition-shadow-20261012"
         temporary_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="ax-shadow-", dir=temporary_root) as directory:
             root = pathlib.Path(directory)
@@ -1418,6 +1421,8 @@ class AXSettledBaselineShadowTests(unittest.TestCase):
             (root / "baseline-original.stdout.txt").write_bytes(b"baseline")
             baseline = {"label": "baseline", "host": host, "stdout_sha256": hashlib.sha256(b"baseline").hexdigest()}
             def capture(pid, graph, timeout):
+                self.assertEqual(timeout, 15)
+                clock[0] += capture_seconds
                 graph.write_bytes(b"graph")
                 return {"capture_status": "complete", "capture_exit_code": 0}
             sequence = iter(counts)
@@ -1426,6 +1431,7 @@ class AXSettledBaselineShadowTests(unittest.TestCase):
                 if timeout:
                     clock[0] += kwargs["timeout"]
                     raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                clock[0] += probe_seconds
                 n = next(sequence)
                 return subprocess.CompletedProcess(command, 1,
                     f"{n} leaks for {n * 100} total leaked bytes.\nSTACK OF {n} INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n  {n} ({n * 100} bytes) ROOT CYCLE: NSXPCConnection\n", "")
@@ -1434,10 +1440,24 @@ class AXSettledBaselineShadowTests(unittest.TestCase):
                     mock.patch.object(PROBE, "capture_terminal_snapshot", side_effect=capture), \
                     mock.patch.object(PROBE.subprocess, "run", side_effect=scan):
                 shadow.settle(123, baseline, lambda timeout: dict(host), reader)
+                if include_late:
+                    shadow.capture("auxiliary-late", shadow.data["probes"][-1])
             for before, after in zip(shadow.data["probes"], shadow.data["probes"][1:]):
                 self.assertGreaterEqual(after["start_monotonic"] - before["end_monotonic"], 2)
-            self.assertLessEqual(clock[0], 15)
+            probe_ends = [row["end_monotonic"] for row in shadow.data["probes"]]
+            if probe_ends:
+                self.assertLessEqual(max(probe_ends) - shadow.data["settling_started_monotonic"], 15)
             return shadow.data
+
+    def test_graph_captures_have_independent_budget_from_idle_probes(self):
+        data = self.exercise([2, 2], capture_seconds=14, probe_seconds=4, include_late=True)
+        self.assertEqual(data["settling_policy"]["graph_capture_timeout_seconds"], 15)
+        self.assertEqual(data["chosen_index"], 1)
+        self.assertEqual(data["settling_started_monotonic"], 14)
+        self.assertEqual([row["start_monotonic"] for row in data["probes"]], [14, 20])
+        self.assertEqual([row["end_monotonic"] for row in data["captures"]], [14, 38, 52])
+        self.assertTrue(all(row["status"] == "complete" for row in data["captures"]))
+        self.assertTrue(all(row["host_activity_zero"] for row in data["captures"][:2]))
 
     def test_two_roots_are_valid_and_growth_requires_a_new_equal_pair(self):
         self.assertEqual(self.exercise([2, 2])["chosen_index"], 1)
@@ -1450,7 +1470,7 @@ class AXSettledBaselineShadowTests(unittest.TestCase):
             self.assertEqual(len(data["captures"]), 1)
 
     def test_original_baseline_classification_cannot_be_hidden_by_candidate(self):
-        temporary_root = ROOT / ".build/Temporary"
+        temporary_root = ROOT / ".build/Temporary/ax-composition-shadow-20261012"
         temporary_root.mkdir(parents=True, exist_ok=True)
         for invalid in ("unclassified_nodes", "destroyed_notification_stack_present", "root_type"):
             with self.subTest(invalid=invalid), tempfile.TemporaryDirectory(prefix="ax-shadow-", dir=temporary_root) as directory:
@@ -1605,7 +1625,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     if capture:
                         self.assertEqual("--fullStackHistory" in command, heap_diagnostics)
                         if settled_shadow:
-                            self.assertLessEqual(_kwargs["timeout"], 5)
+                            self.assertEqual(_kwargs["timeout"], 15)
                             label = pathlib.Path(capture.split("=", 1)[1]).stem
                             if label != "auxiliary-late":
                                 self.assertEqual(scanned, ["baseline"])
@@ -1834,7 +1854,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 self.assertEqual(receipt["chosen_index"], None if shadow_timeout else 1)
                 self.assertEqual(len(receipt["captures"]), 2 if shadow_timeout else 3)
                 self.assertLessEqual(receipt["baseline_finished_monotonic"], receipt["settling_started_monotonic"])
-                self.assertLessEqual(receipt["settling_started_monotonic"], receipt["captures"][0]["start_monotonic"])
+                self.assertLessEqual(receipt["baseline_finished_monotonic"], receipt["captures"][0]["start_monotonic"])
+                self.assertLessEqual(receipt["captures"][0]["end_monotonic"], receipt["settling_started_monotonic"])
                 for capture in receipt["captures"][:-1]:
                     self.assertLessEqual(capture["end_monotonic"], receipt["first_measurement_cycle_monotonic"])
                 self.assertLessEqual(receipt["first_measurement_cycle_monotonic"], receipt["last_original_scan_finished_monotonic"])

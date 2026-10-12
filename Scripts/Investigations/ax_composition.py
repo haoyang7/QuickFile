@@ -4,10 +4,12 @@ import json
 import re
 
 import ax_frozen_nodes as frozen
+import ax_parser_evidence as parser_evidence
 
 NODE_LIMIT = 512
 BUCKET_LIMIT = 128
 PUBLIC_LIMIT = 8192
+FRAGMENT_LIMIT = 4096
 RAW_LIMIT = 16 * 1024 * 1024
 TYPES = frozen.REFERENCE_TYPES
 REASONS = ("not_available", "invalid_report", "node_budget", "bucket_budget", "summary_budget",
@@ -110,11 +112,43 @@ def empty_grouped(reason="not_available", totals=None, failure_stage=None):
     if reason == "node_budget": failure_stage = "budget"
     require(failure_stage in FAILURE_STAGES if reason == "invalid_report" else
             failure_stage == ("budget" if reason == "node_budget" else None))
-    return {"schema": 2, "status": "unavailable", "counts_status": "unavailable",
-            "size_bounds": "combined-self-bytes", "failure_stage": failure_stage,
+    return {"schema": 3, "status": "unavailable", "counts_status": "unavailable",
+            "size_bounds": "combined-self-bytes", "failure_stage": failure_stage, "failure_fragment": None,
             "total_nodes": totals[0] if totals else None, "total_bytes": totals[1] if totals else None,
             "type_counts": [], "exact_size_histogram": [], "size_unknown_nodes": 0, "unresolved_sizes": [],
             "unknown_type_nodes": 0, "omitted_nodes": totals[0] if totals else 0, "reasons": [reason]}
+
+
+def _failure_fragment(lines):
+    """Reuse the reviewed lexical codec; discard an incomplete/oversized fragment."""
+    if not 1 <= len(lines) <= 3 or any(len(line) > parser_evidence.LINE_LENGTH_LIMIT for line in lines):
+        return None
+    try:
+        collector = parser_evidence.Collector()
+        # Required codec metadata is synthetic: no checkpoint or graph is bound.
+        collector.record("tree", "baseline", 0, "0" * 64, "\n".join(lines), ValueError("Unsupported tree row"))
+        value = {"kind": "diagnostic-only", "equivalence": "non-equivalent-fragment",
+                 "codec_context": "synthetic-placeholders", "offender_index": len(lines) - 1,
+                 "evidence": collector.value}
+        _validate_failure_fragment(value)
+        return value
+    except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
+        return None
+
+
+def _validate_failure_fragment(value):
+    require(type(value) is dict and set(value) == {"kind", "equivalence", "codec_context", "offender_index", "evidence"})
+    require(value["kind"] == "diagnostic-only" and value["equivalence"] == "non-equivalent-fragment"
+            and value["codec_context"] == "synthetic-placeholders")
+    require(len(encoded(value)) <= FRAGMENT_LIMIT)
+    evidence = parser_evidence.validate_evidence(value["evidence"])
+    require(evidence["status"] == "complete" and evidence["omitted_documents"] == 0 and len(evidence["documents"]) == 1)
+    doc = evidence["documents"][0]
+    require(doc["tool"] == "tree" and doc["label"] == "baseline" and doc["tool_index"] == 0
+            and doc["graph_sha256"] == "0" * 64 and doc["error"] == "unsupported_tree_row"
+            and doc["status"] == "complete" and doc["nodes"] == [] and doc["target"] is None)
+    require(1 <= len(doc["lines"]) <= 3 and type(value["offender_index"]) is int
+            and value["offender_index"] == len(doc["lines"]) - 1)
 
 
 def _name(text, stage=None):
@@ -137,7 +171,7 @@ def _byte_range(text, count, total):
     return count, total
 
 
-def _group_tree(lines, instances, marker, header_name, total_bytes):
+def _group_tree(lines, instances, marker, header_name, total_bytes, failure_context):
     stack, output, roots = [], [], []
     total_row = None
     separated = any(re.fullmatch(r" +----", line) for line in lines)
@@ -159,6 +193,9 @@ def _group_tree(lines, instances, marker, header_name, total_bytes):
 
     for line in lines:
         if not line.strip(): continue
+        # These private strings never leave through a public field. Only the
+        # bounded reviewed codec may publish the current line and two ancestors.
+        failure_context[:] = [row["line"] for row in stack[-2:]] + [line]
         if re.fullmatch(r" +----", line):
             require(total_row is not None and not separator_pending and len(line) - 4 == total_row["indent"] + 2)
             while len(stack) > 1: close()
@@ -168,6 +205,8 @@ def _group_tree(lines, instances, marker, header_name, total_bytes):
         require(match is not None)
         indent, count, byte_text, text = len(match[1]), match[2], match[3], match[4]
         while stack and indent <= stack[-1]["indent"]: close()
+        if count is not None:
+            failure_context[:] = [row["line"] for row in stack[-2:]] + [line]
         if " --> " in text:
             edge, text = text.split(" --> ", 1)
             require(re.fullmatch(frozen.EDGE_NAME, edge) is not None)
@@ -196,7 +235,7 @@ def _group_tree(lines, instances, marker, header_name, total_bytes):
             # Indentation still determines ancestry; the marker adds no root.
             require(row_marker in (None, "ROOT CYCLE"), "child_marker")
             require(indent == stack[-1]["indent"] + 3)
-        row = {"indent": indent, "name": name, "count": int(count), "bytes": _byte_range(byte_text, int(count), total_bytes), "children": []}
+        row = {"indent": indent, "name": name, "count": int(count), "bytes": _byte_range(byte_text, int(count), total_bytes), "children": [], "line": line}
         if stack:
             stack[-1]["children"].append(row)
         if aggregate: total_row = row
@@ -207,6 +246,7 @@ def _group_tree(lines, instances, marker, header_name, total_bytes):
     require(roots and (instances is None or sum(root["own"] for root in roots) == instances), "totals")
     if total_row is not None:
         require(total_row["count"] == sum(root["count"] for root in roots), "totals")
+    failure_context.clear()
     return output, roots
 
 
@@ -214,6 +254,7 @@ def grouped_composition(report):
     """Decode full grouped trees; subtract direct child subtrees before counting."""
     totals = None
     stage = "header"
+    failure_context = []
     try:
         require(type(report) is str)
         stage = "budget"
@@ -246,13 +287,13 @@ def grouped_composition(report):
                 require(key not in seen); seen.add(key)
                 header_name = _name(header[3])
                 stage = "tree_shape"
-                group, group_roots = _group_tree(tree.splitlines(), int(header[1]), header[2], header_name, totals[1])
+                group, group_roots = _group_tree(tree.splitlines(), int(header[1]), header[2], header_name, totals[1], failure_context)
                 rows.extend(group); roots.extend(group_roots)
         elif body.strip():
             stage = "tree_shape"
             lines = [line for line in body.splitlines() if line.strip()]
             require(re.fullmatch(r" *\d+ \([^)]+\) << TOTAL >>", lines[0]) is not None)
-            rows, roots = _group_tree(lines, None, None, None, totals[1])
+            rows, roots = _group_tree(lines, None, None, None, totals[1], failure_context)
         else:
             require(totals == (0, 0), "totals")
         stage = "totals"
@@ -272,8 +313,8 @@ def grouped_composition(report):
         omitted = sum(row["count"] for row in exact_rows[BUCKET_LIMIT:]) + sum(row["count"] for row in unresolved[BUCKET_LIMIT:])
         unknown_sizes = sum(row["count"] for row in kept_unresolved)
         reasons = (["unknown_type"] if types["unknown"] else []) + (["size_unresolved"] if unresolved else []) + (["bucket_budget"] if omitted else [])
-        value = {"schema": 2, "status": "partial" if reasons else "complete", "counts_status": "complete",
-            "size_bounds": "combined-self-bytes", "failure_stage": None,
+        value = {"schema": 3, "status": "partial" if reasons else "complete", "counts_status": "complete",
+            "size_bounds": "combined-self-bytes", "failure_stage": None, "failure_fragment": None,
             "total_nodes": totals[0], "total_bytes": totals[1], "type_counts": [{"type": kind, "count": count} for kind, count in sorted(types.items()) if count],
             "exact_size_histogram": kept_exact, "size_unknown_nodes": unknown_sizes, "unresolved_sizes": kept_unresolved,
             "unknown_type_nodes": types["unknown"], "omitted_nodes": omitted, "reasons": reasons}
@@ -283,19 +324,29 @@ def grouped_composition(report):
         validate_grouped_composition(value)
         return value
     except (ValueError, TypeError, KeyError, RecursionError, OverflowError) as exc:
-        return empty_grouped("invalid_report", totals, exc.stage if isinstance(exc, _GroupedError) else stage)
+        value = empty_grouped("invalid_report", totals, exc.stage if isinstance(exc, _GroupedError) else stage)
+        if value["failure_stage"] == "tree_shape":
+            value["failure_fragment"] = _failure_fragment(failure_context)
+        return value
 
 
 def validate_grouped_composition(value):
     require(type(value) is dict and set(value) == set(empty_grouped()))
-    require(type(value["schema"]) is int and value["schema"] == 2 and value["status"] in ("complete", "partial", "unavailable"))
+    require(type(value["schema"]) is int and value["schema"] == 3 and value["status"] in ("complete", "partial", "unavailable"))
     require(value["counts_status"] in ("complete", "unavailable"))
     require(value["size_bounds"] == "combined-self-bytes")
     require(type(value["reasons"]) is list and len(value["reasons"]) == len(set(value["reasons"])) and all(r in REASONS for r in value["reasons"]))
+    if value["failure_fragment"] is not None:
+        require(value["status"] == value["counts_status"] == "unavailable"
+                and value["reasons"] == ["invalid_report"] and value["failure_stage"] == "tree_shape")
+        _validate_failure_fragment(value["failure_fragment"])
+    require(len(encoded(value)) <= PUBLIC_LIMIT)
     if value["counts_status"] == "unavailable":
         totals = (value["total_nodes"], value["total_bytes"]) if value["total_nodes"] is not None else None
         require(totals is None and value["total_bytes"] is None or totals is not None and all(integer(n) for n in totals))
-        require(len(value["reasons"]) == 1 and value == empty_grouped(value["reasons"][0], totals, value["failure_stage"]))
+        expected = empty_grouped(value["reasons"][0], totals, value["failure_stage"]) if len(value["reasons"]) == 1 else None
+        if expected is not None: expected["failure_fragment"] = value["failure_fragment"]
+        require(value == expected)
         return
     require(value["status"] in ("complete", "partial"))
     require(value["failure_stage"] is None)

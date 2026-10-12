@@ -164,8 +164,8 @@ class SettledBaselineShadow:
 
     def __init__(self, records, graphs, idle=False):
         self.records, self.graphs = records, graphs
-        self.data = {"schema": 1, "settling_policy": {"max_probes": 6, "min_interval_seconds": 2,
-            "deadline_seconds": 15, "tool_timeout_seconds": 5, "consecutive_equal": 2,
+        self.data = {"schema": 2, "settling_policy": {"max_probes": 6, "min_interval_seconds": 2,
+            "deadline_seconds": 15, "tool_timeout_seconds": 5, "graph_capture_timeout_seconds": 15, "consecutive_equal": 2,
             "comparison": "counts-bytes-root-kind-type-instances-tree-nodes", "size_histogram_compared": False},
             "status": "not_settled", "chosen_index": None, "probes": [], "captures": [],
             "errors": [], "environments": {}, "observer_query_policy": "initial-query-only" if idle else "ordinary",
@@ -202,7 +202,7 @@ class SettledBaselineShadow:
         except Exception:
             self.error("environment_unavailable")
 
-    def capture(self, label, entry, timeout=5):
+    def capture(self, label, entry):
         row = {"label": label, "status": "failed", "graph_sha256": None,
                "capture_status": "failed", "host_activity_zero": False if label == "auxiliary-late" else None,
                "exit_code": None, "source_label": entry.get("label"), "source_stdout_sha256": entry.get("stdout_sha256"),
@@ -211,8 +211,6 @@ class SettledBaselineShadow:
                "start_monotonic": time.monotonic()}
         self.data["captures"].append(row)
         try:
-            if timeout <= 0:
-                raise TimeoutError("settling deadline")
             source_suffix = ".stdout.txt" if entry["label"].startswith("shadow-probe-") else "-original.stdout.txt"
             source = self.records / (entry["label"] + source_suffix)
             source_info = source.lstat()
@@ -225,7 +223,7 @@ class SettledBaselineShadow:
                 validate_control_host(entry["host"])
                 row["host_activity_zero"] = True
             graph = self.graphs / (label + ".memgraph")
-            value = capture_terminal_snapshot(self.pid, graph, timeout=min(5, timeout))
+            value = capture_terminal_snapshot(self.pid, graph, timeout=15)
             row["exit_code"] = value["capture_exit_code"]
             row["capture_status"] = value["capture_status"]
             if value["capture_status"] != "complete":
@@ -243,13 +241,13 @@ class SettledBaselineShadow:
 
     def settle(self, pid, baseline, checkpoint, warmed):
         self.pid = pid
-        self.data["settling_started_monotonic"] = time.monotonic()
-        deadline = self.data["settling_started_monotonic"] + 15
         previous = None
         try:
             validate_control_reader(warmed)
             validate_control_host(baseline["host"])
-            self.capture("auxiliary-original-baseline", baseline, deadline - time.monotonic())
+            self.capture("auxiliary-original-baseline", baseline)
+            self.data["settling_started_monotonic"] = time.monotonic()
+            deadline = self.data["settling_started_monotonic"] + 15
             for index in range(6):
                 if previous is not None:
                     remaining_interval = previous["end_monotonic"] + 2 - time.monotonic()
@@ -288,13 +286,14 @@ class SettledBaselineShadow:
                     break
                 if previous is not None and self.signature(previous) == self.signature(row):
                     self.data.update(status="observed-stable", chosen_index=index)
-                    self.capture("auxiliary-candidate", row, deadline - time.monotonic())
                     break
                 previous = row
         except Exception:
             self.error("settling_failed")
         if self.data["chosen_index"] is None:
             self.error("not_settled")
+        else:
+            self.capture("auxiliary-candidate", self.data["probes"][self.data["chosen_index"]])
         self.save()
 
     def finish(self, scans, errors, failed):

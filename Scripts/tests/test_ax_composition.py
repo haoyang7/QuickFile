@@ -1,5 +1,6 @@
 """Self-authored grouped reports and pure composition invariants."""
 import copy
+import hashlib
 from pathlib import Path
 import sys
 import unittest
@@ -9,6 +10,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "Investigations"))
 sys.path.insert(0, str(HERE))
 import ax_composition as composition
+import ax_ci_failure as ci_evidence
 from test_ax_frozen_nodes import listing, tree
 
 
@@ -142,7 +144,7 @@ class CompositionTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 value = self.parse(report)
                 self.assertEqual((value["schema"], value["failure_stage"], value["reasons"]),
-                                 (2, stage, ["invalid_report"]))
+                                 (3, stage, ["invalid_report"]))
                 self.assertEqual(value["type_counts"], [])
                 for invalid in (None, "private/path", "0x1234", 42):
                     bad = copy.deepcopy(value); bad["failure_stage"] = invalid
@@ -155,6 +157,84 @@ class CompositionTests(unittest.TestCase):
             self.assertIsNone(value["failure_stage"])
             value["failure_stage"] = "header"
             with self.assertRaises(ValueError): composition.validate_grouped_composition(value)
+
+    def test_tree_shape_fragment_uses_reviewed_codec_without_private_text(self):
+        report = array_report().replace("NSMutableArray", "CustomerTemplate")
+        report = report.replace("CFData", "SecretCustomerType 0xdeadbeefcafebabe /Users/private/customer")
+        value = self.parse(report)
+        fragment = value["failure_fragment"]
+        self.assertEqual((value["failure_stage"], value["counts_status"]), ("tree_shape", "unavailable"))
+        self.assertEqual((fragment["kind"], fragment["equivalence"], fragment["offender_index"]),
+                         ("diagnostic-only", "non-equivalent-fragment", 2))
+        doc = fragment["evidence"]["documents"][0]
+        self.assertEqual(len(doc["lines"]), 3)
+        self.assertTrue(any(token[0] == "address" for token in doc["lines"][-1]))
+        decoded, nodes, target = composition.parser_evidence.decode_document(doc)
+        payload = composition.encoded(value).decode()
+        for private in ("CustomerTemplate", "SecretCustomerType", "deadbeefcafebabe", "/Users/private/customer"):
+            self.assertNotIn(private, payload)
+            self.assertNotIn(private, decoded)
+        self.assertEqual((nodes, target, value["type_counts"]), ({}, None, []))
+        self.assertLessEqual(len(composition.encoded(fragment)), composition.FRAGMENT_LIMIT)
+        self.assertLessEqual(len(composition.encoded(value)), composition.PUBLIC_LIMIT)
+        pid_report = grouped(1, 48, "    1 (48 bytes) ROOT LEAK: NSMutableArray\nProcess 987654321: private_name")
+        pid_value = self.parse(pid_report)
+        self.assertNotIn("987654321", composition.encoded(pid_value).decode())
+        self.assertIn(["pid", 0], pid_value["failure_fragment"]["evidence"]["documents"][0]["lines"][-1])
+
+    def test_fragment_replays_offender_whitespace_without_claiming_full_tree_equivalence(self):
+        report = array_report().replace("          1 (80", "\t1 (80")
+        value = self.parse(report)
+        fragment = value["failure_fragment"]
+        doc = fragment["evidence"]["documents"][0]
+        decoded, _, _ = composition.parser_evidence.decode_document(doc)
+        offender = decoded.splitlines()[fragment["offender_index"]]
+        self.assertTrue(offender.startswith("\t"))
+        # A local row-shape replay only: byte labels and unknown names are opaque,
+        # and this deliberately does not replay a complete tree or its totals.
+        for line in ("\t1 (80 bytes) CFData", offender):
+            with self.assertRaises(ValueError):
+                composition._group_tree([line], None, None, None, 144, [])
+        self.assertIsNone(self.parse(array_report())["failure_fragment"])
+        self.assertIsNone(self.parse(report.replace("====", "bad boundary"))["failure_fragment"])
+
+    def test_fragment_public_gate_rejects_extra_text_metadata_and_excess_lines(self):
+        value = self.parse(array_report().replace("          1 (80", "\t1 (80"))
+        mutations = (
+            lambda f: f.update(raw="private"),
+            lambda f: f.update(codec_context="actual-baseline"),
+            lambda f: f.update(offender_index=True),
+            lambda f: f["evidence"]["documents"][0].update(graph_sha256="1" * 64),
+            lambda f: f["evidence"]["documents"][0].update(raw="private"),
+            lambda f: f["evidence"]["documents"][0]["lines"][-1].append(["word", "PrivateCustomerType"]),
+            lambda f: f["evidence"]["documents"][0]["lines"].append([]),
+            lambda f: f["evidence"]["documents"][0]["lines"][-1].extend([["word", "ROOT"]] * 400),
+        )
+        for mutation in mutations:
+            bad = copy.deepcopy(value); mutation(bad["failure_fragment"])
+            with self.assertRaises(ValueError): composition.validate_grouped_composition(bad)
+        success = self.parse(array_report()); success["failure_fragment"] = value["failure_fragment"]
+        with self.assertRaises(ValueError): composition.validate_grouped_composition(success)
+
+    def test_fragment_budget_omits_whole_fragment_and_preserves_original_scan_evidence(self):
+        report = array_report().replace("          1 (80", "\t1 (80")
+        raw = report.encode()
+        groups = ci_evidence.leak_groups(report)
+        entry = {"label": "baseline", "stdout_sha256": hashlib.sha256(raw).hexdigest(), "exit_code": 1,
+                 "leak_nodes": 3, "leak_bytes": 144, "groups": groups,
+                 "unclassified_nodes": 0, "destroyed_notification_stack_present": False}
+        ordinary = ci_evidence.scan_summary("baseline", entry, raw)
+        with mock.patch.object(composition, "FRAGMENT_LIMIT", 1):
+            bounded = ci_evidence.scan_summary("baseline", entry, raw)
+        self.assertIsNotNone(ordinary["composition"]["failure_fragment"])
+        self.assertIsNone(bounded["composition"]["failure_fragment"])
+        self.assertEqual((bounded["status"], bounded["binding"]), ("complete", "matched"))
+        ordinary.pop("composition"); bounded.pop("composition")
+        self.assertEqual(ordinary, bounded)
+        for suffix in (" ROOT" * 1000, "a" * (composition.parser_evidence.LINE_LENGTH_LIMIT + 1)):
+            oversized = self.parse(array_report().replace("CFData", "CFData " + suffix))
+            self.assertEqual((oversized["failure_stage"], oversized["reasons"]), ("tree_shape", ["invalid_report"]))
+            self.assertIsNone(oversized["failure_fragment"])
 
     def test_count_byte_and_budget_conservation(self):
         reports = [grouped(1, size, f"    1 ({size} bytes) ROOT LEAK: NSString", kind="NSString", frame=size)

@@ -50,7 +50,7 @@ def manifest(mode):
 
 
 def initial():
-    return {'schema': 2, 'identity': {'checkout_sha': 'a' * 40, 'macos': '26.0.1', 'os_build': '25A354', 'architecture': 'arm64',
+    return {'schema': 3, 'identity': {'checkout_sha': 'a' * 40, 'macos': '26.0.1', 'os_build': '25A354', 'architecture': 'arm64',
         'xcode': '26.3', 'scan_mode': 'settled-baseline-shadow', 'history_mode': 'current-stacks'}, 'builds': {}, 'cases': [],
         'completed': False, 'strict_checks_passed': False, 'evidence_checks_passed': False, 'temporary_cleanup': 'not-run'}
 
@@ -101,7 +101,7 @@ class TemporaryTests(unittest.TestCase):
         captures = []
         graphs = self.records / 'shadow'
         graphs.mkdir()
-        for label, source, start, end in ((C.CAPTURES[0], rows[0], 100.2, 100.5), (C.CAPTURES[1], probes[1], 103.3, 103.5), (C.CAPTURES[2], rows[-1], 120., 121.)):
+        for label, source, start, end in ((C.CAPTURES[0], rows[0], 100.01, 100.05), (C.CAPTURES[1], probes[1], 103.3, 103.5), (C.CAPTURES[2], rows[-1], 120., 121.)):
             data = label.encode()
             (graphs / (label + '.memgraph')).write_bytes(data)
             captures.append({'label': label, 'status': 'complete', 'graph_sha256': hashlib.sha256(data).hexdigest(), 'exit_code': 0,
@@ -110,7 +110,7 @@ class TemporaryTests(unittest.TestCase):
                 'start_monotonic': start, 'end_monotonic': end})
         if capture_failure:
             captures[1].update(status='failed', graph_sha256=None)
-        raw = {'schema': 1, 'settling_policy': C.POLICY, 'status': 'observed-stable', 'chosen_index': 1,
+        raw = {'schema': 2, 'settling_policy': C.POLICY, 'status': 'observed-stable', 'chosen_index': 1,
             'baseline_finished_monotonic': 100., 'settling_started_monotonic': 100.1, 'first_measurement_cycle_monotonic': 104., 'last_original_scan_finished_monotonic': 119.,
             'probes': probes, 'captures': captures, 'errors': ['capture_failed'] if capture_failure else [], 'environments': copy.deepcopy(C.ENVIRONMENT),
             'observer_query_policy': 'initial-query-only' if case == C.CASES[-1] else 'ordinary', 'timing_perturbed': True, 'original_parity': False,
@@ -210,9 +210,10 @@ class ProjectionTests(TemporaryTests):
         self.assertEqual(shadow['candidate_hypothetical_verdict'], 'unavailable')
 
 
-    def test_candidate_timeout_after_deadline_keeps_receipt_and_fails_timing(self):
+    def test_candidate_timeout_after_probe_deadline_keeps_independent_window(self):
         _, _, raw = self.fixture()
-        raw['captures'][0].update(end_monotonic=105.2, status='failed', capture_status='timeout', graph_sha256=None)
+        raw['captures'][0].update(start_monotonic=85., end_monotonic=100., status='failed', capture_status='timeout', graph_sha256=None)
+        raw['baseline_finished_monotonic'] = 84.9
         raw['probes'][0].update(start_monotonic=108., end_monotonic=111.)
         raw['probes'][1].update(start_monotonic=113., end_monotonic=114.95)
         raw['captures'][1].update(start_monotonic=114.96, end_monotonic=115.11, status='failed', capture_status='timeout', graph_sha256=None)
@@ -221,7 +222,7 @@ class ProjectionTests(TemporaryTests):
         measurement, shadow = self.project()
         self.assertEqual(len(measurement['original_scans']), 6)
         self.assertEqual(shadow['chosen_index'], 1)
-        self.assertFalse(shadow['timing_evidence'])
+        self.assertTrue(shadow['timing_evidence'])
         self.assertEqual(shadow['captures'][1]['capture_status'], 'timeout')
         self.assertGreater(shadow['captures'][1]['end_elapsed_ms'] - shadow['timing_markers']['settling_started'], 15000)
         C.validate_shadow(shadow, measurement, process(), C.CASES[0])
@@ -317,6 +318,44 @@ class ProjectionTests(TemporaryTests):
         changed['timing_markers']['first_measurement_cycle'] = changed['captures'][1]['end_elapsed_ms']
         changed['timing_evidence'] = False
         with self.assertRaises(ValueError): C.validate_shadow(changed, measurement, process(), C.CASES[0])
+
+
+    def test_independent_graph_windows_leave_probe_budget_unchanged(self):
+        _, _, raw = self.fixture()
+        raw['captures'][0].update(start_monotonic=100.01, end_monotonic=114.9)
+        raw['settling_started_monotonic'] = 115.
+        raw['probes'][0].update(start_monotonic=116., end_monotonic=119.)
+        raw['probes'][1].update(start_monotonic=121., end_monotonic=123.8)
+        raw['captures'][1].update(start_monotonic=124., end_monotonic=139.1)
+        raw.update(first_measurement_cycle_monotonic=140., last_original_scan_finished_monotonic=150.)
+        raw['captures'][2].update(start_monotonic=151., end_monotonic=166.1)
+        self.save('settled-baseline-shadow.json', raw)
+        measurement, shadow = self.project()
+        self.assertEqual(shadow['schema'], 2)
+        self.assertEqual(shadow['settling_policy']['graph_capture_timeout_seconds'], 15)
+        self.assertEqual(shadow['settling_policy']['deadline_seconds'], 15)
+        self.assertEqual(shadow['settling_policy']['tool_timeout_seconds'], 5)
+        self.assertTrue(shadow['timing_evidence'])
+        self.assertEqual(shadow['chosen_index'], 1)
+        self.assertGreater(shadow['captures'][1]['end_elapsed_ms'] - shadow['timing_markers']['settling_started'], 15000)
+        # Graph metadata/hash work is included in the window; it is not a tool-runtime receipt.
+        self.assertGreater(shadow['captures'][1]['end_elapsed_ms'] - shadow['captures'][1]['start_elapsed_ms'], 15000)
+        self.assertEqual(shadow['original_strict_verdict'], 'failed')
+        self.assertEqual(shadow['candidate_hypothetical_verdict'], 'passed')
+        C.validate_shadow(shadow, measurement, process(), C.CASES[0])
+
+    def test_independent_graph_timeout_remains_failed_evidence(self):
+        _, _, raw = self.fixture()
+        raw['captures'][1].update(start_monotonic=103.3, end_monotonic=118.4, status='failed', capture_status='timeout', graph_sha256=None)
+        raw.update(first_measurement_cycle_monotonic=119., last_original_scan_finished_monotonic=120., errors=['capture_failed'], candidate_hypothetical_verdict='unavailable')
+        raw['captures'][2].update(start_monotonic=121., end_monotonic=136.1)
+        self.save('settled-baseline-shadow.json', raw)
+        measurement, shadow = self.project()
+        self.assertTrue(shadow['timing_evidence'])
+        self.assertEqual(shadow['captures'][1]['capture_status'], 'timeout')
+        self.assertFalse(C.evidence_passed({'shadow': shadow, 'offline': None, 'offline_process_run': process(0)}))
+        self.assertEqual(len(measurement['original_scans']), 6)
+        self.assertEqual(shadow['original_strict_verdict'], 'failed')
 
 
 class HistogramTests(TemporaryTests):
@@ -418,8 +457,9 @@ class PublicTests(TemporaryTests):
         public.unlink(); os.link(original, public)
         with self.assertRaises(ValueError): C.read_json(public)
     def test_previous_campaign_schema_is_rejected(self):
-        value = initial(); value['schema'] = 1
-        with self.assertRaises(ValueError): C.validate_summary(value)
+        for schema in (1, 2):
+            value = initial(); value['schema'] = schema
+            with self.subTest(schema=schema), self.assertRaises(ValueError): C.validate_summary(value)
 
     def test_unknown_fields_wrong_numbers_and_privacy_strings_rejected(self):
         for mutate in (lambda v: v.update(message='private'), lambda v: v.update(schema=True), lambda v: v['identity'].update(checkout_sha='secret'), lambda v: v['identity'].update(history_mode='full-no-compact')):

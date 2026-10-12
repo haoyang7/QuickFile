@@ -34,7 +34,7 @@ CASES = ('patched-product', 'patched-empty', 'pure-appkit-empty', 'pure-appkit-i
 LABELS = frozen.LIVE_LABELS
 CAPTURES = ('auxiliary-original-baseline', 'auxiliary-candidate', 'auxiliary-late')
 POLICY = {'max_probes': 6, 'min_interval_seconds': 2, 'deadline_seconds': 15,
-          'tool_timeout_seconds': 5, 'consecutive_equal': 2,
+          'tool_timeout_seconds': 5, 'graph_capture_timeout_seconds': 15, 'consecutive_equal': 2,
           'comparison': 'counts-bytes-root-kind-type-instances-tree-nodes', 'size_histogram_compared': False}
 ENVIRONMENT = {'host': {'MallocStackLogging': '1', 'MallocStackLoggingNoCompact': '1', 'MallocScribble': 'unset'},
                'reader': dict.fromkeys(('MallocStackLogging', 'MallocStackLoggingNoCompact', 'MallocScribble'), 'unset')}
@@ -229,7 +229,7 @@ def project_shadow(records, measurement, process, expected, case):
 def _project_shadow(records, measurement, process, expected, case, stage):
     raw = read_json(records / 'settled-baseline-shadow.json')
     stage[0] = 'policy'
-    require(type(raw.get('schema')) is int and raw['schema'] == 1 and raw.get('settling_policy') == POLICY and canonical(raw['settling_policy']) == canonical(POLICY))
+    require(type(raw.get('schema')) is int and raw['schema'] == 2 and raw.get('settling_policy') == POLICY and canonical(raw['settling_policy']) == canonical(POLICY))
     require(raw.get('timing_perturbed') is True and raw.get('original_parity') is False)
     require(raw.get('logging_mode') == 'compact' and raw.get('history_mode') == 'current-stacks')
     stage[0] = 'environment'
@@ -310,7 +310,7 @@ def _project_shadow(records, measurement, process, expected, case, stage):
     require(result.get('settled_baseline_shadow') is True and result.get('scan_mode') == 'live'
             and result.get('mode') == ('product' if case == CASES[0] else 'heap-control')
             and result.get('reader_mode') == ('initial-query-only' if case == CASES[-1] else 'subscribed'))
-    shadow = {'schema': 1, 'elapsed_time_resolution_ms': 1, 'timing_markers': {key: None if value is None else round((value - origin) * 1000) for key, value in markers.items()}, 'timing_evidence': False, 'settling_policy': POLICY, 'status': raw['status'], 'chosen_index': chosen,
+    shadow = {'schema': 2, 'elapsed_time_resolution_ms': 1, 'timing_markers': {key: None if value is None else round((value - origin) * 1000) for key, value in markers.items()}, 'timing_evidence': False, 'settling_policy': POLICY, 'status': raw['status'], 'chosen_index': chosen,
               'probes': public_probes, 'captures': public_captures, 'errors': raw['errors'],
               'environments': raw['environments'], 'observer_query_policy': observer,
               'timing_perturbed': True, 'original_parity': False, 'logging_mode': 'compact', 'history_mode': 'current-stacks',
@@ -330,20 +330,20 @@ def timing_complete(value):
     captures = {row['label']: row for row in value['captures']}
     if CAPTURES[0] not in captures or CAPTURES[2] not in captures: return False
     baseline, settling, first, last = (markers[key] for key in TIME_KEYS)
-    if not baseline <= settling <= captures[CAPTURES[0]]['start_elapsed_ms']: return False
+    if not baseline <= captures[CAPTURES[0]]['start_elapsed_ms'] <= captures[CAPTURES[0]]['end_elapsed_ms'] <= settling: return False
     if not first <= last <= captures[CAPTURES[2]]['start_elapsed_ms']: return False
     if captures[CAPTURES[2]]['endpoint'] != 'observer-exited': return False
     if any(row['end_elapsed_ms'] > first or row['host_activity_zero'] is not True for label, row in captures.items() if label != CAPTURES[2]): return False
     # Rounded time differences have at most 1 ms uncertainty. Boundary values
     # retain the exact probe predicate but cannot prove strict timing evidence.
     if any(not row['within_settling_deadline'] or row['end_elapsed_ms'] - row['start_elapsed_ms'] >= 5000 or row['end_elapsed_ms'] - settling >= 14999 for row in value['probes']): return False
-    return all(row['end_elapsed_ms'] - settling < 14999 for label, row in captures.items() if label != CAPTURES[2])
+    return True
 
 
 def validate_shadow(value, measurement, process, case):
     fields(value, ('schema', 'elapsed_time_resolution_ms', 'timing_markers', 'timing_evidence', 'settling_policy', 'status', 'chosen_index', 'probes', 'captures', 'errors', 'environments', 'observer_query_policy',
                    'timing_perturbed', 'original_parity', 'logging_mode', 'history_mode', 'original_strict_verdict', 'candidate_hypothetical_verdict'))
-    require(type(value['schema']) is int and value['schema'] == 1)
+    require(type(value['schema']) is int and value['schema'] == 2)
     require(type(value['elapsed_time_resolution_ms']) is int and value['elapsed_time_resolution_ms'] == 1)
     require(value['settling_policy'] == POLICY and canonical(value['settling_policy']) == canonical(POLICY))
     require(value['timing_perturbed'] is True and value['original_parity'] is False and value['logging_mode'] == 'compact' and value['history_mode'] == 'current-stacks')
@@ -368,6 +368,7 @@ def validate_shadow(value, measurement, process, case):
         window(row, 330000)
         require(value['timing_markers']['settling_started'] is not None)
         require(type(row['within_settling_deadline']) is bool)
+        require(row['start_elapsed_ms'] >= markers['settling_started'])
         elapsed = row['end_elapsed_ms'] - markers['settling_started']
         if elapsed < 14999: require(row['within_settling_deadline'])
         if elapsed > 15001: require(not row['within_settling_deadline'])
@@ -400,7 +401,8 @@ def validate_shadow(value, measurement, process, case):
         if label != CAPTURES[2] and markers['first_measurement_cycle'] is not None: require(row['end_elapsed_ms'] <= markers['first_measurement_cycle'])
         if label == CAPTURES[2] and markers['last_original_scan_finished'] is not None: require(markers['last_original_scan_finished'] <= row['start_elapsed_ms'])
         if label == CAPTURES[0]:
-            if markers['baseline_finished'] is not None and markers['settling_started'] is not None: require(markers['baseline_finished'] <= markers['settling_started'] <= row['start_elapsed_ms'])
+            if markers['baseline_finished'] is not None: require(markers['baseline_finished'] <= row['start_elapsed_ms'])
+            if markers['settling_started'] is not None: require(row['end_elapsed_ms'] <= markers['settling_started'])
             require(row['source_label'] == 'baseline' and (not probes or row['end_elapsed_ms'] <= probes[0]['start_elapsed_ms']))
         if label == CAPTURES[1]:
             require(chosen is not None and row['source_label'] == 'shadow-probe-' + str(chosen) and row['start_elapsed_ms'] >= probes[chosen]['end_elapsed_ms'])
@@ -539,7 +541,7 @@ def evidence_passed(case):
 
 def validate_summary(value):
     fields(value, ('schema', 'identity', 'builds', 'cases', 'completed', 'strict_checks_passed', 'evidence_checks_passed', 'temporary_cleanup'))
-    require(type(value['schema']) is int and value['schema'] == 2)
+    require(type(value['schema']) is int and value['schema'] == 3)
     identity = value['identity']
     fields(identity, ('checkout_sha', 'macos', 'os_build', 'architecture', 'xcode', 'scan_mode', 'history_mode'))
     require(type(identity['checkout_sha']) is str and re.fullmatch(r'[0-9a-f]{40}', identity['checkout_sha']) is not None)
@@ -621,7 +623,7 @@ def campaign(root):
     private = root / 'private'
     private.mkdir(mode=0o700)
     public = root / 'summary.json'
-    summary = {'schema': 2, 'identity': observed_identity, 'builds': {}, 'cases': [], 'completed': False,
+    summary = {'schema': 3, 'identity': observed_identity, 'builds': {}, 'cases': [], 'completed': False,
                'strict_checks_passed': False, 'evidence_checks_passed': False, 'temporary_cleanup': 'not-run'}
     save_summary(public, summary)
     environment = dict(os.environ)
