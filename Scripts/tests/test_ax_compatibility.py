@@ -1493,7 +1493,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 elif command[0] == "leaks":
                     capture = next((value for value in command if value.startswith("--outputGraph=")), None)
                     if capture:
-                        self.assertEqual("--fullStackHistory" in command, heap_diagnostics or live_attribution)
+                        self.assertEqual("--fullStackHistory" in command, heap_diagnostics)
                         if live_attribution:
                             self.assertIn(scanned[-1], ("baseline", failed_scan))
                             self.assertEqual(pathlib.Path(capture.split("=", 1)[1]).stem, scanned[-1])

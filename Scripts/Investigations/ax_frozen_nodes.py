@@ -537,7 +537,7 @@ def capture_error_signals(output):
 
 
 def capture_live_point(pid, label, graphs, records, completed):
-    """A later auxiliary capture, never the ordinary live scan itself."""
+    """A later current-stack graph; compact histories cannot prove generations."""
     started = time.monotonic()
     row = {"label": label, "status": "failed", "exit_code": None,
            "after_scan_ms": round((started - completed) * 1000), "duration_ms": 0,
@@ -545,7 +545,7 @@ def capture_live_point(pid, label, graphs, records, completed):
            "graph_sha256": None, "error_signals": []}
     graph = graphs / (label + ".memgraph")
     try:
-        run = subprocess.run(["leaks", "--noContent", "--fullStacks", "--fullStackHistory",
+        run = subprocess.run(["leaks", "--noContent", "--fullStacks",
                               f"--outputGraph={graph}", str(pid)], capture_output=True, text=True, timeout=60)
         (graphs / (label + "-capture.txt")).write_text(run.stdout + run.stderr)
         row["exit_code"] = run.returncode

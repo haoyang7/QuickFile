@@ -83,12 +83,28 @@ def native_diagnostic_clues(output):
     return {"status": "recognized" if words else "unknown", "words": words, "truncated": truncated}
 
 
+def native_full_history_failure(stdout, stderr, pid):
+    """Classify complete private output before applying lossy display filters."""
+    if stdout and stderr:
+        return "unknown"
+    # Both static forms are present in leaks. Match the complete diagnostic,
+    # with this owned target PID and no extra line, word, or second channel.
+    message = (f"[fatal] Cannot save a memgraph with '--fullStackHistory' for pid {pid} "
+               "because it ran with MallocStackLogging lite mode. "
+               "Please run the process with full MallocStackLogging.")
+    pattern = r"(?:leaks\[[1-9][0-9]*\]: )?" + re.escape(message) + r"\n?"
+    return "unsupported_lite_mode" if re.fullmatch(pattern, stdout or stderr) else "unknown"
+
+
 def native_capture_comparison(pid, work):
     """One owned process, unchanged malloc settings, full history first."""
     cases = []
     for full in (True, False):
-        graph = work / ("baseline.memgraph" if full else "current-history.memgraph")
-        if full:
+        failure_kind = "unknown"
+        graph = work / ("full-history.memgraph" if full else "baseline.memgraph")
+        if not full:
+            # Exercise the live auxiliary contract itself, independently of
+            # the preceding full-history capability observation.
             captured = NODES.capture_live_point(pid, "baseline", work, work, time.monotonic())
             status, code = captured["status"], captured["exit_code"]
             log = work / "baseline-capture.txt"
@@ -98,17 +114,20 @@ def native_capture_comparison(pid, work):
                     diagnostic = stream.read(65537)
         else:
             try:
-                captured = subprocess.run(["leaks", "--noContent", "--fullStacks", f"--outputGraph={graph}", str(pid)],
+                captured = subprocess.run(["leaks", "--noContent", "--fullStacks", "--fullStackHistory",
+                                          f"--outputGraph={graph}", str(pid)],
                                           capture_output=True, text=True, timeout=60)
                 code = captured.returncode
                 status = "complete" if code in (0, 1) and graph.is_file() else "failed"
                 diagnostic = captured.stdout + "\n" + captured.stderr
+                failure_kind = native_full_history_failure(captured.stdout, captured.stderr, pid)
             except subprocess.TimeoutExpired:
                 status, code, diagnostic = "timeout", None, ""
             except OSError:
                 status, code, diagnostic = "failed", None, ""
         row = {"case": "full_stack_history" if full else "current_stack_history", "capture_status": status,
                "capture_exit_code": code, "graph_created": graph.is_file(),
+               "capture_failure_kind": failure_kind if status != "complete" else None,
                "capture_clues": native_diagnostic_clues(diagnostic) if status != "complete" else None,
                "history_status": "not_attempted", "history_exit_code": None, "history_clues": None}
         if status == "complete":
@@ -124,12 +143,29 @@ def native_capture_comparison(pid, work):
             except OSError:
                 row["history_status"] = "io_error"
         cases.append(row)
-    return {"schema": 1, "scope": "owned-native-capture-comparison", "same_process": True,
+    return {"schema": 2, "scope": "owned-native-capture-comparison", "same_process": True,
             "malloc_settings": {"MallocStackLogging": "1", "MallocStackLoggingNoCompact": "1"},
             "cases": cases}
 
 
 class AXLiveAttributionTests(unittest.TestCase):
+    def assert_native_capture_contract(self, comparison):
+        full, current = comparison["cases"]
+        self.assertEqual(current["case"], "current_stack_history")
+        self.assertEqual(full["case"], "full_stack_history")
+        for row in (current, full) if full["capture_status"] == "complete" else (current,):
+            self.assertEqual(row["capture_status"], "complete", row)
+            self.assertIn(row["capture_exit_code"], (0, 1), row)
+            self.assertTrue(row["graph_created"], row)
+            self.assertEqual((row["history_status"], row["history_exit_code"]), ("readable", 0), row)
+        if full["capture_status"] != "complete":
+            # Only classification of the complete private diagnostic can
+            # permit this capability failure. Display clues are not evidence.
+            self.assertEqual((full["capture_status"], full["capture_exit_code"], full["graph_created"],
+                              full["history_status"], full["history_exit_code"]),
+                             ("failed", 255, False, "not_attempted", None), full)
+            self.assertEqual(full["capture_failure_kind"], "unsupported_lite_mode", full)
+
     def test_native_diagnostic_clues_are_ordered_bounded_whitelist_words(self):
         self.assertEqual(native_diagnostic_clues(
             "leaks[123]: ERROR: --fullStackHistory is only supported with MallocStackLoggingNoCompact=1.\n"
@@ -171,40 +207,98 @@ class AXLiveAttributionTests(unittest.TestCase):
         self.assertEqual(native_diagnostic_clues(b"x" * 65533 + b" no"),
                          {"status": "recognized", "words": ["no"], "truncated": False})
 
-    def test_native_control_runs_after_full_history_failure_and_preserves_it(self):
+    def test_native_full_history_classification_requires_complete_single_channel_message(self):
+        message = ("[fatal] Cannot save a memgraph with '--fullStackHistory' for pid 9876 "
+                   "because it ran with MallocStackLogging lite mode. "
+                   "Please run the process with full MallocStackLogging.")
+        for prefix in ("", "leaks[123]: "):
+            for suffix in ("", "\n"):
+                output = prefix + message + suffix
+                for stdout, stderr in ((output, ""), ("", output)):
+                    with self.subTest(prefix=prefix, suffix=suffix, stdout=bool(stdout)):
+                        self.assertEqual(native_full_history_failure(stdout, stderr, 9876), "unsupported_lite_mode")
+        for stdout, stderr in (
+            ("", message + "\nPermission denied"),
+            ("", message + "\nUnexpected backend diagnostic 0x1234"),
+            ("", message + " unknownword"),
+            ("", message.replace("ran with", "ran unexpectedly with")),
+            ("", message.replace("9876", "9877")),
+            ("", message.replace("lite mode", "not enabled")),
+            ("", "different[123]: " + message),
+            ("", "leaks[unknown]: " + message),
+            ("", message + "\n\n"),
+            ("", "\n" + message),
+            ("unexpected", message),
+            (message, "\n"),
+            (message, message),
+            ("", ""),
+        ):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                self.assertEqual(native_full_history_failure(stdout, stderr, 9876), "unknown")
+
+    def test_native_current_contract_preserves_full_history_capability_and_rejects_unknown_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
             pid = 9876
-            def full_capture(actual_pid, label, graphs, records, completed):
-                self.assertEqual((actual_pid, label, graphs, records), (pid, "baseline", work, work))
-                (work / "baseline-capture.txt").write_text("fullStackHistory requires MallocStackLoggingNoCompact; "
-                                                          "compact mode not supported. /private/user 0x1234")
-                return {"status": "failed", "exit_code": 255}
+            (work / "baseline-live.stdout.txt").write_text("owned ordinary scan")
+            full_error = ("leaks[123]: [fatal] Cannot save a memgraph with '--fullStackHistory' for pid 9876 "
+                          "because it ran with MallocStackLogging lite mode. "
+                          "Please run the process with full MallocStackLogging.\n")
             commands = []
             def run(command, **kwargs):
                 commands.append(command)
                 if command[0] == "leaks":
+                    if "--fullStackHistory" in command:
+                        self.assertEqual(command, ["leaks", "--noContent", "--fullStacks", "--fullStackHistory",
+                                                   f"--outputGraph={work / 'full-history.memgraph'}", str(pid)])
+                        return subprocess.CompletedProcess(command, 255, "", full_error)
                     self.assertEqual(command, ["leaks", "--noContent", "--fullStacks",
-                                               f"--outputGraph={work / 'current-history.memgraph'}", str(pid)])
-                    (work / "current-history.memgraph").write_bytes(b"owned graph")
+                                               f"--outputGraph={work / 'baseline.memgraph'}", str(pid)])
+                    (work / "baseline.memgraph").write_bytes(b"owned graph")
                     return subprocess.CompletedProcess(command, 0, "", "")
-                self.assertEqual(command, ["malloc_history", "--allEvents", "--fullStacks", str(work / "current-history.memgraph")])
+                self.assertEqual(command, ["malloc_history", "--allEvents", "--fullStacks", str(work / "baseline.memgraph")])
                 return subprocess.CompletedProcess(command, 0, "ALLOC 0x1234 private stack\n", "")
-            with mock.patch.object(NODES, "capture_live_point", side_effect=full_capture), \
-                    mock.patch.object(subprocess, "run", side_effect=run):
+            with mock.patch.object(subprocess, "run", side_effect=run):
                 result = native_capture_comparison(pid, work)
+            self.assert_native_capture_contract(result)
             full, control = result["cases"]
             self.assertEqual((full["capture_status"], full["capture_exit_code"], full["graph_created"], full["history_status"]),
                              ("failed", 255, False, "not_attempted"))
-            self.assertEqual(full["capture_clues"]["words"],
-                ["fullStackHistory", "requires", "MallocStackLoggingNoCompact", "compact", "mode", "not", "supported"])
             self.assertEqual((control["capture_status"], control["capture_exit_code"], control["history_status"]),
                              ("complete", 0, "readable"))
-            self.assertEqual(len(commands), 2)
+            self.assertEqual(len(commands), 3)
             self.assertTrue(result["same_process"])
             encoded = json.dumps(result)
             for private in ("/private", "0x1234", "9876", directory):
                 self.assertNotIn(private, encoded)
+            for case, field, value in (
+                (0, "capture_status", "timeout"), (0, "capture_exit_code", 2), (0, "graph_created", True),
+                (0, "capture_failure_kind", "unknown"),
+                (1, "capture_status", "failed"), (1, "capture_exit_code", 255), (1, "graph_created", False),
+                (1, "history_status", "no_allocations"), (1, "history_exit_code", 1),
+            ):
+                with self.subTest(case=case, field=field, value=value):
+                    invalid = copy.deepcopy(result)
+                    invalid["cases"][case][field] = value
+                    with self.assertRaises(AssertionError):
+                        self.assert_native_capture_contract(invalid)
+            original_error = full_error
+            for extra in ("Permission denied\n", "Unexpected backend diagnostic 0x1234\n"):
+                full_error = original_error + extra
+                with self.subTest(extra=extra), mock.patch.object(subprocess, "run", side_effect=run):
+                    rejected = native_capture_comparison(pid, work)
+                # These additions disappear from the display whitelist but
+                # must survive classification and reject the actual contract.
+                self.assertEqual(rejected["cases"][0]["capture_clues"], full["capture_clues"])
+                self.assertEqual(rejected["cases"][0]["capture_failure_kind"], "unknown")
+                with self.assertRaises(AssertionError):
+                    self.assert_native_capture_contract(rejected)
+            supported = copy.deepcopy(result)
+            supported["cases"][0] = control | {"case": "full_stack_history"}
+            self.assert_native_capture_contract(supported)
+            supported["cases"][0]["history_status"] = "no_allocations"
+            with self.assertRaises(AssertionError):
+                self.assert_native_capture_contract(supported)
 
     @unittest.skipUnless(sys.platform == "darwin" and os.environ.get("QUICKFILE_AX_LIVE_CAPTURE_SMOKE") == "1",
                          "Explicit native live-capture investigation only")
@@ -255,11 +349,9 @@ class AXLiveAttributionTests(unittest.TestCase):
                             process.communicate(timeout=5)
                         self.assertIsNotNone(process.returncode, "Owned CLI fixture did not exit")
                     print(json.dumps(comparison, separators=(",", ":")), flush=True)
-                    # The successful control must never replace a failed full-
-                    # history contract. Assert only after both captures/cleanup.
-                    full = comparison["cases"][0]
-                    self.assertEqual(full["capture_status"], "complete", full)
-                    self.assertEqual(full["history_status"], "readable", full)
+                    # Current-stack capture is the live contract. Full-history
+                    # support remains a separate, bounded capability check.
+                    self.assert_native_capture_contract(comparison)
         finally:
             if not any(root.iterdir()):
                 root.rmdir()
