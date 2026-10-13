@@ -4400,11 +4400,16 @@ class AXCompatibilityCopyTests(unittest.TestCase):
             if result.returncode == 77:
                 LIFECYCLE.record(records, kind, result.returncode)
                 self.skipTest("AX notification coverage unavailable: " + result.stdout.strip())
-            receipt = json.loads((records / "result.json").read_text())
+            diagnostics = (f"AX {kind} runner exit code: {result.returncode}\n"
+                           f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+            self.assertIn(result.returncode, (0,) if require_strict_heap else (0, 1), diagnostics)
+            try:
+                receipt = json.loads((records / "result.json").read_text())
+                LIFECYCLE.evaluate(kind, receipt, result.returncode)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                raise self.failureException(f"AX receipt validation failed: {error}\n{diagnostics}") from error
             if require_strict_heap:
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(receipt["coverage"], "passed")
-            LIFECYCLE.evaluate(kind, receipt, result.returncode)
+                self.assertEqual(receipt["coverage"], "passed", diagnostics)
             self.assertEqual(receipt["notifications"], 60)
             self.assertGreaterEqual(receipt["ordinary_compensations"], 30)
             self.assertGreaterEqual(receipt["mutable_compensations"], 30)
