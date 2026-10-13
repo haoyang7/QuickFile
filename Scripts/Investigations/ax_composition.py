@@ -214,7 +214,9 @@ def _group_tree(lines, instances, marker, header_name, total_bytes, failure_cont
             failure_context[:] = [row["line"] for row in stack[-2:]] + [line]
         if " --> " in text:
             edge, text = text.split(" --> ", 1)
-            require(re.fullmatch(frozen.EDGE_NAME, edge) is not None)
+            # Grouped reports can compose storage offsets ("storage + 8 + 8").
+            # This reference annotation contributes no nodes or bytes.
+            require(re.fullmatch(frozen.EDGE_NAME + r"(?: \+ [0-9]{1,10})*", edge) is not None)
         if text.startswith("CYCLE BACK TO "):
             require(count is None and stack and indent == stack[-1]["indent"] + 3, "backref")
             target = _name(text[len("CYCLE BACK TO "):], "backref")
