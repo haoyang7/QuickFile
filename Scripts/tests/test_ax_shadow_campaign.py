@@ -50,7 +50,7 @@ def manifest(mode):
 
 
 def initial():
-    return {'schema': 3, 'identity': {'checkout_sha': 'a' * 40, 'macos': '26.0.1', 'os_build': '25A354', 'architecture': 'arm64',
+    return {'schema': 4, 'identity': {'checkout_sha': 'a' * 40, 'macos': '26.0.1', 'os_build': '25A354', 'architecture': 'arm64',
         'xcode': '26.3', 'scan_mode': 'settled-baseline-shadow', 'history_mode': 'current-stacks'}, 'builds': {}, 'cases': [],
         'completed': False, 'strict_checks_passed': False, 'evidence_checks_passed': False, 'temporary_cleanup': 'not-run'}
 
@@ -87,7 +87,8 @@ class TemporaryTests(unittest.TestCase):
             'mode': 'product' if case == 'patched-product' else 'heap-control', 'reader_mode': 'initial-query-only' if case == C.CASES[-1] else 'subscribed',
             **dict.fromkeys(C.ACTIVITY, 0)}
         self.save('result.json', result)
-        self.save('process-cleanup.json', {'processes_exited': True})
+        self.save('process-cleanup.json', {'processes_exited': True, 'errors': [],
+            'host': {'exited': True, 'errors': []}, 'reader': {'exited': True, 'errors': []}})
         external = {'receipt_mode': 'external-startup', 'requested': 'off', 'executables': self.hashes, 'binary_reuse_verified': True}
         for role in ('host', 'reader'):
             external[role] = {'malloc_scribble': 'unset', 'path_matches': True, 'startup_executable_matches': True, 'alive_during_check': True, 'executable_sha256': self.hashes[role]}
@@ -429,6 +430,7 @@ class PublicTests(TemporaryTests):
                 for tool in ('list', 'tree'): offline['tools'].append({'tool': tool, 'label': label, 'status': 'complete', 'return_code': 0, 'cleanup_confirmed': True})
             offline['diffs'] = {'initial_to_late': C.histogram_diff(snapshot(2), snapshot(3)), 'candidate_to_late': C.histogram_diff(snapshot(3), snapshot(3))}
             value['cases'].append({'name': name, 'process_run': process(), 'measurement': copy.deepcopy(measurement), 'shadow': sh, 'shadow_projection_reason': 'none',
+                'original_result': {'coverage': 'failed', 'failure_counts': copy.deepcopy(measurement['failure_counts'])}, 'measurement_projection_reason': 'none',
                 'offline_process_run': process(0), 'offline': offline, 'offline_cleanup': {key: offline[key] for key in ('tools', 'process_cleanup_confirmed')}, 'fixture_cleanup_confirmed': True, 'strict_checks_passed': False, 'evidence_checks_passed': True, 'cleanup_confirmed': True})
         value.update(completed=True, evidence_checks_passed=True)
         C.validate_summary(value)
@@ -457,9 +459,15 @@ class PublicTests(TemporaryTests):
         public.unlink(); os.link(original, public)
         with self.assertRaises(ValueError): C.read_json(public)
     def test_previous_campaign_schema_is_rejected(self):
-        for schema in (1, 2):
+        for schema in (1, 2, 3):
             value = initial(); value['schema'] = schema
             with self.subTest(schema=schema), self.assertRaises(ValueError): C.validate_summary(value)
+
+    def test_manifest_requires_successful_build_and_confirmed_cleanup(self):
+        for run in (process(1), process(124, status='timeout'), process(125, complete=False), process(0, status='timeout')):
+            value = initial()
+            value['builds']['ordinary'] = {'process_run': run, 'manifest': manifest('ordinary')}
+            with self.subTest(run=run), self.assertRaises(ValueError): C.validate_summary(value)
 
     def test_unknown_fields_wrong_numbers_and_privacy_strings_rejected(self):
         for mutate in (lambda v: v.update(message='private'), lambda v: v.update(schema=True), lambda v: v['identity'].update(checkout_sha='secret'), lambda v: v['identity'].update(history_mode='full-no-compact')):
@@ -569,7 +577,8 @@ class CampaignTests(TemporaryTests):
                 self.assertFalse(value['strict_checks_passed'])
                 self.assertEqual(len(value['cases']), 3 if failure == 'case-budget' else 4)
 
-    def run_campaign(self, *, cleanup=True, missing_capture=False, tool_cleanup=True, corrupt_evidence=False, strict_failed=True, cleanup_failure=False, shadow_failure=False):
+    def run_campaign(self, *, cleanup=True, missing_capture=False, tool_cleanup=True, corrupt_evidence=False, strict_failed=True, cleanup_failure=False, shadow_failure=False,
+                     fixture_cleanup=None, measurement_failure=None):
         calls = []
         def owned(command, log, env, timeout):
             calls.append((command, timeout))
@@ -596,6 +605,15 @@ class CampaignTests(TemporaryTests):
             measurement, _ = C.project_measurement(records, process(1 if strict_failed else 0))
             shadow = C.project_shadow(records, measurement, process(1 if strict_failed else 0), self.hashes, name)
             self.save('projected-measurement.json', measurement); self.save('projected-shadow.json', shadow)
+            if fixture_cleanup is not None: self.save('process-cleanup.json', fixture_cleanup)
+            if measurement_failure == 'scan-binding':
+                (records / (C.LABELS[0] + '-original.stdout.txt')).write_text(report(9, 432))
+            elif measurement_failure == 'missing-counts':
+                raw = C.read_json(records / 'result.json')
+                for key in C.ACTIVITY: del raw[key]
+                self.save('result.json', raw)
+            elif measurement_failure == 'result-json':
+                (records / 'result.json').write_text('{')
             if shadow_failure:
                 raw = C.read_json(records / 'settled-baseline-shadow.json')
                 raw['environments']['host']['MallocStackLogging'] = 'other'
@@ -607,6 +625,50 @@ class CampaignTests(TemporaryTests):
             if cleanup_failure: stack.enter_context(mock.patch.object(C.shutil, 'rmtree', side_effect=OSError('controlled cleanup failure')))
             code = C.main(['--work-directory', str(self.root / 'campaign')])
         return code, C.read_json(self.root / 'campaign/summary.json'), calls
+
+    def test_fixture_cleanup_errors_stop_and_retain_raw_evidence(self):
+        parent = self.root
+        for kind in ('top', 'host', 'reader', 'missing'):
+            with self.subTest(kind=kind):
+                self.root = parent / kind
+                cleanup = {'processes_exited': True, 'errors': [],
+                    'host': {'exited': True, 'errors': []}, 'reader': {'exited': True, 'errors': []}}
+                if kind == 'top': cleanup['errors'] = ['launch_services']
+                elif kind == 'missing': del cleanup['host']
+                else: cleanup[kind]['errors'] = ['stop_request_failed']
+                code, value, calls = self.run_campaign(fixture_cleanup=cleanup)
+                self.assertEqual(code, 1)
+                self.assertEqual(len(value['cases']), 1)
+                self.assertFalse(value['cases'][0]['fixture_cleanup_confirmed'])
+                self.assertFalse(any('--offline' in command for command, _ in calls))
+                self.assertEqual(value['temporary_cleanup'], 'retained-unconfirmed')
+                self.assertTrue((self.root / 'campaign/private').is_dir())
+
+    def test_measurement_failure_preserves_original_result_and_private_evidence(self):
+        parent = self.root
+        for strict_failed, failure in ((True, 'scan-binding'), (False, 'scan-binding'), (True, 'missing-counts'), (True, 'result-json')):
+            with self.subTest(strict_failed=strict_failed, failure=failure):
+                self.root = parent / f'{failure}-{strict_failed}'
+                code, value, calls = self.run_campaign(strict_failed=strict_failed, measurement_failure=failure)
+                self.assertEqual(code, 1)
+                self.assertEqual(len(value['cases']), 4)
+                self.assertEqual(value['temporary_cleanup'], 'retained-evidence')
+                self.assertTrue((self.root / 'campaign/private').is_dir())
+                self.assertEqual(C.main(['--validate-public', '--work-directory', str(self.root / 'campaign')]), 0)
+                for row in value['cases']:
+                    self.assertTrue(row['cleanup_confirmed'])
+                    self.assertIsNone(row['measurement'])
+                    self.assertEqual(row['measurement_projection_reason'], 'invalid')
+                    if failure == 'result-json': self.assertIsNone(row['original_result'])
+                    else:
+                        self.assertEqual(row['original_result']['coverage'], 'failed' if strict_failed else 'passed')
+                        self.assertEqual(row['original_result']['failure_counts']['heap_baseline'], int(strict_failed))
+                forged = copy.deepcopy(value); forged['temporary_cleanup'] = 'complete'
+                with self.assertRaises(ValueError): C.validate_summary(forged)
+                original = value['cases'][0]['original_result']
+                if original is not None:
+                    original['raw'] = 'private failure message'
+                    with self.assertRaises(ValueError): C.validate_summary(value)
     def test_four_cases_reuse_two_builds_red_strict_cleanup_complete(self):
         code, value, calls = self.run_campaign()
         self.assertEqual(code, 1)

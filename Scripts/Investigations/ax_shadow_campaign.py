@@ -24,7 +24,7 @@ import ax_frozen_nodes as frozen
 from ax_external_receipt import fixture_sources, load_prepared_build, validate_external_receipt, validate_empty_control_build
 from ax_probe_report import leak_groups, validation_failure_counts
 from ax_process import run_owned
-from ax_reference_campaign import validate_process
+from ax_reference_campaign import fixture_clean, validate_process
 
 ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_LIMIT = 512 * 1024
@@ -202,10 +202,15 @@ def project_measurement(records, process):
         require(len(result['scans']) == len(rows))
         for row, summary in zip(rows, result['scans']):
             require(all(summary.get(key) == value for key, value in row.items() if key != 'host'))
-    counts = {key: result.get(key, 0) for key in ACTIVITY}
+    counts = {key: result.get(key) for key in ACTIVITY}
     require(all(integer(value, 100000) for value in counts.values()))
     measurement = {'original_scans': scans, 'failure_counts': validation_failure_counts(result), 'activity_counts': counts}
     return measurement, result
+
+
+def project_original_result(result):
+    failures = validation_failure_counts(result)
+    return {'coverage': result['coverage'], 'failure_counts': failures}
 
 
 def finite_time(value):
@@ -541,7 +546,7 @@ def evidence_passed(case):
 
 def validate_summary(value):
     fields(value, ('schema', 'identity', 'builds', 'cases', 'completed', 'strict_checks_passed', 'evidence_checks_passed', 'temporary_cleanup'))
-    require(type(value['schema']) is int and value['schema'] == 3)
+    require(type(value['schema']) is int and value['schema'] == 4)
     identity = value['identity']
     fields(identity, ('checkout_sha', 'macos', 'os_build', 'architecture', 'xcode', 'scan_mode', 'history_mode'))
     require(type(identity['checkout_sha']) is str and re.fullmatch(r'[0-9a-f]{40}', identity['checkout_sha']) is not None)
@@ -549,13 +554,15 @@ def validate_summary(value):
     require(type(identity['os_build']) is str and re.fullmatch(r'25[A-Z][0-9]{1,6}[a-z]?', identity['os_build']) is not None)
     require(identity['architecture'] == 'arm64' and identity['xcode'] == '26.3' and identity['scan_mode'] == 'settled-baseline-shadow' and identity['history_mode'] == 'current-stacks')
     require(all(type(value[key]) is bool for key in ('completed', 'strict_checks_passed', 'evidence_checks_passed')))
-    require(value['temporary_cleanup'] in ('not-run', 'complete', 'retained-unconfirmed', 'failed'))
+    require(value['temporary_cleanup'] in ('not-run', 'complete', 'retained-unconfirmed', 'retained-evidence', 'failed'))
     require(type(value['builds']) is dict and set(value['builds']) <= {'ordinary', 'pure-appkit'})
     for mode, row in value['builds'].items():
         fields(row, ('process_run', 'manifest'))
         validate_process(row['process_run'])
         manifest = row['manifest']
         if manifest is None: continue
+        require(row['process_run']['status'] == 'completed' and row['process_run']['return_code'] == 0
+                and row['process_run']['cleanup']['complete'])
         fields(manifest, ('schema', 'build_mode', 'sources', 'executables', *(['build_evidence'] if mode == 'pure-appkit' else [])))
         require(type(manifest['schema']) is int and manifest['schema'] == (1 if mode == 'ordinary' else 2) and manifest['build_mode'] == mode)
         fields(manifest['sources'], fixture_sources(mode))
@@ -565,12 +572,24 @@ def validate_summary(value):
     cases = value['cases']
     require(type(cases) is list and len(cases) <= 4)
     for index, case in enumerate(cases):
-        fields(case, ('name', 'process_run', 'measurement', 'shadow', 'shadow_projection_reason', 'offline_process_run', 'offline', 'offline_cleanup', 'fixture_cleanup_confirmed',
+        fields(case, ('name', 'process_run', 'original_result', 'measurement', 'measurement_projection_reason', 'shadow', 'shadow_projection_reason', 'offline_process_run', 'offline', 'offline_cleanup', 'fixture_cleanup_confirmed',
                       'strict_checks_passed', 'evidence_checks_passed', 'cleanup_confirmed'))
         require(case['name'] == CASES[index])
         require(all(type(case[key]) is bool for key in ('fixture_cleanup_confirmed', 'strict_checks_passed', 'evidence_checks_passed', 'cleanup_confirmed')))
         validate_process(case['process_run'])
-        if case['measurement'] is not None: validate_measurement(case['measurement'])
+        original = case['original_result']
+        if original is not None:
+            fields(original, ('coverage', 'failure_counts'))
+            require(original['coverage'] in ('passed', 'measured', 'failed'))
+            fields(original['failure_counts'], FAILURES)
+            require(all(integer(count, 64) for count in original['failure_counts'].values()))
+            require(sum(original['failure_counts'].values()) <= 64)
+            require((original['coverage'] == 'failed') == any(original['failure_counts'].values()))
+        require(case['measurement_projection_reason'] in ('unavailable', 'none', 'invalid'))
+        require((case['measurement'] is not None) == (case['measurement_projection_reason'] == 'none'))
+        if case['measurement'] is not None:
+            validate_measurement(case['measurement'])
+            require(original is not None and case['measurement']['failure_counts'] == original['failure_counts'])
         require(case['shadow_projection_reason'] in PROJECTION_REASONS and (case['shadow'] is not None) == (case['shadow_projection_reason'] == 'none'))
         if case['shadow'] is not None:
             require(case['measurement'] is not None)
@@ -590,6 +609,12 @@ def validate_summary(value):
         require(case['strict_checks_passed'] == (strict_verdict(case['measurement'], case['process_run']) == 'passed' and case['cleanup_confirmed']))
         require(case['evidence_checks_passed'] == bool(evidence_passed(case)))
         if index < len(cases) - 1: require(case['cleanup_confirmed'])
+    if value['temporary_cleanup'] == 'complete':
+        require(all(row['process_run']['cleanup']['complete'] for row in value['builds'].values()))
+        require(all(case['cleanup_confirmed'] and case['measurement_projection_reason'] == 'none' for case in cases))
+    if value['temporary_cleanup'] == 'retained-evidence':
+        require(all(case['cleanup_confirmed'] for case in cases))
+        require(any(case['measurement_projection_reason'] == 'invalid' for case in cases))
     require(not value['completed'] or len(cases) == 4)
     for key in ('strict_checks_passed', 'evidence_checks_passed'):
         require(value[key] == (value['completed'] and all(case[key] for case in cases)))
@@ -623,12 +648,13 @@ def campaign(root):
     private = root / 'private'
     private.mkdir(mode=0o700)
     public = root / 'summary.json'
-    summary = {'schema': 3, 'identity': observed_identity, 'builds': {}, 'cases': [], 'completed': False,
+    summary = {'schema': 4, 'identity': observed_identity, 'builds': {}, 'cases': [], 'completed': False,
                'strict_checks_passed': False, 'evidence_checks_passed': False, 'temporary_cleanup': 'not-run'}
     save_summary(public, summary)
     environment = dict(os.environ)
     for key in ('MallocScribble', 'MallocStackLogging', 'MallocStackLoggingNoCompact'): environment.pop(key, None)
     cleanup_confirmed = True
+    evidence_preserved = True
     prepared = {}
     runner = ROOT / 'Scripts/Investigations/verify-ax-compatibility.py'
     try:
@@ -656,19 +682,28 @@ def campaign(root):
                 '--prepared-fixture-directory', str(directory), '--work-directory', str(case_root / 'fixture'), '--records-directory', str(records),
                 *(['--heap-control'] if name != CASES[0] else []), *(['--empty-control-mode', mode] if mode == 'pure-appkit' else []),
                 *(['--reference-idle'] if name == CASES[-1] else [])], case_root / 'measurement.log', environment, timeout=330)
-            case = {'name': name, 'process_run': process, 'measurement': None, 'shadow': None, 'shadow_projection_reason': 'invalid', 'offline_process_run': None,
+            case = {'name': name, 'process_run': process, 'original_result': None, 'measurement': None, 'measurement_projection_reason': 'unavailable',
+                    'shadow': None, 'shadow_projection_reason': 'invalid', 'offline_process_run': None,
                     'offline': None, 'offline_cleanup': None, 'fixture_cleanup_confirmed': False, 'strict_checks_passed': False, 'evidence_checks_passed': False,
                     'cleanup_confirmed': False}
             summary['cases'].append(case)
             cleanup_confirmed = process['cleanup']['complete']
             try:
                 cleanup = read_json(records / 'process-cleanup.json')
-                case['fixture_cleanup_confirmed'] = cleanup.get('processes_exited') is True
+                case['fixture_cleanup_confirmed'] = fixture_clean(cleanup)
                 cleanup_confirmed = cleanup_confirmed and case['fixture_cleanup_confirmed']
             except (ValueError, OSError, TypeError): cleanup_confirmed = False
             try:
-                case['measurement'], result = project_measurement(records, process)
+                case['original_result'] = project_original_result(read_json(records / 'result.json'))
             except (ValueError, OSError, TypeError, KeyError, RuntimeError, UnicodeError): pass
+            try:
+                measurement, result = project_measurement(records, process)
+                require(case['original_result'] == project_original_result(result))
+                case['measurement'] = measurement
+                case['measurement_projection_reason'] = 'none'
+            except (ValueError, OSError, TypeError, KeyError, RuntimeError, UnicodeError):
+                case['measurement_projection_reason'] = 'invalid'
+                evidence_preserved = False
             if case['measurement'] is not None:
                 try:
                     case['shadow'] = project_shadow(records, case['measurement'], process, hashes, name)
@@ -708,7 +743,7 @@ def campaign(root):
         for key in ('strict_checks_passed', 'evidence_checks_passed'): summary[key] = all(case[key] for case in summary['cases'])
         return_code = 0 if summary['strict_checks_passed'] and summary['evidence_checks_passed'] else 1
     finally:
-        if cleanup_confirmed:
+        if cleanup_confirmed and evidence_preserved:
             # A failed publication must leave the raw evidence recoverable.
             # Preflight the final receipt before deleting any private files.
             try:
@@ -722,7 +757,8 @@ def campaign(root):
                 summary['temporary_cleanup'] = 'complete'
             except OSError:
                 summary['temporary_cleanup'] = 'failed'
-        else: summary['temporary_cleanup'] = 'retained-unconfirmed'
+        elif not cleanup_confirmed: summary['temporary_cleanup'] = 'retained-unconfirmed'
+        else: summary['temporary_cleanup'] = 'retained-evidence'
         save_summary(public, summary)
     return return_code if summary['temporary_cleanup'] == 'complete' else 1
 

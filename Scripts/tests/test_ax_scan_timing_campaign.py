@@ -160,6 +160,15 @@ class TemporaryTests(unittest.TestCase):
 
 
 class ProjectionTests(TemporaryTests):
+    def test_failed_measurement_cannot_change_planned_install_mode(self):
+        value = self.project(partial=True)
+        for role in ('host', 'reader'):
+            with self.subTest(role=role):
+                changed = copy.deepcopy(value)
+                changed['environments'][role][C.INSTALL_ENV] = 'preflight-only'
+                with self.assertRaises(ValueError):
+                    C.validate_measurement(changed, manifest()['executables'], 'twice', 'installed')
+
     def test_trial_initializer_policy_contract_is_order_independent_and_typed(self):
         spec = importlib.util.spec_from_file_location("ax_scan_timing_trial_contract", INVESTIGATIONS / "ax_reader_exit_trial.py")
         trial = importlib.util.module_from_spec(spec)

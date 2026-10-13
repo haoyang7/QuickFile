@@ -62,6 +62,12 @@ def validate_process(value):
         require(cleanup["group_signal"] != "failed" and cleanup["group_members_exited"] and cleanup["leader_reaped"])
 
 
+def fixture_clean(cleanup):
+    return (type(cleanup) is dict and cleanup.get("processes_exited") is True and cleanup.get("errors") == []
+            and all(type(cleanup.get(role)) is dict and cleanup[role].get("exited") is True
+                    and cleanup[role].get("errors") == [] for role in ("host", "reader")))
+
+
 def project_measurement(result, external, input_receipt, expected, case):
     require(result.get("reference_validation") is True and result.get("scan_mode") == "diagnostic")
     require(result.get("mode") == ("product" if case == "patched-product" else "heap-control"))
@@ -93,7 +99,7 @@ def project_measurement(result, external, input_receipt, expected, case):
 def validate_summary(value):
     from ax_reference_validation import validate_summary as validate_reference
     require(type(value) is dict and set(value) == {"schema", "identity", "builds", "cases", "completed", "strict_checks_passed", "evidence_checks_passed", "temporary_cleanup"})
-    require(type(value["schema"]) is int and value["schema"] == 1)
+    require(type(value["schema"]) is int and value["schema"] == 2)
     identity = value["identity"]
     require(type(identity) is dict and set(identity) == {"checkout_sha", "macos", "os_build", "architecture", "xcode", "scan_mode", "history_mode"})
     require(type(identity["checkout_sha"]) is str and re.fullmatch(r"[0-9a-f]{40}", identity["checkout_sha"]) is not None)
@@ -102,7 +108,7 @@ def validate_summary(value):
     require(identity["architecture"] == "arm64" and identity["xcode"] == "26.3")
     require(identity["scan_mode"] == "frozen-reference-investigation" and identity["history_mode"] == "full-no-compact")
     require(all(type(value[key]) is bool for key in ("completed", "strict_checks_passed", "evidence_checks_passed")))
-    require(value["temporary_cleanup"] in ("not-run", "complete", "retained-unconfirmed", "failed"))
+    require(value["temporary_cleanup"] in ("not-run", "complete", "retained-unconfirmed", "retained-evidence", "failed"))
     builds = value["builds"]
     require(type(builds) is dict and set(builds) <= {"ordinary", "pure-appkit"})
     for mode, build in builds.items():
@@ -110,6 +116,8 @@ def validate_summary(value):
         validate_process(build["process_run"])
         manifest = build["manifest"]
         if manifest is not None:
+            require(build["process_run"]["status"] == "completed" and build["process_run"]["return_code"] == 0
+                    and build["process_run"]["cleanup"]["complete"])
             fields = {"schema", "build_mode", "sources", "executables"} | ({"build_evidence"} if mode == "pure-appkit" else set())
             require(type(manifest) is dict and set(manifest) == fields and manifest["build_mode"] == mode)
             require(type(manifest["schema"]) is int and manifest["schema"] == (1 if mode == "ordinary" else 2))
@@ -122,7 +130,7 @@ def validate_summary(value):
     cases = value["cases"]
     require(type(cases) is list and len(cases) <= 4)
     for index, case in enumerate(cases):
-        fields = {"name", "process_run", "measurement", "measurement_valid", "strict_checks_passed", "offline_process_run", "frozen", "bridge", "reference", "evidence_checks_passed", "cleanup_confirmed"}
+        fields = {"name", "process_run", "measurement", "measurement_valid", "projection_reason", "strict_checks_passed", "offline_process_run", "frozen", "bridge", "reference", "evidence_checks_passed", "cleanup_confirmed"}
         require(type(case) is dict and set(case) == fields and case["name"] == CASES[index])
         require(all(type(case[key]) is bool for key in ("measurement_valid", "strict_checks_passed", "evidence_checks_passed", "cleanup_confirmed")))
         validate_process(case["process_run"])
@@ -130,6 +138,8 @@ def validate_summary(value):
             validate_process(case["offline_process_run"])
         measurement = case["measurement"]
         require(case["measurement_valid"] == (measurement is not None))
+        require(case["projection_reason"] in ("unavailable", "none", "measurement-invalid", "offline-invalid"))
+        require((measurement is None) == (case["projection_reason"] in ("unavailable", "measurement-invalid")))
         if measurement is not None:
             require(type(measurement) is dict and set(measurement) == {"scan_totals", "failure_counts", "activity_counts"})
             require(type(measurement["failure_counts"]) is dict and set(measurement["failure_counts"]) == set(FAILURES) and all(integer(item, 64) for item in measurement["failure_counts"].values()))
@@ -148,14 +158,23 @@ def validate_summary(value):
             require(case["frozen"] is not None and case["bridge"] is not None)
             validate_reference(case["reference"], case["frozen"], case["bridge"])
         if case["cleanup_confirmed"]:
-            require(case["process_run"]["cleanup"]["complete"] and case["offline_process_run"] is not None and case["offline_process_run"]["cleanup"]["complete"])
-            require(all(part is not None and part["process_cleanup_confirmed"] and all(tool["cleanup_confirmed"] for tool in part["tools"]) for part in (case["frozen"], case["bridge"], case["reference"])))
+            require(case["process_run"]["cleanup"]["complete"])
+            require(measurement is None or case["offline_process_run"] is not None)
+            if case["offline_process_run"] is not None:
+                require(case["offline_process_run"]["cleanup"]["complete"])
+                require(all(part is not None and part["process_cleanup_confirmed"] and all(tool["cleanup_confirmed"] for tool in part["tools"]) for part in (case["frozen"], case["bridge"], case["reference"])))
         if case["strict_checks_passed"]:
             require(case["measurement_valid"] and case["process_run"]["status"] == "completed" and case["process_run"]["return_code"] == 0 and not any(measurement["failure_counts"].values()))
         if case["evidence_checks_passed"]:
             require(case["offline_process_run"] is not None and case["offline_process_run"]["return_code"] == 0 and case["cleanup_confirmed"])
             require(case["frozen"] is not None and case["frozen"]["status"] == "complete" and case["bridge"] is not None and case["bridge"]["status"] in ("complete", "not_needed"))
             require(case["reference"] is not None and case["reference"]["status"] == "complete")
+    if value["temporary_cleanup"] == "complete":
+        require(all(build["process_run"]["cleanup"]["complete"] for build in builds.values()))
+        require(all(case["cleanup_confirmed"] and case["projection_reason"] == "none" for case in cases))
+    if value["temporary_cleanup"] == "retained-evidence":
+        require(all(case["cleanup_confirmed"] for case in cases))
+        require(any(case["projection_reason"] == "measurement-invalid" for case in cases))
     require(not value["completed"] or len(cases) == 4)
     for key in ("strict_checks_passed", "evidence_checks_passed"):
         if value[key]:
@@ -218,7 +237,7 @@ def main(argv=None):
         return subprocess.check_output(command, text=True, timeout=15).strip()
     xcode = output("xcodebuild", "-version").splitlines()[0]
     require(xcode == "Xcode 26.3")
-    summary = {"schema": 1, "identity": {"checkout_sha": output("git", "rev-parse", "HEAD"),
+    summary = {"schema": 2, "identity": {"checkout_sha": output("git", "rev-parse", "HEAD"),
         "macos": output("sw_vers", "-productVersion"), "os_build": output("sw_vers", "-buildVersion"),
         "architecture": output("uname", "-m"), "xcode": "26.3", "scan_mode": "frozen-reference-investigation", "history_mode": "full-no-compact"},
         "builds": {}, "cases": [], "completed": False, "strict_checks_passed": False,
@@ -229,6 +248,7 @@ def main(argv=None):
         environment.pop(key, None)
     prepared = {}
     cleanup_confirmed = True
+    evidence_preserved = True
     try:
         for mode in ("ordinary", "pure-appkit"):
             directory = private / mode
@@ -258,7 +278,7 @@ def main(argv=None):
                 *(["--heap-control"] if name != "patched-product" else []),
                 *(["--empty-control-mode", "pure-appkit"] if mode == "pure-appkit" else []),
                 *(["--reference-idle"] if name == "pure-appkit-idle" else [])], case_root / "measurement.log", environment, timeout=330)
-            case = {"name": name, "process_run": process, "measurement": None, "measurement_valid": False,
+            case = {"name": name, "process_run": process, "measurement": None, "measurement_valid": False, "projection_reason": "unavailable",
                 "strict_checks_passed": False, "offline_process_run": None, "frozen": None, "bridge": None,
                 "reference": None, "evidence_checks_passed": False, "cleanup_confirmed": False}
             summary["cases"].append(case)
@@ -266,15 +286,22 @@ def main(argv=None):
             save_summary(public, summary)
             try:
                 result = read_json(records / "result.json", 262144)
-                exited = result.get("cleanup", {}).get("processes_exited") is True
-                cleanup_confirmed &= exited
+                require(type(result) is dict)
+                cleanup_confirmed &= fixture_clean(result.get("cleanup"))
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                cleanup_confirmed = False
+                result = None
+            try:
+                require(type(result) is dict)
                 case["measurement"] = project_measurement(result, read_json(records / "external-startup.json", 16384),
                     read_json(records / "reference-validation-input.json", 16384), hashes, name)
                 case["measurement_valid"] = True
+                case["projection_reason"] = "none"
                 case["strict_checks_passed"] = (process["status"] == "completed" and process["return_code"] == 0
                     and not any(case["measurement"]["failure_counts"].values()))
             except (OSError, ValueError, TypeError, KeyError, RuntimeError):
-                cleanup_confirmed = False
+                case["projection_reason"] = "measurement-invalid"
+                evidence_preserved = False
             if cleanup_confirmed and case["measurement_valid"]:
                 offline = run_owned([sys.executable, str(ROOT / "Scripts/Investigations/ax_frozen_nodes.py"),
                     "--graph-directory", str(case_root / "fixture/heap"), "--records-directory", str(records),
@@ -289,7 +316,9 @@ def main(argv=None):
                     case["evidence_checks_passed"] = (offline["return_code"] == 0 and cleanup_confirmed and frozen["status"] == "complete"
                         and bridge["status"] in ("complete", "not_needed") and reference["status"] == "complete")
                 except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                    case["projection_reason"] = "offline-invalid"
                     cleanup_confirmed = False
+            case["cleanup_confirmed"] = bool(cleanup_confirmed)
             save_summary(public, summary)
             print(json.dumps({"case": name, "strict_checks_passed": case["strict_checks_passed"],
                 "evidence_checks_passed": case["evidence_checks_passed"], "cleanup_confirmed": case["cleanup_confirmed"]}), flush=True)
@@ -300,7 +329,7 @@ def main(argv=None):
         summary["evidence_checks_passed"] = all(case["evidence_checks_passed"] for case in summary["cases"])
         return 0 if summary["strict_checks_passed"] and summary["evidence_checks_passed"] else 1
     finally:
-        if cleanup_confirmed:
+        if cleanup_confirmed and evidence_preserved:
             # Keep raw evidence until all collected cases are durably saved and
             # the final cleanup receipt also fits the public encoding budget.
             try:
@@ -315,8 +344,10 @@ def main(argv=None):
             except OSError:
                 summary["temporary_cleanup"] = "failed"
                 summary["evidence_checks_passed"] = False
-        else:
+        elif not cleanup_confirmed:
             summary["temporary_cleanup"] = "retained-unconfirmed"
+        else:
+            summary["temporary_cleanup"] = "retained-evidence"
         save_summary(public, summary)
         if summary["temporary_cleanup"] == "failed" and sys.exc_info()[0] is None:
             return 1

@@ -53,7 +53,7 @@ def manifest(mode, sources=None):
 
 
 def summary():
-    return {"schema": 1, "identity": {"checkout_sha": "a" * 40, "macos": "26.0.1",
+    return {"schema": 2, "identity": {"checkout_sha": "a" * 40, "macos": "26.0.1",
             "os_build": "25A354", "architecture": "arm64", "xcode": "26.3",
             "scan_mode": "frozen-reference-investigation", "history_mode": "full-no-compact"},
             "builds": {}, "cases": [], "completed": False, "strict_checks_passed": False,
@@ -62,7 +62,7 @@ def summary():
 
 def case(name="patched-product", strict=False):
     return {"name": name, "process_run": process_run(0 if strict else 1),
-            "measurement": measurement(failed=not strict), "measurement_valid": True,
+            "measurement": measurement(failed=not strict), "measurement_valid": True, "projection_reason": "none",
             "strict_checks_passed": strict, "offline_process_run": None, "frozen": None,
             "bridge": None, "reference": None, "evidence_checks_passed": False,
             "cleanup_confirmed": False}
@@ -94,7 +94,7 @@ class CampaignTemporaryTests(CampaignBoundaryTests):
 class CampaignOrchestrationTests(CampaignTemporaryTests):
     def run_campaign(self, *, strict_failures=False, failed_phase=None, fixture_exited=True,
                      tool_cleanup=True, final_cleanup_failure=False, build_failure=None,
-                     reference_failure=None):
+                     reference_failure=None, fixture_cleanup=None, projection_failure=False):
         calls = []
         prepared = []
         collect_evidence = CAMPAIGN.collect_evidence
@@ -123,7 +123,9 @@ class CampaignOrchestrationTests(CampaignTemporaryTests):
 
         def read(path, limit):
             if path.name == "result.json":
-                return {"cleanup": {"processes_exited": fixture_exited}}
+                return {"cleanup": fixture_cleanup if fixture_cleanup is not None else {
+                    "processes_exited": fixture_exited, "errors": [],
+                    "host": {"exited": fixture_exited, "errors": []}, "reader": {"exited": True, "errors": []}}}
             if path.name == "frozen-nodes.json":
                 return frozen
             if path.name == "bridge-evidence.json":
@@ -148,6 +150,7 @@ class CampaignOrchestrationTests(CampaignTemporaryTests):
             stack.enter_context(mock.patch.object(CAMPAIGN, "load_prepared_build", side_effect=build))
             stack.enter_context(mock.patch.object(CAMPAIGN, "read_json", side_effect=read))
             stack.enter_context(mock.patch.object(CAMPAIGN, "project_measurement",
+                                                   side_effect=ValueError('synthetic projection failure') if projection_failure else None,
                                                    return_value=measurement(strict_failures)))
             stack.enter_context(mock.patch.object(CAMPAIGN, "collect_evidence", side_effect=evidence))
             stack.enter_context(mock.patch.object(CAMPAIGN, "graph_hash", return_value="d" * 64))
@@ -161,6 +164,34 @@ class CampaignOrchestrationTests(CampaignTemporaryTests):
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             code = CAMPAIGN.main(["--work-directory", str(self.work)])
         return code, json.loads((self.work / "summary.json").read_bytes()), calls, prepared
+
+    def test_fixture_cleanup_errors_stop_before_offline_and_retain_private(self):
+        for kind in ('top', 'host', 'reader', 'missing'):
+            with self.subTest(kind=kind):
+                self.work = Path(self.temporary.name) / kind
+                cleanup = {'processes_exited': True, 'errors': [],
+                    'host': {'exited': True, 'errors': []}, 'reader': {'exited': True, 'errors': []}}
+                if kind == 'top': cleanup['errors'] = ['launch_services']
+                elif kind == 'missing': del cleanup['reader']
+                else: cleanup[kind]['errors'] = ['stop_request_failed']
+                code, value, calls, _ = self.run_campaign(fixture_cleanup=cleanup)
+                self.assertEqual(code, 1)
+                self.assertEqual(len(calls), 3)
+                self.assertFalse(value['cases'][0]['cleanup_confirmed'])
+                self.assertEqual(value['temporary_cleanup'], 'retained-unconfirmed')
+                self.assertTrue((self.work / 'private').is_dir())
+
+    def test_projection_failure_has_independent_status_and_retains_private(self):
+        code, value, _, _ = self.run_campaign(projection_failure=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(value['temporary_cleanup'], 'retained-evidence')
+        self.assertTrue((self.work / 'private').is_dir())
+        for row in value['cases']:
+            self.assertTrue(row['cleanup_confirmed'])
+            self.assertFalse(row['measurement_valid'])
+            self.assertEqual(row['projection_reason'], 'measurement-invalid')
+        value['temporary_cleanup'] = 'complete'
+        with self.assertRaises(ValueError): CAMPAIGN.validate_summary(value)
 
     def test_four_known_strict_failures_continue_and_preserve_original_results(self):
         code, value, calls, _ = self.run_campaign(strict_failures=True)
@@ -288,6 +319,16 @@ class CampaignOrchestrationTests(CampaignTemporaryTests):
 
 
 class CampaignPublicBoundaryTests(CampaignBoundaryTests):
+    def test_manifest_requires_successful_build_and_confirmed_cleanup(self):
+        for run in (process_run(1), process_run(124, status='timeout'), process_run(125, cleanup=False), process_run(0, status='timeout')):
+            value = summary()
+            value['builds']['ordinary'] = {'process_run': run, 'manifest': manifest('ordinary')}
+            with self.subTest(run=run), self.assertRaises(ValueError): CAMPAIGN.validate_summary(value)
+
+    def test_previous_schema_is_rejected(self):
+        value = summary(); value['schema'] = 1
+        with self.assertRaises(ValueError): CAMPAIGN.validate_summary(value)
+
     def test_empty_initial_summary_round_trips_with_real_validator(self):
         value = summary()
         self.assertEqual(json.loads(CAMPAIGN.encode_summary(value)), value)

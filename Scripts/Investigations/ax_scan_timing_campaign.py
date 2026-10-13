@@ -243,7 +243,7 @@ def validate_measurement(value, expected, control, mode):
         if entry is not None:
             fields(entry, environment(mode)["host"])
             require(all(entry[key] in ("1", "unset") for key in reader.ENVIRONMENT["host"]))
-            require(entry[INSTALL_ENV] in INSTALL_MODES)
+            require(entry[INSTALL_ENV] == mode)
     fields(value["clock_markers"], ("host_start_ms", "host_ready_ms", "reader_start_ms", "warm_ms"))
     require(all(number is None or reader.ms(number, signed=True) for number in value["clock_markers"].values()))
     require(value["clock_markers"]["warm_ms"] in (None, 0))
