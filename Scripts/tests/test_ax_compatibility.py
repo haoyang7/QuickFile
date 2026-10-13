@@ -4407,7 +4407,10 @@ class AXCompatibilityCopyTests(unittest.TestCase):
                 receipt = json.loads((records / "result.json").read_text())
                 LIFECYCLE.evaluate(kind, receipt, result.returncode)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
-                raise self.failureException(f"AX receipt validation failed: {error}\n{diagnostics}") from error
+                problem = ("AX receipt incomplete: result.json missing"
+                           if isinstance(error, FileNotFoundError) and error.filename == str(records / "result.json")
+                           else f"AX receipt validation failed: {error}")
+                raise self.failureException(f"{problem}\n{diagnostics}") from error
             if require_strict_heap:
                 self.assertEqual(receipt["coverage"], "passed", diagnostics)
             self.assertEqual(receipt["notifications"], 60)

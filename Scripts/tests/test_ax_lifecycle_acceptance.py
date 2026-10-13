@@ -124,6 +124,8 @@ class LifecycleAcceptanceTests(unittest.TestCase):
                             self.assertIn(expected, message)
                         if cause is not None and (not strict or code == 0):
                             self.assertIsInstance(caught.exception.__cause__, cause)
+                        missing_receipt = raw is None and code in (0, 1) and (not strict or code == 0)
+                        self.assertEqual('AX receipt incomplete: result.json missing' in message, missing_receipt)
                         record.assert_not_called()
 
     def test_native_caller_accepts_lifecycle_but_manual_strict_trial_still_fails(self):
