@@ -67,6 +67,8 @@ Reader 摘要 schema 2 使用紧凑 JSON，保持 512 KiB 上限；历史 schema
 
 晚时点首次扫描与早时点首次扫描的差异同时包含年龄、异步演化和 checkpoint 历史；同龄的 twice 晚点与 late-only 才有相同 checkpoint 历史，可调查此前扫描的总体影响。跨进程比较须核对实际年龄与启动耗时，不能假设初始堆可交换，也不自动生成因果通过结论。固定样本无漂移、迟到或不完整时保留不可判定；小幅计数变化与新增根分别描述，根数量不建立对象身份或连接创建时间。该入口不改变 ordinary CI、正式基线或发布门禁。
 
+reference、shadow、Reader exit 和 scan timing campaign 在回收私有产物前，先保存所有已收集样本的公共摘要，并预检最终清理收据的编码。摘要超预算或保存失败时返回失败并保留私有证据；此前已写出的部分摘要不能冒充本轮完整结果。
+
 旁路采图失败时，仅公开固定的错误词法提示，不将其称为根因。身份验证成功、测量及离线工具的进程清理均确认后，才运行额外的自有进程 CLI 检查，验证当前图及其分配栈可读；同进程另记完整历史能力对照，明确区分模式不支持与未知失败。此检查位于原测量之后，不会覆盖原失败，也不在 live 采图失败后自动改用另一套协议。
 
 `receipt_mode=internal` 是默认回执路径，在夹具中编译额外的环境读取代码。`receipt_mode=external-startup` 要求 `malloc_scribble=true`、`scan_mode=live`、`heap_diagnostics=false` 和 `ax_causal_probe=false`：只构建一次普通 host/reader，不定义 `QUICKFILE_AX_MALLOC_RECEIPT`，将同一签名 App 和 reader 按字节复制到 20 个独立 case。准备清单绑定当前夹具源码哈希；每次复制、实际子进程启动检查、测量完成和子进程退出后均校验两个可执行文件的 SHA-256，工作流再次对照统一构建哈希。这里保证本轮 off/on 和 control/product 复用相同字节，不宣称与另一个 CI job 的独立构建逐字节相同。

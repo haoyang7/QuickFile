@@ -229,6 +229,37 @@ class CampaignOrchestrationTests(CampaignTemporaryTests):
         self.assertEqual(value["temporary_cleanup"], "failed")
         self.assertTrue((self.work / "private").is_dir())
 
+    def test_publication_failure_retains_private_evidence_and_prior_summary(self):
+        original_encode = CAMPAIGN.encode_summary
+        original_save = CAMPAIGN.save_summary
+        for failure in ("case-budget", "final-budget", "write"):
+            with self.subTest(failure=failure):
+                self.work = Path(self.temporary.name) / ("campaign-" + failure)
+                def encode(value):
+                    if ((failure == "case-budget" and len(value["cases"]) == 4)
+                            or (failure == "final-budget" and value["temporary_cleanup"] == "complete")):
+                        with mock.patch.object(CAMPAIGN, "PUBLIC_LIMIT", 1):
+                            return original_encode(value)
+                    return original_encode(value)
+                def save(path, value):
+                    if failure == "write" and value["completed"]:
+                        raise OSError("synthetic private publication failure")
+                    return original_save(path, value)
+                code = None
+                with mock.patch.object(CAMPAIGN, "encode_summary", side_effect=encode), \
+                        mock.patch.object(CAMPAIGN, "save_summary", side_effect=save), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        code, _, _, _ = self.run_campaign(strict_failures=True)
+                    except (ValueError, OSError):
+                        pass
+                self.assertTrue((self.work / "private").is_dir())
+                self.assertEqual(code, 1)
+                value = json.loads((self.work / "summary.json").read_bytes())
+                self.assertNotEqual(value["temporary_cleanup"], "complete")
+                self.assertFalse(value["strict_checks_passed"])
+                self.assertEqual(len(value["cases"]), 3 if failure == "case-budget" else 4)
+
     def test_missing_or_invalid_reference_keeps_verified_frozen_and_bridge_in_public_summary(self):
         for failure in ("missing", "invalid-json", "invalid-summary"):
             with self.subTest(failure=failure):

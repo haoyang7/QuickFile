@@ -301,6 +301,14 @@ def main(argv=None):
         return 0 if summary["strict_checks_passed"] and summary["evidence_checks_passed"] else 1
     finally:
         if cleanup_confirmed:
+            # Keep raw evidence until all collected cases are durably saved and
+            # the final cleanup receipt also fits the public encoding budget.
+            try:
+                save_summary(public, summary)
+                encode_summary(dict(summary, temporary_cleanup="complete"))
+            except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
+                print("Public summary unavailable; private evidence retained", file=sys.stderr)
+                return 1
             try:
                 shutil.rmtree(private)
                 summary["temporary_cleanup"] = "complete"

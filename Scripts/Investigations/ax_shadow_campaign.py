@@ -709,6 +709,14 @@ def campaign(root):
         return_code = 0 if summary['strict_checks_passed'] and summary['evidence_checks_passed'] else 1
     finally:
         if cleanup_confirmed:
+            # A failed publication must leave the raw evidence recoverable.
+            # Preflight the final receipt before deleting any private files.
+            try:
+                save_summary(public, summary)
+                encode_summary(dict(summary, temporary_cleanup='complete'))
+            except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
+                print('Public summary unavailable; private evidence retained', file=sys.stderr)
+                return 1
             try:
                 shutil.rmtree(private)
                 summary['temporary_cleanup'] = 'complete'
