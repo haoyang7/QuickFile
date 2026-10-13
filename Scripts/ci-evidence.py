@@ -17,7 +17,7 @@ import sys
 import tempfile
 
 MAX_FILE_BYTES = 16 * 1024
-UPLOAD_FILES = frozenset({"identity.json", "verification.json", "ax-evidence.json"})
+UPLOAD_FILES = frozenset({"identity.json", "verification.json", "ax-evidence.json", "ax-lifecycle.json"})
 VERSION = r"[0-9]{1,3}(?:\.[0-9]{1,4}){1,3}"
 SHA = r"[0-9a-f]{40}"
 APPLE_BUILD = r"[0-9]{2}[A-Z][0-9]{1,5}[a-z]?"
@@ -230,6 +230,11 @@ def ax_module():
     return importlib.import_module("ax_ci_failure")
 
 
+def lifecycle_module():
+    ax_module()
+    return importlib.import_module("ax_lifecycle_acceptance")
+
+
 def run_scripts(root, command):
     root = Path(root)
     if not root.is_absolute() or ".." in root.parts or "\n" in str(root) or "\r" in str(root):
@@ -240,10 +245,11 @@ def run_scripts(root, command):
     if identity["identity_verified"] is not True:
         raise ValueError("script verification requires validated identity")
     evidence = root / "upload" / "ax-evidence.json"
-    if evidence.exists() or evidence.is_symlink():
+    lifecycle_file = root / "upload" / "ax-lifecycle.json"
+    if any(path.exists() or path.is_symlink() for path in (evidence, lifecycle_file)):
         raise ValueError("AX evidence already exists")
     records = root / "ax-records"
-    for directory in (records, root / "ax-records-copy-lifetime"):
+    for directory in (records, root / "ax-records-copy-lifetime", root / "ax-records-negative-control"):
         if directory.exists() or directory.is_symlink():
             raise ValueError("AX record directory already exists")
     module = ax_module()
@@ -270,7 +276,20 @@ def run_scripts(root, command):
         except Exception:
             print("error: sanitized AX evidence could not be written", file=sys.stderr)
             return code if code else 1
-    return code if code else (0 if payload["status"] in {"complete", "unsupported"} else 1)
+    lifecycle = lifecycle_module()
+    checkout = identity["source"]["checkout_sha"]
+    try:
+        acceptance = lifecycle.collect(records, checkout, payload)
+        lifecycle.validate_public(acceptance)
+    except Exception:
+        acceptance = lifecycle.empty(checkout)
+    try:
+        write_json(lifecycle_file, acceptance, lifecycle.LIMIT)
+    except Exception:
+        print("error: AX lifecycle evidence could not be written", file=sys.stderr)
+        return code if code else 1
+    return code if code else (0 if payload["status"] in {"complete", "unsupported"}
+                             and acceptance["status"] in {"passed", "unsupported"} else 1)
 
 
 def validate_identity(payload):
@@ -342,6 +361,12 @@ def check_upload(root):
     validate_verification(read_json(directory / "verification.json"))
     module = ax_module()
     module.validate_public(read_json(directory / "ax-evidence.json", module.PUBLIC_LIMIT))
+    lifecycle = lifecycle_module()
+    acceptance = read_json(directory / "ax-lifecycle.json", lifecycle.LIMIT)
+    lifecycle.validate_public(acceptance)
+    lifecycle.bind_original(acceptance, read_json(directory / "ax-evidence.json", module.PUBLIC_LIMIT))
+    if acceptance["checkout_sha"] != read_json(directory / "identity.json")["source"]["checkout_sha"]:
+        raise ValueError("AX lifecycle checkout mismatch")
 
 
 def finish(root, env):
@@ -354,6 +379,12 @@ def finish(root, env):
         started = root / "scripts-start.json"
         status = "unavailable" if started.exists() or started.is_symlink() else "not_attempted"
         write_json(ax_file, module.empty(status=status), module.PUBLIC_LIMIT, compact=True)
+    lifecycle = lifecycle_module()
+    lifecycle_file = root / "upload" / "ax-lifecycle.json"
+    if not lifecycle_file.exists() and not lifecycle_file.is_symlink():
+        status = "unavailable" if (root / "scripts-start.json").exists() else "not_attempted"
+        write_json(lifecycle_file, lifecycle.empty(identity["source"]["checkout_sha"], status), lifecycle.LIMIT)
+    acceptance = read_json(lifecycle_file, lifecycle.LIMIT)
     native_file = root / "native-exit.json"
     native = read_json(native_file) if native_file.exists() else None
     version_output = optional_tool(["xcodegen", "version"], rf"(?:Version: )?{VERSION}")
@@ -374,12 +405,18 @@ def finish(root, env):
             stream.write(f"- {key}: `{source[key]}`\n")
         stream.write(f"- Actual macOS / architecture / Xcode: `{actual['macos_version']}` / `{actual['architecture']}` / `{actual['xcode']}` (build `{actual['xcode_build']}`)\n")
         stream.write(f"- Step outcomes before upload: `{json.dumps(outcomes, sort_keys=True)}`\n")
+        strict = read_json(ax_file, module.PUBLIC_LIMIT)["original_verdict"]
+        stream.write(f"- AX lifecycle policy: `{acceptance['policy']}`; result: `{acceptance['status']}`\n")
+        stream.write(f"- Original strict heap result: `{strict}`; growth attribution: `{acceptance['growth_attribution']}`\n")
+        stream.write("- Lifecycle acceptance does not establish whole-heap zero growth or harmless platform allocations.\n")
         stream.write("\nOnly bounded identity/verification and sanitized AX JSON receipts are retained for 7 days. Raw xcresult, AX records, workspace/user paths, test names, messages and attachments are not uploaded.\n")
         stream.write("\nScope: script tests, native Swift tests, unsigned Universal build and bundle/security checks. Remaining gates: signed installation, Finder interaction, memory/recovery, real latency, hardware and storage environments.\n")
     # Missing/mismatched evidence must not make a nominally green job credible.
     if outcomes["native"] == "success" and (native is None or native["exit_code"] != 0 or not all(native["result_bundles_present"].values())):
         return 1
     if outcomes["scripts"] == "success" and read_json(ax_file, module.PUBLIC_LIMIT)["status"] not in {"complete", "unsupported"}:
+        return 1
+    if outcomes["scripts"] == "success" and acceptance["status"] not in {"passed", "unsupported"}:
         return 1
     return 0
 

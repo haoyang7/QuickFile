@@ -200,6 +200,7 @@ jobs:
             ${{ steps.identity.outputs.root }}/upload/identity.json
             ${{ steps.identity.outputs.root }}/upload/verification.json
             ${{ steps.identity.outputs.root }}/upload/ax-evidence.json
+            ${{ steps.identity.outputs.root }}/upload/ax-lifecycle.json
           retention-days: 7
           if-no-files-found: error
           include-hidden-files: false

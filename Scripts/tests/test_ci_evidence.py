@@ -95,7 +95,9 @@ class CIEvidenceTests(unittest.TestCase):
             "(p/'command-ran').write_text('1')",
             f"raise SystemExit({code})",
         ])
-        return MODULE.run_scripts(root, [sys.executable, "-c", program])
+        from test_ax_lifecycle_acceptance import public_unsupported
+        with patch.object(MODULE.lifecycle_module(), "collect", return_value=public_unsupported()):
+            return MODULE.run_scripts(root, [sys.executable, "-c", program])
 
     def test_scripts_failure_is_not_rerun_or_overridden_by_collector_failure(self):
         for status, failure in (("complete", None), ("partial", None), ("unavailable", RuntimeError("PRIVATE-SECRET"))):
@@ -113,6 +115,34 @@ class CIEvidenceTests(unittest.TestCase):
             _, root, _ = self.initialize()
             with self.subTest(status=status), patch.object(MODULE, "ax_module", return_value=self.collector(status)):
                 self.assertEqual(self.scripts(root), expected)
+
+    def test_missing_lifecycle_receipts_block_success_without_overriding_command_failure(self):
+        for code, expected in ((0, 1), (65, 65)):
+            _, root, _ = self.initialize()
+            program = ("import os; from pathlib import Path; "
+                       "p=Path(os.environ['QUICKFILE_AX_TEST_RECORDS']); p.mkdir(); "
+                       "(p/'command-ran').write_text('1'); " + f"raise SystemExit({code})")
+            with patch.object(MODULE, "ax_module", return_value=self.collector()):
+                result = MODULE.run_scripts(root, [sys.executable, '-c', program])
+            self.assertEqual(result, expected)
+            self.assertEqual(MODULE.read_json(root / 'upload/ax-lifecycle.json')['status'], 'unavailable')
+
+    def test_lifecycle_upload_is_bound_to_checkout_and_exact_public_schema(self):
+        _, root, _ = self.initialize()
+        self.native(root)
+        self.finish(root)
+        target = root / 'upload/ax-lifecycle.json'
+        original = MODULE.read_json(target)
+        for change in ({'checkout_sha': 'f' * 40}, {'private_path': 'PRIVATE-SECRET'}, {'policy': 'old-policy'}):
+            target.write_text(json.dumps(original | change))
+            with self.assertRaises(ValueError): MODULE.check_upload(root)
+        target.write_text(json.dumps(original))
+        MODULE.check_upload(root)
+
+    def test_missing_negative_control_directory_is_reserved_before_running(self):
+        _, root, _ = self.initialize()
+        (root / 'ax-records-negative-control').mkdir()
+        with self.assertRaises(ValueError): self.scripts(root)
 
     def test_scripts_rejects_invalid_identity_root_and_preexisting_records(self):
         _, root, _ = self.initialize(dict(actual(), xcode="26.6"))
@@ -607,7 +637,8 @@ class CIWorkflowContractTests(unittest.TestCase):
             path_block = text.split("          path: |\n")[1].split("          retention-days:")[0]
             self.assertEqual(path_block.splitlines(), ["            ${{ steps.identity.outputs.root }}/upload/identity.json",
                                                      "            ${{ steps.identity.outputs.root }}/upload/verification.json",
-                                                     "            ${{ steps.identity.outputs.root }}/upload/ax-evidence.json"])
+                                                     "            ${{ steps.identity.outputs.root }}/upload/ax-evidence.json",
+                                                     "            ${{ steps.identity.outputs.root }}/upload/ax-lifecycle.json"])
             self.assertIn("retention-days: 7", text)
             self.assertIn("if-no-files-found: error", text)
             self.assertIn("include-hidden-files: false", text)
