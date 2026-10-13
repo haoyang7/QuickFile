@@ -72,6 +72,39 @@ class CompositionTests(unittest.TestCase):
         report = "Process 123: 5 leaks for 272 total leaked bytes.\n" + body + "\n"
         self.assertEqual(self.parse(report)["type_counts"], value["type_counts"])
 
+    def test_observed_composed_edge_offsets_preserve_all_nodes_and_bytes(self):
+        # An owned native grouped report used "storage + 8 + 8 -->".
+        # Offsets annotate the reference, not extra objects or allocation sizes.
+        plain = grouped(3, 144, "    3 (144 bytes) ROOT CYCLE: NSXPCConnection\n"
+                        "       2 (96 bytes) NSArray\n          1 (48 bytes) NSData",
+                        kind='NSXPCConnection', marker='ROOT CYCLE')
+        for edge in ('storage + 8', 'storage + 8 + 8', '_values + 16 + 8 + 0'):
+            report = plain.replace(') NSArray', f') {edge} --> NSArray')
+            value = self.parse(report)
+            with self.subTest(edge=edge):
+                self.assertEqual(value, self.parse(plain))
+                self.assertEqual(value['counts_status'], 'complete')
+                self.assertEqual(sum(row['count'] for row in value['type_counts']), 3)
+                self.assertEqual(sum(row['count'] * row['size'] for row in value['exact_size_histogram']), 144)
+                self.assertNotIn(edge, composition.encoded(value).decode())
+                from ax_startup_baseline import fingerprint
+                from ax_probe_report import leak_groups
+                self.assertEqual(len(fingerprint({'leak_nodes': 3, 'leak_bytes': 144,
+                    'groups': leak_groups(report)}, value)), 64)
+
+    def test_edge_offset_support_does_not_accept_bad_syntax_or_subtree_accounting(self):
+        base = array_report()
+        for edge in ('storage +', 'storage + -8', 'storage + 0x1234', 'storage + privateOffset',
+                     'storage + 8 trailing', '/private/storage + 8', 'storage + 12345678901'):
+            with self.subTest(edge=edge):
+                value = self.parse(base.replace(') CFData', f') {edge} --> CFData'))
+                self.assertEqual(value['counts_status'], 'unavailable')
+        valid = base.replace(') CFData', ') storage + 8 + 8 --> CFData')
+        for report in (valid.replace('1 (80 bytes)', '3 (80 bytes)'),
+                       valid.replace('1 (80 bytes)', '1 (145 bytes)'),
+                       valid.replace('          1 (80', '           1 (80')):
+            self.assertEqual(self.parse(report)['counts_status'], 'unavailable')
+
     def test_observed_grouped_cycle_markers_on_descendants_are_not_extra_roots(self):
         # Structure observed in an owned native leaks --groupByType report.
         # Its rounded top label cannot provide an exact individual size.
