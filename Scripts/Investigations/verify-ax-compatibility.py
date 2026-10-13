@@ -805,7 +805,10 @@ def main():
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             raise RuntimeError("Startup checkpoint exceeded the fixed deadline")
-                        return scan(f"startup-{index}", empty_host, startup=True, timeout=min(12, remaining))
+                        # Every sample shares the fixed startup deadline. A
+                        # separate short tool timeout can discard a valid first
+                        # scan while most of that total budget is still unused.
+                        return scan(f"startup-{index}", empty_host, startup=True, timeout=remaining)
                     baseline = ax_startup_baseline.settle(startup_measure,
                         lambda value: write_json(records / "startup-baseline.json", value), startup_baseline)
                     # Reuse the selected scan byte-for-byte; a later capture must
