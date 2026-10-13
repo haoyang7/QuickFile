@@ -337,7 +337,7 @@ class StartupBaselineTests(unittest.TestCase):
                 startup.validate(value)
 
     def test_fingerprint_requires_complete_counts_and_detects_composition_change(self):
-        from ax_composition import grouped_composition
+        from ax_composition import empty_grouped, grouped_composition
         empty = {"leak_nodes": 0, "leak_bytes": 0, "groups": []}
         composition = grouped_composition("Process 1: 0 leaks for 0 total leaked bytes.\n")
         first = startup.fingerprint(empty, composition)
@@ -345,7 +345,31 @@ class StartupBaselineTests(unittest.TestCase):
         changed["type_counts"] = [{"type": "NSArray", "count": 1}]
         self.assertNotEqual(first, startup.fingerprint(empty, changed))
         with self.assertRaises(RuntimeError):
-            startup.fingerprint(empty, composition | {"counts_status": "unavailable"})
+            startup.fingerprint(empty, empty_grouped('node_budget', (513, 32832)))
+
+    def test_failed_fingerprint_reports_bounded_anonymous_parser_diagnostics(self):
+        from ax_composition import encoded, grouped_composition, PUBLIC_LIMIT, validate_grouped_composition
+        reports = [
+            'Process 1: 513 leaks for 32832 total leaked bytes.\n',
+            "Process 1: 1 leaks for 64 total leaked bytes.\n\n"
+            "STACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
+            "0 private-image 0x1234 private_symbol + 0\n====\n"
+            "    1 (64 bytes) ROOT CYCLE: NSXPCConnection\n"
+            "       /private/secret-account 0x1234 unsupported-row\n",
+        ]
+        for report in reports:
+            composition = grouped_composition(report)
+            with self.subTest(reason=composition['reasons']), self.assertRaises(RuntimeError) as caught:
+                startup.fingerprint({}, composition)
+            published = str(caught.exception).split(': ', 1)[1]
+            value = json.loads(published)
+            validate_grouped_composition(value)
+            self.assertEqual(value, composition)
+            self.assertLessEqual(len(encoded(value)), PUBLIC_LIMIT)
+            for secret in ('secret-account', 'private-image', 'private_symbol', '0x1234'):
+                self.assertNotIn(secret, published)
+            with self.assertRaises(ValueError):
+                startup.fingerprint({}, composition | {'private_path': '/private/secret-account'})
 
     def test_new_protocol_refuses_other_investigation_modes_before_launch(self):
         import contextlib

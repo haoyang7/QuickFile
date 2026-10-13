@@ -4,6 +4,8 @@ import json
 import re
 import time
 
+from ax_composition import validate_grouped_composition
+
 PROTOCOL = "zero-target-settled-v1"
 POLICY = {"max_probes": 12, "deadline_ms": 40000, "interval_ms": 2000,
           "minimum_observation_ms": 20000, "consecutive_equal": 3}
@@ -18,7 +20,11 @@ def fingerprint(entry, composition):
     # Aggregate stability is an observed precondition, not object identity or
     # proof of ownership. Incomplete parsing must not establish a baseline.
     if composition["counts_status"] != "complete" or composition["omitted_nodes"]:
-        raise RuntimeError("Startup heap composition is incomplete")
+        # CI retains stderr when a probe fails before entering the accepted
+        # sequence. Publish only the bounded anonymous parser projection.
+        validate_grouped_composition(composition)
+        raise RuntimeError("Startup heap composition is incomplete: "
+                           + json.dumps(composition, separators=(",", ":")))
     roots = sorted((g["root_kind"], g["root_type"], g["root_instances"], g["tree_nodes"])
                    for g in entry["groups"])
     value = [entry["leak_nodes"], entry["leak_bytes"], roots,
