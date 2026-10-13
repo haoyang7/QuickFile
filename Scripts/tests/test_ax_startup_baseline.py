@@ -1,6 +1,8 @@
 """The startup precondition cannot absorb growth from measured target cycles."""
 import copy
+import contextlib
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -14,6 +16,81 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Investigations"))
 import ax_startup_baseline as startup
 import test_ax_compatibility as compatibility
 PROBE = compatibility.PROBE
+
+
+SCAN_LABELS = ['baseline', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited']
+
+
+def registration_scan_classification(scans):
+    """Separate a fully classified baseline increase from other strict failures."""
+    try:
+        baseline, registered = scans[:2]
+        if [baseline['label'], registered['label']] != SCAN_LABELS[:2]:
+            return 'invalid-scan'
+        for row in (baseline, registered):
+            if (type(row['exit_code']) is not int or row['exit_code'] not in (0, 1)
+                    or row['destroyed_notification_stack_present'] is not False
+                    or type(row['unclassified_nodes']) is not int
+                    or any(type(row[key]) is not int or row[key] < 0 for key in ('leak_nodes', 'leak_bytes'))
+                    or any(type(group['tree_nodes']) is not int or group['tree_nodes'] < 0
+                           or type(group['root_instances']) is not int or group['root_instances'] < 1
+                           for group in row['groups'])
+                    or sum(group['tree_nodes'] for group in row['groups']) != row['leak_nodes']):
+                return 'invalid-scan'
+            PROBE.validate_product_scan(row)
+        try:
+            PROBE.validate_product_scan(registered, baseline)
+        except RuntimeError:
+            return 'classified-growth'
+        return 'no-growth'
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        return 'invalid-scan'
+
+
+def check_negative_control(test, receipt, records, original, modified, return_code):
+    # Emit only anonymous observations before any acceptance assertion, including
+    # on failure. The runner's strict verdict stays failed for an injected leak.
+    scans = receipt.get('scans', [])
+    classification = registration_scan_classification(scans)
+    labels = [row['stage'] for row in receipt.get('validation_errors', [])]
+    safe_labels = {*SCAN_LABELS, 'execution', 'cleanup', 'notifications', 'compensation-branches'}
+    number = lambda value: value if type(value) is int else None
+    evidence = {'protocol': startup.PROTOCOL, 'removed_autoreleases': 2,
+        'original_source_sha256': hashlib.sha256(original.encode()).hexdigest(),
+        'negative_source_sha256': hashlib.sha256(modified).hexdigest(),
+        'runner_return_code': return_code,
+        'registration_scan_classification': classification,
+        'strict_failure_labels': [label if label in safe_labels else 'other' for label in labels],
+        'scans': [{'label': row.get('label') if row.get('label') in SCAN_LABELS else 'other',
+                   **{key: number(row.get(key)) for key in ('exit_code', 'leak_nodes', 'leak_bytes', 'unclassified_nodes')},
+                   'destroyed_notification_stack_present': row.get('destroyed_notification_stack_present') if type(row.get('destroyed_notification_stack_present')) is bool else None,
+                   'root_instances': (sum(group['root_instances'] for group in row['groups'])
+                                      if all(type(group.get('root_instances')) is int for group in row.get('groups', [])) and 'groups' in row else None),
+                   'unexpected_root_present': any(group.get('root_type') != 'NSXPCConnection' for group in row.get('groups', []))}
+                  for row in scans]}
+    (records / 'negative-control.json').write_text(json.dumps(evidence, indent=2) + '\n')
+    print(json.dumps({'negative_control': evidence}), flush=True)
+
+    test.assertEqual(return_code, 1)
+    startup.validate(receipt['startup_baseline'])
+    test.assertEqual(receipt['startup_baseline']['status'], 'observed-stable')
+    test.assertEqual(receipt['coverage'], 'failed')
+    for key, expected in (('destroyed_buttons', 30), ('notifications', 60),
+                          ('ordinary_compensations', 30), ('mutable_compensations', 30)):
+        test.assertEqual(receipt[key], expected)
+    test.assertEqual([row['label'] for row in scans], SCAN_LABELS)
+    test.assertIn(classification, ('no-growth', 'classified-growth'))
+    test.assertTrue(all(row['exit_code'] in (0, 1) for row in scans))
+    test.assertTrue(all(not row['destroyed_notification_stack_present'] for row in scans[:2]))
+    test.assertTrue(all(row['destroyed_notification_stack_present'] for row in scans[2:]))
+    test.assertTrue(all(row['leak_nodes'] > scans[0]['leak_nodes'] and row['leak_bytes'] > scans[0]['leak_bytes'] for row in scans[2:]))
+    expected_labels = SCAN_LABELS[1:] if classification == 'classified-growth' else SCAN_LABELS[2:]
+    test.assertEqual(labels, expected_labels)
+    test.assertTrue(receipt['cleanup']['processes_exited'])
+    test.assertEqual(receipt['cleanup']['errors'], [])
+    test.assertTrue(all(receipt['cleanup'][role]['exited'] and not receipt['cleanup'][role]['errors'] for role in ('host', 'reader')))
+    inputs = json.loads((records / 'inputs.json').read_text())
+    test.assertEqual(inputs['sources']['QuickFileApp/AXCompatibility.m'], evidence['negative_source_sha256'])
 
 
 @unittest.skipUnless(sys.platform == 'darwin' and shutil.which('xcrun'), 'requires macOS SDK')
@@ -53,34 +130,125 @@ raise SystemExit(runner.main())
                 '--settle-startup-baseline'], capture_output=True, text=True, timeout=300)
             if result.returncode == 77:
                 self.skipTest('AX negative control unavailable: ' + result.stdout.strip())
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             receipt = json.loads((records / 'result.json').read_text())
-            startup.validate(receipt['startup_baseline'])
-            self.assertEqual(receipt['startup_baseline']['status'], 'observed-stable')
-            self.assertEqual(receipt['coverage'], 'failed')
-            self.assertEqual(receipt['destroyed_buttons'], 30)
-            self.assertEqual(receipt['notifications'], 60)
-            self.assertEqual(receipt['ordinary_compensations'], 30)
-            self.assertEqual(receipt['mutable_compensations'], 30)
-            scans = receipt['scans']
-            self.assertEqual([row['label'] for row in scans],
-                ['baseline', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited'])
-            self.assertTrue(all(not row['destroyed_notification_stack_present'] for row in scans[:2]))
-            self.assertTrue(all(row['destroyed_notification_stack_present'] for row in scans[2:]))
-            self.assertTrue(all(row['leak_nodes'] > scans[0]['leak_nodes'] and row['leak_bytes'] > scans[0]['leak_bytes'] for row in scans[2:]))
-            self.assertEqual([error['stage'] for error in receipt['validation_errors']], [row['label'] for row in scans[2:]])
-            self.assertTrue(receipt['cleanup']['processes_exited'])
-            self.assertEqual(receipt['cleanup']['errors'], [])
-            self.assertTrue(all(receipt['cleanup'][role]['exited'] and not receipt['cleanup'][role]['errors'] for role in ('host', 'reader')))
-            inputs = json.loads((records / 'inputs.json').read_text())
-            self.assertEqual(inputs['sources']['QuickFileApp/AXCompatibility.m'], hashlib.sha256(source.read_bytes()).hexdigest())
-            evidence = {'protocol': startup.PROTOCOL, 'removed_autoreleases': 2,
-                'original_source_sha256': hashlib.sha256(original.encode()).hexdigest(),
-                'negative_source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
-                'strict_failure_labels': [row['stage'] for row in receipt['validation_errors']],
-                'scans': [{key: row[key] for key in ('label', 'leak_nodes', 'leak_bytes')} for row in scans]}
-            (records / 'negative-control.json').write_text(json.dumps(evidence, indent=2) + '\n')
-            print(json.dumps({'negative_control': evidence}))
+            check_negative_control(self, receipt, records, original, source.read_bytes(), result.returncode)
+
+
+class NegativeControlReceiptTests(unittest.TestCase):
+    def receipt(self):
+        baseline, _ = StartupBaselineTests().exercise([288])
+        scans = []
+        for index, label in enumerate(SCAN_LABELS):
+            growth = max(0, index - 1) * 10
+            scans.append(compatibility.AXCompatibilityHeapValidationTests.scan(
+                288 + growth, 18432 + growth * 64, ax=index >= 2)
+                | {'label': label, 'exit_code': 1, 'host': {'private_path': '/private/secret'}})
+        return {'startup_baseline': baseline, 'coverage': 'failed', 'scans': scans,
+                'destroyed_buttons': 30, 'notifications': 60,
+                'ordinary_compensations': 30, 'mutable_compensations': 30,
+                'validation_errors': [{'stage': label, 'message': '/private/secret 0x1234'} for label in SCAN_LABELS[2:]],
+                'cleanup': {'processes_exited': True, 'errors': [],
+                            'host': {'exited': True, 'errors': []}, 'reader': {'exited': True, 'errors': []}}}
+
+    @staticmethod
+    def add_registration_growth(receipt, metric='leak_nodes'):
+        row = receipt['scans'][1]
+        if metric == 'root_instances':
+            row['groups'][0]['root_instances'] += 1
+        else:
+            row[metric] += 1
+            if metric == 'leak_nodes': row['groups'][0]['tree_nodes'] += 1
+        receipt['validation_errors'].insert(0, {'stage': 'registered-10', 'message': '/private/secret growth'})
+
+    def exercise(self, receipt, *, fails=False, return_code=1, wrong_source=False):
+        with tempfile.TemporaryDirectory() as directory:
+            records = Path(directory)
+            digest = hashlib.sha256(b'negative').hexdigest()
+            (records / 'inputs.json').write_text(json.dumps({'sources': {
+                'QuickFileApp/AXCompatibility.m': '0' * 64 if wrong_source else digest}}))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                if fails:
+                    with self.assertRaises(AssertionError):
+                        check_negative_control(self, receipt, records, 'original', b'negative', return_code)
+                else:
+                    check_negative_control(self, receipt, records, 'original', b'negative', return_code)
+            evidence = json.loads((records / 'negative-control.json').read_text())
+            self.assertEqual(json.loads(output.getvalue()), {'negative_control': evidence})
+            self.assertNotIn('secret', output.getvalue())
+            self.assertNotIn('0x1234', output.getvalue())
+            return evidence
+
+    def test_accepts_four_required_failures_or_classified_registration_growth(self):
+        receipt = self.receipt()
+        self.assertEqual(self.exercise(receipt)['registration_scan_classification'], 'no-growth')
+        for metric in ('leak_nodes', 'leak_bytes', 'root_instances'):
+            with self.subTest(metric=metric):
+                receipt = self.receipt()
+                self.add_registration_growth(receipt, metric)
+                evidence = self.exercise(receipt)
+                self.assertEqual(evidence['registration_scan_classification'], 'classified-growth')
+                self.assertEqual(evidence['strict_failure_labels'], SCAN_LABELS[1:])
+                self.assertEqual(evidence['runner_return_code'], 1)
+
+    def test_unclassified_unknown_and_unavailable_registration_remain_failures(self):
+        mutations = [lambda row: row.update(unclassified_nodes=1),
+                     lambda row: row['groups'][0].update(root_type='/private/secret'),
+                     lambda row: row.update(destroyed_notification_stack_present=True),
+                     lambda row: row.update(exit_code=2),
+                     lambda row: row.update(leak_nodes=None),
+                     lambda row: row['groups'][0].update(tree_nodes=None),
+                     lambda row: row['groups'][0].update(root_instances=None),
+                     lambda row: row['groups'][0].update(tree_nodes=0)]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                receipt = self.receipt()
+                self.add_registration_growth(receipt)
+                mutate(receipt['scans'][1])
+                self.assertEqual(self.exercise(receipt, fails=True)['registration_scan_classification'], 'invalid-scan')
+
+    def test_failure_labels_must_match_every_required_checkpoint_without_extras(self):
+        expected = SCAN_LABELS[1:]
+        invalid = [expected[:index] + expected[index + 1:] for index in range(1, 5)]
+        invalid += [expected + [extra] for extra in ('cleanup', 'execution', 'baseline', '/private/secret')]
+        invalid += [list(reversed(expected)), ['registered-10', *expected]]
+        for labels in invalid:
+            with self.subTest(labels=labels):
+                receipt = self.receipt()
+                self.add_registration_growth(receipt)
+                receipt['validation_errors'] = [{'stage': label} for label in labels]
+                self.exercise(receipt, fails=True)
+
+    def test_registration_failure_and_actual_growth_must_agree(self):
+        receipt = self.receipt()
+        receipt['validation_errors'].insert(0, {'stage': 'registered-10'})
+        self.exercise(receipt, fails=True)
+        receipt = self.receipt()
+        self.add_registration_growth(receipt)
+        receipt['validation_errors'].pop(0)
+        self.exercise(receipt, fails=True)
+
+    def test_target_leak_detection_and_activity_checks_remain_required(self):
+        for index in range(2, 6):
+            for change in ({'destroyed_notification_stack_present': False}, {'leak_nodes': 288}, {'leak_bytes': 18432}):
+                with self.subTest(index=index, change=change):
+                    receipt = self.receipt()
+                    receipt['scans'][index].update(change)
+                    self.exercise(receipt, fails=True)
+        for key in ('destroyed_buttons', 'notifications', 'ordinary_compensations', 'mutable_compensations'):
+            receipt = self.receipt(); receipt[key] = 0
+            self.exercise(receipt, fails=True)
+        self.exercise(self.receipt(), fails=True, return_code=0)
+
+    def test_cleanup_and_source_checks_remain_required_with_failure_evidence(self):
+        mutations = [lambda value: value.update(processes_exited=False),
+                     lambda value: value.update(errors=['private cleanup failure']),
+                     lambda value: value['host'].update(exited=False),
+                     lambda value: value['reader'].update(errors=['private cleanup failure'])]
+        for mutate in mutations:
+            receipt = self.receipt(); mutate(receipt['cleanup'])
+            self.exercise(receipt, fails=True)
+        self.exercise(self.receipt(), fails=True, wrong_source=True)
 
 
 class StartupBaselineTests(unittest.TestCase):
