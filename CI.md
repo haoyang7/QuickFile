@@ -61,6 +61,12 @@ live 旁路图只请求当前存活分配的栈，不要求 `--fullStackHistory`
 
 Reader 摘要 schema 2 使用紧凑 JSON，保持 512 KiB 上限；历史 schema 1 仍按原缩进格式校验，私有构建清单的编码和哈希保持原契约。成分数据超出预算时明确标为 `summary_budget`，保留每点计数、根组、时钟、活动状态和原严格判定，并重算不可用的成分差集。清理私有证据前先保存完整摘要并预检最终清理收据的编码；核心证据仍超预算时失败并保留私有产物，不以此前的部分摘要冒充完整九例。
 
+独立 [AX scan timing controls](.github/workflows/ax-scan-timing.yml) 手动工作流（也可由 `AX system baseline` 的 `scan_timing_control=true` 转发）复用一个带安装探针的构建，执行三个轮换 block、共 18 次新进程。每个 block 各含 `installed` / `preflight-only` × `early-only` / `late-only` / `twice` 六条件；日程组先后和安装模式先后在 block 间变化，完整顺序由 campaign 固定。两模式共同执行原安装预检，只有 installed 继续替换 IMP；启动及每次 ready 都核验真实 IMP 状态。它首先测量安装探针构建，不能自动推广到 ordinary 或已安装产品。
+
+以唯一初始 AX 查询完成为零点，所有条件都在第 0、20 秒执行相同 checkpoint，分别只在第 0 秒、第 20 秒或两个时点执行普通 live 扫描；Reader 均存活到第 40 秒后正常退出。checkpoint 与扫描分别调度，记录实际 Host/Reader 年龄、扫描起止及退出请求/wait 返回。扫描、checkpoint、退出等待分别限时 12/5/5 秒，计划迟到上限 3 秒。仅 twice 对自身 0→20 秒作原严格增长判定，单扫描组明确为 `not-evaluated`；每点仍执行原严格分类，分类、增长和证据完整度分别记录，失败不能被后续样本撤销。不增加采图、settling 或新解析器；匿名摘要沿用 512 KiB 上限，最终编码预检通过且进程清理确认后才回收私有 App、缓存与原始数据。
+
+晚时点首次扫描与早时点首次扫描的差异同时包含年龄、异步演化和 checkpoint 历史；同龄的 twice 晚点与 late-only 才有相同 checkpoint 历史，可调查此前扫描的总体影响。跨进程比较须核对实际年龄与启动耗时，不能假设初始堆可交换，也不自动生成因果通过结论。固定样本无漂移、迟到或不完整时保留不可判定；小幅计数变化与新增根分别描述，根数量不建立对象身份或连接创建时间。该入口不改变 ordinary CI、正式基线或发布门禁。
+
 旁路采图失败时，仅公开固定的错误词法提示，不将其称为根因。身份验证成功、测量及离线工具的进程清理均确认后，才运行额外的自有进程 CLI 检查，验证当前图及其分配栈可读；同进程另记完整历史能力对照，明确区分模式不支持与未知失败。此检查位于原测量之后，不会覆盖原失败，也不在 live 采图失败后自动改用另一套协议。
 
 `receipt_mode=internal` 是默认回执路径，在夹具中编译额外的环境读取代码。`receipt_mode=external-startup` 要求 `malloc_scribble=true`、`scan_mode=live`、`heap_diagnostics=false` 和 `ax_causal_probe=false`：只构建一次普通 host/reader，不定义 `QUICKFILE_AX_MALLOC_RECEIPT`，将同一签名 App 和 reader 按字节复制到 20 个独立 case。准备清单绑定当前夹具源码哈希；每次复制、实际子进程启动检查、测量完成和子进程退出后均校验两个可执行文件的 SHA-256，工作流再次对照统一构建哈希。这里保证本轮 off/on 和 control/product 复用相同字节，不宣称与另一个 CI job 的独立构建逐字节相同。

@@ -69,6 +69,11 @@ on:
         type: boolean
         required: false
         default: false
+      scan_timing_control:
+        description: 'Eighteen same-build install-gate trials: early/late first scan or both; other inputs stay default'
+        type: boolean
+        required: false
+        default: false
       reader_exit_control:
         description: 'Nine fresh zero-target trials with fixed scans and keep/early/late Reader exit; other inputs stay default'
         type: boolean
@@ -88,7 +93,7 @@ defaults:
 
 jobs:
   ax-system-probe:
-    if: ${{ !inputs.reader_exit_control && !inputs.settled_baseline_shadow && !inputs.reference_validation && !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin && !inputs.pure_appkit_control && !inputs.install_gate_control && !inputs.frozen_control && !inputs.live_attribution }}
+    if: ${{ !inputs.scan_timing_control && !inputs.reader_exit_control && !inputs.settled_baseline_shadow && !inputs.reference_validation && !inputs.heap_diagnostics && !inputs.malloc_scribble && inputs.scan_mode != 'live' && inputs.receipt_mode != 'external-startup' && !inputs.terminal_origin && !inputs.pure_appkit_control && !inputs.install_gate_control && !inputs.frozen_control && !inputs.live_attribution }}
     name: macOS ${{ matrix.expected_os }} (arm64)
     strategy:
       fail-fast: false
@@ -188,7 +193,7 @@ jobs:
           PY
 
   ax-heap-diagnostics:
-    if: ${{ !inputs.reader_exit_control && !inputs.settled_baseline_shadow && !inputs.reference_validation && (inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin || inputs.pure_appkit_control || inputs.install_gate_control || inputs.frozen_control || inputs.live_attribution) }}
+    if: ${{ !inputs.scan_timing_control && !inputs.reader_exit_control && !inputs.settled_baseline_shadow && !inputs.reference_validation && (inputs.heap_diagnostics || inputs.malloc_scribble || inputs.scan_mode == 'live' || inputs.receipt_mode == 'external-startup' || inputs.terminal_origin || inputs.pure_appkit_control || inputs.install_gate_control || inputs.frozen_control || inputs.live_attribution) }}
     name: macOS 26 ${{ inputs.live_attribution && 'live attribution' || inputs.install_gate_control && (inputs.heap_diagnostics && 'install gate frozen' || 'install gate live') || inputs.pure_appkit_control && 'pure AppKit live' || inputs.scan_mode }} heap comparison (arm64)
     runs-on: macos-26
     timeout-minutes: ${{ inputs.malloc_scribble && 70 || inputs.heap_diagnostics && 55 || (inputs.pure_appkit_control || inputs.install_gate_control) && 40 || 35 }}
@@ -902,5 +907,11 @@ jobs:
   ax-reader-exit:
     if: ${{ inputs.reader_exit_control }}
     uses: ./.github/workflows/ax-reader-exit.yml
+    with:
+      dispatch_inputs: ${{ toJSON(inputs) }}
+
+  ax-scan-timing:
+    if: ${{ inputs.scan_timing_control }}
+    uses: ./.github/workflows/ax-scan-timing.yml
     with:
       dispatch_inputs: ${{ toJSON(inputs) }}

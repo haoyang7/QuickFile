@@ -12,7 +12,7 @@ import subprocess
 import time
 import traceback
 
-from ax_external_receipt import (EXECUTABLES, fixture_sources, load_prepared_fixture,
+from ax_external_receipt import (EXECUTABLES, INSTALL_ENV, INSTALL_MODES, fixture_sources, load_prepared_fixture,
     owned_child_receipt, read_procargs, require_fixture_hashes, validate_external_receipt)
 from ax_process import reap_owned
 from ax_probe_report import leak_groups
@@ -22,6 +22,10 @@ SPEC = importlib.util.spec_from_file_location("ax_reader_exit_verify", Path(__fi
 VERIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(VERIFY)
 SCAN_SCHEDULE = (("baseline", 0), ("t20", 20), ("t40", 40), ("t60", 60), ("t80", 80), ("t110", 110))
+TIMING_SCANS = {"early-only": (("baseline", 0),), "late-only": (("baseline", 20),),
+                "twice": (("baseline", 0), ("t20", 20))}
+TIMING_CHECKPOINTS = (("t0", 0), ("t20", 20))
+HOLD_UNTIL_SECONDS = 40
 EXIT_OFFSETS = {"keep": None, "early": 30, "late": 70}
 SCAN_TIMEOUT = 12
 CHECKPOINT_TIMEOUT = 5
@@ -36,8 +40,8 @@ class TrialFailure(RuntimeError):
         self.reason = reason
 
 
-def initial_trial(arm):
-    return {"schema": 1, "arm": arm, "policy": {
+def initial_trial(arm, timing_control=None, install_gate=None):
+    value = {"schema": 1, "arm": arm, "policy": {
         "schedule": [{"label": label, "offset_seconds": offset} for label, offset in SCAN_SCHEDULE],
         "exit_offset_seconds": EXIT_OFFSETS[arm], "scan_timeout_seconds": SCAN_TIMEOUT,
         "checkpoint_timeout_seconds": CHECKPOINT_TIMEOUT, "stop_timeout_seconds": STOP_TIMEOUT,
@@ -49,13 +53,24 @@ def initial_trial(arm):
         "scans": [], "warm_receipt": None, "completed_receipt": None,
         "strict_verdict": {"status": "not-evaluated", "failed_labels": []}, "cleanup": None}
 
+    if timing_control is not None:
+        value.update(schema=2, timing_control=timing_control, install_gate=install_gate,
+                     checkpoints=[], initial_host_receipt=None)
+        value["policy"].pop("schedule")
+        value["policy"].update(
+            checkpoint_schedule=[{"label": label, "offset_seconds": offset} for label, offset in TIMING_CHECKPOINTS],
+            scan_schedule=[{"label": label, "offset_seconds": offset} for label, offset in TIMING_SCANS[timing_control]],
+            hold_until_seconds=HOLD_UNTIL_SECONDS)
+    return value
+
 
 class Trial:
-    def __init__(self, prepared, work, records, arm):
+    def __init__(self, prepared, work, records, arm, timing_control=None, install_gate=None):
         self.prepared, self.work, self.records = prepared, work, records
         self.state = work / "state"
         self.app = work / "AXCompatibilityFixture.app"
-        self.data = initial_trial(arm)
+        self.timing_control, self.install_gate = timing_control, install_gate
+        self.data = initial_trial(arm, timing_control, install_gate)
         self.host = self.reader = None
         self.origin = None
         self.sequence = 0
@@ -90,8 +105,9 @@ class Trial:
             raise TrialFailure("timing_mismatch")
 
     def startup(self):
-        hashes = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in fixture_sources()}
-        expected = load_prepared_fixture(self.prepared, hashes)
+        build_mode = "install-gate" if self.timing_control else "ordinary"
+        hashes = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in fixture_sources(build_mode)}
+        expected = load_prepared_fixture(self.prepared, hashes, build_mode=build_mode)
         self.data["executables"] = expected
         source_app = self.prepared / self.app.name
         if source_app.is_symlink() or any(path.is_symlink() for path in source_app.rglob("*")):
@@ -104,6 +120,8 @@ class Trial:
         for key in ("MallocScribble", "MallocStackLogging", "MallocStackLoggingNoCompact",
                     "QUICKFILE_DISABLE_AX_COMPATIBILITY", "QUICKFILE_AX_INSTALL_PROBE_MODE"):
             base.pop(key, None)
+        if self.install_gate:
+            base[INSTALL_ENV] = self.install_gate
         environments = {"host": dict(base, MallocStackLogging="1", MallocStackLoggingNoCompact="1"), "reader": base}
         capabilities = {}
         for role, name in EXECUTABLES.items():
@@ -111,12 +129,14 @@ class Trial:
                 capture_output=True, text=True, check=True, timeout=15)
             capabilities[role] = json.loads(result.stdout)
         VERIFY.write_json(self.records / "inputs.json", {"capabilities": capabilities, "sources": hashes})
-        reason = VERIFY.preflight_reason(capabilities["host"], capabilities["reader"])
+        reason = VERIFY.preflight_reason(capabilities["host"], capabilities["reader"], install_gate=self.install_gate)
         if reason:
             self.data.update(status="not-covered", reason=reason)
             return False
         external = {"receipt_mode": "external-startup", "requested": "off", "host": None,
             "reader": None, "executables": expected, "binary_reuse_verified": False}
+        if self.install_gate:
+            external["install_gate"] = self.install_gate
         self.data["external_startup"] = external
         markers = self.data["clock_markers"]
         for role, name in EXECUTABLES.items():
@@ -130,17 +150,22 @@ class Trial:
             if role == "host":
                 ready = VERIFY.wait_json(self.state / "ready.json", lambda row: row["sequence"] == 0, [process])
                 self.start_markers["host_ready"] = time.monotonic()
+                if self.timing_control:
+                    self.data["initial_host_receipt"] = ready
+                    self.activity(VERIFY.validate_install_gate_state, ready.get("install_probe"), self.install_gate)
                 self.activity(VERIFY.validate_control_host, ready)
-            external[role] = owned_child_receipt(process, path, environments[role], "off", expected[role])
+            external[role] = owned_child_receipt(process, path, environments[role], "off", expected[role], self.install_gate)
             _, _, actual = read_procargs(process.pid)
-            for key in ("MallocStackLogging", "MallocStackLoggingNoCompact", "MallocScribble"):
+            environment_keys = ("MallocStackLogging", "MallocStackLoggingNoCompact", "MallocScribble")
+            if self.install_gate:
+                environment_keys += (INSTALL_ENV,)
+            for key in environment_keys:
                 wanted = environments[role].get(key)
                 if actual.get(key.encode()) != (wanted.encode() if wanted else None):
                     raise TrialFailure("environment_mismatch")
             if process.poll() is not None:
                 raise TrialFailure("reader_liveness")
-            self.data["environments"][role] = {key: environments[role].get(key, "unset") for key in
-                ("MallocStackLogging", "MallocStackLoggingNoCompact", "MallocScribble")}
+            self.data["environments"][role] = {key: environments[role].get(key, "unset") for key in environment_keys}
             VERIFY.write_json(self.records / "external-startup.json", external)
         VERIFY.write_json(self.state / "reader-command.json", {"sequence": 1})
         warm = VERIFY.wait_json(self.state / "reader-ready.json", lambda row: row["sequence"] == 1, [self.host, self.reader])
@@ -172,13 +197,7 @@ class Trial:
             self.on_time(timing["stop_requested"], timing["target_offset_seconds"])
             self.on_time(timing["wait_returned"], timing["target_offset_seconds"])
 
-    def sample(self, label, target):
-        expected_alive = self.data["exit_timing"]["return_code"] is None
-        row = {"label": label, "target_offset_seconds": target, "host": None, "exit_code": None,
-            "leak_nodes": None, "leak_bytes": None, "groups": None, "unclassified_nodes": None,
-            "destroyed_notification_stack_present": None, "stdout_sha256": None,
-            "checkpoint": self.window(), "scan": None}
-        self.data["scans"].append(row)
+    def checkpoint(self, row, expected_alive):
         self.liveness(expected_alive)
         self.sequence += 1
         try:
@@ -188,7 +207,22 @@ class Trial:
         finally:
             self.end(row["checkpoint"])
         self.activity(VERIFY.validate_control_host, row["host"])
+        if self.install_gate:
+            self.activity(VERIFY.validate_install_gate_state, row["host"].get("install_probe"), self.install_gate)
         self.liveness(expected_alive)
+
+    def sample(self, label, target, checkpoint=None):
+        expected_alive = self.data["exit_timing"]["return_code"] is None
+        row = {"label": label, "target_offset_seconds": target, "host": None, "exit_code": None,
+            "leak_nodes": None, "leak_bytes": None, "groups": None, "unclassified_nodes": None,
+            "destroyed_notification_stack_present": None, "stdout_sha256": None,
+            "checkpoint": self.window(), "scan": None}
+        self.data["scans"].append(row)
+        if checkpoint is None:
+            self.checkpoint(row, expected_alive)
+        else:
+            row.update(host=checkpoint["host"], checkpoint=checkpoint["checkpoint"])
+            self.liveness(expected_alive)
         row["scan"] = self.window()
         try:
             result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(self.host.pid)],
@@ -222,6 +256,23 @@ class Trial:
         self.on_time(row["scan"]["start"], target)
 
     def schedule(self):
+        if self.timing_control:
+            scans = {offset: label for label, offset in TIMING_SCANS[self.timing_control]}
+            for label, offset in TIMING_CHECKPOINTS:
+                time.sleep(max(0, offset - self.now()))
+                row = {"label": label, "target_offset_seconds": offset,
+                       "checkpoint": self.window(), "host": None}
+                self.data["checkpoints"].append(row)
+                self.checkpoint(row, True)
+                self.on_time(row["checkpoint"]["start"], offset)
+                if offset in scans:
+                    self.sample(scans[offset], offset, checkpoint=row)
+            time.sleep(max(0, HOLD_UNTIL_SECONDS - self.now()))
+            self.stop("cleanup")
+            timing = self.data["exit_timing"]
+            self.on_time(timing["stop_requested"], HOLD_UNTIL_SECONDS)
+            self.on_time(timing["wait_returned"], HOLD_UNTIL_SECONDS)
+            return
         events = [(offset, label) for label, offset in SCAN_SCHEDULE]
         stop = self.data["exit_timing"]["target_offset_seconds"]
         if stop is not None:
@@ -263,7 +314,7 @@ class Trial:
                 require_fixture_hashes(self.prepared, self.data["executables"])
                 require_fixture_hashes(self.work, self.data["executables"])
                 external["binary_reuse_verified"] = cleanup["processes_exited"]
-                validate_external_receipt(external, "off", self.data["executables"])
+                validate_external_receipt(external, "off", self.data["executables"], self.install_gate)
             except Exception:
                 traceback.print_exc(file=self.error_log)
                 external["binary_reuse_verified"] = False
@@ -307,14 +358,18 @@ def main(argv=None):
     for name in ("prepared-fixture-directory", "work-directory", "records-directory"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--arm", choices=EXIT_OFFSETS, required=True)
+    parser.add_argument("--timing-control", choices=TIMING_SCANS)
+    parser.add_argument("--install-gate", choices=INSTALL_MODES)
     args = parser.parse_args(argv)
+    if bool(args.timing_control) != bool(args.install_gate) or (args.timing_control and args.arm != "keep"):
+        parser.error("Timing control and install gate require each other and --arm keep")
     paths = [getattr(args, key).resolve() for key in ("prepared_fixture_directory", "work_directory", "records_directory")]
     root = (ROOT / ".build/Temporary").resolve()
     if any(path == root or not path.is_relative_to(root) for path in paths):
         parser.error("Directories must be below .build/Temporary")
     if any(a == b or a.is_relative_to(b) or b.is_relative_to(a) for i, a in enumerate(paths) for b in paths[i + 1:]):
         parser.error("Directories must be disjoint")
-    return Trial(*paths, args.arm).run()
+    return Trial(*paths, args.arm, args.timing_control, args.install_gate).run()
 
 
 if __name__ == "__main__":

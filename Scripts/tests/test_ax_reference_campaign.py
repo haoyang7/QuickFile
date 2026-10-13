@@ -431,7 +431,7 @@ class CampaignSelectionTests(CampaignBoundaryTests):
 class CampaignWorkflowGuardTests(unittest.TestCase):
     FLAGS = ("ax_causal_probe", "heap_diagnostics", "malloc_scribble", "terminal_origin",
              "live_attribution", "install_gate_control", "pure_appkit_control", "frozen_control",
-             "settled_baseline_shadow", "reader_exit_control")
+             "settled_baseline_shadow", "reader_exit_control", "scan_timing_control")
 
     @classmethod
     def setUpClass(cls):

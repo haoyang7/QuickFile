@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-FLAGS = ('ax_causal_probe', 'heap_diagnostics', 'malloc_scribble', 'terminal_origin',
+FLAGS = ('scan_timing_control', 'ax_causal_probe', 'heap_diagnostics', 'malloc_scribble', 'terminal_origin',
          'live_attribution', 'install_gate_control', 'pure_appkit_control', 'frozen_control',
          'reference_validation', 'settled_baseline_shadow')
 
