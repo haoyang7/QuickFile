@@ -277,19 +277,34 @@ class CampaignOrchestrationTests(CampaignTemporaryTests):
                         raise OSError("synthetic private publication failure")
                     return original_save(path, value)
                 code = None
+                caught = None
                 with mock.patch.object(CAMPAIGN, "encode_summary", side_effect=encode), \
                         mock.patch.object(CAMPAIGN, "save_summary", side_effect=save), \
                         contextlib.redirect_stderr(io.StringIO()):
                     try:
                         code, _, _, _ = self.run_campaign(strict_failures=True)
-                    except (ValueError, OSError):
-                        pass
+                    except (ValueError, OSError) as error:
+                        caught = error
                 self.assertTrue((self.work / "private").is_dir())
-                self.assertEqual(code, 1)
+                if failure in ('final-budget', 'write'):
+                    self.assertEqual(code, 1)
+                    self.assertIsNone(caught)
+                else:
+                    self.assertIsNone(code)
+                    self.assertIsInstance(caught, ValueError)
                 value = json.loads((self.work / "summary.json").read_bytes())
                 self.assertNotEqual(value["temporary_cleanup"], "complete")
                 self.assertFalse(value["strict_checks_passed"])
                 self.assertEqual(len(value["cases"]), 3 if failure == "case-budget" else 4)
+
+    def test_handled_caller_exception_does_not_skip_normal_cleanup(self):
+        try:
+            raise RuntimeError('already handled by caller')
+        except RuntimeError:
+            code, value, _, _ = self.run_campaign()
+        self.assertEqual(code, 0)
+        self.assertEqual(value['temporary_cleanup'], 'complete')
+        self.assertFalse((self.work / 'private').exists())
 
     def test_missing_or_invalid_reference_keeps_verified_frozen_and_bridge_in_public_summary(self):
         for failure in ("missing", "invalid-json", "invalid-summary"):

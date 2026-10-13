@@ -561,21 +561,36 @@ class CampaignTests(TemporaryTests):
                         raise OSError('synthetic private publication failure')
                     return original_save(path, value)
                 code = None
+                caught = None
                 with mock.patch.object(C, 'encode_summary', side_effect=encode), \
                         mock.patch.object(C, 'save_summary', side_effect=save), \
                         contextlib.redirect_stderr(io.StringIO()):
                     try:
                         code, _, _ = self.run_campaign()
-                    except (ValueError, OSError):
-                        pass
+                    except (ValueError, OSError) as error:
+                        caught = error
                 private = self.root / 'campaign/private'
                 self.assertTrue(private.is_dir())
                 self.assertTrue(any(private.rglob('process-cleanup.json')))
-                self.assertEqual(code, 1)
+                if failure in ('final-budget', 'write'):
+                    self.assertEqual(code, 1)
+                    self.assertIsNone(caught)
+                else:
+                    self.assertIsNone(code)
+                    self.assertIsInstance(caught, ValueError)
                 value = C.read_json(self.root / 'campaign/summary.json')
                 self.assertNotEqual(value['temporary_cleanup'], 'complete')
                 self.assertFalse(value['strict_checks_passed'])
                 self.assertEqual(len(value['cases']), 3 if failure == 'case-budget' else 4)
+
+    def test_handled_caller_exception_does_not_skip_normal_cleanup(self):
+        try:
+            raise RuntimeError('already handled by caller')
+        except RuntimeError:
+            code, value, _ = self.run_campaign(strict_failed=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(value['temporary_cleanup'], 'complete')
+        self.assertFalse((self.root / 'campaign/private').exists())
 
     def run_campaign(self, *, cleanup=True, missing_capture=False, tool_cleanup=True, corrupt_evidence=False, strict_failed=True, cleanup_failure=False, shadow_failure=False,
                      fixture_cleanup=None, measurement_failure=None):

@@ -655,6 +655,7 @@ def campaign(root):
     for key in ('MallocScribble', 'MallocStackLogging', 'MallocStackLoggingNoCompact'): environment.pop(key, None)
     cleanup_confirmed = True
     evidence_preserved = True
+    exception_pending = False
     prepared = {}
     runner = ROOT / 'Scripts/Investigations/verify-ax-compatibility.py'
     try:
@@ -742,24 +743,30 @@ def campaign(root):
         summary['completed'] = True
         for key in ('strict_checks_passed', 'evidence_checks_passed'): summary[key] = all(case[key] for case in summary['cases'])
         return_code = 0 if summary['strict_checks_passed'] and summary['evidence_checks_passed'] else 1
+    except BaseException:
+        exception_pending = True
+        raise
     finally:
-        if cleanup_confirmed and evidence_preserved:
-            # A failed publication must leave the raw evidence recoverable.
-            # Preflight the final receipt before deleting any private files.
-            try:
-                save_summary(public, summary)
-                encode_summary(dict(summary, temporary_cleanup='complete'))
-            except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
-                print('Public summary unavailable; private evidence retained', file=sys.stderr)
-                return 1
-            try:
-                shutil.rmtree(private)
-                summary['temporary_cleanup'] = 'complete'
-            except OSError:
-                summary['temporary_cleanup'] = 'failed'
-        elif not cleanup_confirmed: summary['temporary_cleanup'] = 'retained-unconfirmed'
-        else: summary['temporary_cleanup'] = 'retained-evidence'
-        save_summary(public, summary)
+        # An unhandled failure keeps private diagnostics and the last durable
+        # summary. Finalization must neither delete evidence nor mask the error.
+        if not exception_pending:
+            if cleanup_confirmed and evidence_preserved:
+                # A failed publication must leave the raw evidence recoverable.
+                # Preflight the final receipt before deleting any private files.
+                try:
+                    save_summary(public, summary)
+                    encode_summary(dict(summary, temporary_cleanup='complete'))
+                except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
+                    print('Public summary unavailable; private evidence retained', file=sys.stderr)
+                    return 1
+                try:
+                    shutil.rmtree(private)
+                    summary['temporary_cleanup'] = 'complete'
+                except OSError:
+                    summary['temporary_cleanup'] = 'failed'
+            elif not cleanup_confirmed: summary['temporary_cleanup'] = 'retained-unconfirmed'
+            else: summary['temporary_cleanup'] = 'retained-evidence'
+            save_summary(public, summary)
     return return_code if summary['temporary_cleanup'] == 'complete' else 1
 
 
