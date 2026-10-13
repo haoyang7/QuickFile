@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import struct
 import subprocess
 import sys
@@ -115,34 +116,46 @@ class AXExternalStartupTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "darwin", "Darwin owned-child startup metadata")
     def test_native_owned_child_success_and_injected_syscall_failure(self):
-        executable = Path(sys.executable).resolve()
-        environment = dict(os.environ, QUICKFILE_AX_INSTALL_PROBE_MODE="installed")
-        environment.pop("MallocScribble", None)
-        child = subprocess.Popen([str(executable), "-B", "-c", "import sys; sys.stdin.buffer.read()"],
-                                 stdin=subprocess.PIPE, env=environment)
-        try:
-            digest = EXTERNAL.executable_hash(executable)
-            receipt = EXTERNAL.owned_child_receipt(child, executable, environment, "off", digest, "installed")
-            self.assertEqual(receipt["malloc_scribble"], "unset")
-            self.assertEqual(receipt["install_gate"], "installed")
-            def sysctl(mib, count, output, size, *_):
-                if count == 2:
-                    output._obj.value = 4096; size._obj.value = 4
-                    return 0
-                ctypes.set_errno(13)
-                return -1
-            library = mock.Mock(); library.sysctl.side_effect = sysctl
-            with mock.patch.object(EXTERNAL.ctypes, "CDLL", return_value=library), self.assertRaises(EXTERNAL.StartupReceiptError) as caught:
-                EXTERNAL.owned_child_receipt(child, executable, environment, "off", digest, "installed")
-            self.assertEqual(EXTERNAL.startup_failure("external-startup-host", caught.exception),
-                {"stage": "external-startup-host", "reason": "sysctl_procargs", "errno": 13})
-            self.assertIsNone(child.poll())
-        finally:
+        temporary = ROOT / ".build/Temporary"
+        temporary.mkdir(parents=True, exist_ok=True)
+        parent = Path(tempfile.gettempdir()).resolve()
+        if not parent.is_relative_to(temporary): parent = temporary
+        with tempfile.TemporaryDirectory(prefix="ax-owned-child-", dir=parent) as directory:
+            executable = Path(directory) / "owned-child"
+            # macOS framework Python can re-exec another binary after Popen.
+            # This fixture has one executable identity for the entire check.
+            source = '#include <stdio.h>\nint main(void) { puts("ready"); fflush(stdout); return getchar() == EOF ? 0 : 1; }\n'
+            subprocess.run(["xcrun", "clang", "-x", "c", "-", "-o", str(executable)],
+                           input=source, text=True, capture_output=True, check=True, timeout=30)
+            environment = dict(os.environ, QUICKFILE_AX_INSTALL_PROBE_MODE="installed")
+            environment.pop("MallocScribble", None)
+            child = subprocess.Popen([str(executable)], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, env=environment)
             try:
-                child.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                child.kill(); child.communicate(timeout=5)
-        self.assertEqual(child.returncode, 0)
+                self.assertTrue(select.select([child.stdout], [], [], 10)[0], "Owned child did not become ready")
+                self.assertEqual(child.stdout.readline(), b"ready\n")
+                digest = EXTERNAL.executable_hash(executable)
+                receipt = EXTERNAL.owned_child_receipt(child, executable, environment, "off", digest, "installed")
+                self.assertEqual(receipt["malloc_scribble"], "unset")
+                self.assertEqual(receipt["install_gate"], "installed")
+                def sysctl(mib, count, output, size, *_):
+                    if count == 2:
+                        output._obj.value = 4096; size._obj.value = 4
+                        return 0
+                    ctypes.set_errno(13)
+                    return -1
+                library = mock.Mock(); library.sysctl.side_effect = sysctl
+                with mock.patch.object(EXTERNAL.ctypes, "CDLL", return_value=library), self.assertRaises(EXTERNAL.StartupReceiptError) as caught:
+                    EXTERNAL.owned_child_receipt(child, executable, environment, "off", digest, "installed")
+                self.assertEqual(EXTERNAL.startup_failure("external-startup-host", caught.exception),
+                    {"stage": "external-startup-host", "reason": "sysctl_procargs", "errno": 13})
+                self.assertIsNone(child.poll())
+            finally:
+                try:
+                    child.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill(); child.communicate(timeout=5)
+            self.assertEqual(child.returncode, 0)
 
     def test_install_gate_startup_requires_exact_setting_and_public_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
