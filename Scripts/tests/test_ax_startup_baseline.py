@@ -3,7 +3,10 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -11,6 +14,73 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Investigations"))
 import ax_startup_baseline as startup
 import test_ax_compatibility as compatibility
 PROBE = compatibility.PROBE
+
+
+@unittest.skipUnless(sys.platform == 'darwin' and shutil.which('xcrun'), 'requires macOS SDK')
+class StartupBaselineNativeNegativeControlTests(unittest.TestCase):
+    def test_settled_baseline_rejects_real_uncompensated_ax_copies(self):
+        temporary = compatibility.ROOT / '.build/Temporary'
+        temporary.mkdir(parents=True, exist_ok=True)
+        parent = Path(tempfile.gettempdir()).resolve()
+        if not parent.is_relative_to(temporary): parent = temporary
+        with tempfile.TemporaryDirectory(prefix='ax-startup-negative-', dir=parent) as directory:
+            work = Path(directory)
+            overlay = work / 'source'
+            for name in PROBE.fixture_sources():
+                target = overlay / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(compatibility.ROOT / name, target)
+            source = overlay / 'QuickFileApp/AXCompatibility.m'
+            original = source.read_text()
+            self.assertEqual(original.count('[result autorelease];'), 2)
+            # Reintroduce the verified ownership defect only in this isolated
+            # build. Keep branch counters so a compensation-count assertion
+            # cannot substitute for detecting the actual leaked AX copies.
+            source.write_text(original.replace('[result autorelease];', '(void)result;'))
+            records = compatibility.notification_records(work)
+            records = records.with_name(records.name + '-negative-control')
+            loader = '''import importlib.util, pathlib, sys
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location('negative_control_runner', pathlib.Path(sys.argv[1]) / 'verify-ax-compatibility.py')
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+runner.ROOT = pathlib.Path(sys.argv[2])
+sys.argv = [str(spec.origin), *sys.argv[3:]]
+raise SystemExit(runner.main())
+'''
+            result = subprocess.run([sys.executable, '-B', '-c', loader, str(compatibility.INVESTIGATIONS), str(overlay),
+                '--work-directory', str(overlay / '.build/Temporary/fixture'), '--records-directory', str(records),
+                '--settle-startup-baseline'], capture_output=True, text=True, timeout=300)
+            if result.returncode == 77:
+                self.skipTest('AX negative control unavailable: ' + result.stdout.strip())
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            receipt = json.loads((records / 'result.json').read_text())
+            startup.validate(receipt['startup_baseline'])
+            self.assertEqual(receipt['startup_baseline']['status'], 'observed-stable')
+            self.assertEqual(receipt['coverage'], 'failed')
+            self.assertEqual(receipt['destroyed_buttons'], 30)
+            self.assertEqual(receipt['notifications'], 60)
+            self.assertEqual(receipt['ordinary_compensations'], 30)
+            self.assertEqual(receipt['mutable_compensations'], 30)
+            scans = receipt['scans']
+            self.assertEqual([row['label'] for row in scans],
+                ['baseline', 'registered-10', 'removed-10', 'removed-20', 'removed-30', 'observer-exited'])
+            self.assertTrue(all(not row['destroyed_notification_stack_present'] for row in scans[:2]))
+            self.assertTrue(all(row['destroyed_notification_stack_present'] for row in scans[2:]))
+            self.assertTrue(all(row['leak_nodes'] > scans[0]['leak_nodes'] and row['leak_bytes'] > scans[0]['leak_bytes'] for row in scans[2:]))
+            self.assertEqual([error['stage'] for error in receipt['validation_errors']], [row['label'] for row in scans[2:]])
+            self.assertTrue(receipt['cleanup']['processes_exited'])
+            self.assertEqual(receipt['cleanup']['errors'], [])
+            self.assertTrue(all(receipt['cleanup'][role]['exited'] and not receipt['cleanup'][role]['errors'] for role in ('host', 'reader')))
+            inputs = json.loads((records / 'inputs.json').read_text())
+            self.assertEqual(inputs['sources']['QuickFileApp/AXCompatibility.m'], hashlib.sha256(source.read_bytes()).hexdigest())
+            evidence = {'protocol': startup.PROTOCOL, 'removed_autoreleases': 2,
+                'original_source_sha256': hashlib.sha256(original.encode()).hexdigest(),
+                'negative_source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+                'strict_failure_labels': [row['stage'] for row in receipt['validation_errors']],
+                'scans': [{key: row[key] for key in ('label', 'leak_nodes', 'leak_bytes')} for row in scans]}
+            (records / 'negative-control.json').write_text(json.dumps(evidence, indent=2) + '\n')
+            print(json.dumps({'negative_control': evidence}))
 
 
 class StartupBaselineTests(unittest.TestCase):

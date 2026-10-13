@@ -1517,7 +1517,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         startup_error=None, hash_io_failure=None, live_attribution=False, live_capture_failure=None,
                         reference_validation=False, reference_idle=False, ci_failure_evidence=False,
                         ci_capture_failed=False, settled_shadow=False, shadow_capture_failed=False, shadow_timeout=False,
-                        settled_startup=False):
+                        settled_startup=False, startup_scan_durations=()):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -1553,6 +1553,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             protocol = []
             real_settle = PROBE.ax_startup_baseline.settle
             clock = [0.0]
+            startup_timeouts = []
             counter = itertools.count(step=0.25)
             def monotonic():
                 if not settled_startup:
@@ -1642,6 +1643,12 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         self.assertEqual(host_state["allocatedButtons"], 0)
                         self.assertEqual(host_state["destroyedButtons"], 0)
                         self.assertEqual(host_state["compensations"], 0)
+                        duration = startup_scan_durations[min(len(startup_timeouts), len(startup_scan_durations) - 1)] if startup_scan_durations else 0
+                        self.assertGreaterEqual(_kwargs["timeout"], duration)
+                        self.assertLessEqual(_kwargs["timeout"], 40)
+                        if startup_timeouts: self.assertLess(_kwargs["timeout"], startup_timeouts[-1])
+                        startup_timeouts.append(_kwargs["timeout"])
+                        clock[0] += duration
                         return subprocess.CompletedProcess(command, 0,
                             "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
                     capture = next((value for value in command if value.startswith("--outputGraph=")), None)
@@ -2233,6 +2240,14 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             self.assertEqual(outcome.exception.code, 2)
             run.assert_not_called()
             spawn.assert_not_called()
+
+    def test_slow_startup_scan_uses_remaining_total_budget(self):
+        code, result = self.exercise_runner(settled_startup=True, startup_scan_durations=(13, 1))
+        self.assertEqual(code, 0)
+        receipt = result['startup_baseline']
+        self.assertGreaterEqual(receipt['probes'][0]['elapsed_ms'], 13000)
+        self.assertGreaterEqual(receipt['probes'][-1]['elapsed_ms'], 20000)
+        self.assertLess(receipt['probes'][-1]['elapsed_ms'], 40000)
 
     def test_settled_startup_finishes_before_targets_and_retains_later_failures(self):
         for failure in (None, "registered-10", "removed-20", "observer-exited"):
