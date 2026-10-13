@@ -249,6 +249,7 @@ def main(argv=None):
     prepared = {}
     cleanup_confirmed = True
     evidence_preserved = True
+    exception_pending = False
     try:
         for mode in ("ordinary", "pure-appkit"):
             directory = private / mode
@@ -328,29 +329,35 @@ def main(argv=None):
         summary["strict_checks_passed"] = all(case["strict_checks_passed"] for case in summary["cases"])
         summary["evidence_checks_passed"] = all(case["evidence_checks_passed"] for case in summary["cases"])
         return 0 if summary["strict_checks_passed"] and summary["evidence_checks_passed"] else 1
+    except BaseException:
+        exception_pending = True
+        raise
     finally:
-        if cleanup_confirmed and evidence_preserved:
-            # Keep raw evidence until all collected cases are durably saved and
-            # the final cleanup receipt also fits the public encoding budget.
-            try:
-                save_summary(public, summary)
-                encode_summary(dict(summary, temporary_cleanup="complete"))
-            except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
-                print("Public summary unavailable; private evidence retained", file=sys.stderr)
+        # An unhandled failure keeps private diagnostics and the last durable
+        # summary. Finalization must neither delete evidence nor mask the error.
+        if not exception_pending:
+            if cleanup_confirmed and evidence_preserved:
+                # Keep raw evidence until all collected cases are durably saved and
+                # the final cleanup receipt also fits the public encoding budget.
+                try:
+                    save_summary(public, summary)
+                    encode_summary(dict(summary, temporary_cleanup="complete"))
+                except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
+                    print("Public summary unavailable; private evidence retained", file=sys.stderr)
+                    return 1
+                try:
+                    shutil.rmtree(private)
+                    summary["temporary_cleanup"] = "complete"
+                except OSError:
+                    summary["temporary_cleanup"] = "failed"
+                    summary["evidence_checks_passed"] = False
+            elif not cleanup_confirmed:
+                summary["temporary_cleanup"] = "retained-unconfirmed"
+            else:
+                summary["temporary_cleanup"] = "retained-evidence"
+            save_summary(public, summary)
+            if summary["temporary_cleanup"] == "failed":
                 return 1
-            try:
-                shutil.rmtree(private)
-                summary["temporary_cleanup"] = "complete"
-            except OSError:
-                summary["temporary_cleanup"] = "failed"
-                summary["evidence_checks_passed"] = False
-        elif not cleanup_confirmed:
-            summary["temporary_cleanup"] = "retained-unconfirmed"
-        else:
-            summary["temporary_cleanup"] = "retained-evidence"
-        save_summary(public, summary)
-        if summary["temporary_cleanup"] == "failed" and sys.exc_info()[0] is None:
-            return 1
 
 
 if __name__ == "__main__":
