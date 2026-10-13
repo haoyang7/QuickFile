@@ -10,11 +10,17 @@ public final class PrivateFileStagingDirectory {
     private let name: String
     private let identity: stat
 
-    private init(parentDescriptor: Int32, name: String, url: URL) throws {
+    private init(parentDescriptor: Int32, name: String, url: URL, createdIdentity: stat? = nil) throws {
         let descriptor = openat(parentDescriptor, name, O_SEARCH | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw Self.stagingError(at: url, underlying: Self.posixError()) }
         do {
-            identity = try Self.privateDirectoryIdentity(descriptor)
+            let opened = try Self.privateDirectoryIdentity(descriptor)
+            if let createdIdentity {
+                guard opened.st_dev == createdIdentity.st_dev, opened.st_ino == createdIdentity.st_ino else {
+                    throw Self.posixError(code: ESTALE)
+                }
+            }
+            identity = opened
         } catch {
             close(descriptor)
             throw Self.stagingError(at: url, underlying: error)
@@ -97,14 +103,37 @@ public final class PrivateFileStagingDirectory {
         let name = prefix + UUID().uuidString
         let parent = fcntl(directoryDescriptor, F_DUPFD_CLOEXEC, 0)
         guard parent >= 0 else { throw posixError() }
+        let url = folderURL.appendingPathComponent(name, isDirectory: true)
         do {
             guard mkdirat(parent, name, 0o700) == 0 else { throw posixError() }
-            return try PrivateFileStagingDirectory(
-                parentDescriptor: parent, name: name,
-                url: folderURL.appendingPathComponent(name, isDirectory: true)
-            )
+            // Capture our new entry without allocating another descriptor. In particular,
+            // EMFILE at openat must not strand an empty directory after a successful mkdirat.
+            var created = stat()
+            guard fstatat(parent, name, &created, AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw stagingError(at: url, underlying: posixError())
+            }
+            guard created.st_mode & S_IFMT == S_IFDIR, created.st_uid == geteuid() else {
+                throw stagingError(at: url, underlying: posixError(code: ESTALE))
+            }
+            do {
+                return try PrivateFileStagingDirectory(
+                    parentDescriptor: parent, name: name, url: url, createdIdentity: created
+                )
+            } catch let initializationError {
+                do {
+                    // No payload was written. Reclaim only this unchanged, empty entry;
+                    // the protected parent and inode comparison also guard early cleanup.
+                    try removeDirectory(parentDescriptor: parent, name: name, identity: created)
+                } catch let cleanupError {
+                    throw NSError(domain: "QuickFile.PrivateFileStaging", code: 4, userInfo: [
+                        NSLocalizedDescriptionKey: "临时目录初始化失败且清理未完成：\(url.path)。请检查此位置。\(initializationError.localizedDescription) 清理错误：\(cleanupError.localizedDescription)",
+                        NSUnderlyingErrorKey: initializationError
+                    ])
+                }
+                throw initializationError
+            }
         } catch {
-            // Do not delete a name whose opened identity/permissions were not verified.
+            // Missing identity, replacements and nonempty directories remain untouched.
             close(parent)
             throw error
         }
@@ -136,6 +165,10 @@ public final class PrivateFileStagingDirectory {
     }
 
     public func remove() throws {
+        try Self.removeDirectory(parentDescriptor: parentDescriptor, name: name, identity: identity)
+    }
+
+    private static func removeDirectory(parentDescriptor: Int32, name: String, identity: stat) throws {
         var current = stat()
         guard fstatat(parentDescriptor, name, &current, AT_SYMLINK_NOFOLLOW) == 0 else {
             throw Self.posixError()
