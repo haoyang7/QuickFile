@@ -129,9 +129,11 @@ raise SystemExit(runner.main())
                 '--work-directory', str(overlay / '.build/Temporary/fixture'), '--records-directory', str(records),
                 '--settle-startup-baseline'], capture_output=True, text=True, timeout=300)
             if result.returncode == 77:
+                compatibility.LIFECYCLE.record(records, 'negative-control', result.returncode)
                 self.skipTest('AX negative control unavailable: ' + result.stdout.strip())
             receipt = json.loads((records / 'result.json').read_text())
             check_negative_control(self, receipt, records, original, source.read_bytes(), result.returncode)
+            compatibility.LIFECYCLE.record(records, 'negative-control', result.returncode)
 
 
 class NegativeControlReceiptTests(unittest.TestCase):
