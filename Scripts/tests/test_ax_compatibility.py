@@ -1516,7 +1516,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         cleanup_failure=None, ls_failure=False, install_gate=None, invalid_install_gate=None,
                         startup_error=None, hash_io_failure=None, live_attribution=False, live_capture_failure=None,
                         reference_validation=False, reference_idle=False, ci_failure_evidence=False,
-                        ci_capture_failed=False, settled_shadow=False, shadow_capture_failed=False, shadow_timeout=False):
+                        ci_capture_failed=False, settled_shadow=False, shadow_capture_failed=False, shadow_timeout=False,
+                        settled_startup=False):
         with tempfile.TemporaryDirectory(prefix="ax-protocol-") as directory:
             temporary = pathlib.Path(directory).resolve()
             work = temporary / "fixture"
@@ -1550,6 +1551,22 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             commands = []
             processes = []
             protocol = []
+            real_settle = PROBE.ax_startup_baseline.settle
+            clock = [0.0]
+            counter = itertools.count(step=0.25)
+            def monotonic():
+                if not settled_startup:
+                    return next(counter)
+                clock[0] += 0.01
+                return clock[0]
+            def sleep(seconds):
+                if settled_startup:
+                    clock[0] += seconds
+            def settle(*args):
+                baseline = real_settle(*args)
+                scanned.append("baseline")
+                protocol.append(("scan", "baseline"))
+                return baseline
 
             class FixtureProcess:
                 returncode = None
@@ -1621,6 +1638,12 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 elif command[0] == "heap" and unavailable_cohorts:
                     raise OSError("allocation tool unavailable")
                 elif command[0] == "leaks":
+                    if settled_startup and not scanned:
+                        self.assertEqual(host_state["allocatedButtons"], 0)
+                        self.assertEqual(host_state["destroyedButtons"], 0)
+                        self.assertEqual(host_state["compensations"], 0)
+                        return subprocess.CompletedProcess(command, 0,
+                            "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
                     capture = next((value for value in command if value.startswith("--outputGraph=")), None)
                     if capture:
                         self.assertEqual("--fullStackHistory" in command, heap_diagnostics)
@@ -1680,6 +1703,9 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                         self.assertEqual(reader_command["sequence"], 2 if label == "registered-10" and not reference_idle else 1)
                         self.assertEqual(host_state["destroyedButtons"], 0)
                     nodes, size = (287, 18_768) if label == failed_scan else (280, 18_416)
+                    if settled_startup and label != failed_scan:
+                        return subprocess.CompletedProcess(command, 0,
+                            "Process 1234: 0 leaks for 0 total leaked bytes.\n", "")
                     output = (f"Process 1234: {nodes} leaks for {size} total leaked bytes.\n"
                               "STACK OF 3 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
                               f"  {nodes} ({size} bytes) ROOT CYCLE: NSXPCConnection\n")
@@ -1762,6 +1788,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                 arguments.append("--copy-lifetime")
             if ci_failure_evidence:
                 arguments.append("--ci-failure-evidence")
+            if settled_startup:
+                arguments.append("--settle-startup-baseline")
             if malloc_scribble:
                 arguments.extend(["--malloc-scribble", malloc_scribble])
             if terminal_origin:
@@ -1818,6 +1846,7 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     PROBE.write_json(prepared / "fixture-build.json", AXInstallGateTests.manifest(EXTERNAL.fixture_hashes(prepared)))
                 arguments.extend(["--external-startup-receipt", "--prepared-fixture-directory", str(prepared)])
             with mock.patch.object(EXTERNAL, "read_procargs", side_effect=startup_metadata) as startup_reads, \
+                    mock.patch.object(PROBE.ax_startup_baseline, "settle", side_effect=settle), \
                     mock.patch.object(PROBE, "read_procargs", side_effect=startup_metadata), \
                     mock.patch.object(PROBE, "require_fixture_hashes", side_effect=require_fixture_hashes), \
                     mock.patch.object(sys, "argv", arguments), mock.patch.object(PROBE, "ROOT", ProbeRoot()), \
@@ -1826,8 +1855,8 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     mock.patch.object(PROBE, "wait_json", side_effect=wait_json), \
                     mock.patch.object(PROBE.os, "uname", return_value=mock.Mock(machine="arm64")), \
                     mock.patch.object(PROBE, "disassemble_symbols", return_value={"source": "owned mock"}) as disassembled, \
-                    mock.patch.object(PROBE.time, "sleep"), \
-                    mock.patch.object(PROBE.time, "monotonic", side_effect=itertools.count(step=0.25)), \
+                    mock.patch.object(PROBE.time, "sleep", side_effect=sleep), \
+                    mock.patch.object(PROBE.time, "monotonic", side_effect=monotonic), \
                     contextlib.redirect_stdout(io.StringIO()):
                 try:
                     exit_code = PROBE.main()
@@ -2055,6 +2084,12 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
                     expected_protocol = [item for item in expected_protocol if item[0] != "observe" or item[1] == 1]
                 if settled_shadow:
                     expected_protocol[3:3] = [("command", "checkpoint")] * (1 if shadow_timeout else 2)
+                if settled_startup:
+                    receipt = summary["startup_baseline"]
+                    self.assertEqual(receipt["status"], "observed-stable")
+                    expected_protocol[1:2] = [("command", "checkpoint")] * len(receipt["probes"])
+                    self.assertEqual(scans[0]["stdout_sha256"], receipt["probes"][-1]["stdout_sha256"])
+                    self.assertEqual(scans[0]["host"]["allocatedButtons"], 0)
                 self.assertEqual(protocol, expected_protocol)
             if reference_validation:
                 receipt = json.loads((records / "reference-validation-input.json").read_text())
@@ -2198,6 +2233,18 @@ class AXCompatibilityLifecycleTests(unittest.TestCase):
             self.assertEqual(outcome.exception.code, 2)
             run.assert_not_called()
             spawn.assert_not_called()
+
+    def test_settled_startup_finishes_before_targets_and_retains_later_failures(self):
+        for failure in (None, "registered-10", "removed-20", "observer-exited"):
+            with self.subTest(failure=failure):
+                code, result = self.exercise_runner(settled_startup=True, ci_failure_evidence=True, failed_scan=failure)
+                self.assertEqual(code, int(failure is not None))
+                self.assertEqual(len(result["scans"]), 6)
+                self.assertEqual(result["notifications"], 60)
+                self.assertEqual(result["destroyed_buttons"], 30)
+                self.assertEqual(result["ordinary_compensations"], 30)
+                self.assertEqual(result["mutable_compensations"], 30)
+                self.assertTrue(result["cleanup"]["processes_exited"])
 
     def test_ci_failure_capture_follows_original_scans_and_preserves_failure(self):
         for failure, timeout in itertools.product((None, "registered-10", "removed-20"), (False, True)):
@@ -4327,6 +4374,8 @@ class AXCompatibilityCopyTests(unittest.TestCase):
             ]
             if copy_lifetime:
                 arguments.append("--copy-lifetime")
+            else:
+                arguments.append("--settle-startup-baseline")
             if not copy_lifetime and os.environ.get("QUICKFILE_AX_CI_FAILURE_EVIDENCE") == "1":
                 arguments.append("--ci-failure-evidence")
             result = subprocess.run(arguments, capture_output=True, text=True, timeout=300)
@@ -4349,6 +4398,11 @@ class AXCompatibilityCopyTests(unittest.TestCase):
                 PROBE.validate_copy_lifetime_host(hosts[-1], 30)
                 self.assertFalse((records / "scans.json").exists())
             else:
+                PROBE.ax_startup_baseline.validate(receipt["startup_baseline"])
+                self.assertEqual(receipt["startup_baseline"]["status"], "observed-stable")
+                print(json.dumps({"startup_baseline": receipt["startup_baseline"],
+                    "strict_scans": [{key: row[key] for key in ("label", "leak_nodes", "leak_bytes")}
+                                     for row in receipt["scans"]]}))
                 self.assertEqual(receipt["ax_leak_nodes"], 0)
                 self.assertLessEqual(receipt["leak_nodes"], receipt["baseline_leak_nodes"])
                 self.assertLessEqual(receipt["leak_bytes"], receipt["baseline_leak_bytes"])

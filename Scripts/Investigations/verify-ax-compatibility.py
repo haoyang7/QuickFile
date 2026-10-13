@@ -19,6 +19,8 @@ import stat
 import subprocess
 import sys
 import time
+import ax_composition
+import ax_startup_baseline
 from ax_process import reap_owned
 from ax_probe_report import (capture_terminal_snapshot, collect_heap_diagnostics, collect_terminal_snapshot,
                              disassemble_symbols, empty_terminal_snapshot, leak_groups)
@@ -318,6 +320,8 @@ def main():
     parser.add_argument("--work-directory", required=True, type=Path)
     parser.add_argument("--records-directory", required=True, type=Path)
     parser.add_argument("--system-baseline", action="store_true")
+    parser.add_argument("--settle-startup-baseline", action="store_true",
+                        help="Require bounded zero-target startup stability before the six strict product scans")
     parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; product or install-gate controls only")
     parser.add_argument("--reference-validation", action="store_true", help="Explicit full-history frozen reference investigation using prepared external off fixtures; separate from ordinary CI")
     parser.add_argument("--reference-idle", action="store_true", help="Pure AppKit empty reference control: after the initial empty AX query, skip subsequent AX queries while retaining all seven heap checkpoints")
@@ -342,6 +346,13 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.settle_startup_baseline and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
+            args.reference_validation, args.reference_idle, args.malloc_scribble, args.empty_control_mode,
+            args.install_gate, args.prepare_external_fixture, args.prepare_install_gate_fixture,
+            args.external_startup_receipt, args.prepared_fixture_directory, args.terminal_origin,
+            args.live_attribution, args.copy_lifetime, args.read_only, args.ownership_trace, args.balance_copies,
+            args.settled_baseline_shadow)):
+        parser.error("--settle-startup-baseline requires independent ordinary product measurement")
     if args.settled_baseline_shadow and (not args.external_startup_receipt or args.malloc_scribble != "off"
             or any((args.heap_diagnostics, args.reference_validation, args.live_attribution, args.terminal_origin,
                     args.install_gate, args.copy_lifetime, args.system_baseline, args.ci_failure_evidence,
@@ -562,6 +573,7 @@ def main():
             "AppKit": args.expected_appkit_uuid, "CoreFoundation": args.expected_corefoundation_uuid}:
         raise RuntimeError("Diagnostic balance refused: system images differ from the reviewed trace")
     write_json(records / "inputs.json", {"capabilities": capabilities, "reader_capabilities": reader_capabilities,
+        "baseline_protocol": ax_startup_baseline.PROTOCOL if args.settle_startup_baseline else "immediate",
         "system": run(["sw_vers"]).stdout,
         "sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources}})
     reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline, args.empty_control_mode, args.install_gate)
@@ -592,6 +604,7 @@ def main():
     reference_environment = {}
     checkpoint_windows = []
     results = []
+    startup_scans = []
     validation_errors = []
     checkpoints = []
     copy_lifetime_hosts = []
@@ -601,6 +614,7 @@ def main():
     sequence = reader_sequence = 0
     terminal_snapshot = empty_terminal_snapshot() if args.terminal_origin else None
     live_captures = []
+    startup_baseline = ax_startup_baseline.empty() if args.settle_startup_baseline else None
     shadow = SettledBaselineShadow(records, records / "shadow", args.reference_idle) if args.settled_baseline_shadow else None
     with (records / "host.log").open("w") as host_log, (records / "reader.log").open("w") as reader_log:
         def validate(stage, validator, *values):
@@ -688,7 +702,7 @@ def main():
             except RuntimeError as error:
                 raise StartupReceiptError("receipt_incomplete", str(error)) from None
 
-        def scan(label, host_state):
+        def scan(label, host_state, *, startup=False, timeout=60):
             if args.copy_lifetime:
                 # Preserve commands evaluated at scan call sites. This separate
                 # probe measures weak availability without sampling the heap.
@@ -709,10 +723,10 @@ def main():
                 # snapshot offline; do not sample the live heap a second time.
                 target = str(graph)
             result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", target],
-                                    capture_output=True, text=True, timeout=60)
+                                    capture_output=True, text=True, timeout=timeout)
             completed = time.monotonic() if args.live_attribution else None
             (records / f"{label}-leaks.txt").write_text(result.stdout + result.stderr)
-            if args.ci_failure_evidence:
+            if args.ci_failure_evidence or startup:
                 (records / f"{label}-original.stdout.txt").write_bytes(result.stdout.encode())
             elif shadow:
                 try:
@@ -724,15 +738,25 @@ def main():
                      "leak_nodes": int(match[1]) if match else None, "leak_bytes": int(match[2]) if match else None,
                      "destroyed_notification_stack_present": "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification" in result.stdout}
             entry["groups"] = leak_groups(result.stdout)
-            if args.ci_failure_evidence or shadow:
+            if args.ci_failure_evidence or shadow or startup:
                 entry["stdout_sha256"] = hashlib.sha256(result.stdout.encode()).hexdigest()
             entry["unclassified_nodes"] = int(match[1]) - sum(group["tree_nodes"] or 0 for group in entry["groups"]) if match else None
             entry["scan_duration_seconds"] = round(time.monotonic() - started, 3)
             entry["since_observer_exit_seconds"] = round(started - observer_exited, 3) if observer_exited is not None else None
-            results.append(entry)
-            write_json(records / "scans.json", results)
+            if not startup:
+                results.append(entry)
+                write_json(records / "scans.json", results)
+            else:
+                startup_scans.append(entry)
+                write_json(records / "startup-scans.json", startup_scans)
             if not match or result.returncode not in (0, 1):
                 raise RuntimeError(f"Full-heap scan was unavailable: {entry}")
+            if startup:
+                validate_control_host(host_state)
+                validate_product_scan(entry)
+                entry["startup_signature"] = ax_startup_baseline.fingerprint(
+                    entry, ax_composition.grouped_composition(result.stdout))
+                return entry
             if not args.system_baseline:
                 validate(label, validate_product_scan, entry, results[0] if label != "baseline" else None)
             if args.live_attribution:
@@ -772,7 +796,30 @@ def main():
                 warmed = observe()
                 if not args.heap_control and (warmed["buttons"] or warmed["registrations"] or warmed["notifications"]):
                     raise RuntimeError(f"AX baseline warm-up was not empty: {warmed}")
-                scan("baseline", command("checkpoint"))
+                if startup_baseline is not None:
+                    validate_control_reader(warmed)
+                    def startup_measure(index, deadline):
+                        if reader.poll() is not None:
+                            raise RuntimeError("AX reader exited during startup observation")
+                        empty_host = command("checkpoint", timeout=min(5, deadline - time.monotonic()))
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RuntimeError("Startup checkpoint exceeded the fixed deadline")
+                        return scan(f"startup-{index}", empty_host, startup=True, timeout=min(12, remaining))
+                    baseline = ax_startup_baseline.settle(startup_measure,
+                        lambda value: write_json(records / "startup-baseline.json", value), startup_baseline)
+                    # Reuse the selected scan byte-for-byte; a later capture must
+                    # not silently replace the established measurement baseline.
+                    source = records / (baseline["label"] + "-original.stdout.txt")
+                    (records / "baseline-original.stdout.txt").write_bytes(source.read_bytes())
+                    (records / "baseline-leaks.txt").write_bytes(
+                        (records / (baseline["label"] + "-leaks.txt")).read_bytes())
+                    baseline = {key: value for key, value in baseline.items() if key != "startup_signature"}
+                    baseline["label"] = "baseline"
+                    results.append(baseline)
+                    write_json(records / "scans.json", results)
+                else:
+                    scan("baseline", command("checkpoint"))
                 if shadow:
                     shadow.data["baseline_finished_monotonic"] = time.monotonic()
                     shadow.settle(host.pid, results[0], lambda timeout: command("checkpoint", timeout=timeout), warmed)
@@ -901,7 +948,7 @@ def main():
                            "baseline_leak_bytes": results[0]["leak_bytes"],
                            "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
-                           "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX groups and no increase over the non-AX startup baseline; not an installed-app or VoiceOver test"}
+                           "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX groups and no increase over the zero-target AX startup baseline; not an installed-app or VoiceOver test"}
             if args.ci_failure_evidence and validation_errors:
                 # Every original strict scan and notification check is finished.
                 # This later graph cannot identify baseline allocations or turn
@@ -1011,6 +1058,8 @@ def main():
             if primary_exception or validation_errors:
                 summary["coverage"] = "failed"
             summary["cleanup"] = cleanup
+            if startup_baseline is not None:
+                summary["startup_baseline"] = startup_baseline
             if validation_errors:
                 summary["validation_errors"] = validation_errors
                 cleanup_step("validation_receipt", lambda: write_json(records / "validation-errors.json", validation_errors))

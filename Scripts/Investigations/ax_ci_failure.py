@@ -18,6 +18,7 @@ import time
 
 import ax_frozen_nodes as frozen
 import ax_composition as composition
+import ax_startup_baseline as startup
 from ax_evidence_errors import EvidenceError, ExitUnconfirmed
 from ax_probe_report import HEAP_LABELS, leak_groups
 from ax_process import run_owned
@@ -35,7 +36,7 @@ REASONS = ("result_unavailable", "result_mismatch", "scans_unavailable", "scan_m
            "group_budget", "fixture_cleanup_unconfirmed", "capture_missing", "capture_invalid", "capture_failed",
            "graph_unavailable", "graph_changed", "graph_budget", "node_budget", "edge_budget",
            "list_invalid", "tree_invalid", "tool_failed", "deadline", "worker_failed",
-           "process_exit_unconfirmed", "private_cleanup_failed")
+           "process_exit_unconfirmed", "private_cleanup_failed", "startup_baseline_invalid")
 
 
 def encoded(value):
@@ -62,7 +63,8 @@ def empty(status="not_attempted"):
     if status not in ("not_attempted", "unavailable"):
         raise ValueError("Invalid empty evidence status")
     scans = [empty_scan(label) for label in LABELS]
-    return {"schema": 2, "status": status, "original_verdict": "unknown", "unsupported_reason": None,
+    return {"schema": 3, "status": status, "original_verdict": "unknown", "unsupported_reason": None,
+            "baseline_protocol": "unknown", "startup_baseline": None,
             "original_address_coverage": "unavailable", "generation": "unknown", "inputs_sha256": None,
             "fixture_cleanup_confirmed": None, "process_cleanup_confirmed": True,
             "original_scans": scans, "strict_growth_labels": [], "composition_deltas": composition_deltas(scans),
@@ -270,7 +272,11 @@ def collect(records):
     try:
         raw = frozen.read_bytes(records / "inputs.json", 1024 * 1024)
         value["inputs_sha256"] = hashlib.sha256(raw).hexdigest()
-        unsupported = unsupported_reason(json.loads(raw))
+        inputs = json.loads(raw)
+        protocol = inputs.get("baseline_protocol", "immediate") if type(inputs) is dict else "unknown"
+        if protocol in ("immediate", startup.PROTOCOL):
+            value["baseline_protocol"] = protocol
+        unsupported = unsupported_reason(inputs)
         if unsupported and not (records / "scans.json").exists():
             value.update(status="unsupported", original_verdict="unsupported", unsupported_reason=unsupported)
             return value
@@ -317,6 +323,40 @@ def collect(records):
         for reason in value["original_scans"][index]["reasons"]:
             fail(value, reason)
     value["strict_growth_labels"], value["strict_failure_labels"] = verdict_labels(value["original_scans"])
+    if value["baseline_protocol"] == startup.PROTOCOL:
+        try:
+            receipt = json_file(records / "startup-baseline.json")
+            startup.validate(receipt)
+            raw_scans = json_file(records / "startup-scans.json") if receipt["probes"] else []
+            if (type(raw_scans) is not list or len(raw_scans) < len(receipt["probes"])
+                    or len(raw_scans) > startup.POLICY["max_probes"]):
+                raise ValueError("Incomplete startup scans")
+            for index, probe in enumerate(receipt["probes"]):
+                label = f"startup-{index}"
+                raw = frozen.read_bytes(records / (label + "-original.stdout.txt"), RAW_LIMIT)
+                entry = raw_scans[index]
+                point = scan_summary(label, entry, raw)
+                host = entry.get("host", {})
+                if (point["status"] != "complete" or point["binding"] != "matched"
+                        or point["unclassified_nodes"] or point["destroyed_notification_stack_present"]
+                        or point["unexpected_roots"]
+                        or any(type(host.get(key)) is not int or host[key] != 0 for key in (
+                            "buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations"))
+                        or any(probe[key] != point[key] for key in (
+                            "stdout_sha256", "leak_nodes", "leak_bytes", "root_instances"))
+                        or probe["signature_sha256"] != startup.fingerprint(entry, point["composition"])):
+                    raise ValueError("Startup probe binding failed")
+            value["startup_baseline"] = receipt
+            if receipt["status"] == "observed-stable":
+                selected = receipt["probes"][-1]
+                baseline = value["original_scans"][0]
+                if baseline["binding"] != "matched" or any(selected[key] != baseline[key] for key in (
+                        "stdout_sha256", "leak_nodes", "leak_bytes", "root_instances")):
+                    raise ValueError("Unbound startup baseline")
+            elif value["original_verdict"] == "passed":
+                raise ValueError("Unsettled startup cannot pass")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError, AttributeError):
+            fail(value, "startup_baseline_invalid")
     if value["original_verdict"] == "passed" and value["strict_failure_labels"]:
         fail(value, "result_mismatch")
     capture_path = records / "failure-capture.json"
@@ -450,7 +490,21 @@ def validate_public(value):
     def require(ok):
         if not ok: raise ValueError("Invalid bounded ordinary AX evidence")
     require(type(value) is dict and set(value) == set(empty()))
-    require(type(value["schema"]) is int and value["schema"] == 2 and value["original_address_coverage"] == "unavailable" and value["generation"] == "unknown")
+    require(type(value["schema"]) is int and value["schema"] == 3 and value["original_address_coverage"] == "unavailable" and value["generation"] == "unknown")
+    require(value["baseline_protocol"] in ("unknown", "immediate", startup.PROTOCOL))
+    if value["startup_baseline"] is not None:
+        require(value["baseline_protocol"] == startup.PROTOCOL)
+        startup.validate(value["startup_baseline"])
+        receipt = value["startup_baseline"]
+        if receipt["status"] == "observed-stable":
+            selected, baseline = receipt["probes"][-1], value["original_scans"][0]
+            if baseline["binding"] != "matched" or any(selected[key] != baseline[key] for key in (
+                    "stdout_sha256", "leak_nodes", "leak_bytes", "root_instances")):
+                require("startup_baseline_invalid" in value["reasons"])
+        elif value["original_verdict"] == "passed":
+            require("startup_baseline_invalid" in value["reasons"])
+    elif value["baseline_protocol"] == startup.PROTOCOL and value["status"] != "unsupported":
+        require("startup_baseline_invalid" in value["reasons"])
     require(value["status"] in ("not_attempted", "unavailable", "unsupported", "partial", "complete"))
     require(value["original_verdict"] in ("unknown", "passed", "failed", "unsupported"))
     require(value["unsupported_reason"] is None or value["unsupported_reason"] in UNSUPPORTED)

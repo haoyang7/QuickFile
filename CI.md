@@ -47,7 +47,11 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 侧录最多 56 次工具调用、180 秒、128 KiB 公共摘要，另行绑定原 frozen/bridge 摘要和七张图的哈希；不占用或扩大原诊断预算。campaign 使用独立进程组，逐例保留严格退出码及证据完整度；已知严格失败仍采集后续对照，进程回收无法确认则停止。上传前独立校验固定字段、枚举、数量、嵌套摘要和总字节上限，仅上传匿名 `summary.json`；原始地址、路径、完整栈、启动元数据、堆图和日志保留在私有临时目录，不上传。确认所有进程退出后回收本轮 App、缓存和原始临时产物；回收失败保持非零结果。该工作流只用于归因，完整侧录不等于产品泄漏已排除或正式版放行。
 
-独立 `AX settled baseline shadow` 手动工作流（也可由 `AX system baseline` 的 `settled_baseline_shadow=true` 转发）在 macOS 26 arm64 执行一次四组影子实验：产品动作、带补丁空窗口、纯 AppKit 空窗口、只进行初始 AX 查询的纯 AppKit 空窗口。普通严格基线及六点判定保留；候选基线的假设判定单独记录，不能覆盖原失败。host 保持普通 compact 配置（`MallocStackLogging=1`、`MallocStackLoggingNoCompact=1`），reader 的两个键未设置，双方 `MallocScribble` 未设置；必须从实际子进程启动元数据核验。影子模式额外观测改变后续时序，不能声称与未扰动的普通 CI 等价。
+普通原生 AX 回归通过 `--settle-startup-baseline` 建立 `zero-target-settled-v1` 基线：首次空窗口 AX 查询后，在任何测试按钮创建前观察至少 20 秒，最多 12 次探测、总计 40 秒；探测结束后至少间隔 2 秒，连续 3 次节点、字节、根分组和有界类型／尺寸构成一致才接受最后一次扫描。20 秒窗口覆盖既有空窗口时点实验中发生变化的观测点，不是系统初始化完成的 API 保证。每次须确认 Reader 存活、宿主目标分配／销毁及两类补偿为零，且完整堆分类没有目标 AX 栈或未知根。不可解析、超时、持续变化均失败；不重试失败探测，不取历史最大值，也不在目标生命周期开始后重设基线。
+
+所选探测的 stdout 按字节复用为六点中的 baseline，随后 registered、三次 removed 和 observer-exited 继续严格禁止节点、字节和根数量增长；通知逐目标逐观察者核对与独立 copy-lifetime 检查保留。启动期所有探测数值和选中索引独立记录，不能声称进程全生命周期没有增长，也不能据此认定 XPC 泄漏已修复。未传该参数的手动调查继续使用历史 immediate 协议，结果须按协议区分。
+
+独立 `AX settled baseline shadow` 手动工作流（也可由 `AX system baseline` 的 `settled_baseline_shadow=true` 转发）在 macOS 26 arm64 执行一次四组影子实验：产品动作、带补丁空窗口、纯 AppKit 空窗口、只进行初始 AX 查询的纯 AppKit 空窗口。普通严格基线及六点判定保留；候选基线的假设判定单独记录，不能覆盖原失败。host 保持普通 compact 配置（`MallocStackLogging=1`、`MallocStackLoggingNoCompact=1`），reader 的两个键未设置，双方 `MallocScribble` 未设置；必须从实际子进程启动元数据核验。影子模式额外观测改变后续时序，不能声称与未扰动的普通 CI 等价。 此工作流另有独立 startup-precondition 作业，固定执行 5 次新进程的正式严格回归；能力跳过或任一次失败立即使该作业失败，不重跑。原四组影子结果与新协议的结果分别保留。
 
 影子候选只在零目标、零补偿阶段观测，最多六次、总期限 15 秒、单工具最多 5 秒，相邻观测间隔至少两秒。连续两次节点、字节和根组签名相等只是 `observed-stable`，未比较完整尺寸直方图，也不证明永久稳定；两根状态可以成为候选，不要求第三根出现。超时或观测失败明确保留 `not_settled` / 不可判定。公共 campaign schema 3 保留 `capture_status=timeout|failed|complete`、未核验的早期活动状态和固定的投影失败阶段；合法的截止时间耗尽不能丢弃原观测或成为有效候选。公开毫秒区间的舍入不确定性须与精确截止判定区分。单调时钟记录原基线结束、稳定观测开始、首个测量循环开始和最后原扫描结束，公开摘要只保留相对区间，以核对前期采图早于目标动作、晚期采图晚于原六点。
 
@@ -152,7 +156,7 @@ Xcode 的 macOS App 构建会添加 Launch Services 注册步骤，文件回收�
 
 - `identity.json`：实际 checkout SHA、event SHA、workflow SHA、PR head/base SHA（适用时），run/attempt 链接、job、预期与实际 OS/架构/工具身份
 - `verification.json`：身份/工具/脚本/原生步骤的 outcome、上传前 job 状态、原生命令退出码、两个结果 bundle 是否存在，以及实际 XcodeGen 版本
-- `ax-evidence.json`：schema 2 保留原六点严格 AX 扫描、各点有界类型成分、带正负计数的成分差集，以及严格失败后可用的终点图和精确尺寸直方图；未执行、能力跳过、缺失和不完整状态分别保留
+- `ax-evidence.json`：schema 3 显式记录 baseline_protocol；新协议保留有界启动期探测和选中值，并校验其与正式 baseline 的 stdout 哈希、节点、字节和根数量相符。继续保留六点严格 AX 扫描、各点有界类型成分、带正负计数的成分差集，以及严格失败后可用的终点图和精确尺寸直方图；未执行、能力跳过、缺失和不完整状态分别保留
 
 类型成分子摘要使用 schema 3；无法解析时以固定 `failure_stage` 定位失败阶段，不输出原始行或类型名。树行格式失败可附不超过 4 KiB 的匿名诊断片段：最多两个父行和当前行，经已有词法白名单编码，地址匿名化、任意名称替换为 opaque，完整摘要仍限 8 KiB。片段仅用于语法调查，不是完整树、类型身份或等价重放证据；超预算时不保留片段。真实报告的子层 `ROOT CYCLE` 标记不新增根或节点，层级与计数仍由缩进及子树守恒核对。
 

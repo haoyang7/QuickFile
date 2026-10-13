@@ -54,6 +54,70 @@ class FailureEvidenceTests(unittest.TestCase):
         evidence.validate_public(value)
         return value
 
+    def startup(self):
+        self.scans = []
+        for index, label in enumerate(evidence.LABELS):
+            count = 1 if index == 0 else 2
+            self.add_scan(label, f"Process 123: {count} leaks for {count * 64} total leaked bytes.\n\n"
+                f"STACK OF {count} INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
+                "0 synthetic-image 0x1234 synthetic_function + 0\n====\n"
+                f"    {count} ({count * 64} bytes) ROOT CYCLE: NSXPCConnection\n")
+        self.write("scans.json", self.scans)
+        self.write("inputs.json", {"baseline_protocol": evidence.startup.PROTOCOL})
+        receipt = evidence.startup.empty()
+        base = evidence.scan_summary("baseline", self.scans[0],
+            (self.records / "baseline-original.stdout.txt").read_bytes())
+        receipt.update(status="observed-stable", selected_index=2, probes=[{
+            "index": i, "elapsed_ms": 16000 + i * 2000,
+            "signature_sha256": evidence.startup.fingerprint(self.scans[0], base["composition"]),
+            **{key: base[key] for key in ("stdout_sha256", "leak_nodes", "leak_bytes", "root_instances")}}
+            for i in range(3)])
+        scans = []
+        for index in range(3):
+            label = f"startup-{index}"
+            scans.append(self.scans[0] | {"label": label, "host": dict.fromkeys((
+                "buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations"), 0)})
+            (self.records / (label + "-original.stdout.txt")).write_bytes(
+                (self.records / "baseline-original.stdout.txt").read_bytes())
+        self.write("startup-scans.json", scans)
+        self.write("startup-baseline.json", receipt)
+        return receipt
+
+    def test_startup_receipt_is_bound_to_baseline_without_hiding_later_growth(self):
+        receipt = self.startup()
+        value = self.collect()
+        self.assertEqual(value["startup_baseline"], receipt)
+        self.assertEqual(value["status"], "complete")
+        self.assertEqual(value["strict_growth_labels"], list(evidence.LABELS[1:]))
+
+    def test_changed_startup_baseline_and_missing_receipt_are_incomplete_evidence(self):
+        receipt = self.startup()
+        receipt["probes"][-1]["stdout_sha256"] = "b" * 64
+        self.write("startup-baseline.json", receipt)
+        value = self.collect()
+        self.assertIn("startup_baseline_invalid", value["reasons"])
+        (self.records / "startup-baseline.json").unlink()
+        self.assertIn("startup_baseline_invalid", self.collect()["reasons"])
+
+    def test_invalid_startup_receipt_cannot_publish_extra_fields(self):
+        receipt = self.startup()
+        receipt["private"] = "secret path"
+        self.write("startup-baseline.json", receipt)
+        value = self.collect()
+        self.assertIsNone(value["startup_baseline"])
+        self.assertNotIn("secret", json.dumps(value))
+        self.assertIn("startup_baseline_invalid", value["reasons"])
+
+    def test_startup_target_activity_or_raw_probe_drift_cannot_establish_baseline(self):
+        self.startup()
+        rows = json.loads((self.records / "startup-scans.json").read_text())
+        rows[0]["host"]["allocatedButtons"] = 1
+        self.write("startup-scans.json", rows)
+        self.assertIn("startup_baseline_invalid", self.collect()["reasons"])
+        self.startup()
+        (self.records / "startup-0-original.stdout.txt").write_text("changed")
+        self.assertIn("startup_baseline_invalid", self.collect()["reasons"])
+
     def capture(self):
         graph = self.records / "terminal.memgraph"
         graph.write_bytes(b"synthetic private graph")
@@ -107,7 +171,7 @@ class FailureEvidenceTests(unittest.TestCase):
     def test_schema_two_composition_and_signed_deltas_supplement_strict_result(self):
         self.valid_grouped_scans()
         value = self.collect()
-        self.assertEqual((value["schema"], value["status"], value["original_verdict"]), (2, "complete", "failed"))
+        self.assertEqual((value["schema"], value["status"], value["original_verdict"]), (3, "complete", "failed"))
         self.assertTrue(all(row["composition"]["status"] == "complete" for row in value["original_scans"]))
         self.assertEqual(value["composition_deltas"][0]["delta"]["changes"], [{"type": "NSString", "count_delta": 1}])
         self.assertEqual(value["composition_deltas"][0]["delta"]["generation"], "unknown")

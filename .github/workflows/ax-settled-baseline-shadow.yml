@@ -22,12 +22,8 @@ defaults:
     shell: bash
 
 jobs:
-  shadow:
-    name: Bounded baseline shadow controls (macOS 26 arm64)
-    runs-on: macos-26
-    timeout-minutes: 40
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+  validate-request:
+    runs-on: ubuntu-24.04
     steps:
       - name: Reject mixed investigation requests
         env:
@@ -45,6 +41,52 @@ jobs:
           assert value.get('scan_mode', 'diagnostic') == 'diagnostic'
           assert value.get('receipt_mode', 'internal') == 'internal'
           PY
+  startup-precondition:
+    needs: validate-request
+    name: Five strict startup baseline trials (macOS 26 arm64)
+    runs-on: macos-26
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Verify host and run five fresh strict fixtures without retries
+        run: |
+          python3 - <<'PY'
+          import json, platform, subprocess, sys, unittest
+          def output(*args):
+              return subprocess.check_output(args, text=True).strip()
+          identity = dict(checkout=output('git', 'rev-parse', 'HEAD'),
+              macos=output('sw_vers', '-productVersion'), build=output('sw_vers', '-buildVersion'),
+              architecture=platform.machine(), xcode=output('xcodebuild', '-version'))
+          print(json.dumps(identity), flush=True)
+          assert identity['macos'].split('.')[0] == '26'
+          assert identity['architecture'] == 'arm64'
+          assert identity['xcode'].splitlines()[0] == 'Xcode 26.3'
+          sys.path.insert(0, 'Scripts/tests')
+          from test_ax_compatibility import AXCompatibilityCopyTests
+          for trial in range(1, 6):
+              print(f'Predeclared startup trial {trial}/5', flush=True)
+              suite = unittest.TestSuite([AXCompatibilityCopyTests(
+                  'test_real_destroyed_notifications_cover_both_compensation_branches')])
+              result = unittest.TextTestRunner(verbosity=2).run(suite)
+              if not result.wasSuccessful() or result.skipped or result.testsRun != 1:
+                  raise SystemExit(1)
+          PY
+  shadow:
+    needs: validate-request
+    name: Bounded baseline shadow controls (macOS 26 arm64)
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
