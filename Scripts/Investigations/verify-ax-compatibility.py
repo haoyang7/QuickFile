@@ -15,15 +15,18 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
+import ax_composition
+import ax_startup_baseline
 from ax_process import reap_owned
 from ax_probe_report import (capture_terminal_snapshot, collect_heap_diagnostics, collect_terminal_snapshot,
                              disassemble_symbols, empty_terminal_snapshot, leak_groups)
 from ax_external_receipt import (EXECUTABLES, FIXTURE_SOURCES, INSTALL_ENV, INSTALL_MODES, STARTUP_STAGES, StartupReceiptError,
                                  fixture_hashes, fixture_sources, load_prepared_fixture, startup_failure,
-                                 owned_child_receipt, require_fixture_hashes, validate_empty_control_build,
+                                 owned_child_receipt, read_procargs, require_fixture_hashes, validate_empty_control_build,
                                  validate_external_receipt, validate_install_gate_build, validate_install_gate_state)
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,8 +38,8 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def wait_json(path, predicate, processes):
-    deadline = time.monotonic() + 15
+def wait_json(path, predicate, processes, timeout=15):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for process in processes:
             if process.poll() is not None:
@@ -157,12 +160,171 @@ def validate_copy_lifetime_host(receipt, expected_copies=None):
         raise RuntimeError(f"Copy lifetime coverage or weak unavailability failed: {receipt}")
 
 
+
+class SettledBaselineShadow:
+    """Auxiliary current-stack observations; never an ordinary gate input."""
+
+    def __init__(self, records, graphs, idle=False):
+        self.records, self.graphs = records, graphs
+        self.data = {"schema": 2, "settling_policy": {"max_probes": 6, "min_interval_seconds": 2,
+            "deadline_seconds": 15, "tool_timeout_seconds": 5, "graph_capture_timeout_seconds": 15, "consecutive_equal": 2,
+            "comparison": "counts-bytes-root-kind-type-instances-tree-nodes", "size_histogram_compared": False},
+            "status": "not_settled", "chosen_index": None, "probes": [], "captures": [],
+            "errors": [], "environments": {}, "observer_query_policy": "initial-query-only" if idle else "ordinary",
+            "timing_perturbed": True, "original_parity": False, "logging_mode": "compact", "history_mode": "current-stacks",
+            "original_strict_verdict": "unavailable", "candidate_hypothetical_verdict": "unavailable",
+            "baseline_finished_monotonic": None, "settling_started_monotonic": None,
+            "first_measurement_cycle_monotonic": None, "last_original_scan_finished_monotonic": None}
+        try:
+            graphs.mkdir(parents=True)
+        except OSError:
+            self.error("graph_directory_failed")
+
+    def error(self, reason):
+        self.data["errors"].append(reason)
+
+    def save(self):
+        try:
+            write_json(self.records / "settled-baseline-shadow.json", self.data)
+        except Exception:
+            self.error("receipt_write_failed")
+
+    @staticmethod
+    def signature(entry):
+        return (entry["leak_nodes"], entry["leak_bytes"],
+                sorted((g["root_kind"], g["root_type"], g["root_instances"], g["tree_nodes"]) for g in entry["groups"]))
+
+    def environment(self, role, process):
+        try:
+            _, _, actual = read_procargs(process.pid)
+            self.data["environments"][role] = {
+                key: "unset" if actual.get(key.encode()) is None else
+                     "1" if actual[key.encode()] == b"1" else "other"
+                for key in ("MallocStackLogging", "MallocStackLoggingNoCompact", "MallocScribble")}
+        except Exception:
+            self.error("environment_unavailable")
+
+    def capture(self, label, entry):
+        row = {"label": label, "status": "failed", "graph_sha256": None,
+               "capture_status": "failed", "host_activity_zero": False if label == "auxiliary-late" else None,
+               "exit_code": None, "source_label": entry.get("label"), "source_stdout_sha256": entry.get("stdout_sha256"),
+               "leak_nodes": entry.get("leak_nodes"), "leak_bytes": entry.get("leak_bytes"),
+               "groups": entry.get("groups"), "counts_binding": "requires-offline-verification",
+               "start_monotonic": time.monotonic()}
+        self.data["captures"].append(row)
+        try:
+            source_suffix = ".stdout.txt" if entry["label"].startswith("shadow-probe-") else "-original.stdout.txt"
+            source = self.records / (entry["label"] + source_suffix)
+            source_info = source.lstat()
+            if not stat.S_ISREG(source_info.st_mode) or source_info.st_size > 256 * 1024 * 1024:
+                raise ValueError("invalid source stdout")
+            with source.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != entry["stdout_sha256"]:
+                    raise ValueError("source stdout binding mismatch")
+            if label != "auxiliary-late":
+                validate_control_host(entry["host"])
+                row["host_activity_zero"] = True
+            graph = self.graphs / (label + ".memgraph")
+            value = capture_terminal_snapshot(self.pid, graph, timeout=15)
+            row["exit_code"] = value["capture_exit_code"]
+            row["capture_status"] = value["capture_status"]
+            if value["capture_status"] != "complete":
+                raise RuntimeError("capture unavailable")
+            info = graph.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 256 * 1024 * 1024:
+                raise ValueError("invalid graph")
+            with graph.open("rb") as stream:
+                row["graph_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+            row.update(status="complete", graph_file=graph.name, graph_bytes=info.st_size)
+        except Exception:
+            self.error("capture_failed")
+        row["end_monotonic"] = time.monotonic()
+        self.save()
+
+    def settle(self, pid, baseline, checkpoint, warmed):
+        self.pid = pid
+        previous = None
+        try:
+            validate_control_reader(warmed)
+            validate_control_host(baseline["host"])
+            self.capture("auxiliary-original-baseline", baseline)
+            self.data["settling_started_monotonic"] = time.monotonic()
+            deadline = self.data["settling_started_monotonic"] + 15
+            for index in range(6):
+                if previous is not None:
+                    remaining_interval = previous["end_monotonic"] + 2 - time.monotonic()
+                    if remaining_interval > 0:
+                        if time.monotonic() + remaining_interval >= deadline:
+                            break
+                        time.sleep(remaining_interval)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                host = checkpoint(min(5, remaining))
+                validate_control_host(host)
+                validate_control_reader(warmed)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                started = time.monotonic()
+                output = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", str(pid)],
+                                        capture_output=True, text=True, timeout=min(5, remaining))
+                ended = time.monotonic()
+                label = "shadow-probe-" + str(index)
+                payload = output.stdout.encode()
+                (self.records / (label + ".stdout.txt")).write_bytes(payload)
+                match = re.search(r"(\d+) leaks for (\d+) total leaked bytes", output.stdout)
+                if output.returncode not in (0, 1) or not match:
+                    raise ValueError("invalid probe")
+                groups = leak_groups(output.stdout)
+                row = {"label": label, "index": index, "exit_code": output.returncode, "leak_nodes": int(match[1]), "leak_bytes": int(match[2]),
+                    "groups": groups, "unclassified_nodes": int(match[1]) - sum(g["tree_nodes"] or 0 for g in groups),
+                    "destroyed_notification_stack_present": "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification" in output.stdout,
+                    "stdout_sha256": hashlib.sha256(payload).hexdigest(), "host": host, "reader_warm": warmed,
+                    "host_activity_zero": True, "start_monotonic": started, "end_monotonic": ended}
+                self.data["probes"].append(row)
+                validate_product_scan(row)
+                if ended >= deadline:
+                    break
+                if previous is not None and self.signature(previous) == self.signature(row):
+                    self.data.update(status="observed-stable", chosen_index=index)
+                    break
+                previous = row
+        except Exception:
+            self.error("settling_failed")
+        if self.data["chosen_index"] is None:
+            self.error("not_settled")
+        else:
+            self.capture("auxiliary-candidate", self.data["probes"][self.data["chosen_index"]])
+        self.save()
+
+    def finish(self, scans, errors, failed):
+        self.data["original_strict_verdict"] = "failed" if failed or errors else "passed"
+        index = self.data["chosen_index"]
+        if index is not None and not self.data["errors"] and len(scans) == 6 and not failed:
+            candidate = self.data["probes"][index]
+            scan_labels = {row["label"] for row in scans}
+            hypothetical = not any(error["stage"] not in scan_labels for error in errors)
+            try:
+                validate_product_scan(scans[0])
+                for row in scans[1:]:
+                    validate_product_scan(row, candidate)
+            except Exception:
+                hypothetical = False
+            self.data["candidate_hypothetical_verdict"] = "passed" if hypothetical else "failed"
+        self.save()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-directory", required=True, type=Path)
     parser.add_argument("--records-directory", required=True, type=Path)
     parser.add_argument("--system-baseline", action="store_true")
+    parser.add_argument("--settle-startup-baseline", action="store_true",
+                        help="Require bounded zero-target startup stability before the six strict product scans")
     parser.add_argument("--heap-diagnostics", action="store_true", help="Retain local heap graphs and write a bounded offline diff summary; product or install-gate controls only")
+    parser.add_argument("--reference-validation", action="store_true", help="Explicit full-history frozen reference investigation using prepared external off fixtures; separate from ordinary CI")
+    parser.add_argument("--reference-idle", action="store_true", help="Pure AppKit empty reference control: after the initial empty AX query, skip subsequent AX queries while retaining all seven heap checkpoints")
     parser.add_argument("--heap-control", action="store_true", help="Match the selected product scan checkpoints with an empty window and no target buttons; requires --heap-diagnostics or --malloc-scribble")
     parser.add_argument("--malloc-scribble", choices=("off", "on"), help="Explicitly unset MallocScribble or set it to 1 in both actual fixture processes, with environment receipts; uses ordinary live scans unless --heap-diagnostics is selected")
     parser.add_argument("--prepare-external-fixture", action="store_true", help="Build host/reader once without running them; ordinary binaries unless --empty-control-mode is explicit")
@@ -173,6 +335,8 @@ def main():
     parser.add_argument("--empty-control-mode", choices=("patched", "pure-appkit"), help="Explicit empty-control build/measurement; pure-appkit excludes the production AX implementation; measurement requires external startup receipts, MallocScribble off and --heap-control")
     parser.add_argument("--terminal-origin", action="store_true", help="Capture one later heap graph after all six live scans; requires external startup receipts and MallocScribble off")
     parser.add_argument("--live-attribution", action="store_true", help="Keep six ordinary live scans and compact logging; capture auxiliary graphs after baseline and first node/byte growth; captures change later timing")
+    parser.add_argument("--settled-baseline-shadow", action="store_true", help="Independent bounded idle baseline observations; preserves the six original strict scans and perturbs later timing")
+    parser.add_argument("--ci-failure-evidence", action="store_true", help="Retain original ordinary stdout and capture one later graph only after all six strict scans complete with a failure; no baseline graph or address diff")
     parser.add_argument("--copy-lifetime", action="store_true", help="Instrument the product fixture with weak copy lifetime tracking; independent product mode only")
     parser.add_argument("--read-only", action="store_true", help="Read AX without subscriptions; requires --system-baseline")
     parser.add_argument("--ownership-trace", action="store_true", help="Trace copy/dealloc in the synthetic host; requires --system-baseline")
@@ -182,6 +346,33 @@ def main():
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--idle-seconds", type=int, default=2)
     args = parser.parse_args()
+    if args.settle_startup_baseline and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
+            args.reference_validation, args.reference_idle, args.malloc_scribble, args.empty_control_mode,
+            args.install_gate, args.prepare_external_fixture, args.prepare_install_gate_fixture,
+            args.external_startup_receipt, args.prepared_fixture_directory, args.terminal_origin,
+            args.live_attribution, args.copy_lifetime, args.read_only, args.ownership_trace, args.balance_copies,
+            args.settled_baseline_shadow)):
+        parser.error("--settle-startup-baseline requires independent ordinary product measurement")
+    if args.settled_baseline_shadow and (not args.external_startup_receipt or args.malloc_scribble != "off"
+            or any((args.heap_diagnostics, args.reference_validation, args.live_attribution, args.terminal_origin,
+                    args.install_gate, args.copy_lifetime, args.system_baseline, args.ci_failure_evidence,
+                    args.prepare_external_fixture, args.prepare_install_gate_fixture, args.read_only,
+                    args.ownership_trace, args.balance_copies))):
+        parser.error("--settled-baseline-shadow requires independent prepared external off ordinary measurement")
+    if args.ci_failure_evidence and any((args.system_baseline, args.heap_diagnostics, args.heap_control,
+            args.reference_validation, args.reference_idle, args.malloc_scribble, args.empty_control_mode,
+            args.install_gate, args.prepare_external_fixture, args.prepare_install_gate_fixture,
+            args.external_startup_receipt, args.prepared_fixture_directory, args.terminal_origin,
+            args.live_attribution, args.copy_lifetime, args.read_only, args.ownership_trace, args.balance_copies)):
+        parser.error("--ci-failure-evidence requires independent ordinary product measurement")
+    if args.reference_validation and (not args.heap_diagnostics or not args.external_startup_receipt
+            or args.malloc_scribble != "off" or args.install_gate or args.terminal_origin or args.live_attribution
+            or args.empty_control_mode not in (None, "pure-appkit")
+            or args.prepare_external_fixture or args.prepare_install_gate_fixture):
+        parser.error("--reference-validation requires independent prepared external off frozen measurement")
+    if args.reference_idle and (not (args.reference_validation or args.settled_baseline_shadow) or not args.heap_control
+            or args.empty_control_mode != "pure-appkit"):
+        parser.error("--reference-idle requires a pure AppKit empty reference control")
     if args.live_attribution and (not args.external_startup_receipt or args.malloc_scribble != "off"
             or args.heap_diagnostics or args.terminal_origin or args.install_gate or args.empty_control_mode
             or args.prepare_external_fixture or args.prepare_install_gate_fixture):
@@ -202,7 +393,7 @@ def main():
             args.expected_appkit_uuid, args.expected_corefoundation_uuid, args.terminal_origin)):
         parser.error("--prepare-external-fixture requires an independent fixture build")
     if args.external_startup_receipt and (not args.malloc_scribble or not args.prepared_fixture_directory
-            or (args.heap_diagnostics and not args.install_gate)
+            or (args.heap_diagnostics and not (args.install_gate or args.reference_validation))
             or any((args.system_baseline, args.copy_lifetime, args.read_only,
                     args.ownership_trace, args.balance_copies, args.expected_appkit_uuid, args.expected_corefoundation_uuid))):
         parser.error("external startup receipts require a prepared fixture; frozen scans require --install-gate")
@@ -237,6 +428,9 @@ def main():
     work.relative_to(ROOT / ".build/Temporary")
     work.mkdir(parents=True, exist_ok=False)
     records.mkdir(parents=True, exist_ok=False)
+    if args.ci_failure_evidence:
+        write_json(records / "failure-capture.json", {"status": "not_attempted", "exit_code": None,
+                   "after_label": None, "graph_sha256": None})
     state = work / "state"
     state.mkdir()
     graphs = work / "heap"
@@ -379,6 +573,7 @@ def main():
             "AppKit": args.expected_appkit_uuid, "CoreFoundation": args.expected_corefoundation_uuid}:
         raise RuntimeError("Diagnostic balance refused: system images differ from the reviewed trace")
     write_json(records / "inputs.json", {"capabilities": capabilities, "reader_capabilities": reader_capabilities,
+        "baseline_protocol": ax_startup_baseline.PROTOCOL if args.settle_startup_baseline else "immediate",
         "system": run(["sw_vers"]).stdout,
         "sources": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in sources}})
     reason = preflight_reason(capabilities, reader_capabilities, args.system_baseline, args.empty_control_mode, args.install_gate)
@@ -392,6 +587,8 @@ def main():
             receipt.update(mode="copy-lifetime", instrumented=True)
         if args.empty_control_mode:
             receipt["empty_control_mode"] = args.empty_control_mode
+        if args.ci_failure_evidence:
+            write_json(records / "result.json", receipt)
         print(json.dumps(receipt))
         return 77
     environment.update(MallocStackLogging="1", MallocStackLoggingNoCompact="1")
@@ -399,7 +596,15 @@ def main():
         # Full frozen histories must preserve free/reallocation generations.
         # MallocStackLogging would take precedence over NoCompact if both were set.
         environment.pop("MallocStackLogging")
+    if args.reference_validation:
+        # This independent frozen protocol also pins the reader environment.
+        # Ordinary measurements retain their existing logging configuration.
+        reader_environment.pop("MallocStackLogging", None)
+        reader_environment["MallocStackLoggingNoCompact"] = "1"
+    reference_environment = {}
+    checkpoint_windows = []
     results = []
+    startup_scans = []
     validation_errors = []
     checkpoints = []
     copy_lifetime_hosts = []
@@ -409,6 +614,8 @@ def main():
     sequence = reader_sequence = 0
     terminal_snapshot = empty_terminal_snapshot() if args.terminal_origin else None
     live_captures = []
+    startup_baseline = ax_startup_baseline.empty() if args.settle_startup_baseline else None
+    shadow = SettledBaselineShadow(records, records / "shadow", args.reference_idle) if args.settled_baseline_shadow else None
     with (records / "host.log").open("w") as host_log, (records / "reader.log").open("w") as reader_log:
         def validate(stage, validator, *values):
             # Assertion failures must not discard later lifecycle evidence. They
@@ -430,12 +637,13 @@ def main():
             write_json(records / "copy-lifetime-hosts.json", copy_lifetime_hosts)
             validate(f"copy-lifetime-host-{receipt['sequence']}", validate_copy_lifetime_host, receipt, expected_copies)
 
-        def command(action, expected_copies=None):
+        def command(action, expected_copies=None, timeout=15):
             nonlocal sequence
             sequence += 1
             write_json(state / "command.json", {"sequence": sequence, "action": action, "count": 10})
-            receipt = wait_json(state / "ready.json", lambda value: value["sequence"] == sequence, [host])
-            if args.heap_control:
+            receipt = wait_json(state / "ready.json", lambda value: value["sequence"] == sequence, [host],
+                                **({"timeout": timeout} if timeout != 15 else {}))
+            if args.heap_control and timeout == 15:
                 validate(f"control-host-{sequence}", validate_control_host, receipt)
             if args.install_gate:
                 validate(f"install-gate-host-{sequence}", validate_install_gate_state, receipt.get("install_probe"), args.install_gate)
@@ -466,6 +674,15 @@ def main():
             allocator_receipt[role] = value["malloc_scribble"]
             write_json(records / "external-startup.json", external_receipt)
             write_json(records / "malloc-scribble.json", allocator_receipt)
+            if shadow:
+                shadow.environment(role, process)
+            if args.reference_validation:
+                _, _, actual = read_procargs(process.pid)
+                if (process.poll() is not None or actual.get(b"PATH") != os.fsencode(child_environment["PATH"])
+                        or actual.get(b"MallocStackLogging") is not None
+                        or actual.get(b"MallocStackLoggingNoCompact") != b"1"):
+                    raise RuntimeError("Reference fixture full-history startup environment was not confirmed")
+                reference_environment[role] = {"malloc_stack_logging": "unset", "malloc_stack_logging_no_compact": "1"}
 
         def finish_external_receipt():
             for directory, reason in ((prepared, "prepared_hash"), (work, "working_hash")):
@@ -485,7 +702,7 @@ def main():
             except RuntimeError as error:
                 raise StartupReceiptError("receipt_incomplete", str(error)) from None
 
-        def scan(label, host_state):
+        def scan(label, host_state, *, startup=False, timeout=60):
             if args.copy_lifetime:
                 # Preserve commands evaluated at scan call sites. This separate
                 # probe measures weak availability without sampling the heap.
@@ -499,25 +716,47 @@ def main():
                 (graphs / f"{label}-capture.txt").write_text(capture.stdout + capture.stderr)
                 if capture.returncode not in (0, 1) or not graph.is_file():
                     raise RuntimeError("Diagnostic heap graph capture was unavailable")
+                if args.reference_validation:
+                    checkpoint_windows.append({"label": label, "phase": label,
+                        "start_monotonic": started, "end_monotonic": time.monotonic()})
                 # --outputGraph suppresses the text report. Decode that same
                 # snapshot offline; do not sample the live heap a second time.
                 target = str(graph)
             result = subprocess.run(["leaks", "--noContent", "--groupByType", "--nosources", "--fullStacks", target],
-                                    capture_output=True, text=True, timeout=60)
+                                    capture_output=True, text=True, timeout=timeout)
             completed = time.monotonic() if args.live_attribution else None
             (records / f"{label}-leaks.txt").write_text(result.stdout + result.stderr)
+            if args.ci_failure_evidence or startup:
+                (records / f"{label}-original.stdout.txt").write_bytes(result.stdout.encode())
+            elif shadow:
+                try:
+                    (records / f"{label}-original.stdout.txt").write_bytes(result.stdout.encode())
+                except OSError:
+                    shadow.error("stdout_write_failed")
             match = re.search(r"(\d+) leaks for (\d+) total leaked bytes", result.stdout)
             entry = {"label": label, "host": host_state, "exit_code": result.returncode,
                      "leak_nodes": int(match[1]) if match else None, "leak_bytes": int(match[2]) if match else None,
                      "destroyed_notification_stack_present": "_NSAccessibilityRemoveAllObserversAndSendDestroyedNotification" in result.stdout}
             entry["groups"] = leak_groups(result.stdout)
+            if args.ci_failure_evidence or shadow or startup:
+                entry["stdout_sha256"] = hashlib.sha256(result.stdout.encode()).hexdigest()
             entry["unclassified_nodes"] = int(match[1]) - sum(group["tree_nodes"] or 0 for group in entry["groups"]) if match else None
             entry["scan_duration_seconds"] = round(time.monotonic() - started, 3)
             entry["since_observer_exit_seconds"] = round(started - observer_exited, 3) if observer_exited is not None else None
-            results.append(entry)
-            write_json(records / "scans.json", results)
+            if not startup:
+                results.append(entry)
+                write_json(records / "scans.json", results)
+            else:
+                startup_scans.append(entry)
+                write_json(records / "startup-scans.json", startup_scans)
             if not match or result.returncode not in (0, 1):
                 raise RuntimeError(f"Full-heap scan was unavailable: {entry}")
+            if startup:
+                validate_control_host(host_state)
+                validate_product_scan(entry)
+                entry["startup_signature"] = ax_startup_baseline.fingerprint(
+                    entry, ax_composition.grouped_composition(result.stdout))
+                return entry
             if not args.system_baseline:
                 validate(label, validate_product_scan, entry, results[0] if label != "baseline" else None)
             if args.live_attribution:
@@ -557,14 +796,42 @@ def main():
                 warmed = observe()
                 if not args.heap_control and (warmed["buttons"] or warmed["registrations"] or warmed["notifications"]):
                     raise RuntimeError(f"AX baseline warm-up was not empty: {warmed}")
-                scan("baseline", command("checkpoint"))
+                if startup_baseline is not None:
+                    validate_control_reader(warmed)
+                    def startup_measure(index, deadline):
+                        if reader.poll() is not None:
+                            raise RuntimeError("AX reader exited during startup observation")
+                        empty_host = command("checkpoint", timeout=min(5, deadline - time.monotonic()))
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RuntimeError("Startup checkpoint exceeded the fixed deadline")
+                        return scan(f"startup-{index}", empty_host, startup=True, timeout=min(12, remaining))
+                    baseline = ax_startup_baseline.settle(startup_measure,
+                        lambda value: write_json(records / "startup-baseline.json", value), startup_baseline)
+                    # Reuse the selected scan byte-for-byte; a later capture must
+                    # not silently replace the established measurement baseline.
+                    source = records / (baseline["label"] + "-original.stdout.txt")
+                    (records / "baseline-original.stdout.txt").write_bytes(source.read_bytes())
+                    (records / "baseline-leaks.txt").write_bytes(
+                        (records / (baseline["label"] + "-leaks.txt")).read_bytes())
+                    baseline = {key: value for key, value in baseline.items() if key != "startup_signature"}
+                    baseline["label"] = "baseline"
+                    results.append(baseline)
+                    write_json(records / "scans.json", results)
+                else:
+                    scan("baseline", command("checkpoint"))
+                if shadow:
+                    shadow.data["baseline_finished_monotonic"] = time.monotonic()
+                    shadow.settle(host.pid, results[0], lambda timeout: command("checkpoint", timeout=timeout), warmed)
             for cycle in range(1, args.cycles + 1):
+                if shadow and cycle == 1:
+                    shadow.data["first_measurement_cycle_monotonic"] = time.monotonic()
                 added = command("checkpoint" if args.heap_control else "add")
                 if args.heap_diagnostics and cycle == 1:
                     # Split button construction from the first AX subscription;
                     # this remains subject to the original empty-window baseline.
                     scan("added-10", added)
-                observed = observe()
+                observed = warmed if args.reference_idle else observe()
                 if not args.heap_control and (observed["buttons"] != 10 or observed["registrations"] != expected_registrations):
                     raise RuntimeError(f"AX registrations incomplete: {observed}")
                 if not args.system_baseline and cycle == 1:
@@ -572,7 +839,8 @@ def main():
                     # or destroying any target button before the first scan.
                     scan("registered-10", command("checkpoint"))
                 removed = command("checkpoint" if args.heap_control else "remove")
-                observe()
+                if not args.reference_idle:
+                    observe()
                 if not args.heap_control and removed["destroyedButtons"] != cycle * 10:
                     raise RuntimeError(f"Buttons did not deallocate: {removed}")
                 checkpoint_keys = (("buttons", "allocatedButtons", "destroyedButtons", "compensations", "mutableCompensations")
@@ -604,10 +872,14 @@ def main():
                 time.sleep(min(1, remaining))
             final = command("checkpoint", 30 if args.copy_lifetime else None)
             scan("observer-exited", final)
+            if shadow:
+                shadow.data["last_original_scan_finished_monotonic"] = time.monotonic()
             if args.terminal_origin:
                 # The ordinary six scans are finished. This later capture never
                 # changes their totals or strict validation results.
                 terminal_snapshot = capture_terminal_snapshot(host.pid, graphs / "terminal.memgraph")
+            if shadow:
+                shadow.capture("auxiliary-late", results[-1])
             ordinary = final["compensations"] - final["mutableCompensations"]
             if args.system_baseline:
                 if final["compensations"] != 0 or final["mutableCompensations"] != 0:
@@ -676,7 +948,26 @@ def main():
                            "baseline_leak_bytes": results[0]["leak_bytes"],
                            "leak_nodes": results[-1]["leak_nodes"], "leak_bytes": results[-1]["leak_bytes"],
                            "scans": [{key: value for key, value in scan.items() if key != "host"} for scan in results],
-                           "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX groups and no increase over the non-AX startup baseline; not an installed-app or VoiceOver test"}
+                           "scope": "optimized production implementation, synthetic AppKit fixture; requires absent target AX groups and no increase over the zero-target AX startup baseline; not an installed-app or VoiceOver test"}
+            if args.ci_failure_evidence and validation_errors:
+                # Every original strict scan and notification check is finished.
+                # This later graph cannot identify baseline allocations or turn
+                # the original grouped reports into an address-level difference.
+                graph = records / "terminal.memgraph"
+                captured = capture_terminal_snapshot(host.pid, graph, timeout=15)
+                failure_capture = {"status": captured["capture_status"],
+                    "exit_code": captured["capture_exit_code"], "after_label": "observer-exited",
+                    "graph_sha256": None}
+                if failure_capture["status"] == "complete":
+                    try:
+                        graph_info = graph.lstat()
+                        if not stat.S_ISREG(graph_info.st_mode) or graph_info.st_size > 256 * 1024 * 1024:
+                            raise ValueError("Failure graph exceeds the bounded input limit")
+                        with graph.open("rb") as stream:
+                            failure_capture["graph_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+                    except (OSError, ValueError):
+                        failure_capture["status"] = "failed"
+                write_json(records / "failure-capture.json", failure_capture)
             if args.external_startup_receipt:
                 validate("external-startup-complete", finish_external_receipt)
                 summary["receipt_mode"] = "external-startup"
@@ -690,6 +981,16 @@ def main():
                 summary["scope"] += "; install-gate empty control; no product destruction coverage"
             if args.live_attribution:
                 summary["live_attribution"] = True
+            if args.reference_validation:
+                if set(reference_environment) != {"host", "reader"}:
+                    raise RuntimeError("Reference environment receipt is incomplete")
+                summary["reference_validation"] = True
+                summary["reader_mode"] = "initial-query-only" if args.reference_idle else "subscribed"
+                summary["scope"] += "; independent frozen full-history reference investigation; not ordinary CI parity"
+                write_json(records / "reference-validation-input.json", {"schema": 1,
+                    "history_mode": "full-no-compact", "malloc_stack_logging": "unset",
+                    "malloc_stack_logging_no_compact": "1", "environments": reference_environment,
+                    "checkpoint_windows": checkpoint_windows})
             if validation_errors:
                 summary["coverage"] = "failed"
                 summary["validation_errors"] = validation_errors
@@ -703,6 +1004,9 @@ def main():
             write_json(records / "result.json", summary)
         finally:
             primary_exception = sys.exc_info()[0] is not None
+            if shadow and host is not None and results and not any(row["label"] == "auxiliary-late" for row in shadow.data["captures"]):
+                shadow.pid = host.pid
+                shadow.capture("auxiliary-late", results[-1])
             cleanup = {"primary_exception": primary_exception, "errors": []}
             if primary_exception:
                 validation_errors.append({"stage": "execution", "message": "Fixture execution failed"})
@@ -754,9 +1058,16 @@ def main():
             if primary_exception or validation_errors:
                 summary["coverage"] = "failed"
             summary["cleanup"] = cleanup
+            if startup_baseline is not None:
+                summary["startup_baseline"] = startup_baseline
             if validation_errors:
                 summary["validation_errors"] = validation_errors
                 cleanup_step("validation_receipt", lambda: write_json(records / "validation-errors.json", validation_errors))
+            if shadow:
+                shadow.finish(results, validation_errors, primary_exception)
+                summary["settled_baseline_shadow"] = True
+                summary["reader_mode"] = "initial-query-only" if args.reference_idle else "subscribed"
+                summary["scope"] = summary.get("scope", "") + "; shadow probes and captures perturb subsequent timing; observed stability is not permanent stability or ordinary run parity"
             cleanup_step("result_receipt", lambda: write_json(records / "result.json", summary))
             print(json.dumps(summary))
     return 1 if validation_errors else 0

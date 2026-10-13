@@ -761,11 +761,11 @@ def terminal_snapshot_summary(grouped, listed, resolver, image_worker_receipt=No
     return result
 
 
-def capture_terminal_snapshot(pid, graph):
+def capture_terminal_snapshot(pid, graph, timeout=60):
     result = empty_terminal_snapshot()
     try:
         captured = subprocess.run(["leaks", "--noContent", "--fullStacks", f"--outputGraph={graph}", str(pid)],
-                                  capture_output=True, text=True, timeout=60)
+                                  capture_output=True, text=True, timeout=timeout)
         graph.with_suffix(".capture.txt").write_text(captured.stdout + captured.stderr)
         result["capture_exit_code"] = captured.returncode
         result["capture_status"] = "complete" if captured.returncode in (0, 1) and graph.is_file() else "failed"

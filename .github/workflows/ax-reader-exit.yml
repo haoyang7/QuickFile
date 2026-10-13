@@ -1,0 +1,74 @@
+name: AX Reader exit controls
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      dispatch_inputs:
+        description: 'Original dispatcher inputs for rejecting mixed investigation modes'
+        type: string
+        required: false
+        default: '{}'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ax-reader-exit-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  reader-exit:
+    name: Fixed Reader exit controls (macOS 26 arm64)
+    runs-on: macos-26
+    timeout-minutes: 35
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - name: Reject mixed investigation requests
+        env:
+          AX_READER_EXIT_INPUTS: ${{ inputs.dispatch_inputs || '{}' }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          value = json.loads(os.environ['AX_READER_EXIT_INPUTS'])
+          flags = ('scan_timing_control', 'ax_causal_probe', 'heap_diagnostics', 'malloc_scribble', 'terminal_origin',
+              'live_attribution', 'install_gate_control', 'pure_appkit_control', 'frozen_control',
+              'reference_validation', 'settled_baseline_shadow')
+          assert type(value) is dict and set(value) <= set(flags) | {'reader_exit_control', 'scan_mode', 'receipt_mode'}
+          assert all(value.get(key, False) is False for key in flags)
+          assert value.get('reader_exit_control', True) is True
+          assert value.get('scan_mode', 'diagnostic') == 'diagnostic'
+          assert value.get('receipt_mode', 'internal') == 'internal'
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Run the predeclared nine-trial experiment
+        run: >-
+          python3 Scripts/Investigations/ax_reader_exit_campaign.py
+          --work-directory .build/Temporary/ax-reader-exit-controls/campaign
+      - name: Validate the public artifact independently
+        id: public-evidence
+        if: always()
+        run: |
+          python3 Scripts/Investigations/ax_reader_exit_campaign.py --validate-public \
+            --work-directory .build/Temporary/ax-reader-exit-controls/campaign
+          echo 'safe=true' >> "$GITHUB_OUTPUT"
+      - name: Retain bounded anonymous Reader exit evidence for 7 days
+        if: always() && steps.public-evidence.outputs.safe == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ax-reader-exit-summary
+          path: .build/Temporary/ax-reader-exit-controls/campaign/summary.json
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: true # Only the exact allowlisted summary under .build.
+          overwrite: false

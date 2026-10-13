@@ -1229,9 +1229,12 @@ def main(argv=None):
     parser.add_argument("--first-strict-growth", action="store_true")
     parser.add_argument("--bridge-evidence", action="store_true")
     parser.add_argument("--live-pair", action="store_true", help="Compare later auxiliary captures; compact histories never certify retained-address generations")
+    parser.add_argument("--reference-validation", action="store_true", help="Separately validate full-history frozen references after original summaries are saved")
     args = parser.parse_args(argv)
     if args.live_pair and args.first_strict_growth:
         parser.error("Choose frozen checkpoints or auxiliary live pair")
+    if args.reference_validation and (args.live_pair or not args.first_strict_growth or not args.bridge_evidence):
+        parser.error("Reference validation requires frozen first-strict-growth and bridge evidence")
     collector = Collector()
     bridge_context = {} if args.bridge_evidence else None
     result = compare(args.graph_directory, args.records_directory, first_strict_growth=args.first_strict_growth,
@@ -1259,8 +1262,12 @@ def main(argv=None):
     bridge_written = True
     if args.bridge_evidence:
         bridge_written = write_bridge_evidence(result, bridge_context, args.records_directory)
+    reference_complete = True
+    if args.reference_validation:
+        from ax_reference_validation import write_sidecar
+        reference_complete = bridge_written and write_sidecar(result, bridge_context, args.graph_directory, args.records_directory)
     print("Frozen-node summary " + result["status"])
-    return 0 if result["status"] == "complete" and bridge_written else 1
+    return 0 if result["status"] == "complete" and bridge_written and reference_complete else 1
 
 
 def write_bridge_evidence(frozen, context, records):

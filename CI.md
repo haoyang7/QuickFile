@@ -41,7 +41,37 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 `live_attribution=true` 单独运行一对同构建的空白对照与产品路径；其他输入须保持默认值。此入口内部采用普通 live 扫描和原来的两个 malloc 栈记录变量，在原始 baseline 与首次节点或字节增长扫描结束后，各追加一张旁路图，最多两张。六次原始扫描、严格判定及失败结果保留，离线分析在子进程退出后进行。摘要分别绑定原始 stdout 和后采集图的哈希、计数及采集间隔；计数不符明确标为 partial，计数相同也不证明对象集合相同。旁路采集会改变后续时序，不能与无旁路运行等同；compact 日志中的已有地址不能证明分配代次，未知代次继续报告 unknown。此模式用于调查，不能凭诊断结果解除普通 CI 的失败。
 
+独立的 `AX reference validation` 手动工作流在 macOS 26 arm64 执行一次四组冻结调查：产品动作、复用同一普通二进制的空窗口、另行构建且不链接产品 AX 实现的纯 AppKit 空窗口，以及只进行初始 AX 查询的纯 AppKit 空窗口。最后一组仍保留宿主命令、reader 生命周期和七个堆快照检查点；它仅停止基线后的 AX 查询，不能称为完全无活动对照。四组均固定 MallocScribble off，并从实际自有子进程启动元数据核对 host/reader 的 `MallocStackLogging` 未设置、`MallocStackLoggingNoCompact=1`。此配置为独立完整历史协议，会改变普通 live 的测量条件，不能撤销普通严格失败。
+
+原严格计数、冻结对象和 bridge schema 先保存，再运行独立有界 reference 侧录，补充 source/target 角色、两端分配代次、工具报告的引用路径差集、NSXPCConnection 环成员在基线的存在及泄漏判定、data/block 上游，以及事件首次可见的检查点区间。采图开始/结束使用同一单调时钟；首次可见区间不能替代分配事件的精确时间，路径或槽位也不证明完整强所有权。未采到服务接口身份、精确 malloc_history 时钟、完整代次或所有候选时保留 unknown/partial。无节点或字节增长时明确使用终点作补充比较，不冒充首次增长样本。
+
+侧录最多 56 次工具调用、180 秒、128 KiB 公共摘要，另行绑定原 frozen/bridge 摘要和七张图的哈希；不占用或扩大原诊断预算。campaign 使用独立进程组，逐例保留严格退出码及证据完整度；已知严格失败仍采集后续对照，进程回收无法确认则停止。上传前独立校验固定字段、枚举、数量、嵌套摘要和总字节上限，仅上传匿名 `summary.json`；原始地址、路径、完整栈、启动元数据、堆图和日志保留在私有临时目录，不上传。确认所有进程退出后回收本轮 App、缓存和原始临时产物；回收失败保持非零结果。该工作流只用于归因，完整侧录不等于产品泄漏已排除或正式版放行。
+
+普通原生 AX 回归通过 `--settle-startup-baseline` 建立 `zero-target-settled-v1` 基线：首次空窗口 AX 查询后，在任何测试按钮创建前观察至少 20 秒，最多 12 次探测、总计 40 秒；探测结束后至少间隔 2 秒，连续 3 次节点、字节、根分组和有界类型／尺寸构成一致才接受最后一次扫描。20 秒窗口覆盖既有空窗口时点实验中发生变化的观测点，不是系统初始化完成的 API 保证。每次须确认 Reader 存活、宿主目标分配／销毁及两类补偿为零，且完整堆分类没有目标 AX 栈或未知根。不可解析、超时、持续变化均失败；不重试失败探测，不取历史最大值，也不在目标生命周期开始后重设基线。
+
+所选探测的 stdout 按字节复用为六点中的 baseline，随后 registered、三次 removed 和 observer-exited 继续严格禁止节点、字节和根数量增长；通知逐目标逐观察者核对与独立 copy-lifetime 检查保留。启动期所有探测数值和选中索引独立记录，不能声称进程全生命周期没有增长，也不能据此认定 XPC 泄漏已修复。未传该参数的手动调查继续使用历史 immediate 协议，结果须按协议区分。
+
+独立 `AX settled baseline shadow` 手动工作流（也可由 `AX system baseline` 的 `settled_baseline_shadow=true` 转发）在 macOS 26 arm64 执行一次四组影子实验：产品动作、带补丁空窗口、纯 AppKit 空窗口、只进行初始 AX 查询的纯 AppKit 空窗口。普通严格基线及六点判定保留；候选基线的假设判定单独记录，不能覆盖原失败。host 保持普通 compact 配置（`MallocStackLogging=1`、`MallocStackLoggingNoCompact=1`），reader 的两个键未设置，双方 `MallocScribble` 未设置；必须从实际子进程启动元数据核验。影子模式额外观测改变后续时序，不能声称与未扰动的普通 CI 等价。 此工作流另有独立 startup-precondition 作业，固定执行 5 次新进程的正式严格回归；能力跳过或任一次失败立即使该作业失败，不重跑。原四组影子结果与新协议的结果分别保留。
+
+影子候选只在零目标、零补偿阶段观测，最多六次、总期限 15 秒、单工具最多 5 秒，相邻观测间隔至少两秒。连续两次节点、字节和根组签名相等只是 `observed-stable`，未比较完整尺寸直方图，也不证明永久稳定；两根状态可以成为候选，不要求第三根出现。超时或观测失败明确保留 `not_settled` / 不可判定。公共 campaign schema 3 保留 `capture_status=timeout|failed|complete`、未核验的早期活动状态和固定的投影失败阶段；合法的截止时间耗尽不能丢弃原观测或成为有效候选。公开毫秒区间的舍入不确定性须与精确截止判定区分。单调时钟记录原基线结束、稳定观测开始、首个测量循环开始和最后原扫描结束，公开摘要只保留相对区间，以核对前期采图早于目标动作、晚期采图晚于原六点。
+
+最多保留初始、候选、晚期三张辅助 current-stack 图，各有独立的 15 秒采图工具超时。初始图完成后才开始稳定性轮询的 15 秒期限；候选图在轮询结束后采集，晚期图在原六点之后采集，采图不消耗轮询期限。采图时间窗口还包含文件与哈希处理，不能等同于工具运行时长。夹具退出后，在同一图上交叉核对完整 list/tree、哈希、精确类型与 malloc size 的有界直方图，公开前后带正负桶的成分差集、节点及字节守恒、`unknown` 和遗漏状态。图与前一原扫描的总数相等只称 `totals-match`，不证明对象同一；初始辅助图晚于原 baseline，不能据此恢复原 baseline 的地址或分配代次。数值分桶无遗漏时，未知类型仍以 `unknown` 参与差集，并用 `type_coverage=includes-unknown` 标记命名缺口；数值完整不代表类型已识别。每例离线最多六次工具调用、45 秒，总进程限时 60 秒；单份公共摘要上限 512 KiB。所有地址、原图和完整日志留在 runner，确认进程退出后回收。原严格失败、证据失败与假设结果分别记录；上传独立校验后的单份摘要，不放宽主 CI 或发布门槛。
+
 live 旁路图只请求当前存活分配的栈，不要求 `--fullStackHistory`；普通 malloc 记录设置、六次原始扫描及严格阈值不变。图中的当前分配栈不能证明已释放对象的历史或跨扫描分配代次，冻结调查仍使用独立的完整历史协议。
+
+独立 [AX Reader exit controls](.github/workflows/ax-reader-exit.yml) 手动工作流（也可由 `AX system baseline` 的 `reader_exit_control=true` 转发）执行预先固定的九次普通 live 调查。同一 ordinary host/reader 构建用于三个 block；顺序依次为 `keep/early/late`、`early/late/keep`、`late/keep/early`，每例均启动新进程，不因增长选择性重跑。以唯一一次初始 AX 查询完成为零点，六次 checkpoint 和扫描安排在第 0、20、40、60、80、110 秒；Reader 分别持续运行至最后扫描结束、在第 30 秒请求正常退出、在第 70 秒请求正常退出。各组保持相同扫描次数及 checkpoint 序列；记录 Host 启动、ready、Reader 启动、初始查询、checkpoint、扫描和退出的实际相对时钟。计划时点最大迟到 3 秒，退出同时约束 stop 请求和 wait 返回；wait 返回是已退出的观察上界，不是精确死亡时刻。扫描、checkpoint、退出等待分别限时 12、5、5 秒；时间失配、提前退出和不完整样本保留，不冒充配平。初始查询完成后的日程相同不能自动证明 Host 进程龄相同，归因前须对照各组实际启动及扫描时钟。
+
+这轮的零活动仅指零目标按钮、零目标注册、零目标通知和零补偿；Reader 仍创建原有两个应用级 AXObserver，Host 的 checkpoint 仍执行原布局、显示和回执。初始查询后不再主动查询 AX，补丁和普通 compact 环境保持启用，并核对实际子进程环境及复用二进制哈希。不增加 memgraph、settling 或故障注入，复用已有类型成分解析器。严格分类及相对起始基线的增长判定逐点保留；严格失败不阻止后续样本，清理无法确认则停止。上传前独立验证匿名 `summary.json`，原始 stdout、启动元数据、地址和日志不上传。该调查能检验报告变化与 Reader 退出时点的关系，不能仅由根数量推断新增连接，也不能排除扫描自身或异步初始化的作用；专项实验结果不能覆盖普通 CI 或更改发布门禁。
+
+Reader 摘要 schema 2 使用紧凑 JSON，保持 512 KiB 上限；历史 schema 1 仍按原缩进格式校验，私有构建清单的编码和哈希保持原契约。成分数据超出预算时明确标为 `summary_budget`，保留每点计数、根组、时钟、活动状态和原严格判定，并重算不可用的成分差集。清理私有证据前先保存完整摘要并预检最终清理收据的编码；核心证据仍超预算时失败并保留私有产物，不以此前的部分摘要冒充完整九例。
+
+独立 [AX scan timing controls](.github/workflows/ax-scan-timing.yml) 手动工作流（也可由 `AX system baseline` 的 `scan_timing_control=true` 转发）复用一个带安装探针的构建，执行三个轮换 block、共 18 次新进程。每个 block 各含 `installed` / `preflight-only` × `early-only` / `late-only` / `twice` 六条件；日程组先后和安装模式先后在 block 间变化，完整顺序由 campaign 固定。两模式共同执行原安装预检，只有 installed 继续替换 IMP；启动及每次 ready 都核验真实 IMP 状态。它首先测量安装探针构建，不能自动推广到 ordinary 或已安装产品。
+
+以唯一初始 AX 查询完成为零点，所有条件都在第 0、20 秒执行相同 checkpoint，分别只在第 0 秒、第 20 秒或两个时点执行普通 live 扫描；Reader 均存活到第 40 秒后正常退出。checkpoint 与扫描分别调度，记录实际 Host/Reader 年龄、扫描起止及退出请求/wait 返回。扫描、checkpoint、退出等待分别限时 12/5/5 秒，计划迟到上限 3 秒。仅 twice 对自身 0→20 秒作原严格增长判定，单扫描组明确为 `not-evaluated`；每点仍执行原严格分类，分类、增长和证据完整度分别记录，失败不能被后续样本撤销。不增加采图、settling 或新解析器；匿名摘要沿用 512 KiB 上限，最终编码预检通过且进程清理确认后才回收私有 App、缓存与原始数据。
+
+晚时点首次扫描与早时点首次扫描的差异同时包含年龄、异步演化和 checkpoint 历史；同龄的 twice 晚点与 late-only 才有相同 checkpoint 历史，可调查此前扫描的总体影响。跨进程比较须核对实际年龄与启动耗时，不能假设初始堆可交换，也不自动生成因果通过结论。固定样本无漂移、迟到或不完整时保留不可判定；小幅计数变化与新增根分别描述，根数量不建立对象身份或连接创建时间。该入口不改变 ordinary CI、正式基线或发布门禁。
+
+reference、shadow、Reader exit 和 scan timing campaign 在回收私有产物前，先保存所有已收集样本的公共摘要，并预检最终清理收据的编码。摘要超预算或保存失败时返回失败并保留私有证据；此前已写出的部分摘要不能冒充本轮完整结果。
 
 旁路采图失败时，仅公开固定的错误词法提示，不将其称为根因。身份验证成功、测量及离线工具的进程清理均确认后，才运行额外的自有进程 CLI 检查，验证当前图及其分配栈可读；同进程另记完整历史能力对照，明确区分模式不支持与未知失败。此检查位于原测量之后，不会覆盖原失败，也不在 live 采图失败后自动改用另一套协议。
 
@@ -122,16 +152,23 @@ AX 读取权限由实际 reader 可执行文件检查；不匹配映像或缺权
 
 Xcode 的 macOS App 构建会添加 Launch Services 注册步骤，文件回收不能证明注册状态已恢复。CI 临时 runner 没有日常安装版；本机验证结束后须按 [临时产物回收约定](CONTRIBUTING.md#临时产物回收) 恢复日常 App 与 Finder 扩展的实际加载身份，并在清理后验收真实 Finder 菜单。自检脚本的清理收据只记录本轮文件回收结果。
 
-每个 macOS job 只上传两份从有限字段生成的 synthetic CI JSON 回执，不读取或导出 xcresult 内容：
+每个 macOS job 上传三份从有限字段生成的 synthetic CI JSON 回执，不读取或导出 xcresult 内容：
 
 - `identity.json`：实际 checkout SHA、event SHA、workflow SHA、PR head/base SHA（适用时），run/attempt 链接、job、预期与实际 OS/架构/工具身份
 - `verification.json`：身份/工具/脚本/原生步骤的 outcome、上传前 job 状态、原生命令退出码、两个结果 bundle 是否存在，以及实际 XcodeGen 版本
+- `ax-evidence.json`：schema 3 显式记录 baseline_protocol；新协议保留有界启动期探测和选中值，并校验其与正式 baseline 的 stdout 哈希、节点、字节和根数量相符。继续保留六点严格 AX 扫描、各点有界类型成分、带正负计数的成分差集，以及严格失败后可用的终点图和精确尺寸直方图；未执行、能力跳过、缺失和不完整状态分别保留
 
-这些回执不声明测试数量或断言详情，也不是签名、实机、安装、性能或发布验收。PR 的 checkout 通常是临时合并提交，不应拿 PR head SHA 替代。最终 job 结论仍以 Actions 为准：`job_before_upload` 不能证明上传步骤本身成功。
+类型成分子摘要使用 schema 3；无法解析时以固定 `failure_stage` 定位失败阶段，不输出原始行或类型名。树行格式失败可附不超过 4 KiB 的匿名诊断片段：最多两个父行和当前行，经已有词法白名单编码，地址匿名化、任意名称替换为 opaque，完整摘要仍限 8 KiB。片段仅用于语法调查，不是完整树、类型身份或等价重放证据；超预算时不保留片段。真实报告的子层 `ROOT CYCLE` 标记不新增根或节点，层级与计数仍由缩进及子树守恒核对。
 
-上传前校验严格字段/类型、文件名白名单、无符号链接且每文件不超过 16 KiB；两份文件合计最多 32 KiB。`upload-artifact` 固定官方 v7.0.1 的完整提交 SHA，路径逐个列出，不使用 glob。artifact 名含 job、OS、架构、Xcode、run ID 与 attempt，不覆盖旧 artifact，只保留 7 天。身份校验、测试或构建失败后仍用 `always()` 生成脱敏回执，并保持原 job 失败；若 checkout/Python 初始化失败、作业被硬终止或上传服务失败，可能没有回执，不得解释为验证通过。
+身份与 verification 回执不声明测试数量或断言详情；AX 回执只保留有限扫描判定标签与脱敏诊断。三份回执都不是签名、实机、安装、性能或发布验收。PR 的 checkout 通常是临时合并提交，不应拿 PR head SHA 替代。最终 job 结论仍以 Actions 为准：`job_before_upload` 不能证明上传步骤本身成功。
 
-原始 `.xcresult` 留在 runner 本地，随托管 runner 回收；不上传原始 trace、测试附件/消息、完整日志、整个 `.build`/DerivedData、证书、profile、环境变量 dump、书签或用户数据。新增或修改回执逻辑后应检查生成的两份回执与 Actions 日志、确认身份/退出码/失败路径，再判断是否需要另行设计经过审查的数值型 xcresult 摘要；不能直接扩大为原包上传。
+上传前校验严格字段/类型、精确文件名白名单、无符号链接及硬链接，并用同一文件描述符有界读取。`identity.json` 与 `verification.json` 各不超过 16 KiB；`ax-evidence.json` 独立上限为 256 KiB，三份合计最多 288 KiB。`upload-artifact` 固定官方 v7.0.1 的完整提交 SHA，路径逐个列出，不使用 glob。artifact 名含 job、OS、架构、Xcode、run ID 与 attempt，不覆盖旧 artifact，只保留 7 天。身份校验、测试或构建失败后仍用 `always()` 生成脱敏回执，并保持原 job 失败；若 checkout/Python 初始化失败、作业被硬终止或上传服务失败，可能没有回执，不得解释为验证通过。
+
+`run-scripts` 将原脚本测试命令的 AX 记录目录绑定为本 job 独占的 `ax-records/`，由原 runner 独占创建，命令结束后直接收集证据，不重跑失败测试。原失败退出码始终保留；原命令成功但必要 AX 证据缺失或不完整仍失败。collector 出错使用固定 `unavailable` 摘要；脚本步骤未执行时，`finish` 生成明确的 `not_attempted` 摘要。原始 `groupByType` 输出不包含完整地址；严格失败后的单张终点图晚于原六点扫描，不是 baseline 或 first-growth 快照，不能提供分配 generation 或跨图 diff，也不改变原严格扫描、门禁、malloc 配置或发布验收声明。原始 AX 记录和内存图只留在 runner，不上传。
+
+原 grouped 输出的行数值描述子树总量，不能直接当类型实例数或每实例 size。类型自身计数通过完整树的直接子树扣除核对；只有可证明的单实例、未舍入字节数才能进入精确尺寸桶。同类型多实例聚合与 K/M 舍入造成的尺寸缺失明确记录，不能推断为某个 48 B 对象。成分解析是独立补充状态，失败不会丢掉原严格扫描或改变其判定。终点精确直方图来自后期图的完整节点，仅在完整成分间计算差集；固定类型白名单外归 `unknown`，正负桶变化不建立分配年龄、代次或所有权关系。
+
+原始 `.xcresult` 留在 runner 本地，随托管 runner 回收；不上传原始 trace、测试附件/消息、完整日志、整个 `.build`/DerivedData、证书、profile、环境变量 dump、书签或用户数据。新增或修改回执逻辑后应检查生成的三份回执与 Actions 日志、确认身份/退出码/失败路径，再判断是否需要另行设计经过审查的数值型 xcresult 摘要；不能直接扩大为原包上传。
 
 上述验证工作流只需要 `contents: read`，checkout 不保留凭据，不使用 secrets，不配置证书/profile，只上传验证收据，不发布 App/ZIP；Community DMG 的五项分发产物按前述独立流程上传。各流程不引入自托管或付费大 runner。fork/untrusted PR 使用原有 `pull_request` 权限边界，不使用 `pull_request_target`。主 CI 的 PR 入口没有工作流级路径过滤，文档跳过由总门禁明确判定；其它工作流保留各自触发范围。工作流未启动或整体取消不等于门禁通过，仍须核对当前提交的 required check 终态。
 

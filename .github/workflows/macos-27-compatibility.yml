@@ -77,7 +77,9 @@ jobs:
           echo "$RUNNER_TEMP/quickfile-tools/xcodegen/bin" >> "$GITHUB_PATH"
       - name: Run script tests
         id: scripts
-        run: python3 -m unittest discover -s Scripts/tests -v
+        env:
+          CI_EVIDENCE_ROOT: ${{ steps.identity.outputs.root }}
+        run: python3 Scripts/ci-evidence.py run-scripts "$CI_EVIDENCE_ROOT" -- python3 -m unittest discover -s Scripts/tests -v
       - name: Run native tests and unsigned Universal self-check
         id: native
         env:
@@ -103,6 +105,7 @@ jobs:
           path: |
             ${{ steps.identity.outputs.root }}/upload/identity.json
             ${{ steps.identity.outputs.root }}/upload/verification.json
+            ${{ steps.identity.outputs.root }}/upload/ax-evidence.json
           retention-days: 7
           if-no-files-found: error
           include-hidden-files: false
