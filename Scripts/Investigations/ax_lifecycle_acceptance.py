@@ -25,6 +25,14 @@ def require(ok):
         raise ValueError("Invalid AX lifecycle evidence")
 
 
+def receipt_fields(value, fields):
+    require(type(value) is dict)
+    missing = sorted(set(fields) - value.keys())
+    if missing:
+        # Only fixed contract keys enter diagnostics, never receipt values.
+        raise ValueError("AX receipt incomplete: missing fields " + ", ".join(missing))
+
+
 @lru_cache(maxsize=1)
 def runner():
     spec = importlib.util.spec_from_file_location("ax_acceptance_runner", Path(__file__).with_name("verify-ax-compatibility.py"))
@@ -34,17 +42,27 @@ def runner():
 
 
 def activity(receipt):
+    require(type(receipt) is dict)
+    cleanup = receipt.get("cleanup")
+    if type(cleanup) is dict and cleanup.get("primary_exception") is True:
+        require(receipt.get("coverage") == "failed")
+        raise ValueError("AX receipt incomplete: runner aborted")
+    receipt_fields(receipt, ("destroyed_buttons", "notifications", "ordinary_compensations",
+                             "mutable_compensations", "notification_receipt", "cleanup"))
     probe = runner()
     for key, expected in (("destroyed_buttons", 30), ("notifications", 60)):
         require(type(receipt[key]) is int and receipt[key] == expected)
     for key in ("ordinary_compensations", "mutable_compensations"):
         require(type(receipt[key]) is int and receipt[key] >= 30)
+    receipt_fields(receipt["notification_receipt"], ("notifications", "all_notifications",
+                   "unmatched_notifications", "tracked_buttons", "target_notification_counts"))
     probe.validate_notifications(receipt["notification_receipt"], 30)
     require(receipt["notification_receipt"]["notifications"] == receipt["notifications"])
-    cleanup = receipt["cleanup"]
+    receipt_fields(cleanup, ("primary_exception", "processes_exited", "errors", "host", "reader"))
     require(cleanup["primary_exception"] is False and cleanup["processes_exited"] is True and cleanup["errors"] == [])
     for role in ("host", "reader"):
         row = cleanup[role]
+        receipt_fields(row, ("started", "exited", "errors", "return_code"))
         require(row["started"] is True and row["exited"] is True and row["errors"] == []
                 and type(row["return_code"]) is int and row["return_code"] == 0)
 
@@ -76,6 +94,8 @@ def evaluate(kind, receipt, code):
     """Reject all failures except recomputed ordinary, fully classified growth."""
     require(kind in KINDS and type(code) is int)
     activity(receipt)
+    receipt_fields(receipt, ("coverage", "mode", "instrumented", "copy_lifetime") if kind == "copy-lifetime"
+                   else ("coverage", "startup_baseline", "scans"))
     probe = runner()
     if kind == "copy-lifetime":
         require(code == 0 and receipt["coverage"] == "passed" and not receipt.get("validation_errors")

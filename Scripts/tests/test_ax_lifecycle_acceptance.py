@@ -53,6 +53,47 @@ def public_unsupported(checkout="a" * 40):
 
 
 class LifecycleAcceptanceTests(unittest.TestCase):
+    def test_aborted_receipt_has_explicit_diagnostic_without_runner_output(self):
+        receipt = {'coverage': 'failed', 'cleanup': {'primary_exception': True},
+                   'validation_errors': [{'stage': 'execution', 'message': '/private/secret'}]}
+        for kind in policy.KINDS:
+            with self.subTest(kind=kind):
+                with self.assertRaises(ValueError) as caught:
+                    policy.evaluate(kind, receipt, 1)
+                self.assertEqual(str(caught.exception), 'AX receipt incomplete: runner aborted')
+
+    def test_missing_fields_are_incomplete_without_claiming_execution_abort(self):
+        for kind in policy.KINDS:
+            receipt = fixture(kind)
+            for path in (('destroyed_buttons',), ('notification_receipt', 'notifications'),
+                         ('cleanup', 'host'), ('cleanup', 'reader', 'return_code'),
+                         ('copy_lifetime' if kind == 'copy-lifetime' else 'startup_baseline',)):
+                bad = copy.deepcopy(receipt)
+                parent = bad
+                for key in path[:-1]: parent = parent[key]
+                del parent[path[-1]]
+                with self.subTest(kind=kind, path=path):
+                    with self.assertRaises(ValueError) as caught:
+                        policy.evaluate(kind, bad, 0 if kind == 'copy-lifetime' else 1)
+                    self.assertEqual(str(caught.exception), 'AX receipt incomplete: missing fields ' + path[-1])
+
+    def test_malformed_receipts_and_contradictory_abort_markers_are_invalid(self):
+        cases = [None, [], 1]
+        for path in (('cleanup',), ('cleanup', 'reader'), ('notification_receipt',)):
+            bad = ordinary()
+            parent = bad
+            for key in path[:-1]: parent = parent[key]
+            parent[path[-1]] = []
+            cases.append(bad)
+        bad = ordinary(False); bad['cleanup']['primary_exception'] = True
+        cases.append(bad)
+        for marker in (1, 'true'):
+            bad = ordinary(); bad['cleanup']['primary_exception'] = marker
+            cases.append(bad)
+        for index, receipt in enumerate(cases):
+            with self.subTest(case=index), self.assertRaisesRegex(ValueError, '^Invalid AX lifecycle evidence$'):
+                policy.evaluate('ordinary', receipt, 1)
+
     def test_native_caller_failures_include_runner_output_and_receipt_cause(self):
         invalid_activity = ordinary(); invalid_activity['notifications'] = 0
         invalid_root = ordinary(); invalid_root['scans'][0]['groups'][0]['root_type'] = 'Unknown'
@@ -62,7 +103,8 @@ class LifecycleAcceptanceTests(unittest.TestCase):
             (1, '{', json.JSONDecodeError),
             (1, json.dumps(invalid_activity), ValueError),
             (1, json.dumps(invalid_root), RuntimeError),
-            (1, '{}', KeyError),
+            (1, '{}', ValueError),
+            (1, json.dumps({'coverage': 'failed', 'cleanup': {'primary_exception': True}}), ValueError),
         ]
         for strict in (False, True):
             for code, raw, cause in scenarios:
