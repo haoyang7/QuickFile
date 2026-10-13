@@ -37,6 +37,40 @@ def actual():
                 python="3.13.9")
 
 
+def write_ax_records(records, unsupported_kind=None):
+    """Synthetic raw receipts for both real collectors; no native tools needed."""
+    from test_ax_ci_failure import FailureEvidenceTests
+    from test_ax_lifecycle_acceptance import compatibility, fixture, policy
+
+    original = FailureEvidenceTests()
+    original.records = records
+    records.mkdir()
+    startup = original.startup()
+    for kind in policy.KINDS:
+        directory = records if kind == 'ordinary' else records.with_name(records.name + '-' + kind)
+        if kind != 'ordinary':
+            directory.mkdir()
+        unsupported = kind == unsupported_kind
+        inputs = {'sources': policy.source_manifest(policy.ROOT, kind),
+                  'baseline_protocol': policy.evidence.startup.PROTOCOL,
+                  'capabilities': {'status': 'unsupported-images' if unsupported else 'enabled', 'enabled': not unsupported},
+                  'reader_capabilities': {'trusted': True}}
+        (directory / 'inputs.json').write_text(json.dumps(inputs))
+        if not unsupported:
+            receipt = fixture(kind)
+            if kind == 'ordinary':
+                receipt.update(scans=original.scans, startup_baseline=startup)
+                original.write('process-cleanup.json', receipt['cleanup'])
+                original.write('failure-capture.json', {'status': 'not_attempted', 'exit_code': None,
+                    'after_label': None, 'graph_sha256': None})
+            (directory / 'result.json').write_text(json.dumps(receipt))
+            if kind == 'copy-lifetime':
+                hosts = [compatibility.AXCompatibilityCopyLifetimeTests.receipt(30 if i == 9 else 0) | {'sequence': i}
+                         for i in range(10)]
+                (directory / 'copy-lifetime-hosts.json').write_text(json.dumps(hosts))
+        policy.record(directory, kind, 77 if unsupported else 0 if kind == 'copy-lifetime' else 1)
+
+
 class CIEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -126,6 +160,41 @@ class CIEvidenceTests(unittest.TestCase):
                 result = MODULE.run_scripts(root, [sys.executable, '-c', program])
             self.assertEqual(result, expected)
             self.assertEqual(MODULE.read_json(root / 'upload/ax-lifecycle.json')['status'], 'unavailable')
+
+    def test_real_collectors_accept_growth_and_reject_mixed_component_coverage(self):
+        for unsupported_kind in (None, 'copy-lifetime', 'negative-control'):
+            with self.subTest(unsupported_kind=unsupported_kind):
+                _, root, _ = self.initialize()
+                program = '\n'.join([
+                    'import os, sys; from pathlib import Path',
+                    f'sys.path.insert(0, {str(PROJECT / "Scripts/tests")!r})',
+                    'from test_ci_evidence import write_ax_records',
+                    f'write_ax_records(Path(os.environ["QUICKFILE_AX_TEST_RECORDS"]), {unsupported_kind!r})',
+                ])
+                code = MODULE.run_scripts(root, [sys.executable, '-c', program])
+                original = MODULE.read_json(root / 'upload/ax-evidence.json', MODULE.ax_module().PUBLIC_LIMIT)
+                acceptance = MODULE.read_json(root / 'upload/ax-lifecycle.json')
+                MODULE.ax_module().validate_public(original)
+                MODULE.lifecycle_module().validate_public(acceptance)
+                self.assertEqual((original['status'], original['original_verdict']), ('complete', 'failed'))
+                self.assertEqual(original['strict_failure_labels'], list(MODULE.lifecycle_module().LABELS[1:]))
+                if unsupported_kind is None:
+                    self.assertEqual(code, 0)
+                    self.assertEqual((acceptance['status'], acceptance['growth_attribution']), ('passed', 'unresolved'))
+                    self.assertEqual(acceptance['checkout_sha'], 'a' * 40)
+                    self.assertTrue(all(row['status'] == 'passed' for row in acceptance['components'].values()))
+                    self.assertEqual(acceptance['components']['ordinary']['original_verdict'], 'failed')
+                else:
+                    self.assertEqual(code, 1)
+                    self.assertEqual(acceptance['status'], 'unavailable')
+                    records = root / 'ax-records'
+                    statuses = []
+                    for kind in MODULE.lifecycle_module().KINDS:
+                        directory = records if kind == 'ordinary' else records.with_name(records.name + '-' + kind)
+                        row = MODULE.read_json(directory / 'lifecycle-acceptance.json')
+                        MODULE.lifecycle_module().validate_component(row, kind)
+                        statuses.append(row['status'])
+                    self.assertEqual(set(statuses), {'passed', 'unsupported'})
 
     def test_lifecycle_upload_is_bound_to_checkout_and_exact_public_schema(self):
         _, root, _ = self.initialize()

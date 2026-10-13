@@ -53,6 +53,37 @@ def public_unsupported(checkout="a" * 40):
 
 
 class LifecycleAcceptanceTests(unittest.TestCase):
+    def test_native_caller_failures_include_runner_output_and_receipt_cause(self):
+        invalid_activity = ordinary(); invalid_activity['notifications'] = 0
+        invalid_root = ordinary(); invalid_root['scans'][0]['groups'][0]['root_type'] = 'Unknown'
+        scenarios = [
+            (2, None, None), (-9, None, None),
+            (1, None, FileNotFoundError), (0, None, FileNotFoundError),
+            (1, '{', json.JSONDecodeError),
+            (1, json.dumps(invalid_activity), ValueError),
+            (1, json.dumps(invalid_root), RuntimeError),
+            (1, '{}', KeyError),
+        ]
+        for strict in (False, True):
+            for code, raw, cause in scenarios:
+                with self.subTest(strict=strict, code=code, cause=cause), tempfile.TemporaryDirectory() as directory:
+                    records = Path(directory)
+                    if raw is not None:
+                        (records / 'result.json').write_text(raw)
+                    result = SimpleNamespace(returncode=code, stdout='runner stdout marker', stderr='runner stderr marker')
+                    case = compatibility.AXCompatibilityCopyTests()
+                    with patch.object(compatibility, 'notification_records', return_value=records), \
+                            patch.object(compatibility.subprocess, 'run', return_value=result), \
+                            patch.object(policy, 'record') as record:
+                        with self.assertRaises(AssertionError) as caught:
+                            case.run_notifications_fixture(require_strict_heap=strict)
+                        message = str(caught.exception)
+                        for expected in (f'exit code: {code}', result.stdout, result.stderr):
+                            self.assertIn(expected, message)
+                        if cause is not None and (not strict or code == 0):
+                            self.assertIsInstance(caught.exception.__cause__, cause)
+                        record.assert_not_called()
+
     def test_native_caller_accepts_lifecycle_but_manual_strict_trial_still_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             records = Path(directory)
