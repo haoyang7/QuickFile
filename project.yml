@@ -5,15 +5,18 @@ options:
   createIntermediateGroups: true
   generateEmptyDirectories: true
   groupSortPosition: top
+  developmentLanguage: zh-Hans
+  knownRegions: [en, zh-Hans]
 
 settings:
   base:
     SWIFT_VERSION: "5.0"
+    SWIFT_EMIT_LOC_STRINGS: YES
     MACOSX_DEPLOYMENT_TARGET: "13.0"
     ARCHS: "arm64 x86_64"
     ONLY_ACTIVE_ARCH: "NO"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "83"
+    CURRENT_PROJECT_VERSION: "92"
     QUICKFILE_STORAGE_MODE: "local-shared"
     QUICKFILE_DISTRIBUTION_CHANNEL: "development"
 
@@ -28,6 +31,7 @@ targets:
     platform: macOS
     deploymentTarget: "13.0"
     sources:
+      - path: Shared/QuickFileLocalization.swift
       - path: Shared/FileTemplate.swift
       - path: Shared/OfficeDocumentFormat.swift
       - path: Shared/OfficeDocumentData.swift
@@ -76,6 +80,8 @@ targets:
       - path: Shared/TemplateStore.swift
       - path: Shared/TemplateTransferFile.swift
       - path: Shared/FinderMenuSettingsStore.swift
+      - path: Shared/FileCreationSettingsStore.swift
+      - path: Shared/LanguageSettingsStore.swift
       - path: Shared/TemplateStoreFailureClassifier.swift
     settings:
       base:
@@ -115,6 +121,7 @@ targets:
           - "**/Info.plist"
       - path: QuickFileApp/AXCompatibility.m
         compilerFlags: "-fno-objc-arc"
+      - path: Resources/Localizable.xcstrings
     settings:
       base:
         SWIFT_OBJC_BRIDGING_HEADER: QuickFileApp/QuickFile-Bridging-Header.h
@@ -178,10 +185,6 @@ targets:
         basedOnDependencyAnalysis: false
         inputFiles:
           - "$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/Sparkle.framework/Versions/B/Sparkle"
-    scheme:
-      testTargets:
-        - QuickFileTests
-
   FinderExtension:
     type: app-extension
     platform: macOS
@@ -191,6 +194,7 @@ targets:
         excludes:
           - "**/*.entitlements"
           - "**/Info.plist"
+      - path: Resources/Localizable.xcstrings
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.haoyoung.QuickFile.FinderExtension
@@ -231,6 +235,7 @@ targets:
       - path: QuickFileTests
       - path: FinderExtension/FinderTemplateCache.swift
       - path: FinderExtension/FinderMenuSettingsCache.swift
+      - path: FinderExtension/FinderLanguageSettings.swift
       - path: FinderExtension/FinderActivityRecorder.swift
       - path: FinderExtension/FinderOperationScheduler.swift
       - path: FinderExtension/FinderDirectoryMonitor.swift
@@ -245,3 +250,13 @@ targets:
         BUNDLE_LOADER: "$(TEST_HOST)"
     dependencies:
       - target: QuickFile
+
+schemes:
+  QuickFile:
+    build:
+      targets:
+        QuickFile: all
+    test:
+      targets: [QuickFileTests]
+      language: zh-Hans
+      region: CN

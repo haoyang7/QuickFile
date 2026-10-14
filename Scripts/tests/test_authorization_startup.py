@@ -139,7 +139,7 @@ class AuthorizationStartupWiringTests(unittest.TestCase):
 
     def test_recovery_native_confirmation_defaults_to_cancel(self):
         view = (ROOT / "QuickFileApp/FinderRequestRecoveryView.swift").read_text()
-        self.assertIn('let cancel = alert.addButton(withTitle: "取消")', view)
+        self.assertIn('let cancel = alert.addButton(withTitle: QuickFileLocalization.text(.init("取消")))', view)
         self.assertIn('archive.keyEquivalent = ""', view)
         self.assertIn("alert.window.defaultButtonCell = cancel.cell as? NSButtonCell", view)
         self.assertIn("return AppModalPresentationGate.shared.present({ alert.runModal() }) == .alertSecondButtonReturn", view)

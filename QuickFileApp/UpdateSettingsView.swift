@@ -1,7 +1,9 @@
+import QuickFileCore
 import SwiftUI
 import QuickFileInfrastructure
 
 struct UpdateSettingsView: View {
+    @Environment(\.locale) private var quickFileLocale
     @ObservedObject var updates: UpdateController
 
     var body: some View {
@@ -9,10 +11,10 @@ struct UpdateSettingsView: View {
             Text("软件更新")
                 .font(.title2)
                 .fontWeight(.semibold)
-            Text("当前版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知")（\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "未知")）")
+            Text("当前版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? QuickFileLocalization.text(.init("未知")))（\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? QuickFileLocalization.text(.init("未知")))）")
                 .foregroundColor(.secondary)
 
-            Text("分发渠道：\(QuickFileDistributionChannel.current?.displayName ?? "未知")")
+            Text("分发渠道：\(QuickFileDistributionChannel.current?.displayName ?? QuickFileLocalization.text(.init("未知")))")
                 .foregroundColor(.secondary)
 
             if updates.isAvailable {

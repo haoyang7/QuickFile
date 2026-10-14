@@ -6,9 +6,9 @@ public enum OfficeDocumentFormat: String, Codable, CaseIterable, Sendable {
 
     public var blankDocumentDescription: String {
         switch self {
-        case .docx: return "空白 Word 文档"
-        case .xlsx: return "空白 Excel 工作簿"
-        case .pptx: return "空白 PowerPoint 演示文稿"
+        case .docx: return QuickFileLocalization.text(.init("空白 Word 文档"))
+        case .xlsx: return QuickFileLocalization.text(.init("空白 Excel 工作簿"))
+        case .pptx: return QuickFileLocalization.text(.init("空白 PowerPoint 演示文稿"))
         }
     }
 

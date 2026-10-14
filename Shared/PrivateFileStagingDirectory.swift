@@ -126,7 +126,7 @@ public final class PrivateFileStagingDirectory {
                     try removeDirectory(parentDescriptor: parent, name: name, identity: created)
                 } catch let cleanupError {
                     throw NSError(domain: "QuickFile.PrivateFileStaging", code: 4, userInfo: [
-                        NSLocalizedDescriptionKey: "临时目录初始化失败且清理未完成：\(url.path)。请检查此位置。\(initializationError.localizedDescription) 清理错误：\(cleanupError.localizedDescription)",
+                        NSLocalizedDescriptionKey: QuickFileLocalization.text(.init("临时目录初始化失败且清理未完成：\(url.path)。请检查此位置。\(initializationError.localizedDescription) 清理错误：\(cleanupError.localizedDescription)")),
                         NSUnderlyingErrorKey: initializationError
                     ])
                 }
@@ -148,7 +148,7 @@ public final class PrivateFileStagingDirectory {
         try Self.inspectACL(directoryDescriptor) { entry in
             if try Self.hasFlag(ACL_ENTRY_FILE_INHERIT, in: entry) {
                 throw NSError(domain: "QuickFile.PrivateFileStaging", code: 2, userInfo: [
-                    NSLocalizedDescriptionKey: "目标文件夹设置了文件继承 ACL，当前暂不支持安全创建，未发布文件。"
+                    NSLocalizedDescriptionKey: QuickFileLocalization.text(.init("目标文件夹设置了文件继承 ACL，当前暂不支持安全创建，未发布文件。"))
                 ])
             }
         }
@@ -206,7 +206,7 @@ public final class PrivateFileStagingDirectory {
         var directory = stat()
         guard fstat(descriptor, &directory) == 0 else { throw posixError() }
         let error = NSError(domain: "QuickFile.PrivateFileStaging", code: 3, userInfo: [
-            NSLocalizedDescriptionKey: "目标文件夹无法保护私有暂存目录免受其他用户替换，当前不能安全创建临时文件。"
+            NSLocalizedDescriptionKey: QuickFileLocalization.text(.init("目标文件夹无法保护私有暂存目录免受其他用户替换，当前不能安全创建临时文件。"))
         ])
         // A sticky root-owned directory also protects our name from other users.
         // Root is already outside the private-namespace boundary. A different
@@ -266,7 +266,7 @@ public final class PrivateFileStagingDirectory {
 
     private static func stagingError(at url: URL, underlying error: Error) -> NSError {
         NSError(domain: "QuickFile.PrivateFileStaging", code: 1, userInfo: [
-            NSLocalizedDescriptionKey: "无法安全使用临时目录：\(url.path)。若有残留请检查此位置。\(error.localizedDescription)",
+            NSLocalizedDescriptionKey: QuickFileLocalization.text(.init("无法安全使用临时目录：\(url.path)。若有残留请检查此位置。\(error.localizedDescription)")),
             NSUnderlyingErrorKey: error
         ])
     }

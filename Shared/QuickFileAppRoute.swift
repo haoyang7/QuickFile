@@ -34,13 +34,13 @@ public enum QuickFileAppRoute: String, CaseIterable, Equatable, Sendable {
 
     public var menuTitle: String {
         switch self {
-        case .create: return "在 QuickFile 中创建…"
-        case .templates: return "打开模板管理…"
-        case .diagnostics: return "打开权限与诊断…"
+        case .create: return QuickFileLocalization.text(.init("在 QuickFile 中创建…"))
+        case .templates: return QuickFileLocalization.text(.init("打开模板管理…"))
+        case .diagnostics: return QuickFileLocalization.text(.init("打开权限与诊断…"))
         }
     }
 
     public var recoveryTitle: String {
-        self == .create ? "打开 QuickFile…" : menuTitle
+        self == .create ? QuickFileLocalization.text(.init("打开 QuickFile…")) : menuTitle
     }
 }

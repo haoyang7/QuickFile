@@ -120,6 +120,76 @@ final class DiagnosticsViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.authorizedDirectories.map(\.url), [temporaryDirectory.standardizedFileURL])
     }
 
+    func testReopenedPageRetainsLastSnapshotUntilRefreshCompletes() async {
+        var probeCount = 0
+        var continuation: CheckedContinuation<Void, Never>?
+        let started = expectation(description: "second probe started")
+        let model = DiagnosticsViewModel(extensionEnabledProvider: { true }, runtimeProvider: { enabled in
+            probeCount += 1
+            if probeCount == 2 {
+                await withCheckedContinuation { continuation = $0; started.fulfill() }
+            }
+            return FinderExtensionDiagnosticSnapshot(
+                embeddedIdentifiers: ["test.extension"], embeddingKnown: true,
+                registration: .registered, registrationEvidence: "fixture",
+                enabled: enabled, responded: probeCount == 1
+            )
+        }, extensionActivityStore: FinderExtensionActivityStore(defaults: defaults,
+            failureHistoryFileURL: temporaryDirectory.appendingPathComponent("failures.json")),
+            authorizedDirectoryStore: makeAuthorizationStore(), inventoryReadGate: inventoryReadGate)
+        await model.refreshRuntimeStatus()
+        XCTAssertEqual(model.extensionSnapshot?.state, .responding)
+        model.directoryDiagnosticsDidDisappear()
+        model.directoryDiagnosticsDidAppear()
+        var states: [ExtensionRuntimeState?] = []
+        let observation = model.$extensionSnapshot.sink { states.append($0?.state) }
+        defer { observation.cancel() }
+        let refresh = Task { await model.refreshRuntimeStatus() }
+        await fulfillment(of: [started], timeout: 2)
+        XCTAssertTrue(model.isRefreshingRuntimeStatus)
+        XCTAssertEqual(model.extensionSnapshot?.state, .responding)
+        continuation?.resume()
+        await refresh.value
+        XCTAssertEqual(model.extensionSnapshot?.state, .noResponse)
+        XCTAssertFalse(model.isRefreshingRuntimeStatus)
+        XCTAssertFalse(states.contains(nil), "Refreshing must not collapse the previous result")
+    }
+
+    func testEnabledChangeDuringRefreshInvalidatesRetainedSnapshot() async {
+        var enabled = true
+        var probeCount = 0
+        var continuation: CheckedContinuation<Void, Never>?
+        let second = expectation(description: "refresh started")
+        let third = expectation(description: "replacement started")
+        let model = DiagnosticsViewModel(extensionEnabledProvider: { enabled }, runtimeProvider: { enabled in
+            probeCount += 1
+            if probeCount > 1 {
+                await withCheckedContinuation {
+                    continuation = $0
+                    if probeCount == 2 { second.fulfill() } else { third.fulfill() }
+                }
+            }
+            return FinderExtensionDiagnosticSnapshot(
+                embeddedIdentifiers: ["test.extension"], embeddingKnown: true,
+                registration: .registered, registrationEvidence: "fixture", enabled: enabled, responded: true
+            )
+        }, extensionActivityStore: FinderExtensionActivityStore(defaults: defaults,
+            failureHistoryFileURL: temporaryDirectory.appendingPathComponent("failures.json")),
+            authorizedDirectoryStore: makeAuthorizationStore(), inventoryReadGate: inventoryReadGate)
+        await model.refreshRuntimeStatus()
+        let refresh = Task { await model.refreshRuntimeStatus() }
+        await fulfillment(of: [second], timeout: 2)
+        enabled = false
+        continuation?.resume()
+        await fulfillment(of: [third], timeout: 2)
+        XCTAssertNil(model.extensionSnapshot, "The retained enabled snapshot is no longer valid")
+        XCTAssertFalse(model.isFinderExtensionEnabled)
+        continuation?.resume()
+        await refresh.value
+        XCTAssertEqual(model.extensionSnapshot?.state, .disabled)
+        XCTAssertEqual(probeCount, 3)
+    }
+
     func testRefreshRetriesWhenEnabledStateChangesAndNeverPublishesStaleSnapshot() async throws {
         var isEnabled = true
         var probeCount = 0
@@ -460,13 +530,13 @@ final class DiagnosticsViewModelTests: XCTestCase {
         await model.revokeAuthorization(child.id)
         XCTAssertEqual(resolver.resolutionCount, resolutionsBeforeRevoke, "Feedback adds no bookmark resolution")
         XCTAssertEqual(model.authorizedDirectories.map(\.id), [parent.id])
-        XCTAssertEqual(model.authorizationMessage, "目录授权已移除。" + overlap)
+        XCTAssertEqual(model.authorizationMessage, "目录授权已移除。 " + overlap)
         XCTAssertFalse(model.authorizationHasError)
         XCTAssertTrue(inventoryReadGate.isReading)
         resolver.release.signal()
         await refresh.value
         XCTAssertEqual(model.authorizedDirectories.map(\.id), [parent.id])
-        XCTAssertEqual(model.authorizationMessage, "目录授权已移除。" + overlap)
+        XCTAssertEqual(model.authorizationMessage, "目录授权已移除。 " + overlap)
         XCTAssertEqual(try store.loadAuthorizedDirectories().map(\.id), [parent.id])
     }
 
@@ -520,7 +590,7 @@ final class DiagnosticsViewModelTests: XCTestCase {
         XCTAssertFalse(overlap.contains("此位置也由"))
         await model.revokeAuthorization(child.id)
         XCTAssertEqual(resolver.resolutionCount, before)
-        XCTAssertEqual(model.authorizationMessage, "目录授权已移除。" + overlap)
+        XCTAssertEqual(model.authorizationMessage, "目录授权已移除。 " + overlap)
         XCTAssertEqual(model.authorizedDirectories.map(\.id), [parent.id])
         XCTAssertTrue(model.authorizedDirectories[0].isBookmarkStale)
     }
@@ -1183,8 +1253,8 @@ final class DiagnosticsViewModelTests: XCTestCase {
         var injectionError: Error?
         // Published feedback is synchronous on MainActor, before inventory is
         // scheduled. Corrupt only the subsequent repository read deterministically.
-        let observation = model.$authorizationMessage.sink { message in
-            guard message == "目录授权已保存。" else { return }
+        let observation = model.$authorizationMessagePresentation.sink { message in
+            guard message?.value == "目录授权已保存。" else { return }
             do { try Data("corrupt after commit".utf8).write(to: repositoryURL) }
             catch { injectionError = error }
         }

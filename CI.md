@@ -209,3 +209,17 @@ gh run view <run-id> --log-failed
 触发后必须等待终态，核对 `headSha`、实际 checkout、各 job 及失败日志。PR 检查通常运行临时合并提交；合并前确认 base 没有失配，合并后另核对 main 结果。主 CI 与 macOS 27 兼容性结论分别记录；PR 根文档跳过记为“门禁通过，测试未执行”，main push 等被路径过滤的运行记为“CI 未触发”。
 
 签名、安装、Finder 实机、真实存储和性能验收另见 [开发流程](CONTRIBUTING.md) 与 [发布清单](RELEASE_CHECKLIST.md)。工作流不配置用户证书或 profile，不发布应用。
+
+## 本地化与自动打开验证
+
+`Scripts/verify-localizations.py` 以 `project.yml` 的 `knownRegions` 为语言集合，检查 String Catalog 翻译完整性、上下文、模板变量 token、参数身份与类型，以及单一计数的复数形式。参数契约取自源语言译文，允许语义键和位置参数重排。新增语言与翻译维护见 [LOCALIZATION.md](LOCALIZATION.md)。
+
+原生 Release 自检和 Community 打包传入本轮 DerivedData 与 App：校对编译器抽取的产品键，并核对主 App 与嵌入扩展实际打包的 `.strings` / `.stringsdict` 内容。漏译或漏打包即失败；`Resources/**` 变更触发对应构建工作流。
+
+原生测试 scheme 固定简体中文与中国地区，既有错误和容量说明断言保留其语言前提。本地化测试另行覆盖最终 bundle 的英文资源、带参数错误、复数规则与用户参数按字面保留。语言设置测试覆盖独立实例持久化、损坏和链接拒绝、保存失败保留选择、扩展通知刷新与慢读不阻塞菜单。切换回归检查原生工具栏、已显示反馈、编辑状态保留，以及内置名称的只读翻译；嵌套 SwiftUI 视图通过保留的真实宿主核验已显示文字，不能只断言字符串 getter。
+
+独立 Swift CLI 测试宿主同样需要真实编译的本地化资源，不能只链接共享模块。脚本夹具通过 `native_test_support.compile_fixture_localizations` 在宿主目录编译简体中文资源以固定断言语言；UI 调查 App 则打包全部译文，并把目录资源纳入构建输入记录。
+
+页签测试覆盖用户切换、程序跳转、语言切换及模态授权面板结束后的选择同步。诊断测试覆盖刷新期间保留上次结果及启用状态变化后作废旧结果。这些夹具不能替代真实 Finder 未授权目录创建的确认与取消验收。
+
+自动打开测试覆盖默认关闭、损坏配置、保存失败、链接拒绝，以及仅在成功发布后处理最终 URL；打开失败不能撤销或重复创建。访问令牌测试检查显式释放、重复释放及放弃操作后的作用域回收。自动化资源与行为检查不能替代双语布局、伪语言、系统默认应用及 Office 文档的实机验收，场景见 [BETA_TEST_GUIDE.md](BETA_TEST_GUIDE.md)。

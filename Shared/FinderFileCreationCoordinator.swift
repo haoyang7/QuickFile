@@ -11,15 +11,15 @@ public enum FinderFileCreationError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .menuContextUnavailable:
-            return "Finder 菜单状态已失效，请重新打开 Finder 菜单后再试。"
+            return QuickFileLocalization.text(.init("Finder 菜单状态已失效，请重新打开 Finder 菜单后再试。"))
         case .templateUnavailable:
-            return "所选模板已不可用，请重新打开 Finder 菜单后再试。"
+            return QuickFileLocalization.text(.init("所选模板已不可用，请重新打开 Finder 菜单后再试。"))
         case .destinationUnavailable:
-            return "无法确定创建目录：所选项目可能来自不同文件夹，或目标已经失效。请重新选择后再试。"
+            return QuickFileLocalization.text(.init("无法确定创建目录：所选项目可能来自不同文件夹，或目标已经失效。请重新选择后再试。"))
         case .operationInProgress:
-            return "已有文件请求正在处理，本次请求未执行。请等待处理完成或检查目标卷后再试。"
+            return QuickFileLocalization.text(.init("已有文件请求正在处理，本次请求未执行。请等待处理完成或检查目标卷后再试。"))
         case .directoryAuthorizationRequired:
-            return "此 Finder 位置尚未授权。"
+            return QuickFileLocalization.text(.init("此 Finder 位置尚未授权。"))
         }
     }
 }

@@ -10,6 +10,7 @@ on:
       - 'QuickFileApp/**'
       - 'FinderExtension/**'
       - 'Shared/**'
+      - 'Resources/**'
       - 'QuickFileTests/**'
       - 'Scripts/**'
       - 'Release/**'

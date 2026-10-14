@@ -10,6 +10,7 @@ final class FinderSync: FIFinderSync {
     private let menuActionRegistry = FinderMenuActionRegistry()
     private let templateCache = FinderTemplateCache()
     private let menuSettingsCache = FinderMenuSettingsCache()
+    private let languageSettings = FinderLanguageSettings()
     private let destinationCache = FinderMenuDestinationCache()
     private var directoryMonitor: FinderDirectoryMonitor?
     private let activityRecorder = FinderActivityRecorder()
@@ -44,11 +45,12 @@ final class FinderSync: FIFinderSync {
     }
 
     override var toolbarItemToolTip: String {
-        "使用 QuickFile 新建文件"
+        QuickFileLocalization.text(.init("使用 QuickFile 新建文件"))
     }
 
     override init() {
         super.init()
+        FinderMenuPresentation.prepareLocalization()
 
         // 根目录不能覆盖其他挂载卷；卷挂载、卸载或改名时同步 Finder 监听范围。
         // 监听不授予写入权限，创建仍须通过安全作用域授权。
@@ -78,6 +80,7 @@ final class FinderSync: FIFinderSync {
         // One total readiness budget, shared by destination and template preparation.
         // Filesystem work remains off this callback; slow reads cannot extend the wait.
         let readinessDeadline = DispatchTime.now() + .milliseconds(20)
+        languageSettings.refreshIfNeeded()
         let timing = CreationTiming.begin("menu")
         timing?.mark("menu.callback")
         defer { timing?.finish(outcome: "menu-returned") }
@@ -185,8 +188,8 @@ final class FinderSync: FIFinderSync {
             diagnosticResponder?.verificationAttempt(in: $0.identity)
         }
         let coordinator = makeFileCreationCoordinator(timing: timing)
-        let completion: @MainActor @Sendable (Result<FileCreationResult, Error>) -> Void = {
-            [weak self] result in
+        let completion: @MainActor @Sendable (Result<FileCreationResult, Error>, Result<AuthorizedDirectoryStore.Access, Error>?) -> Void = {
+            [weak self] result, openingAccess in
             timing?.mark("main.completion.entered")
             guard let self else {
                 timing?.finish(outcome: "owner-ended")
@@ -199,21 +202,36 @@ final class FinderSync: FIFinderSync {
             }
             self.finishCreation(result, destinationIdentity: action.preparedDestination?.identity,
                                 verificationAttempt: verificationAttempt, timing: timing)
+            if let openingAccess, case let .success(created) = result {
+                switch openingAccess {
+                case let .success(access): self.openCreatedFile(created.fileURL, access: access)
+                case let .failure(error): self.presentAutomaticOpenError(error)
+                }
+            }
             switch result {
             case .success: timing?.finish(outcome: "reveal-returned")
             case .failure: timing?.finish(outcome: "failed")
             }
         }
         timing?.mark("background.submit")
+        let authorizationStore = authorizedDirectoryStore
         let admission = operationScheduler.submitCreation(action) {
             timing?.mark("background.entered")
             let result = Result {
                 try coordinator.createFile(for: action, timing: timing)
             }
+            // This optional action is read only after creation, never in the menu callback.
+            let openingAccess: Result<AuthorizedDirectoryStore.Access, Error>?
+            if case let .success(created) = result,
+               (try? FileCreationSettingsStore().loadAutomaticallyOpen()) == true {
+                openingAccess = Result { try authorizationStore.beginAccess(to: created.fileURL.deletingLastPathComponent()) }
+            } else {
+                openingAccess = nil
+            }
             timing?.mark("background.work.finished")
             timing?.mark("main.completion.enqueued")
             Task { @MainActor in
-                completion(result)
+                completion(result, openingAccess)
             }
         }
         if admission != .accepted {
@@ -282,6 +300,35 @@ final class FinderSync: FIFinderSync {
     }
 
     @MainActor
+    private func openCreatedFile(_ url: URL, access: AuthorizedDirectoryStore.Access) {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.promptsUserIfNeeded = false
+        NSWorkspace.shared.open(url, configuration: configuration) { [weak self] _, error in
+            access.release()
+            guard let error else { return }
+            Task { @MainActor in self?.presentAutomaticOpenError(error) }
+        }
+    }
+
+    @MainActor
+    private func presentAutomaticOpenError(_ error: Error) {
+        let nsError = error as NSError
+        logger.error("Created file could not be opened: domain=\(nsError.domain, privacy: .public) code=\(nsError.code)")
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = QuickFileLocalization.text(.init("文件已创建，但无法自动打开"))
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: QuickFileLocalization.text(.init("好")))
+            alert.window.level = .modalPanel
+            alert.window.collectionBehavior.insert(.moveToActiveSpace)
+            NSApp.activate(ignoringOtherApps: true)
+            alert.window.orderFrontRegardless()
+            alert.runModal()
+        }
+    }
+
+    @MainActor
     private func presentCreationError(_ error: Error) {
         // Finder invokes menu actions while its menu is still being dismissed. Presenting an
         // app-modal alert synchronously here can leave the extension's window behind Finder (or
@@ -309,12 +356,12 @@ final class FinderSync: FIFinderSync {
         alert.alertStyle = .warning
         if let creationError = error as? FileCreationError,
            case .createdFileLocationUnavailable = creationError {
-            alert.messageText = "文件已创建，无法定位"
+            alert.messageText = QuickFileLocalization.text(.init("文件已创建，无法定位"))
         } else {
-            alert.messageText = "QuickFile 无法创建文件"
+            alert.messageText = QuickFileLocalization.text(.init("QuickFile 无法创建文件"))
         }
         alert.informativeText = error.localizedDescription
-        alert.addButton(withTitle: "好")
+        alert.addButton(withTitle: QuickFileLocalization.text(.init("好")))
         let recoveryRoute = failureClassifier.classify(error).reason.recoveryRoute
         alert.addButton(withTitle: recoveryRoute.recoveryTitle)
 
@@ -359,9 +406,9 @@ final class FinderSync: FIFinderSync {
     private func presentAuthorizationTransferError(_ error: Error) {
         let alert = NSAlert()
         alert.alertStyle = .critical
-        alert.messageText = "无法启动快捷授权"
+        alert.messageText = QuickFileLocalization.text(.init("无法启动快捷授权"))
         alert.informativeText = error.localizedDescription
-        alert.addButton(withTitle: "好")
+        alert.addButton(withTitle: QuickFileLocalization.text(.init("好")))
         alert.addButton(withTitle: QuickFileAppRoute.diagnostics.recoveryTitle)
         alert.window.level = .modalPanel
         alert.window.collectionBehavior.insert(.moveToActiveSpace)
@@ -398,9 +445,9 @@ final class FinderSync: FIFinderSync {
     private func presentApplicationOpenError(_ error: Error) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "无法打开 QuickFile"
+        alert.messageText = QuickFileLocalization.text(.init("无法打开 QuickFile"))
         alert.informativeText = error.localizedDescription
-        alert.addButton(withTitle: "好")
+        alert.addButton(withTitle: QuickFileLocalization.text(.init("好")))
         alert.window.level = .modalPanel
         alert.window.collectionBehavior.insert(.moveToActiveSpace)
         alert.runModal()

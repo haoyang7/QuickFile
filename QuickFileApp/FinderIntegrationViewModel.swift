@@ -50,11 +50,25 @@ final class FinderIntegrationViewModel: ObservableObject {
         case failed(String)
     }
 
+    private enum AuthorizationInventoryOutcome {
+        case idle, loading, loaded, busy
+        case failed(Error)
+    }
+
     @Published private(set) var hasCompletedGuide: Bool
     @Published var isGuideExpanded: Bool
     @Published private(set) var authorizedDirectories: [AuthorizedDirectory] = []
     @Published private(set) var unavailableAuthorizationCount = 0
-    @Published private(set) var authorizationInventoryState: AuthorizationInventoryState = .idle
+    @Published private var authorizationInventoryOutcome: AuthorizationInventoryOutcome = .idle
+    var authorizationInventoryState: AuthorizationInventoryState {
+        switch authorizationInventoryOutcome {
+        case .idle: return .idle
+        case .loading: return .loading
+        case .loaded: return .loaded
+        case .busy: return .busy
+        case let .failed(error): return .failed(error.localizedDescription)
+        }
+    }
     @Published private(set) var isEnabled: Bool
     @Published private(set) var snapshot: FinderExtensionDiagnosticSnapshot?
     @Published private(set) var isRefreshing = false
@@ -120,11 +134,11 @@ final class FinderIntegrationViewModel: ObservableObject {
     }
 
     var statusText: String {
-        if isRefreshing { return "正在检查扩展响应…" }
+        if isRefreshing { return QuickFileLocalization.text(.init("正在检查扩展响应…")) }
         if !isEnabled, snapshot?.state == .unknown {
-            return "尚未启用；安装或注册状态待确认"
+            return QuickFileLocalization.text(.init("尚未启用；安装或注册状态待确认"))
         }
-        return snapshot?.state.displayName ?? (isEnabled ? "已启用，尚未检查响应" : "扩展未获用户启用")
+        return snapshot?.state.displayName ?? (isEnabled ? QuickFileLocalization.text(.init("已启用，尚未检查响应")) : QuickFileLocalization.text(.init("扩展未获用户启用")))
     }
 
     var isResponding: Bool { isEnabled && !isRefreshing && snapshot?.state == .responding }
@@ -134,21 +148,21 @@ final class FinderIntegrationViewModel: ObservableObject {
     }
 
     var guideHistoryText: String {
-        hasCompletedGuide ? "曾完成首次使用引导；当前状态仍需单独检查" : "可选设置，不影响在此创建文件"
+        hasCompletedGuide ? QuickFileLocalization.text(.init("曾完成首次使用引导；当前状态仍需单独检查")) : QuickFileLocalization.text(.init("可选设置，不影响在此创建文件"))
     }
 
     func refreshAuthorizedDirectories() async {
         guard !Task.isCancelled, authorizationInventoryState != .loading else { return }
         guard inventoryReadGate.tryBegin() else {
-            authorizationInventoryState = .busy
+            authorizationInventoryOutcome = .busy
             return
         }
-        authorizationInventoryState = .loading
+        authorizationInventoryOutcome = .loading
         defer {
             // Cancellation cannot release the global slot while synchronous bookmark
             // resolution is still running. BackgroundWork returns only after it ends.
             inventoryReadGate.finish()
-            if authorizationInventoryState == .loading { authorizationInventoryState = .idle }
+            if authorizationInventoryState == .loading { authorizationInventoryOutcome = .idle }
         }
         let load = authorizationInventoryLoader
         let result = await BackgroundWork.result { try load() }
@@ -157,11 +171,11 @@ final class FinderIntegrationViewModel: ObservableObject {
         case let .success(inventory):
             authorizedDirectories = inventory.availableDirectories
             unavailableAuthorizationCount = inventory.unavailableDirectories.count
-            authorizationInventoryState = .loaded
+            authorizationInventoryOutcome = .loaded
         case let .failure(error):
             authorizedDirectories = []
             unavailableAuthorizationCount = 0
-            authorizationInventoryState = .failed(error.localizedDescription)
+            authorizationInventoryOutcome = .failed(error)
         }
     }
 
@@ -174,59 +188,59 @@ final class FinderIntegrationViewModel: ObservableObject {
             SetupPresentation(message: message, detail: detail, action: action, actionTitle: title)
         }
         if snapshot?.state == .notEmbedded {
-            return presentation("此应用副本未包含 Finder 扩展", "请重新安装包含 Finder 扩展的完整 QuickFile 应用，然后再检查。", .refreshStatus, "重新检查")
+            return presentation(QuickFileLocalization.text(.init("此应用副本未包含 Finder 扩展")), QuickFileLocalization.text(.init("请重新安装包含 Finder 扩展的完整 QuickFile 应用，然后再检查。")), .refreshStatus, QuickFileLocalization.text(.init("重新检查")))
         }
         if snapshot?.state == .notRegistered {
-            return presentation("尚未找到此扩展的注册记录", "请从“应用程序”文件夹启动完整 QuickFile 应用，然后再检查。", .refreshStatus, "重新检查")
+            return presentation(QuickFileLocalization.text(.init("尚未找到此扩展的注册记录")), QuickFileLocalization.text(.init("请从“应用程序”文件夹启动完整 QuickFile 应用，然后再检查。")), .refreshStatus, QuickFileLocalization.text(.init("重新检查")))
         }
         if !isEnabled {
-            return presentation("1. 启用 Finder 右键菜单", "打开系统扩展设置后，找到并启用 QuickFile；返回这里会重新检查。", .openSettings, "打开扩展设置…")
+            return presentation(QuickFileLocalization.text(.init("1. 启用 Finder 右键菜单")), QuickFileLocalization.text(.init("打开系统扩展设置后，找到并启用 QuickFile；返回这里会重新检查。")), .openSettings, QuickFileLocalization.text(.init("打开扩展设置…")))
         }
         guard hasDestination else {
-            return presentation("2. 选择 Finder 将要使用的文件夹", "先选择目标文件夹，再单独保存 Finder 授权。无需完全磁盘访问。", .chooseFolder, "选择文件夹…")
+            return presentation(QuickFileLocalization.text(.init("2. 选择 Finder 将要使用的文件夹")), QuickFileLocalization.text(.init("先选择目标文件夹，再单独保存 Finder 授权。无需完全磁盘访问。")), .chooseFolder, QuickFileLocalization.text(.init("选择文件夹…")))
         }
         switch authorization {
         case .saving:
-            return presentation("正在保存文件夹授权…", "保存完成后再进行 Finder 验证。", .none, "")
+            return presentation(QuickFileLocalization.text(.init("正在保存文件夹授权…")), QuickFileLocalization.text(.init("保存完成后再进行 Finder 验证。")), .none, "")
         case .notConfirmed:
-            return presentation("2. 确认 Finder 的文件夹授权", "这里直接创建无需保存 Finder 授权。若要使用 Finder 菜单，请通过系统面板另行确认。", .saveAuthorization, "保存 Finder 授权…")
+            return presentation(QuickFileLocalization.text(.init("2. 确认 Finder 的文件夹授权")), QuickFileLocalization.text(.init("这里直接创建无需保存 Finder 授权。若要使用 Finder 菜单，请通过系统面板另行确认。")), .saveAuthorization, QuickFileLocalization.text(.init("保存 Finder 授权…")))
         case let .failed(message):
-            return presentation("Finder 文件夹授权未保存", message, .saveAuthorization, "重试保存 Finder 授权…")
+            return presentation(QuickFileLocalization.text(.init("Finder 文件夹授权未保存")), message, .saveAuthorization, QuickFileLocalization.text(.init("重试保存 Finder 授权…")))
         case .saved: break
         }
         guard hasTemplates else {
-            return presentation("还没有可用模板", "请在“模板管理”中启用一个模板；读取失败时先重新加载。", .manageTemplates, "打开模板管理")
+            return presentation(QuickFileLocalization.text(.init("还没有可用模板")), QuickFileLocalization.text(.init("请在“模板管理”中启用一个模板；读取失败时先重新加载。")), .manageTemplates, QuickFileLocalization.text(.init("打开模板管理")))
         }
         if isVerificationOperationInFlight, verificationState == .idle || verificationState == .cancelled {
-            return presentation("正在结束上次位置检查…", "文件系统检查可能仍在等待目标卷；结束后才能开始新的验证。", .none, "")
+            return presentation(QuickFileLocalization.text(.init("正在结束上次位置检查…")), QuickFileLocalization.text(.init("文件系统检查可能仍在等待目标卷；结束后才能开始新的验证。")), .none, "")
         }
         if verificationState == .confirmed, !isResponding {
-            return presentation("曾完成引导，当前扩展状态仍需检查", "历史完成记录不代表扩展现在可用；重新检查响应后可再次验证。", .refreshStatus, "检查当前状态")
+            return presentation(QuickFileLocalization.text(.init("曾完成引导，当前扩展状态仍需检查")), QuickFileLocalization.text(.init("历史完成记录不代表扩展现在可用；重新检查响应后可再次验证。")), .refreshStatus, QuickFileLocalization.text(.init("检查当前状态")))
         }
         if snapshot?.state == .unknown {
-            return presentation("当前扩展状态尚未确认", "首次引导的历史记录不会替代本次检查。直接创建文件仍可继续。", .refreshStatus, "重新检查")
+            return presentation(QuickFileLocalization.text(.init("当前扩展状态尚未确认")), QuickFileLocalization.text(.init("首次引导的历史记录不会替代本次检查。直接创建文件仍可继续。")), .refreshStatus, QuickFileLocalization.text(.init("重新检查")))
         }
         switch verificationState {
         case .idle:
-            return presentation("3. 在 Finder 创建第一个文件", "开始后会打开所选文件夹。请在空白处右键，选择“新建文件”中的模板，再返回这里。", .startVerification, "在 Finder 中验证")
+            return presentation(QuickFileLocalization.text(.init("3. 在 Finder 创建第一个文件")), QuickFileLocalization.text(.init("开始后会打开所选文件夹。请在空白处右键，选择“新建文件”中的模板，再返回这里。")), .startVerification, QuickFileLocalization.text(.init("在 Finder 中验证")))
         case .preparing:
-            return presentation("正在准备本次 Finder 验证…", "只检查所选位置和扩展响应，不会自动创建文件。", .none, "")
+            return presentation(QuickFileLocalization.text(.init("正在准备本次 Finder 验证…")), QuickFileLocalization.text(.init("只检查所选位置和扩展响应，不会自动创建文件。")), .none, "")
         case .awaitingCreation:
-            return presentation("等待你从 Finder 右键菜单创建文件", "若主 App 已代为创建，请先检查已有文件，避免重复；本次仍在等待扩展直接创建。菜单准备中时请稍后重开。", .checkVerification, "检查本次验证")
+            return presentation(QuickFileLocalization.text(.init("等待你从 Finder 右键菜单创建文件")), QuickFileLocalization.text(.init("若主 App 已代为创建，请先检查已有文件，避免重复；本次仍在等待扩展直接创建。菜单准备中时请稍后重开。")), .checkVerification, QuickFileLocalization.text(.init("检查本次验证")))
         case .creationReported:
-            return presentation("扩展报告已在所选位置创建文件", "这是当前安装版本的扩展反馈；还需你确认 Finder 中已出现新文件。", .confirmVisible, "我已看到新文件")
+            return presentation(QuickFileLocalization.text(.init("扩展报告已在所选位置创建文件")), QuickFileLocalization.text(.init("这是当前安装版本的扩展反馈；还需你确认 Finder 中已出现新文件。")), .confirmVisible, QuickFileLocalization.text(.init("我已看到新文件")))
         case .confirmed:
-            return presentation("已完成本次 Finder 首次验证", "扩展报告创建成功，你已确认看到文件；这不保证其他目录或以后每次都可用。", .startVerification, "再次验证")
+            return presentation(QuickFileLocalization.text(.init("已完成本次 Finder 首次验证")), QuickFileLocalization.text(.init("扩展报告创建成功，你已确认看到文件；这不保证其他目录或以后每次都可用。")), .startVerification, QuickFileLocalization.text(.init("再次验证")))
         case .unavailable:
-            return presentation("本次未收到扩展响应", "请先在所选文件夹打开 Finder 右键菜单，再回来重试；未响应不代表扩展崩溃。", .openFolder, "打开所选文件夹")
+            return presentation(QuickFileLocalization.text(.init("本次未收到扩展响应")), QuickFileLocalization.text(.init("请先在所选文件夹打开 Finder 右键菜单，再回来重试；未响应不代表扩展崩溃。")), .openFolder, QuickFileLocalization.text(.init("打开所选文件夹")))
         case .responseUnavailable:
-            return presentation("本次验证检查未收到响应", "文件可能已经创建，请先查看文件夹，避免重复创建。可以再次检查同一次验证。", .checkVerification, "再次检查本次验证")
+            return presentation(QuickFileLocalization.text(.init("本次验证检查未收到响应")), QuickFileLocalization.text(.init("文件可能已经创建，请先查看文件夹，避免重复创建。可以再次检查同一次验证。")), .checkVerification, QuickFileLocalization.text(.init("再次检查本次验证")))
         case .expired:
-            return presentation("本次验证已结束或扩展已重新启动", "没有确认本次扩展创建结果。已有文件不会被删除；重新开始前先检查文件夹，避免重复创建。", .startVerification, "重新开始 Finder 验证")
+            return presentation(QuickFileLocalization.text(.init("本次验证已结束或扩展已重新启动")), QuickFileLocalization.text(.init("没有确认本次扩展创建结果。已有文件不会被删除；重新开始前先检查文件夹，避免重复创建。")), .startVerification, QuickFileLocalization.text(.init("重新开始 Finder 验证")))
         case .cancelled:
-            return presentation("已取消本次 Finder 验证", "已经发出的文件创建不会因此取消。重新开始前请先检查文件夹，避免重复创建。", .startVerification, "重新开始 Finder 验证")
+            return presentation(QuickFileLocalization.text(.init("已取消本次 Finder 验证")), QuickFileLocalization.text(.init("已经发出的文件创建不会因此取消。重新开始前请先检查文件夹，避免重复创建。")), .startVerification, QuickFileLocalization.text(.init("重新开始 Finder 验证")))
         case .destinationUnavailable:
-            return presentation("无法确认所选文件夹", "文件夹可能已移动、被替换或无法访问。请重新选择一个有效文件夹。", .chooseFolder, "重新选择文件夹…")
+            return presentation(QuickFileLocalization.text(.init("无法确认所选文件夹")), QuickFileLocalization.text(.init("文件夹可能已移动、被替换或无法访问。请重新选择一个有效文件夹。")), .chooseFolder, QuickFileLocalization.text(.init("重新选择文件夹…")))
         }
     }
 

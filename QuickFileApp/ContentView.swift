@@ -5,6 +5,7 @@ import QuickFileInfrastructure
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.locale) private var quickFileLocale
     @ObservedObject var viewModel: QuickFileViewModel
     @StateObject private var finderIntegrationViewModel: FinderIntegrationViewModel
     @StateObject private var finderMenuSettings: FinderMenuSettingsViewModel
@@ -176,7 +177,7 @@ struct ContentView: View {
                 confirmAuthorization: { request in
                     AppKitFileActions.confirmFinderAuthorization(
                         for: request,
-                        templateName: viewModel.template(withID: request.templateID)?.name
+                        templateName: viewModel.template(withID: request.templateID)?.displayName
                     )
                 }
             )

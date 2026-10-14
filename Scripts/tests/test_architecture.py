@@ -153,7 +153,7 @@ class ArchitectureTests(ArchitectureFixture):
         for header in ('  "ExtraUI":', "   ExtraUI:", "    ExtraUI:"):
             with self.subTest(header=header):
                 (self.root / "project.yml").write_text(
-                    self.spec + f"\n{header}\n    sources:\n      - path: Shared/FileTemplate.swift\n"
+                    self.spec.replace("targets:\n", f"targets:\n{header}\n    sources:\n      - path: Shared/FileTemplate.swift\n", 1)
                 )
                 self.assert_failure("error:")
         (self.root / "project.yml").write_text("include: extra.yml\n" + self.spec)

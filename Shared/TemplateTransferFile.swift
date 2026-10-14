@@ -49,9 +49,9 @@ public enum TemplateTransferFile {
         public var errorDescription: String? {
             switch self {
             case .destinationChanged:
-                return "导出文件夹在操作期间发生变化，未发布模板文件。请重新选择位置。"
+                return QuickFileLocalization.text(.init("导出文件夹在操作期间发生变化，未发布模板文件。请重新选择位置。"))
             case .unsupportedDestination:
-                return "导出位置不是可安全替换的普通文件，请选择其他位置。"
+                return QuickFileLocalization.text(.init("导出位置不是可安全替换的普通文件，请选择其他位置。"))
             }
         }
     }

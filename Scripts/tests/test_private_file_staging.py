@@ -7,6 +7,11 @@ import sys
 import tempfile
 import unittest
 
+if __package__:
+    from .native_test_support import compile_fixture_localizations
+else:
+    from native_test_support import compile_fixture_localizations
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -19,10 +24,12 @@ class PrivateFileStagingTests(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix="staging-failure-tests-", dir=parent)
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.output = Path(cls.temporary.name)
+        compile_fixture_localizations(cls.output)
         cls.executable = cls.output / "StagingFailureCases"
         result = subprocess.run([
             "xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
             "-module-cache-path", str(cls.output / "module-cache"),
+            str(ROOT / "Shared/QuickFileLocalization.swift"),
             str(ROOT / "Shared/PrivateFileStagingDirectory.swift"),
             str(ROOT / "Scripts/tests/fixtures/StagingFailureCases.swift"),
             "-o", str(cls.executable),

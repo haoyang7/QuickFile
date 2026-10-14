@@ -662,7 +662,7 @@ final class TemplateEditorCapacityGuidanceTests: XCTestCase {
         XCTAssertEqual(limits.maximumNameBytes, 1_024)
         XCTAssertEqual(limits.maximumExtensionBytes, 255)
         XCTAssertEqual(limits.maximumContentBytes, 16 * 1024 * 1024)
-        XCTAssertEqual(TemplateEditorCapacityGuidance.name, "名称保存上限：\(limits.maximumNameBytes) UTF-8 字节")
+        XCTAssertEqual(TemplateEditorCapacityGuidance.name, "名称保存上限：\(limits.maximumNameBytes.formatted(.number.locale(Locale(identifier: "zh-Hans-CN")))) UTF-8 字节")
         XCTAssertEqual(TemplateEditorCapacityGuidance.fileExtension, "扩展名保存上限：\(limits.maximumExtensionBytes) UTF-8 字节")
         XCTAssertEqual(TemplateEditorCapacityGuidance.content,
             "正文保存上限：\(limits.maximumContentBytes / 1024 / 1024) MiB（按 UTF-8 字节计算，非字符数）")
@@ -672,7 +672,7 @@ final class TemplateEditorCapacityGuidanceTests: XCTestCase {
         let limits = TemplateTransferLimits.default
         let guidance = TemplateEditorCapacityGuidance.collection
         XCTAssertTrue(guidance.contains("整库保存"))
-        XCTAssertTrue(guidance.contains("\(limits.maximumTemplates) 个模板"))
+        XCTAssertTrue(guidance.contains("\(limits.maximumTemplates.formatted(.number.locale(Locale(identifier: "zh-Hans-CN")))) 个模板"))
         XCTAssertTrue(guidance.contains("\(limits.maximumFileBytes / 1024 / 1024) MiB"))
         XCTAssertTrue(guidance.contains("含 JSON 转义"))
         XCTAssertTrue(guidance.contains("历史超限配置"))

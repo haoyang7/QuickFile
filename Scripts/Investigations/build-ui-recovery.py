@@ -51,7 +51,7 @@ def main():
     app = out / f"{name}.app"
     executable = app / f"Contents/MacOS/{name}"
     executable.parent.mkdir(parents=True, exist_ok=True)
-    views = ["BackgroundWork", "AppModalPresentationGate", "FinderAuthorizationRequestPump", "QuickFileViewModel", "TemplateRefreshObserver", "CreateFileView", "TemplateManagerView",
+    views = ["BackgroundWork", "LocalizedPresentation", "AppModalPresentationGate", "FinderAuthorizationRequestPump", "QuickFileViewModel", "TemplateRefreshObserver", "CreateFileView", "TemplateManagerView",
              "FinderMenuSettingsSection", "TemplateContentPreview",
              "TemplateEditorView", "TemplateEditorState", "TemplatePreviewController", "TemplateTransferPreviewView", "FinderMenuSettingsViewModel", "FinderIntegrationViewModel", "FinderIntegrationAdapter",
              "FinderExtensionDiagnostics", "AppKitFileActions",
@@ -76,8 +76,15 @@ def main():
                     *[str(overrides.get(path, ROOT / path)) for path in sources], "-o", str(executable)], check=True, cwd=ROOT)
     info = {"CFBundleIdentifier": "local.quickfile.investigation." + ("ui-recovery" if args.probe == "recovery" else args.probe),
             "CFBundleName": name, "CFBundleExecutable": name,
-            "CFBundlePackageType": "APPL", "CFBundleVersion": "1", "NSHighResolutionCapable": True}
+            "CFBundlePackageType": "APPL", "CFBundleVersion": "1", "NSHighResolutionCapable": True,
+            "CFBundleDevelopmentRegion": "zh-Hans"}
     (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+    catalog = "Resources/Localizable.xcstrings"
+    inputs.append(catalog)
+    resources = app / "Contents/Resources"
+    resources.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["xcrun", "xcstringstool", "compile", str(ROOT / catalog),
+                    "--output-directory", str(resources)], check=True, cwd=ROOT)
     subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True)
     manifest = {"baseSHA": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 "scope": "standalone production UI/model fixture; non-sandbox; no App Group or real grants",

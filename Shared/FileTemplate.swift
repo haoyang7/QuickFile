@@ -9,6 +9,9 @@ public struct FileTemplate: Codable, Equatable, Identifiable, Sendable {
     public var isEnabled: Bool
     public var officeFormat: OfficeDocumentFormat?
 
+    /// A display-only projection; serialization and editing keep the original name.
+    public var displayName: String { BuiltInTemplates.displayName(id: id, storedName: name) }
+
     public var usesClipboard: Bool {
         officeFormat == nil && TemplateRenderer.containsVariable("clipboard", in: content)
     }
@@ -60,57 +63,80 @@ public struct FileTemplate: Codable, Equatable, Identifiable, Sendable {
 }
 
 public enum BuiltInTemplates {
-    public static let all: [FileTemplate] = [
-        FileTemplate(
-            id: UUID(uuidString: "E8C77BD3-C8CA-467C-AC5B-A9B92BAF66F0")!,
-            name: "Word 文档",
-            fileExtension: "docx",
-            content: "",
-            officeFormat: .docx
-        ),
-        FileTemplate(
-            id: UUID(uuidString: "9076E542-2A37-4A25-81D3-1A24C5F2776D")!,
-            name: "Excel 工作簿",
-            fileExtension: "xlsx",
-            content: "",
-            officeFormat: .xlsx
-        ),
-        FileTemplate(
-            id: UUID(uuidString: "D11B30A0-BAB3-4DFC-9C8C-4D5AA2EE51F3")!,
-            name: "PowerPoint 演示文稿",
-            fileExtension: "pptx",
-            content: "",
-            officeFormat: .pptx
-        ),
-        FileTemplate(
-            id: UUID(uuidString: "A8A680CC-CC64-4F71-8905-E5B350297A11")!,
-            name: "文本文档",
-            fileExtension: "txt",
-            content: ""
-        ),
-        FileTemplate(
-            id: UUID(uuidString: "B16CD640-23B1-4FF6-A365-816696091E1C")!,
-            name: "Markdown",
-            fileExtension: "md",
-            content: ""
-        ),
-        FileTemplate(
-            id: UUID(uuidString: "42A8D1DB-D9DA-4D84-A698-505130282A67")!,
-            name: "JSON",
-            fileExtension: "json",
-            content: "{}\n"
-        ),
-        FileTemplate(
-            id: UUID(uuidString: "7537DDB2-C1B3-4597-B3B1-24ED056F4BD0")!,
-            name: "YAML",
-            fileExtension: "yaml",
-            content: ""
-        ),
-        FileTemplate(
-            id: UUID(uuidString: "020E1DD5-C50D-436C-A433-39250EE60B3B")!,
-            name: "Shell",
-            fileExtension: "sh",
-            content: "#!/bin/bash\n\n"
-        )
-    ]
+    public static var all: [FileTemplate] { make(bundle: QuickFileLocalization.bundle) }
+
+    // Fixed IDs establish origin; a matching built-in name establishes that the
+    // user has not renamed it. Never infer origin from a name or extension alone.
+    private static let namesByID: [UUID: [String: String]] = {
+        var names: [UUID: [String: String]] = [:]
+        for language in QuickFileLanguage.supportedIdentifiers {
+            for template in make(bundle: QuickFileLocalization.resourceBundle(for: language)) {
+                names[template.id, default: [:]][language] = template.name
+            }
+        }
+        return names
+    }()
+
+    public static func prepareLocalization() { _ = namesByID }
+
+    public static func displayName(id: UUID, storedName: String) -> String {
+        guard let names = namesByID[id], names.values.contains(storedName) else { return storedName }
+        return names[QuickFileLocalization.identifier] ?? storedName
+    }
+
+    private static func make(bundle: Bundle) -> [FileTemplate] {
+        [
+            FileTemplate(
+                id: UUID(uuidString: "E8C77BD3-C8CA-467C-AC5B-A9B92BAF66F0")!,
+                name: String(localized: "Word 文档", bundle: bundle),
+                fileExtension: "docx",
+                content: "",
+                officeFormat: .docx
+            ),
+            FileTemplate(
+                id: UUID(uuidString: "9076E542-2A37-4A25-81D3-1A24C5F2776D")!,
+                name: String(localized: "Excel 工作簿", bundle: bundle),
+                fileExtension: "xlsx",
+                content: "",
+                officeFormat: .xlsx
+            ),
+            FileTemplate(
+                id: UUID(uuidString: "D11B30A0-BAB3-4DFC-9C8C-4D5AA2EE51F3")!,
+                name: String(localized: "PowerPoint 演示文稿", bundle: bundle),
+                fileExtension: "pptx",
+                content: "",
+                officeFormat: .pptx
+            ),
+            FileTemplate(
+                id: UUID(uuidString: "A8A680CC-CC64-4F71-8905-E5B350297A11")!,
+                name: String(localized: "文本文档", bundle: bundle),
+                fileExtension: "txt",
+                content: ""
+            ),
+            FileTemplate(
+                id: UUID(uuidString: "B16CD640-23B1-4FF6-A365-816696091E1C")!,
+                name: "Markdown",
+                fileExtension: "md",
+                content: ""
+            ),
+            FileTemplate(
+                id: UUID(uuidString: "42A8D1DB-D9DA-4D84-A698-505130282A67")!,
+                name: "JSON",
+                fileExtension: "json",
+                content: "{}\n"
+            ),
+            FileTemplate(
+                id: UUID(uuidString: "7537DDB2-C1B3-4597-B3B1-24ED056F4BD0")!,
+                name: "YAML",
+                fileExtension: "yaml",
+                content: ""
+            ),
+            FileTemplate(
+                id: UUID(uuidString: "020E1DD5-C50D-436C-A433-39250EE60B3B")!,
+                name: "Shell",
+                fileExtension: "sh",
+                content: "#!/bin/bash\n\n"
+            )
+        ]
+    }
 }

@@ -1,3 +1,4 @@
+import QuickFileCore
 import Darwin
 import Foundation
 import QuickFileInfrastructure
@@ -11,18 +12,51 @@ enum ExtensionRuntimeState: String, Sendable {
 
     var displayName: String {
         switch self {
-        case .notEmbedded: return "应用未嵌入 Finder 扩展"
-        case .notRegistered: return "未找到扩展注册记录"
-        case .disabled: return "扩展未获用户启用"
-        case .responding: return "已启用，本次探针收到响应"
-        case .noResponse: return "已启用，本次探针未收到响应"
-        case .unknown: return "扩展状态未知"
+        case .notEmbedded: return QuickFileLocalization.text(.init("应用未嵌入 Finder 扩展"))
+        case .notRegistered: return QuickFileLocalization.text(.init("未找到扩展注册记录"))
+        case .disabled: return QuickFileLocalization.text(.init("扩展未获用户启用"))
+        case .responding: return QuickFileLocalization.text(.init("已启用，本次探针收到响应"))
+        case .noResponse: return QuickFileLocalization.text(.init("已启用，本次探针未收到响应"))
+        case .unknown: return QuickFileLocalization.text(.init("扩展状态未知"))
         }
     }
 
     var recoveryGuidance: String? {
         guard self == .noResponse else { return nil }
-        return "先在 Finder 中重新打开右键菜单，再检查响应。更新后可能仍有旧版扩展运行；请打开扩展设置，关闭再开启 QuickFile，然后重新检查。若仍未恢复，可在方便时重启 Finder。扩展进程由 macOS 管理，重开主 App 不保证重启扩展。"
+        return QuickFileLocalization.text(.init("先在 Finder 中重新打开右键菜单，再检查响应。更新后可能仍有旧版扩展运行；请打开扩展设置，关闭再开启 QuickFile，然后重新检查。若仍未恢复，可在方便时重启 Finder。扩展进程由 macOS 管理，重开主 App 不保证重启扩展。"))
+    }
+}
+
+/// Store bounded evidence, never localized text or raw command output. Switching
+/// language renders the same evidence without rerunning pluginkit or a probe.
+indirect enum RegistrationEvidence: Sendable {
+    case verbatim(String)
+    case queryFailed(Int32, RegistrationEvidence)
+    case probeResponse, noIdentifier, undecodable, launch, timeout, outputLimit, io, busy, cleanup, registered, otherCopy, notRegistered, unrecognized, accessDenied, connectionFailed, unknownFailure
+
+    var message: String {
+        switch self {
+        case let .verbatim(value): return value
+        case let .queryFailed(exitCode, reason):
+            let message = reason.message
+            return QuickFileLocalization.text(.init("App 内注册查询未完成（退出码 \(exitCode)）。\(message)可打开扩展管理，或在终端核对注册记录。"))
+        case .probeResponse: return QuickFileLocalization.text(.init("本次探针收到当前安装副本及版本的响应；未单独查询系统注册记录。"))
+        case .noIdentifier: return QuickFileLocalization.text(.init("没有可查询的嵌入扩展标识。"))
+        case .undecodable: return QuickFileLocalization.text(.init("pluginkit 输出无法解码。请在终端检查注册记录。"))
+        case .launch: return QuickFileLocalization.text(.init("pluginkit 无法执行，可能受沙盒限制。请在终端用 pluginkit -m -A -D -v -i 检查下列嵌入标识。"))
+        case .timeout: return QuickFileLocalization.text(.init("pluginkit 查询超时。请打开扩展管理，或在终端检查注册状态。"))
+        case .outputLimit: return QuickFileLocalization.text(.init("pluginkit 输出超过大小限制。请在终端检查注册记录。"))
+        case .io: return QuickFileLocalization.text(.init("pluginkit 输出读取失败。请在终端检查注册记录。"))
+        case .busy: return QuickFileLocalization.text(.init("已有扩展查询正在执行或等待回收，请稍后重试。"))
+        case .cleanup: return QuickFileLocalization.text(.init("pluginkit 查询终止后未能确认退出。请在终端检查注册状态。"))
+        case .registered: return QuickFileLocalization.text(.init("pluginkit 查询成功，找到当前应用内扩展路径的注册记录。"))
+        case .otherCopy: return QuickFileLocalization.text(.init("找到同 Bundle ID 的注册记录，但无法确认属于当前应用副本。请在终端核对 pluginkit 输出中的路径。"))
+        case .notRegistered: return QuickFileLocalization.text(.init("pluginkit 查询成功，未返回匹配记录。请从应用程序目录启动 QuickFile，再打开扩展管理。"))
+        case .unrecognized: return QuickFileLocalization.text(.init("pluginkit 输出无法识别。请在终端检查注册记录。"))
+        case .accessDenied: return QuickFileLocalization.text(.init("系统拒绝访问注册信息，可能受沙盒或系统访问限制。"))
+        case .connectionFailed: return QuickFileLocalization.text(.init("无法连接系统扩展注册服务。"))
+        case .unknownFailure: return QuickFileLocalization.text(.init("未能确认原因，退出码不能用于判断扩展是否已注册或启用。"))
+        }
     }
 }
 
@@ -30,7 +64,24 @@ struct FinderExtensionDiagnosticSnapshot: Sendable {
     let embeddedIdentifiers: [String]
     let embeddingKnown: Bool
     let registration: ExtensionRegistration
-    let registrationEvidence: String
+    let evidence: RegistrationEvidence
+    var registrationEvidence: String { evidence.message }
+
+    init(embeddedIdentifiers: [String], embeddingKnown: Bool, registration: ExtensionRegistration,
+         registrationEvidence: String, enabled: Bool, responded: Bool?) {
+        self.init(embeddedIdentifiers: embeddedIdentifiers, embeddingKnown: embeddingKnown,
+                  registration: registration, evidence: .verbatim(registrationEvidence), enabled: enabled, responded: responded)
+    }
+
+    init(embeddedIdentifiers: [String], embeddingKnown: Bool, registration: ExtensionRegistration,
+         evidence: RegistrationEvidence, enabled: Bool, responded: Bool?) {
+        self.embeddedIdentifiers = embeddedIdentifiers
+        self.embeddingKnown = embeddingKnown
+        self.registration = registration
+        self.evidence = evidence
+        self.enabled = enabled
+        self.responded = responded
+    }
     let enabled: Bool
     let responded: Bool?
 
@@ -54,9 +105,7 @@ enum FinderExtensionRuntimeInspector {
     static func snapshot(
         enabled: Bool,
         probe: (URL) async -> Bool = { await FinderExtensionProbe.check(extensionURL: $0) },
-        registrationQuery: @escaping @Sendable (String, URL?) -> (ExtensionRegistration, String) = {
-            FinderExtensionInstallationInspector.registration(identifier: $0, pluginDirectory: $1)
-        }
+        registrationQuery: (@Sendable (String, URL?) -> (ExtensionRegistration, String))? = nil
     ) async -> FinderExtensionDiagnosticSnapshot {
         let installation = await BackgroundWork.run {
             FinderExtensionInstallationInspector.inspect()
@@ -67,21 +116,25 @@ enum FinderExtensionRuntimeInspector {
         } else {
             response = nil
         }
-        let registration: (ExtensionRegistration, String)
+        let registration: (ExtensionRegistration, RegistrationEvidence)
         if response == true {
             // The path-bound probe is the runtime evidence. A successful response
             // does not claim that an independent system-registration query ran.
-            registration = (.unknown, "本次探针收到当前安装副本及版本的响应；未单独查询系统注册记录。")
+            registration = (.unknown, .probeResponse)
         } else {
             registration = await BackgroundWork.run {
                 installation.identifiers.first.map {
-                    registrationQuery($0, Bundle.main.builtInPlugInsURL)
-                } ?? (.unknown, "没有可查询的嵌入扩展标识。")
+                    if let registrationQuery {
+                        let result = registrationQuery($0, Bundle.main.builtInPlugInsURL)
+                        return (result.0, RegistrationEvidence.verbatim(result.1))
+                    }
+                    return FinderExtensionInstallationInspector.registrationEvidence(identifier: $0, pluginDirectory: Bundle.main.builtInPlugInsURL)
+                } ?? (.unknown, .noIdentifier)
             }
         }
         return FinderExtensionDiagnosticSnapshot(
             embeddedIdentifiers: installation.identifiers, embeddingKnown: installation.known,
-            registration: registration.0, registrationEvidence: registration.1,
+            registration: registration.0, evidence: registration.1,
             enabled: enabled, responded: response
         )
     }
@@ -117,43 +170,53 @@ enum FinderExtensionInstallationInspector {
     }
 
     static func registration(identifier: String, pluginDirectory: URL?) -> (ExtensionRegistration, String) {
+        let result = registrationEvidence(identifier: identifier, pluginDirectory: pluginDirectory)
+        return (result.0, result.1.message)
+    }
+
+    static func registrationEvidence(identifier: String, pluginDirectory: URL?) -> (ExtensionRegistration, RegistrationEvidence) {
         let result = RegistrationCommand.run(
             executable: "/usr/bin/pluginkit", arguments: ["-m", "-A", "-D", "-v", "-i", identifier]
         )
         switch result {
         case let .success(exitCode, data):
             guard let text = String(data: data, encoding: .utf8) else {
-                return (.unknown, "pluginkit 输出无法解码。请在终端检查注册记录。")
+                return (.unknown, .undecodable)
             }
-            return interpretRegistration(exitCode: exitCode, output: text, identifier: identifier, pluginDirectory: pluginDirectory)
+            return interpretRegistrationEvidence(exitCode: exitCode, output: text, identifier: identifier, pluginDirectory: pluginDirectory)
         case .failure(.launch):
-            return (.unknown, "pluginkit 无法执行，可能受沙盒限制。请在终端用 pluginkit -m -A -D -v -i 检查下列嵌入标识。")
+            return (.unknown, .launch)
         case .failure(.timeout):
-            return (.unknown, "pluginkit 查询超时。请打开扩展管理，或在终端检查注册状态。")
+            return (.unknown, .timeout)
         case .failure(.outputLimit):
-            return (.unknown, "pluginkit 输出超过大小限制。请在终端检查注册记录。")
+            return (.unknown, .outputLimit)
         case .failure(.io):
-            return (.unknown, "pluginkit 输出读取失败。请在终端检查注册记录。")
+            return (.unknown, .io)
         case .failure(.busy):
-            return (.unknown, "已有扩展查询正在执行或等待回收，请稍后重试。")
+            return (.unknown, .busy)
         case .failure(.cleanup):
-            return (.unknown, "pluginkit 查询终止后未能确认退出。请在终端检查注册状态。")
+            return (.unknown, .cleanup)
         }
     }
 
     static func interpretRegistration(exitCode: Int32, output: String, identifier: String, pluginDirectory: URL? = nil) -> (ExtensionRegistration, String) {
+        let result = interpretRegistrationEvidence(exitCode: exitCode, output: output, identifier: identifier, pluginDirectory: pluginDirectory)
+        return (result.0, result.1.message)
+    }
+
+    static func interpretRegistrationEvidence(exitCode: Int32, output: String, identifier: String, pluginDirectory: URL? = nil) -> (ExtensionRegistration, RegistrationEvidence) {
         guard exitCode == 0 else {
-            let message: String
+            let message: RegistrationEvidence
             let error = output.lowercased()
             if error.contains("operation not permitted") || error.contains("permission denied") || error.contains("not allowed") {
-                message = "系统拒绝访问注册信息，可能受沙盒或系统访问限制。"
+                message = .accessDenied
             } else if error.contains("connection invalid") || error.contains("connection interrupted") || error.contains("could not connect") || error.contains("connection refused") {
-                message = "无法连接系统扩展注册服务。"
+                message = .connectionFailed
             } else {
-                message = "未能确认原因，退出码不能用于判断扩展是否已注册或启用。"
+                message = .unknownFailure
             }
             // Do not expose raw output: it can contain private filesystem paths.
-            return (.unknown, "App 内注册查询未完成（退出码 \(exitCode)）。\(message)可打开扩展管理，或在终端核对注册记录。")
+            return (.unknown, .queryFailed(exitCode, message))
         }
         var matchingRecord = false
         var foundIdentifier = false
@@ -175,18 +238,18 @@ enum FinderExtensionInstallationInspector {
                     let registeredURL = URL(fileURLWithPath: String(text[start...])).standardizedFileURL
                     if registeredURL.pathExtension == "appex",
                        registeredURL.deletingLastPathComponent().path == pluginDirectory.standardizedFileURL.path {
-                        return (.registered, "pluginkit 查询成功，找到当前应用内扩展路径的注册记录。")
+                        return (.registered, .registered)
                     }
                 }
             }
         }
         if foundIdentifier {
-            return (.unknown, "找到同 Bundle ID 的注册记录，但无法确认属于当前应用副本。请在终端核对 pluginkit 输出中的路径。")
+            return (.unknown, .otherCopy)
         }
         if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return (.notRegistered, "pluginkit 查询成功，未返回匹配记录。请从应用程序目录启动 QuickFile，再打开扩展管理。")
+            return (.notRegistered, .notRegistered)
         }
-        return (.unknown, "pluginkit 输出无法识别。请在终端检查注册记录。")
+        return (.unknown, .unrecognized)
     }
 }
 

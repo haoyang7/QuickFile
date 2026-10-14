@@ -1,3 +1,4 @@
+import QuickFileCore
 import AppKit
 import QuickFileInfrastructure
 import SwiftUI
@@ -6,6 +7,7 @@ import SwiftUI
 /// safe classifications, never queue payloads, destination paths or bookmarks.
 @MainActor
 struct FinderRequestRecoveryView: View {
+    @Environment(\.locale) private var quickFileLocale
     @ObservedObject var model: FinderRequestRecoveryViewModel
     @State private var requestedCandidateID = ""
 
@@ -42,7 +44,7 @@ struct FinderRequestRecoveryView: View {
                 }
                 .frame(minHeight: 90)
                 .disabled(model.isOperationInFlight)
-                .accessibilityLabel("异常请求，仅显示标识和原因")
+                .accessibilityLabel(QuickFileLocalization.text(.init("异常请求，仅显示标识和原因")))
             }
 
             ScrollView {
@@ -153,17 +155,17 @@ struct FinderRequestRecoveryView: View {
     static func makeArchiveConfirmation(_ candidate: FinderRequestRecoveryViewModel.Candidate) -> NSAlert {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "归档此原件并移出待办？"
-        alert.informativeText = """
+        alert.messageText = QuickFileLocalization.text(.init("归档此原件并移出待办？"))
+        alert.informativeText = QuickFileLocalization.text(.init("""
         请求：\(candidate.id)
         原因：\(candidate.reason.localizedDescription)
 
         确认后会把这一个原始记录移到本机的隐藏私有归档目录，使它不再等待处理。不会上传、自动重试或创建文件，也不会清空其他请求。无法安全保留原件时不会移除它。
 
         取消不改动原件。归档后自动处理仍暂停，需你另行点击“重试读取”。
-        """
-        let cancel = alert.addButton(withTitle: "取消")
-        let archive = alert.addButton(withTitle: "归档原件并移出待办")
+        """))
+        let cancel = alert.addButton(withTitle: QuickFileLocalization.text(.init("取消")))
+        let archive = alert.addButton(withTitle: QuickFileLocalization.text(.init("归档原件并移出待办")))
         // Return and Escape are deliberately safe. Archive requires an explicit
         // choice, rather than inheriting NSAlert's first-button default shortcut.
         archive.keyEquivalent = ""

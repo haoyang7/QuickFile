@@ -5,6 +5,7 @@ import QuickFileInfrastructure
 import SwiftUI
 
 struct DiagnosticsView: View {
+    @Environment(\.locale) private var quickFileLocale
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel: DiagnosticsViewModel
     @State private var isManagingDirectories = false
@@ -64,15 +65,15 @@ struct DiagnosticsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 DiagnosticValueRow(
                     title: "App Bundle ID",
-                    value: Bundle.main.bundleIdentifier ?? "未知"
+                    value: Bundle.main.bundleIdentifier ?? QuickFileLocalization.text(.init("未知"))
                 )
                 DiagnosticValueRow(
                     title: "Finder Extension",
                     value: embeddedExtensionIdentifiersText
                 )
                 DiagnosticValueRow(
-                    title: "共享存储类型",
-                    value: QuickFileStorageMode.current.displayName + "（主应用与 Finder 扩展共用）"
+                    title: QuickFileLocalization.text(.init("共享存储类型")),
+                    value: QuickFileStorageMode.current.displayName + QuickFileLocalization.text(.init("（主应用与 Finder 扩展共用）"))
                 )
 
                 if QuickFileConfiguration.usesPlaceholderIdentifiers {
@@ -98,9 +99,9 @@ struct DiagnosticsView: View {
     private var embeddedExtensionIdentifiersText: String {
         viewModel.extensionSnapshot.map { snapshot in
             snapshot.embeddedIdentifiers.isEmpty
-                ? (snapshot.embeddingKnown ? "未发现嵌入扩展" : "无法读取")
+                ? (snapshot.embeddingKnown ? QuickFileLocalization.text(.init("未发现嵌入扩展")) : QuickFileLocalization.text(.init("无法读取")))
                 : snapshot.embeddedIdentifiers.joined(separator: ", ")
-        } ?? "检测中"
+        } ?? QuickFileLocalization.text(.init("检测中"))
     }
 
     private var finderExtensionSection: some View {
@@ -110,27 +111,25 @@ struct DiagnosticsView: View {
                     Image(systemName: viewModel.extensionSnapshot?.state == .responding ? "checkmark.circle.fill" : "questionmark.circle.fill")
                         .foregroundColor(viewModel.extensionSnapshot?.state == .responding ? .green : .secondary)
                     Text(viewModel.extensionSnapshot?.state.displayName
-                         ?? (viewModel.isRefreshingRuntimeStatus ? "正在检查…" : "尚未检测"))
+                         ?? (viewModel.isRefreshingRuntimeStatus ? QuickFileLocalization.text(.init("正在检查…")) : QuickFileLocalization.text(.init("尚未检测"))))
                     Spacer()
                 }
 
-                if let snapshot = viewModel.extensionSnapshot {
-                    Text("响应仅确认当前安装版本的扩展收到检查请求，不代表目录可写；未响应也不等于崩溃。")
+                Text("响应仅确认当前安装版本的扩展收到检查请求，不代表目录可写；未响应也不等于崩溃。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                if let guidance = viewModel.extensionSnapshot?.state.recoveryGuidance {
+                    Text(guidance)
                         .font(.caption)
-                        .foregroundColor(.secondary)
-                    if let guidance = snapshot.state.recoveryGuidance {
-                        Text(guidance)
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    }
+                        .foregroundColor(.orange)
                 }
 
                 if viewModel.hasLoadedActivityStoreStatus {
-                    DiagnosticBooleanRow(title: "共享存储可用", value: viewModel.isSharedStoreAvailable)
+                    DiagnosticBooleanRow(title: QuickFileLocalization.text(.init("共享存储可用")), value: viewModel.isSharedStoreAvailable)
                 } else if viewModel.isRefreshingRuntimeStatus {
-                    DiagnosticValueRow(title: "共享存储", value: "正在检查…")
+                    DiagnosticValueRow(title: QuickFileLocalization.text(.init("共享存储")), value: QuickFileLocalization.text(.init("正在检查…")))
                 } else {
-                    DiagnosticValueRow(title: "共享存储", value: "尚未检测")
+                    DiagnosticValueRow(title: QuickFileLocalization.text(.init("共享存储")), value: QuickFileLocalization.text(.init("尚未检测")))
                 }
 
                 HStack {
@@ -147,11 +146,11 @@ struct DiagnosticsView: View {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(viewModel.diagnosticSummary, forType: .string)
                     }
-                    .help("仅复制状态、标识和计数，不含路径、错误原文、书签或模板内容。")
-                    if viewModel.isRefreshingRuntimeStatus {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
+                    .help(QuickFileLocalization.text(.init("仅复制状态、标识和计数，不含路径、错误原文、书签或模板内容。")))
+                    ProgressView()
+                        .controlSize(.small)
+                        .opacity(viewModel.isRefreshingRuntimeStatus ? 1 : 0)
+                        .accessibilityHidden(!viewModel.isRefreshingRuntimeStatus)
                     Spacer()
                 }
 
@@ -174,7 +173,7 @@ struct DiagnosticsView: View {
     }
 
     private var advancedDetailsSection: some View {
-        DisclosureGroup("高级技术详情", isExpanded: $showsAdvancedDetails) {
+        DisclosureGroup(QuickFileLocalization.text(.init("高级技术详情")), isExpanded: $showsAdvancedDetails) {
             VStack(alignment: .leading, spacing: 12) {
                 identifiersSection
                 extensionTechnicalRecordsSection
@@ -187,7 +186,7 @@ struct DiagnosticsView: View {
         GroupBox(label: Label("扩展技术记录", systemImage: "list.bullet.rectangle")) {
             VStack(alignment: .leading, spacing: 10) {
                 if let snapshot = viewModel.extensionSnapshot {
-                    DiagnosticValueRow(title: "注册证据", value: snapshot.registrationEvidence)
+                    DiagnosticValueRow(title: QuickFileLocalization.text(.init("注册证据")), value: snapshot.registrationEvidence)
                 }
                 Text("响应仅说明当前安装路径及版本的扩展收到探针；未响应可能是旧版扩展仍在运行、扩展尚未运行、主线程忙或系统限制，不能据此判定崩溃。")
                     .font(.caption)
@@ -195,14 +194,14 @@ struct DiagnosticsView: View {
 
                 if let extensionActivity = viewModel.extensionActivity {
                     DiagnosticValueRow(
-                        title: "最近活动（历史）",
-                        value: "\(extensionActivity.kind.displayName) · \(formattedTimestamp(extensionActivity.timestamp))"
+                        title: QuickFileLocalization.text(.init("最近活动（历史）")),
+                        value: QuickFileLocalization.text(.init("\(extensionActivity.kind.displayName) · \(formattedTimestamp(extensionActivity.timestamp))"))
                     )
                     if let failure = extensionActivity.failure {
-                        DiagnosticValueRow(title: "失败类别", value: failure.reason.displayName)
+                        DiagnosticValueRow(title: QuickFileLocalization.text(.init("失败类别")), value: failure.reason.displayName)
                     }
                 } else {
-                    DiagnosticValueRow(title: "最近活动（历史）", value: "尚未收到活动记录")
+                    DiagnosticValueRow(title: QuickFileLocalization.text(.init("最近活动（历史）")), value: QuickFileLocalization.text(.init("尚未收到活动记录")))
                 }
                 Text("活动记录不代表当前健康状态。最近失败最多保留 20 条、14 天，不包含操作路径或文件名。")
                     .font(.caption)
@@ -245,7 +244,7 @@ struct DiagnosticsView: View {
         GroupBox(label: Label("文件夹授权", systemImage: "folder.badge.gearshape")) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text(authorizationCount == 0 ? "尚未保存 Finder 目录授权" : "已保存 \(authorizationCount) 个目录授权")
+                    Text(authorizationCount == 0 ? QuickFileLocalization.text(.init("尚未保存 Finder 目录授权")) : QuickFileLocalization.text(.init("已保存 \(authorizationCount) 个目录授权")))
                         .foregroundColor(.secondary)
                     if authorizationsNeedingAttention > 0 {
                         Label("\(authorizationsNeedingAttention) 个需处理", systemImage: "exclamationmark.triangle")
@@ -255,7 +254,7 @@ struct DiagnosticsView: View {
                     if viewModel.isManagingAuthorizations {
                         ProgressView()
                             .controlSize(.small)
-                            .accessibilityLabel("正在更新授权")
+                            .accessibilityLabel(QuickFileLocalization.text(.init("正在更新授权")))
                     }
                 }
 
@@ -268,6 +267,12 @@ struct DiagnosticsView: View {
                     Button("管理授权…") {
                         isManagingDirectories = true
                     }
+
+                    ProgressView()
+                        .controlSize(.small)
+                        .opacity(viewModel.isLoadingAuthorizationInventory ? 1 : 0)
+                        .accessibilityLabel(QuickFileLocalization.text(.init("正在刷新目录授权列表…")))
+                        .accessibilityHidden(!viewModel.isLoadingAuthorizationInventory)
 
                     Spacer()
                 }
@@ -282,10 +287,6 @@ struct DiagnosticsView: View {
                         .foregroundColor(.secondary)
                 }
 
-                if viewModel.isLoadingAuthorizationInventory {
-                    Label("正在刷新目录授权列表…", systemImage: "hourglass")
-                        .font(.caption).foregroundColor(.secondary)
-                }
                 if let message = viewModel.authorizationInventoryMessage {
                     Label(message, systemImage: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
@@ -331,14 +332,14 @@ struct DiagnosticsView: View {
 
                 if let report = viewModel.report {
                     Divider()
-                    DiagnosticValueRow(title: "路径", value: report.folderURL.path)
-                    DiagnosticValueRow(title: "位置类型", value: report.storageDescription)
-                    DiagnosticValueRow(title: "卷名称", value: report.volumeName ?? "未知")
-                    DiagnosticOptionalBooleanRow(title: "路径存在", value: report.existenceKnown ? report.exists : nil, unknownLabel: "无法确定")
-                    DiagnosticOptionalBooleanRow(title: "是文件夹", value: report.existenceKnown ? report.isDirectory : nil, unknownLabel: "无法确定")
-                    DiagnosticBooleanRow(title: "FileManager 可写", value: report.isWritableByFileManager)
-                    DiagnosticOptionalBooleanRow(title: "实际写入探针", value: report.writeProbeSucceeded)
-                    DiagnosticOptionalBooleanRow(title: "只读卷", value: report.volumeIsReadOnly, inverted: true)
+                    DiagnosticValueRow(title: QuickFileLocalization.text(.init("路径")), value: report.folderURL.path)
+                    DiagnosticValueRow(title: QuickFileLocalization.text(.init("位置类型")), value: report.storageDescription)
+                    DiagnosticValueRow(title: QuickFileLocalization.text(.init("卷名称")), value: report.volumeName ?? QuickFileLocalization.text(.init("未知")))
+                    DiagnosticOptionalBooleanRow(title: QuickFileLocalization.text(.init("路径存在")), value: report.existenceKnown ? report.exists : nil, unknownLabel: QuickFileLocalization.text(.init("无法确定")))
+                    DiagnosticOptionalBooleanRow(title: QuickFileLocalization.text(.init("是文件夹")), value: report.existenceKnown ? report.isDirectory : nil, unknownLabel: QuickFileLocalization.text(.init("无法确定")))
+                    DiagnosticBooleanRow(title: QuickFileLocalization.text(.init("FileManager 可写")), value: report.isWritableByFileManager)
+                    DiagnosticOptionalBooleanRow(title: QuickFileLocalization.text(.init("实际写入探针")), value: report.writeProbeSucceeded)
+                    DiagnosticOptionalBooleanRow(title: QuickFileLocalization.text(.init("只读卷")), value: report.volumeIsReadOnly, inverted: true)
 
                     if report.issues.isEmpty {
                         Label("未发现目录写入问题。", systemImage: "checkmark.circle.fill")
@@ -361,7 +362,7 @@ struct DiagnosticsView: View {
                     if viewModel.isInspectingDirectory {
                         ProgressView()
                             .controlSize(.small)
-                            .accessibilityLabel("正在诊断所选文件夹")
+                            .accessibilityLabel(QuickFileLocalization.text(.init("正在诊断所选文件夹")))
                     }
                 }
                 Text("测试会在所选文件夹中创建一个隐藏临时文件并立即删除，用于验证真实写入权限。")
@@ -410,8 +411,8 @@ struct DiagnosticsView: View {
 
     private func chooseFolderAndRunDiagnostics() {
         let panel = NSOpenPanel()
-        panel.title = "选择要诊断的文件夹"
-        panel.prompt = "测试此文件夹"
+        panel.title = QuickFileLocalization.text(.init("选择要诊断的文件夹"))
+        panel.prompt = QuickFileLocalization.text(.init("测试此文件夹"))
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
@@ -426,9 +427,9 @@ struct DiagnosticsView: View {
 
     private func chooseAuthorizedDirectory() {
         let panel = NSOpenPanel()
-        panel.title = "授权 Finder Extension 可写目录"
-        panel.message = "QuickFile Finder Extension 将能够在所选目录及其子目录中创建文件。"
-        panel.prompt = "授权"
+        panel.title = QuickFileLocalization.text(.init("授权 Finder Extension 可写目录"))
+        panel.message = QuickFileLocalization.text(.init("QuickFile Finder Extension 将能够在所选目录及其子目录中创建文件。"))
+        panel.prompt = QuickFileLocalization.text(.init("授权"))
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
@@ -445,8 +446,14 @@ struct DiagnosticsView: View {
 }
 
 enum AuthorizationListFilter: String, CaseIterable {
-    case all = "全部"
-    case needsAttention = "需处理"
+    case all, needsAttention
+
+    var title: String {
+        switch self {
+        case .all: return QuickFileLocalization.text(.init("全部"))
+        case .needsAttention: return QuickFileLocalization.text(.init("需处理"))
+        }
+    }
 
     func matches(_ directory: AuthorizedDirectory, search: String) -> Bool {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -456,12 +463,13 @@ enum AuthorizationListFilter: String, CaseIterable {
 
     func matches(_ directory: UnavailableAuthorizedDirectory, search: String) -> Bool {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        return query.isEmpty || "授权暂不可用".localizedStandardContains(query)
+        return query.isEmpty || QuickFileLocalization.text(.init("授权暂不可用")).localizedStandardContains(query)
             || directory.id.uuidString.localizedStandardContains(query)
     }
 }
 
 private struct AuthorizationManagementView: View {
+    @Environment(\.locale) private var quickFileLocale
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var viewModel: DiagnosticsViewModel
     let addDirectory: () -> Void
@@ -493,13 +501,13 @@ private struct AuthorizationManagementView: View {
                     Image(systemName: "magnifyingglass").foregroundColor(.secondary)
                     TextField("搜索目录名称或路径", text: $search)
                         .textFieldStyle(.plain)
-                        .accessibilityLabel("搜索已授权目录")
+                        .accessibilityLabel(QuickFileLocalization.text(.init("搜索已授权目录")))
                     if !search.isEmpty {
                         Button { search = "" } label: {
                             Image(systemName: "xmark.circle.fill")
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("清除目录搜索")
+                        .accessibilityLabel(QuickFileLocalization.text(.init("清除目录搜索")))
                     }
                 }
                 .padding(7)
@@ -507,7 +515,7 @@ private struct AuthorizationManagementView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 Picker("授权状态", selection: $filter) {
                     ForEach(AuthorizationListFilter.allCases, id: \.self) { value in
-                        Text(value.rawValue).tag(value)
+                        Text(value.title).tag(value)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -522,11 +530,11 @@ private struct AuthorizationManagementView: View {
                         Task { await viewModel.revokeUnavailableAuthorizations() }
                     }
                     .disabled(viewModel.isManagingAuthorizations)
-                    .help("清理全部当前仍不可用的授权记录，不受搜索或筛选影响；不删除文件。")
+                    .help(QuickFileLocalization.text(.init("清理全部当前仍不可用的授权记录，不受搜索或筛选影响；不删除文件。")))
                 }
                 Spacer()
                 if viewModel.isManagingAuthorizations {
-                    ProgressView().controlSize(.small).accessibilityLabel("正在更新授权")
+                    ProgressView().controlSize(.small).accessibilityLabel(QuickFileLocalization.text(.init("正在更新授权")))
                 }
                 Text("\(resultCount) / \(viewModel.authorizedDirectories.count + viewModel.unavailableAuthorizedDirectories.count) 个目录")
                     .font(.caption).foregroundColor(.secondary)
@@ -538,7 +546,7 @@ private struct AuthorizationManagementView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Label("授权暂不可用", systemImage: "exclamationmark.triangle.fill")
                                 .foregroundColor(.orange)
-                            DisclosureGroup("记录详情") {
+                            DisclosureGroup(QuickFileLocalization.text(.init("记录详情"))) {
                                 Text("记录标识：\(directory.id.uuidString)")
                                     .font(.caption).foregroundColor(.secondary)
                                     .textSelection(.enabled)
@@ -549,7 +557,7 @@ private struct AuthorizationManagementView: View {
                             Task { await viewModel.revokeAuthorization(directory.id) }
                         }
                         .disabled(viewModel.isManagingAuthorizations)
-                        .accessibilityLabel("移除不可用授权 \(directory.id.uuidString)")
+                        .accessibilityLabel(QuickFileLocalization.text(.init("移除不可用授权 \(directory.id.uuidString)")))
                     }
                     .padding(.vertical, 5)
                 }
@@ -576,7 +584,7 @@ private struct AuthorizationManagementView: View {
                             Task { await viewModel.revokeAuthorization(directory.id) }
                         }
                         .disabled(viewModel.isManagingAuthorizations)
-                        .accessibilityLabel("移除目录授权 \(directory.url.path)")
+                        .accessibilityLabel(QuickFileLocalization.text(.init("移除目录授权 \(directory.url.path)")))
                     }
                     .padding(.vertical, 5)
                 }
@@ -587,7 +595,7 @@ private struct AuthorizationManagementView: View {
                     VStack(spacing: 8) {
                         Image(systemName: "folder").font(.title).foregroundColor(.secondary)
                         Text(viewModel.authorizedDirectories.isEmpty && viewModel.unavailableAuthorizedDirectories.isEmpty
-                             ? "尚未添加目录授权" : "没有符合条件的授权")
+                             ? QuickFileLocalization.text(.init("尚未添加目录授权")) : QuickFileLocalization.text(.init("没有符合条件的授权")))
                         Text("可添加目录，或调整搜索与筛选条件。")
                             .font(.caption).foregroundColor(.secondary)
                     }
@@ -616,6 +624,7 @@ private struct AuthorizationManagementView: View {
 }
 
 private struct DiagnosticValueRow: View {
+    @Environment(\.locale) private var quickFileLocale
     let title: String
     let value: String
 
@@ -632,6 +641,7 @@ private struct DiagnosticValueRow: View {
 }
 
 private struct DiagnosticBooleanRow: View {
+    @Environment(\.locale) private var quickFileLocale
     let title: String
     let value: Bool
 
@@ -640,7 +650,7 @@ private struct DiagnosticBooleanRow: View {
             Text(title)
                 .foregroundColor(.secondary)
                 .frame(width: 150, alignment: .leading)
-            Label(value ? "是" : "否", systemImage: value ? "checkmark.circle.fill" : "xmark.circle.fill")
+            Label(value ? QuickFileLocalization.text(.init("是")) : QuickFileLocalization.text(.init("否")), systemImage: value ? "checkmark.circle.fill" : "xmark.circle.fill")
                 .foregroundColor(value ? .green : .red)
             Spacer()
         }
@@ -648,10 +658,11 @@ private struct DiagnosticBooleanRow: View {
 }
 
 private struct DiagnosticOptionalBooleanRow: View {
+    @Environment(\.locale) private var quickFileLocale
     let title: String
     let value: Bool?
     var inverted = false
-    var unknownLabel = "未测试"
+    var unknownLabel = QuickFileLocalization.text(.init("未测试"))
 
     var body: some View {
         HStack {
@@ -661,7 +672,7 @@ private struct DiagnosticOptionalBooleanRow: View {
 
             if let value {
                 let isPositive = inverted ? !value : value
-                Label(value ? "是" : "否", systemImage: isPositive ? "checkmark.circle.fill" : "xmark.circle.fill")
+                Label(value ? QuickFileLocalization.text(.init("是")) : QuickFileLocalization.text(.init("否")), systemImage: isPositive ? "checkmark.circle.fill" : "xmark.circle.fill")
                     .foregroundColor(isPositive ? .green : .red)
             } else {
                 Label(unknownLabel, systemImage: "minus.circle")

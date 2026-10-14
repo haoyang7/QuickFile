@@ -17,10 +17,10 @@ public final class FinderMenuSettingsStore: @unchecked Sendable {
         case saveFailed(Error)
         public var errorDescription: String? {
             switch self {
-            case .unavailable: return "无法访问 Finder 菜单的共享设置。"
-            case .malformed: return "Finder 菜单设置无效，已保留上次有效设置。请重新保存。"
-            case let .readFailed(error): return "无法读取 Finder 菜单设置：\(error.localizedDescription)"
-            case let .saveFailed(error): return "无法保存 Finder 菜单设置，原设置未更改：\(error.localizedDescription)"
+            case .unavailable: return QuickFileLocalization.text(.init("无法访问 Finder 菜单的共享设置。"))
+            case .malformed: return QuickFileLocalization.text(.init("Finder 菜单设置无效，已保留上次有效设置。请重新保存。"))
+            case let .readFailed(error): return QuickFileLocalization.text(.init("无法读取 Finder 菜单设置：\(error.localizedDescription)"))
+            case let .saveFailed(error): return QuickFileLocalization.text(.init("无法保存 Finder 菜单设置，原设置未更改：\(error.localizedDescription)"))
             }
         }
     }

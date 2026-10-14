@@ -129,14 +129,15 @@ struct AppTabsView: NSViewControllerRepresentable {
             finderIntegrationViewModel: finderIntegrationViewModel,
             finderMenuSettings: finderMenuSettings,
             diagnosticsViewModel: diagnosticsViewModel,
-            scenePhase: context.environment.scenePhase
+            scenePhase: context.environment.scenePhase,
+            locale: context.environment.locale
         )
         controller.synchronizeSelection(with: $selectedTab)
         return controller
     }
 
     func updateNSViewController(_ controller: AppTabController, context: Context) {
-        controller.updateScenePhase(context.environment.scenePhase)
+        controller.updateEnvironment(scenePhase: context.environment.scenePhase, locale: context.environment.locale)
         controller.synchronizeSelection(with: $selectedTab)
     }
 
@@ -150,36 +151,57 @@ final class AppTabController: NSTabViewController {
     var selectionChanged: ((AppTab) -> Void)?
     private var pageContents: [AnyView] = []
     private var scenePhase: ScenePhase
+    private(set) var locale: Locale
 
     init(
         viewModel: QuickFileViewModel,
         finderIntegrationViewModel: FinderIntegrationViewModel,
         finderMenuSettings: FinderMenuSettingsViewModel? = nil,
         diagnosticsViewModel: DiagnosticsViewModel? = nil,
-        scenePhase: ScenePhase
+        scenePhase: ScenePhase,
+        locale: Locale = Locale(identifier: QuickFileLocalization.identifier)
     ) {
         self.scenePhase = scenePhase
+        self.locale = locale
         super.init(nibName: nil, bundle: nil)
         tabStyle = .toolbar
         transitionOptions = []
+        let bundle = QuickFileLocalization.resourceBundle(for: locale.identifier)
         addPage(CreateFileView(viewModel: viewModel, finderIntegrationViewModel: finderIntegrationViewModel,
                                showTemplateManager: { [weak self] in self?.selectedTab = .templates }),
-                tab: .create, title: "创建文件", symbol: "doc.badge.plus")
+                tab: .create, title: String(localized: "创建文件", bundle: bundle), symbol: "doc.badge.plus")
         addPage(TemplateManagerView(viewModel: viewModel, finderMenuSettings: finderMenuSettings),
-                tab: .templates, title: "模板管理", symbol: "list.bullet.rectangle")
+                tab: .templates, title: String(localized: "模板管理", bundle: bundle), symbol: "list.bullet.rectangle")
         addPage(DiagnosticsView(viewModel: diagnosticsViewModel),
-                tab: .diagnostics, title: "诊断", symbol: "stethoscope")
+                tab: .diagnostics, title: String(localized: "诊断", bundle: bundle), symbol: "stethoscope")
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("Use init(viewModel:finderIntegrationViewModel:diagnosticsViewModel:scenePhase:)") }
 
     var selectedTab: AppTab {
-        get { AppTab.allCases[selectedTabViewItemIndex] }
-        set {
-            let index = AppTab.allCases.firstIndex(of: newValue)!
-            if selectedTabViewItemIndex != index { selectedTabViewItemIndex = index }
+        get {
+            _ = view
+            return AppTab(rawValue: tabView.selectedTabViewItem!.identifier as! String)!
         }
+        set {
+            _ = view
+            let item = tabViewItems[AppTab.allCases.firstIndex(of: newValue)!]
+            // The visible NSTabView item is authoritative. Finder authorization
+            // can enter a modal run loop immediately after SwiftUI navigation.
+            if tabView.selectedTabViewItem !== item { tabView.selectTabViewItem(item) }
+            synchronizeToolbarSelection()
+        }
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        synchronizeToolbarSelection()
+    }
+
+    private func synchronizeToolbarSelection() {
+        guard isViewLoaded, let identifier = tabView.selectedTabViewItem?.identifier as? String else { return }
+        view.window?.toolbar?.selectedItemIdentifier = NSToolbarItem.Identifier(identifier)
     }
 
     func synchronizeSelection(with selection: Binding<AppTab>) {
@@ -193,18 +215,37 @@ final class AppTabController: NSTabViewController {
     }
 
     func updateScenePhase(_ phase: ScenePhase) {
-        guard scenePhase != phase else { return }
+        updateEnvironment(scenePhase: phase, locale: locale)
+    }
+
+    func updateEnvironment(scenePhase phase: ScenePhase, locale: Locale) {
+        guard scenePhase != phase || self.locale != locale else { return }
         scenePhase = phase
+        self.locale = locale
+        let bundle = QuickFileLocalization.resourceBundle(for: locale.identifier)
+        let titles = [String(localized: "创建文件", bundle: bundle),
+                      String(localized: "模板管理", bundle: bundle),
+                      String(localized: "诊断", bundle: bundle)]
+        for (item, title) in zip(tabViewItems, titles) {
+            item.label = title
+            item.image?.accessibilityDescription = title
+            // NSTabViewController caches toolbar items after creating the window.
+            if let toolbarItem = view.window?.toolbar?.items.first(where: { $0.itemIdentifier.rawValue == item.identifier as? String }) {
+                toolbarItem.label = title
+                toolbarItem.paletteLabel = title
+                toolbarItem.toolTip = title
+            }
+        }
         for (index, content) in pageContents.enumerated() {
             let hosting = tabViewItems[index].viewController as! NSHostingController<AnyView>
-            hosting.rootView = AnyView(content.environment(\.scenePhase, phase))
+            hosting.rootView = AnyView(content.environment(\.scenePhase, phase).environment(\.locale, locale))
         }
     }
 
     private func addPage<Content: View>(_ content: Content, tab: AppTab, title: String, symbol: String) {
         let page = AnyView(content.frame(maxWidth: .infinity, maxHeight: .infinity))
         pageContents.append(page)
-        let hosting = NSHostingController(rootView: AnyView(page.environment(\.scenePhase, scenePhase)))
+        let hosting = NSHostingController(rootView: AnyView(page.environment(\.scenePhase, scenePhase).environment(\.locale, locale)))
         let item = NSTabViewItem(viewController: hosting)
         // AppKit also uses this identifier as an NSToolbarItem.Identifier.
         item.identifier = tab.rawValue
@@ -218,5 +259,8 @@ final class AppTabController: NSTabViewController {
         if let identifier = tabViewItem?.identifier as? String, let tab = AppTab(rawValue: identifier) {
             selectionChanged?(tab)
         }
+        // A callback can apply a newer route. Read the final selected item,
+        // rather than highlighting the item passed to this older callback.
+        synchronizeToolbarSelection()
     }
 }

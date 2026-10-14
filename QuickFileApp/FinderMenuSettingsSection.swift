@@ -1,7 +1,9 @@
+import QuickFileCore
 import SwiftUI
 
 @MainActor
 struct FinderMenuSettingsSection: View {
+    @Environment(\.locale) private var quickFileLocale
     @ObservedObject var viewModel: FinderMenuSettingsViewModel
     @State private var isExpanded = false
 
@@ -12,7 +14,7 @@ struct FinderMenuSettingsSection: View {
     private var progress: some View {
         ProgressView()
             .controlSize(.small)
-            .accessibilityLabel(viewModel.isSaving ? "正在保存菜单设置" : "正在加载菜单设置")
+            .accessibilityLabel(viewModel.isSaving ? QuickFileLocalization.text(.init("正在保存菜单设置")) : QuickFileLocalization.text(.init("正在加载菜单设置")))
     }
 
     var body: some View {
@@ -58,7 +60,7 @@ struct FinderMenuSettingsSection: View {
                 TextField("正整数", text: $viewModel.maximumCountText)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 80)
-                    .accessibilityLabel("Finder 菜单最多显示的模板数")
+                    .accessibilityLabel(QuickFileLocalization.text(.init("Finder 菜单最多显示的模板数")))
                     .disabled(viewModel.showsAll || !viewModel.canEdit)
                 Text("个模板")
                     .foregroundColor(.secondary)
