@@ -19,6 +19,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+if __package__:
+    from .native_test_support import compile_fixture_localizations
+else:
+    from native_test_support import compile_fixture_localizations
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -52,9 +57,9 @@ class UIRecoveryBuildCommandTests(unittest.TestCase):
 
     def test_recovery_compiles_current_container_and_all_dependencies(self):
         calls, manifest, info = self.build_commands("--optimization", "release")
-        self.assertEqual(len(calls), 5)  # Three modules, one executable, ad-hoc signing.
+        self.assertEqual(len(calls), 6)  # Three modules, executable, resources, signing.
         executable = calls[3]
-        for name in ("AppTabsView", "DiagnosticsView", "DiagnosticsViewModel", "FinderMenuSettingsViewModel", "FinderAuthorizationRequestPump", "AppModalPresentationGate", "TemplatePreviewController"):
+        for name in ("AppTabsView", "DiagnosticsView", "DiagnosticsViewModel", "FinderMenuSettingsViewModel", "FinderAuthorizationRequestPump", "AppModalPresentationGate", "TemplatePreviewController", "LocalizedPresentation"):
             source = f"QuickFileApp/{name}.swift"
             self.assertIn(str(ROOT / source), executable)
             self.assertEqual(manifest["sources"][source], hashlib.sha256((ROOT / source).read_bytes()).hexdigest())
@@ -64,6 +69,10 @@ class UIRecoveryBuildCommandTests(unittest.TestCase):
         self.assertTrue(all("-O" in command for command in calls[:4]))
         self.assertEqual(calls[-1][:4], ["codesign", "--force", "--sign", "-"])
         self.assertEqual(info["CFBundleIdentifier"], "local.quickfile.investigation.ui-recovery")
+        self.assertEqual(info["CFBundleDevelopmentRegion"], "zh-Hans")
+        self.assertEqual(calls[4][:3], ["xcrun", "xcstringstool", "compile"])
+        self.assertIn(str(ROOT / "Resources/Localizable.xcstrings"), calls[4])
+        self.assertIn("Resources/Localizable.xcstrings", manifest["sources"])
 
     def test_existing_tab_switch_build_is_preserved(self):
         calls, manifest, info = self.build_commands("--probe", "tab-switch")
@@ -527,6 +536,8 @@ class UIRecoveryNativeBuildTests(unittest.TestCase):
             ], capture_output=True, text=True, timeout=240, cwd=ROOT)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertTrue((Path(temporary) / "UIRecovery.app/Contents/MacOS/UIRecovery").is_file())
+            for language in ("en", "zh-Hans"):
+                self.assertTrue((Path(temporary) / f"UIRecovery.app/Contents/Resources/{language}.lproj/Localizable.strings").is_file())
             manifest = json.loads((Path(temporary) / "source-manifest.json").read_text())
             for source in ("QuickFileApp/FinderMenuSettingsSection.swift", "QuickFileApp/TemplateContentPreview.swift",
                            "QuickFileApp/AppTabsView.swift", "QuickFileApp/DiagnosticsView.swift",
@@ -538,6 +549,7 @@ class UIRecoveryNativeBuildTests(unittest.TestCase):
             # Unsigned CI may lack an app-scope key. Deterministic bookmarks are
             # explicit fixture inputs, never evidence of live bookmark behavior.
             probe = Path(temporary) / "CreationTimingProbe"
+            compile_fixture_localizations(Path(temporary))
             compiled = subprocess.run([
                 "xcrun", "swiftc", "-swift-version", "5", "-g", "-Onone", "-parse-as-library",
                 "-I", temporary, "-L", temporary,

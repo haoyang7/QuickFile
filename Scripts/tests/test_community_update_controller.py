@@ -12,6 +12,11 @@ import unittest
 import uuid
 from xml.parsers.expat import ExpatError
 
+if __package__:
+    from .native_test_support import compile_fixture_localizations, shared_native_modules
+else:
+    from native_test_support import compile_fixture_localizations, shared_native_modules
+
 ROOT = Path(__file__).resolve().parents[2]
 TEMPORARY = ROOT / ".build" / "Temporary"
 BETA_PREFERENCE = "QuickFileReceivesBetaUpdates"
@@ -145,6 +150,8 @@ class CommunityUpdateControllerTests(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix="community-update-controller-", dir=TEMPORARY)
         cls.addClassCleanup(cls.temporary.cleanup)
         cls.directory = Path(cls.temporary.name)
+        compile_fixture_localizations(cls.directory)
+        modules = shared_native_modules()
         main = cls.directory / "CommunityUpdateCases.swift"
         main.write_text(HARNESS)
         cls.executable = cls.directory / "CommunityUpdateCases"
@@ -152,6 +159,8 @@ class CommunityUpdateControllerTests(unittest.TestCase):
         compiled = subprocess.run([
             "xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
             "-D", "QUICKFILE_COMMUNITY", "-module-cache-path", str(cls.directory / "module-cache"),
+            "-I", str(modules), "-L", str(modules), "-lQuickFileCore",
+            "-Xlinker", "-rpath", "-Xlinker", str(modules),
             str(ROOT / "QuickFileApp" / "UpdateController.swift"), str(main),
             "-o", str(cls.executable),
         ], capture_output=True, text=True, timeout=60, cwd=ROOT)

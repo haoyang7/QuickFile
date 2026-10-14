@@ -8,9 +8,9 @@ import tempfile
 import unittest
 
 if __package__:
-    from .native_test_support import shared_native_modules
+    from .native_test_support import compile_fixture_localizations, shared_native_modules
 else:
-    from native_test_support import shared_native_modules
+    from native_test_support import compile_fixture_localizations, shared_native_modules
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -22,6 +22,7 @@ class CreationBoundaryTimingTests(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix="quickfile-boundary-timing-")
         cls.addClassCleanup(cls.temporary.cleanup)
         output = Path(cls.temporary.name)
+        compile_fixture_localizations(output)
         modules = shared_native_modules()
         cls.executable = output / "CreationBoundaryTimingCases"
         compiled = subprocess.run(["xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",

@@ -9,6 +9,14 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def compile_fixture_localizations(directory):
+    """Give standalone CLI hosts real resources and deterministic Chinese output."""
+    subprocess.run([
+        "xcrun", "xcstringstool", "compile", str(ROOT / "Resources/Localizable.xcstrings"),
+        "--language", "zh-Hans", "--output-directory", str(directory),
+    ], check=True, capture_output=True, text=True, timeout=30, cwd=ROOT)
+
+
 @lru_cache(maxsize=1)
 def shared_native_modules():
     # Each process builds current sources afresh. Keep the libraries alive after
