@@ -8,7 +8,7 @@ PACKAGE_LOCK="${PROJECT_DIRECTORY}/QuickFile.xcodeproj/project.xcworkspace/xcsha
 TEST_ARCH=$(/usr/bin/uname -m)
 EXPECTED_APP_BUNDLE_ID="com.haoyoung.QuickFile"
 EXPECTED_EXTENSION_BUNDLE_ID="com.haoyoung.QuickFile.FinderExtension"
-EXPECTED_APP_GROUP="group.com.haoyoung.QuickFile"
+EXPECTED_STORAGE_PATH="/Library/Application Support/QuickFileCommunity/"
 EXPECTED_APP_CATEGORY="public.app-category.utilities"
 EXPECTED_MACOS_VERSION="13.0"
 APP_ICON_DIRECTORY="${PROJECT_DIRECTORY}/QuickFileApp/Assets.xcassets/AppIcon.appiconset"
@@ -153,14 +153,14 @@ verify_plist_value() {
 
 verify_plist_value \
     "QuickFileApp/QuickFile.entitlements" \
-    ":com.apple.security.application-groups:0" \
-    "${EXPECTED_APP_GROUP}" \
-    "QuickFile App Group entitlement"
+    ":com.apple.security.temporary-exception.files.home-relative-path.read-write:0" \
+    "${EXPECTED_STORAGE_PATH}" \
+    "QuickFile shared storage entitlement"
 verify_plist_value \
     "FinderExtension/FinderExtension.entitlements" \
-    ":com.apple.security.application-groups:0" \
-    "${EXPECTED_APP_GROUP}" \
-    "FinderExtension App Group entitlement"
+    ":com.apple.security.temporary-exception.files.home-relative-path.read-write:0" \
+    "${EXPECTED_STORAGE_PATH}" \
+    "FinderExtension shared storage entitlement"
 verify_plist_value \
     "QuickFileApp/QuickFile.entitlements" \
     ":com.apple.security.files.bookmarks.app-scope" \
@@ -337,6 +337,10 @@ for helper in \
     "XPCServices/Installer.xpc/Contents/MacOS/Installer" \
     "XPCServices/Downloader.xpc/Contents/MacOS/Downloader"; do
     verify_architectures "${SPARKLE_FRAMEWORK}/Versions/B/${helper}" "Sparkle ${helper}"
+done
+for bundle in "${APP_BUNDLE}" "${EXTENSION_BUNDLE}"; do
+    verify_plist_value "${bundle}/Contents/Info.plist" ":QuickFileStorageMode" "local-shared" "Shared storage mode"
+    verify_plist_value "${bundle}/Contents/Info.plist" ":QuickFileDistributionChannel" "development" "Default build channel"
 done
 verify_plist_value "${APP_BUNDLE}/Contents/Info.plist" ":QuickFileUpdatesEnabled" "NO" "Default offline update configuration"
 verify_plist_value "${APP_BUNDLE}/Contents/Info.plist" ":SUEnableInstallerLauncherService" "true" "Sparkle installer service"

@@ -14,17 +14,17 @@
 
 ## 源码自编译与注册设备测试
 
-1. 使用测试者自己的 Apple 账号/团队，确认两个 Target 的 Bundle ID、App Group 和设备能力可用。个人团队能力取决于账号状态，不保证所有账号都能使用默认标识。
-2. 按 [README.md](README.md) 生成工程并 Clean 构建。若需替换标识，同步修改主 App、扩展、App Group 及配置断言，保留 App Sandbox。
-3. 核对嵌入扩展、版本/build、各 Target 的 Bundle ID、团队、App Group、权限及双架构，并执行严格签名检查；记录自己的产物哈希和环境。
+1. 使用测试者自己的 Apple 账号/团队，确认两个 Target 的 Bundle ID 和设备能力可用。个人团队能力取决于账号状态，不保证所有账号都能使用默认标识。
+2. 按 [README.md](README.md) 生成工程并 Clean 构建。若需替换标识，同步修改主 App、扩展及配置断言，保留 App Sandbox。
+3. 核对嵌入扩展、版本/build、各 Target 的 Bundle ID、团队、共享存储与渠道元数据、权限及双架构，并执行严格签名检查；记录自己的产物哈希和环境。
 4. 在系统默认安全设置下安装、启动并启用扩展。拒绝安装或启动时保留错误原文并停止该项，不关闭 Gatekeeper、移除隔离属性、重签包或用注册修复掩盖失败。
 5. 按 [测试指南](BETA_TEST_GUIDE.md) 和 [29 项验收清单](RELEASE_CHECKLIST.md) 填写自己的结果。开发签名只覆盖构建者或同时被主 App 与扩展描述文件覆盖的注册设备，不能代替普通用户分发验收。
 
 ## Developer ID 分发准入
 
 - 固定源码基线、工具链、依赖和构建参数；每个新候选递增 build，主 App 与扩展一致，营销版本使用数字格式，Beta 标记写在发布材料中。
-- Clean Archive，使用 Developer ID 导出，完成公证和装订；核对最终产物的签名、权限、嵌入扩展、双架构与 SHA-256。导出配置见 [Developer ID 配置](Release/ExportOptions-DeveloperID.plist)；[注册设备配置](Release/ExportOptions-RegisteredDevices.plist) 只用于对应开发测试范围。
-- 签名证书及所需描述文件的有效期覆盖整个测试窗口，注册设备范围必须同时覆盖两个 Target；同团队或签名完整不能替代 App ID、证书与描述文件授权匹配。
+- 设置 `QUICKFILE_DISTRIBUTION_CHANNEL=developer-id` 后 Clean Archive，使用 Developer ID 导出，完成公证和装订；核对最终产物的签名、权限、嵌入扩展、双架构与 SHA-256。导出配置见 [Developer ID 配置](Release/ExportOptions-DeveloperID.plist)；[注册设备配置](Release/ExportOptions-RegisteredDevices.plist) 只用于对应开发测试范围。
+- Developer ID 本地共享存储不要求 App Group profile；若携带 profile，必须验证其授权、签名证书和有效期。签名证书及所需描述文件的有效期覆盖整个测试窗口，注册设备范围必须同时覆盖两个 Target；同团队或签名完整不能替代 App ID、证书与描述文件授权匹配。
 - 用最终分发文件，在默认安全设置的新机器完成下载、安装、首次启动、扩展启用、授权与创建闭环。
 - 完成 P0，并按 P1 记录系统、架构、存储与发布准备范围。性能、长期内存、完整诊断、无窗口 Desktop、Mac 重启/注销及 HTTPS 跨版本更新的缺口不得由旧候选或 CI 结果代替。
 

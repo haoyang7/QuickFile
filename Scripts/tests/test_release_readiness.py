@@ -66,7 +66,8 @@ elif name == "git":
         sys.exit(1)
 elif name == "PlistBuddy":
     key = args[1].removeprefix("Print :")
-    values = {"com.apple.security.application-groups:0": "group.com.haoyoung.QuickFile",
+    values = {"com.apple.security.temporary-exception.files.home-relative-path.read-write:0": "/Library/Application Support/QuickFileCommunity/",
+              "QuickFileStorageMode": "local-shared", "QuickFileDistributionChannel": "development",
               "com.apple.security.files.bookmarks.app-scope": "true",
               "CFBundleIdentifier": ("com.haoyoung.QuickFile.FinderExtension" if "FinderExtension" in args[-1] else "com.haoyoung.QuickFile"),
               "LSMinimumSystemVersion": "13.0", "CFBundleIconName": "AppIcon",

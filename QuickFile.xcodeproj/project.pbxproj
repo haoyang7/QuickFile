@@ -137,11 +137,13 @@
 		E0F796E8A486EFB4F5521BB2 /* TemplateRefreshObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 568830A921BCC2DD577254B0 /* TemplateRefreshObserver.swift */; };
 		E283C18E2EA341A326212682 /* FinderExtensionFailureClassifierTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 066EF97868F6AA374AA5799A /* FinderExtensionFailureClassifierTests.swift */; };
 		E320FA91337CC73DB0820C18 /* TemplateRendererTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5FDAA0D4D2FB8BB2346AF37 /* TemplateRendererTests.swift */; };
+		E469B604744FFE72EE2355D2 /* QuickFileSharedStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6B42E5ED80F9F6963D268C6 /* QuickFileSharedStorage.swift */; };
 		E47EF2874E6B1EF255CAAEF1 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A98837378F7633FA88772DA5 /* Sparkle */; };
 		E5643E6DFC2BD3529635B443 /* CreateFileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 832178F2716872E94255C60E /* CreateFileView.swift */; };
 		EC0D8A4D58ECEF5C45AB7ED4 /* AppNavigationStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0791CEA28B38C2ABBCB312C6 /* AppNavigationStateTests.swift */; };
 		EC6C6561A654C4046F2206C6 /* DiagnosticsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D9B3CDA5449BF1CC2583988 /* DiagnosticsView.swift */; };
 		EF48855A64A1677E12617FD3 /* FinderMenuSettingsCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39B55FD86EAE189F76F98A53 /* FinderMenuSettingsCacheTests.swift */; };
+		EFDF7987CCA404C269308671 /* LocalSharedStorageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D26BC9D378BFBACA2C39514 /* LocalSharedStorageTests.swift */; };
 		F21718EC55C486B8E5690D35 /* TemplateDraft.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11213A510F870A9DABE374A8 /* TemplateDraft.swift */; };
 		F4BC80F2614CFBE9BB681B29 /* FinderFileCreationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AF2CFBC05B2C307B9D8413F /* FinderFileCreationCoordinator.swift */; };
 		F5C476329F798A749E46E802 /* FinderFileCreationCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E70E478503345AEDBB7D1C4 /* FinderFileCreationCoordinatorTests.swift */; };
@@ -245,6 +247,7 @@
 		088046F94257B0ACE6BA7704 /* TemplateTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateTransfer.swift; sourceTree = "<group>"; };
 		0AA7F01E79EEE1F9822347C0 /* QuickFileViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickFileViewModel.swift; sourceTree = "<group>"; };
 		0C7C1C36BCB8DFEA5F45D81A /* FileCreationServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileCreationServiceTests.swift; sourceTree = "<group>"; };
+		0D26BC9D378BFBACA2C39514 /* LocalSharedStorageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalSharedStorageTests.swift; sourceTree = "<group>"; };
 		0D9B3CDA5449BF1CC2583988 /* DiagnosticsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsView.swift; sourceTree = "<group>"; };
 		11213A510F870A9DABE374A8 /* TemplateDraft.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateDraft.swift; sourceTree = "<group>"; };
 		12FA5DA47909238830425C80 /* ContainingApplicationLauncherTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContainingApplicationLauncherTests.swift; sourceTree = "<group>"; };
@@ -319,6 +322,7 @@
 		A194B32242F58EC5A375C8FA /* DiagnosticsViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsViewModelTests.swift; sourceTree = "<group>"; };
 		A3317EF63C18D53876BA073B /* TemplateStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateStoreTests.swift; sourceTree = "<group>"; };
 		A4F735220B5B554AAAFCE639 /* FinderFirstUseVerificationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderFirstUseVerificationTests.swift; sourceTree = "<group>"; };
+		A6B42E5ED80F9F6963D268C6 /* QuickFileSharedStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickFileSharedStorage.swift; sourceTree = "<group>"; };
 		A91204A8295F6E74C568C70D /* DiagnosticsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsViewModel.swift; sourceTree = "<group>"; };
 		AC3648F8CF0B9441552091DF /* FinderMenuModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderMenuModelTests.swift; sourceTree = "<group>"; };
 		AD2E95C3D552962F9200D752 /* AuthorizedDirectoryStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthorizedDirectoryStoreTests.swift; sourceTree = "<group>"; };
@@ -481,6 +485,7 @@
 				6128F9807E9A7F6F31006F4E /* FinderOperationSchedulerTests.swift */,
 				48448018DB0436AD4C4D9626 /* FinderRequestRecoveryTests.swift */,
 				83027CE6F9EA258812F671DF /* FinderTemplateCacheTests.swift */,
+				0D26BC9D378BFBACA2C39514 /* LocalSharedStorageTests.swift */,
 				921E2264A84B21DF08444640 /* LockedTestValue.swift */,
 				C9BF31D6EB774DACD50EE133 /* MemoryLifecycleTests.swift */,
 				B13B0E3D78B93DA04B41F1A5 /* OfficeTemplateTests.swift */,
@@ -535,6 +540,7 @@
 				C6FA65EFDFA327C309142907 /* OfficeDocumentFormat.swift */,
 				5A102FC0B11A594FAE999203 /* PrivateFileStagingDirectory.swift */,
 				347B9D94733859AD411A3151 /* QuickFileAppRoute.swift */,
+				A6B42E5ED80F9F6963D268C6 /* QuickFileSharedStorage.swift */,
 				BC523DB167769877F7912977 /* SecurityScopedBookmarkClient.swift */,
 				6C82CB64A81FC3B618590594 /* TemplateByteOperations.swift */,
 				11213A510F870A9DABE374A8 /* TemplateDraft.swift */,
@@ -842,6 +848,7 @@
 				AE72614A6E93B585989AC13B /* FinderExtensionProbe.swift in Sources */,
 				E094ACA09F3BD77749FAD569 /* FinderFirstUseVerification.swift in Sources */,
 				3271CCACB845F3A7665B2807 /* FinderMenuSettingsStore.swift in Sources */,
+				E469B604744FFE72EE2355D2 /* QuickFileSharedStorage.swift in Sources */,
 				0D873745AAA2B67D9F3EC532 /* SecurityScopedBookmarkClient.swift in Sources */,
 				C7D3CE099D246604A550866E /* TemplateStore.swift in Sources */,
 				5AF42B8397FF39B3E21354F9 /* TemplateStoreFailureClassifier.swift in Sources */,
@@ -970,6 +977,7 @@
 				298A6055FD6EF5F945354F13 /* FinderRequestRecoveryTests.swift in Sources */,
 				1E157850F5129209BF1406F5 /* FinderTemplateCache.swift in Sources */,
 				4F51A4108633DC2EF1EAD539 /* FinderTemplateCacheTests.swift in Sources */,
+				EFDF7987CCA404C269308671 /* LocalSharedStorageTests.swift in Sources */,
 				1B1887813805FD1CE7C7BD38 /* LockedTestValue.swift in Sources */,
 				57B73F19604947AC32D71C51 /* MemoryLifecycleTests.swift in Sources */,
 				3F803B3EE60FA0905DBACF9E /* OfficeTemplateTests.swift in Sources */,
@@ -1121,7 +1129,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 80;
+				CURRENT_PROJECT_VERSION = 83;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -1139,6 +1147,8 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = NO;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				QUICKFILE_DISTRIBUTION_CHANNEL = development;
+				QUICKFILE_STORAGE_MODE = "local-shared";
 				SDKROOT = macosx;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
@@ -1316,7 +1326,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 80;
+				CURRENT_PROJECT_VERSION = 83;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -1340,6 +1350,8 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = NO;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				QUICKFILE_DISTRIBUTION_CHANNEL = development;
+				QUICKFILE_STORAGE_MODE = "local-shared";
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";

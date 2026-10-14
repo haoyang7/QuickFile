@@ -19,6 +19,7 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
     }
 
     private let defaults: UserDefaults?
+    private let localStorage: LocalSharedStorage?
     private let failureHistoryFileURL: URL?
     private let maximumFailureCount: Int
     private let failureRetentionInterval: TimeInterval
@@ -26,34 +27,28 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
     private let legacyFailureHistoryKey = "finderExtension.failureHistory.v1"
 
     public init() {
-        let containerURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: QuickFileConfiguration.appGroupIdentifier
-        )
-        defaults = containerURL == nil
-            ? nil
-            : UserDefaults(suiteName: QuickFileConfiguration.appGroupIdentifier)
-        failureHistoryFileURL = containerURL?.appendingPathComponent(
-            "finderExtension.failureHistory.v1.json",
-            isDirectory: false
-        )
-        maximumFailureCount = Self.defaultMaximumFailureCount
-        failureRetentionInterval = TimeInterval(Self.defaultFailureRetentionDays * 24 * 60 * 60)
+        let directory = QuickFileSharedStorage.directory()
+        self.init(defaults: directory == nil ? nil : QuickFileSharedStorage.legacyDefaults(),
+                  failureHistoryFileURL: directory?.appendingPathComponent("finderExtension.failureHistory.v1.json"),
+                  localStorage: QuickFileSharedStorage.local)
     }
 
     init(
         defaults: UserDefaults?,
         failureHistoryFileURL: URL?,
+        localStorage: LocalSharedStorage? = nil,
         maximumFailureCount: Int = FinderExtensionActivityStore.defaultMaximumFailureCount,
         failureRetentionDays: Int = FinderExtensionActivityStore.defaultFailureRetentionDays
     ) {
-        self.defaults = defaults
+        self.localStorage = localStorage
+        self.defaults = localStorage == nil ? defaults : nil
         self.failureHistoryFileURL = failureHistoryFileURL
         self.maximumFailureCount = max(1, maximumFailureCount)
         failureRetentionInterval = TimeInterval(max(1, failureRetentionDays) * 24 * 60 * 60)
     }
 
     public var isAvailable: Bool {
-        defaults != nil && failureHistoryFileURL != nil
+        (defaults != nil || localStorage != nil) && failureHistoryFileURL != nil
     }
 
     // v2 is authoritative, including an empty initial state. The defaults value is only
@@ -73,13 +68,13 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
     private func loadLatestActivity(alongside fileURL: URL) throws -> LatestActivityState {
         let latestURL = latestActivityURL(alongside: fileURL)
         if FileManager.default.fileExists(atPath: latestURL.path) {
-            return try JSONDecoder().decode(LatestActivityState.self, from: Data(contentsOf: latestURL))
+            return try JSONDecoder().decode(LatestActivityState.self, from: readData(latestURL))
         }
         let legacyActivity = try defaults?.data(forKey: activityKey).map {
             try JSONDecoder().decode(FinderExtensionActivity.self, from: $0)
         }
         let state = LatestActivityState(activity: legacyActivity)
-        try JSONEncoder().encode(state).write(to: latestURL, options: .atomic)
+        try writeData(JSONEncoder().encode(state), to: latestURL)
         defaults?.removeObject(forKey: activityKey)
         return state
     }
@@ -127,9 +122,8 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
                 latest = nil
             }
             if latest.map({ timestamp >= $0.timestamp }) ?? true {
-                try JSONEncoder().encode(LatestActivityState(activity: activity)).write(
-                    to: latestActivityURL(alongside: fileURL), options: .atomic
-                )
+                try writeData(JSONEncoder().encode(LatestActivityState(activity: activity)),
+                              to: latestActivityURL(alongside: fileURL))
                 defaults?.removeObject(forKey: activityKey)
             }
             guard failure != nil else { return }
@@ -149,10 +143,15 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
     private func withLockedFailureHistory<Result>(
         _ operation: (URL) throws -> Result
     ) throws -> Result {
-        guard defaults != nil, let failureHistoryFileURL else {
+        guard isAvailable, let failureHistoryFileURL else {
             throw StoreError.sharedDefaultsUnavailable
         }
 
+        if let localStorage {
+            return try localStorage.withLock(at: failureHistoryFileURL.appendingPathExtension("lock")) {
+                try operation(failureHistoryFileURL)
+            }
+        }
         let directoryURL = failureHistoryFileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(
             at: directoryURL,
@@ -180,7 +179,7 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
         if FileManager.default.fileExists(atPath: fileURL.path) {
             return try JSONDecoder().decode(
                 [FinderExtensionActivity].self,
-                from: Data(contentsOf: fileURL)
+                from: readData(fileURL)
             )
         }
 
@@ -197,10 +196,20 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
         return legacyHistory
     }
 
+    private func readData(_ url: URL) throws -> Data {
+        if let localStorage { return try localStorage.read(url) }
+        return try Data(contentsOf: url)
+    }
+
+    private func writeData(_ data: Data, to url: URL) throws {
+        if let localStorage { try localStorage.write(data, to: url) }
+        else { try data.write(to: url, options: .atomic) }
+    }
+
     private func persistFailureHistory(
         _ failureHistory: [FinderExtensionActivity],
         to fileURL: URL
     ) throws {
-        try JSONEncoder().encode(failureHistory).write(to: fileURL, options: .atomic)
+        try writeData(JSONEncoder().encode(failureHistory), to: fileURL)
     }
 }

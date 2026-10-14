@@ -70,6 +70,7 @@ struct AuthorizedDirectoryRepository: @unchecked Sendable {
     }
 
     private let directory: URL?
+    private let localStorage: LocalSharedStorage?
     private let legacyData: () throws -> Data?
     private let decodedCache = OSAllocatedUnfairLock(initialState: DecodedCache())
     private let didDecodeSnapshot: (@Sendable () -> Void)?
@@ -80,11 +81,12 @@ struct AuthorizedDirectoryRepository: @unchecked Sendable {
     private static let maximumCachedBytes = 256 * 1024
     private static let authorizationsKey = "authorizedDirectories.v1"
 
-    init(containerURL: URL?) {
+    init(containerURL: URL?, localStorage: LocalSharedStorage? = nil) {
+        self.localStorage = localStorage
         directory = containerURL
         didDecodeSnapshot = nil
         legacyData = {
-            guard let containerURL else { return nil }
+            guard localStorage == nil, let containerURL else { return nil }
             let preferencesURL = containerURL
                 .appendingPathComponent("Library/Preferences", isDirectory: true)
                 .appendingPathComponent(QuickFileConfiguration.appGroupIdentifier + ".plist")
@@ -108,6 +110,7 @@ struct AuthorizedDirectoryRepository: @unchecked Sendable {
     // Tests inject a private directory and legacy defaults; production migration reads
     // the on-disk App Group plist, never a process-local preferences cache.
     init(defaults: UserDefaults?, storageDirectory: URL?, didDecodeSnapshot: (@Sendable () -> Void)? = nil) {
+        localStorage = nil
         directory = defaults == nil ? nil : storageDirectory
         self.didDecodeSnapshot = didDecodeSnapshot
         legacyData = { defaults?.data(forKey: Self.authorizationsKey) }
@@ -152,6 +155,9 @@ struct AuthorizedDirectoryRepository: @unchecked Sendable {
     private func withLock<Result>(_ operation: () throws -> Result) throws -> Result {
         guard let directory else { throw AuthorizedDirectoryStoreError.sharedDefaultsUnavailable }
         do {
+            if let localStorage {
+                return try localStorage.withLock(at: directory.appendingPathComponent("authorizedDirectories.lock"), operation)
+            }
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let descriptor = open(directory.appendingPathComponent("authorizedDirectories.lock").path,
                                   O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
@@ -173,12 +179,12 @@ struct AuthorizedDirectoryRepository: @unchecked Sendable {
         let url = directory!.appendingPathComponent("authorizedDirectories.v2.json")
         let data: Data
         do {
-            data = try Data(contentsOf: url)
+            data = try readData(url)
         } catch let error as NSError where error.domain == NSCocoaErrorDomain
             && error.code == NSFileReadNoSuchFileError {
             let marker = directory!.appendingPathComponent("authorizedDirectories.migrated")
             do {
-                _ = try Data(contentsOf: marker)
+                _ = try readData(marker)
                 throw AuthorizedDirectoryStoreError.persistenceFailed(error)
             } catch let markerError as NSError where markerError.domain == NSCocoaErrorDomain
                 && markerError.code == NSFileReadNoSuchFileError {
@@ -191,7 +197,7 @@ struct AuthorizedDirectoryRepository: @unchecked Sendable {
             // Persist even an empty migration. Later revocations must never fall back
             // to the legacy table, which older processes may still have cached.
             try saveLocked(migrated)
-            try Data().write(to: marker, options: .atomic)
+            try writeData(Data(), to: marker)
             return migrated
         }
         let snapshot: Snapshot
@@ -222,18 +228,27 @@ struct AuthorizedDirectoryRepository: @unchecked Sendable {
         // read or mutation may leave a snapshot eligible for legacy fallback.
         let marker = directory!.appendingPathComponent("authorizedDirectories.migrated")
         do {
-            _ = try Data(contentsOf: marker)
+            _ = try readData(marker)
         } catch let error as NSError where error.domain == NSCocoaErrorDomain
             && error.code == NSFileReadNoSuchFileError {
-            try Data().write(to: marker, options: .atomic)
+            try writeData(Data(), to: marker)
         }
         return snapshot
     }
 
     private func saveLocked(_ snapshot: Snapshot) throws {
         let data = try JSONEncoder().encode(snapshot)
-        try data.write(to: directory!.appendingPathComponent("authorizedDirectories.v2.json"),
-                       options: .atomic)
+        try writeData(data, to: directory!.appendingPathComponent("authorizedDirectories.v2.json"))
+    }
+
+    private func readData(_ url: URL) throws -> Data {
+        if let localStorage { return try localStorage.read(url) }
+        return try Data(contentsOf: url)
+    }
+
+    private func writeData(_ data: Data, to url: URL) throws {
+        if let localStorage { try localStorage.write(data, to: url) }
+        else { try data.write(to: url, options: .atomic) }
     }
 
     private func posixError() -> NSError {

@@ -13,7 +13,9 @@ settings:
     ARCHS: "arm64 x86_64"
     ONLY_ACTIVE_ARCH: "NO"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "80"
+    CURRENT_PROJECT_VERSION: "83"
+    QUICKFILE_STORAGE_MODE: "local-shared"
+    QUICKFILE_DISTRIBUTION_CHANNEL: "development"
 
 packages:
   Sparkle:
@@ -59,6 +61,7 @@ targets:
     platform: macOS
     deploymentTarget: "13.0"
     sources:
+      - path: Shared/QuickFileSharedStorage.swift
       - path: Shared/AuthorizedDirectory.swift
       - path: Shared/AuthorizedDirectoryPolicy.swift
       - path: Shared/AuthorizedDirectoryRepository.swift
@@ -131,6 +134,8 @@ targets:
       properties:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        QuickFileStorageMode: "$(QUICKFILE_STORAGE_MODE)"
+        QuickFileDistributionChannel: "$(QUICKFILE_DISTRIBUTION_CHANNEL)"
         UTExportedTypeDeclarations:
           - UTTypeIdentifier: com.haoyoung.QuickFile.template-order
             UTTypeDescription: QuickFile Template Order
@@ -159,8 +164,8 @@ targets:
         com.apple.security.temporary-exception.mach-lookup.global-name:
           - $(PRODUCT_BUNDLE_IDENTIFIER)-spks
           - $(PRODUCT_BUNDLE_IDENTIFIER)-spki
-        com.apple.security.application-groups:
-          - group.com.haoyoung.QuickFile
+        com.apple.security.temporary-exception.files.home-relative-path.read-write:
+          - "/Library/Application Support/QuickFileCommunity/"
     dependencies:
       - package: Sparkle
       - target: FinderExtension
@@ -200,6 +205,8 @@ targets:
         CFBundleDisplayName: QuickFile Finder Extension
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        QuickFileStorageMode: "$(QUICKFILE_STORAGE_MODE)"
+        QuickFileDistributionChannel: "$(QUICKFILE_DISTRIBUTION_CHANNEL)"
         LSUIElement: true
         NSExtension:
           NSExtensionPointIdentifier: com.apple.FinderSync
@@ -209,8 +216,8 @@ targets:
       properties:
         com.apple.security.app-sandbox: true
         com.apple.security.files.bookmarks.app-scope: true
-        com.apple.security.application-groups:
-          - group.com.haoyoung.QuickFile
+        com.apple.security.temporary-exception.files.home-relative-path.read-write:
+          - "/Library/Application Support/QuickFileCommunity/"
     dependencies:
       - target: QuickFileCore
       - target: QuickFileInfrastructure

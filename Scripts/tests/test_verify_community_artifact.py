@@ -31,7 +31,7 @@ def make_fixture(directory, *, include_sparkle=False):
         identifier = {"app": MODULE.APP_ID, "finder_extension": MODULE.EXTENSION_ID}.get(label, "org.sparkle-project." + label)
         info = {"CFBundleIdentifier": identifier, "CFBundleExecutable": binary.name}
         if label in ("app", "finder_extension"):
-            info.update({"CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "70", "LSMinimumSystemVersion": "13.0"})
+            info.update({"CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "70", "LSMinimumSystemVersion": "13.0", "QuickFileStorageMode": "local-shared", "QuickFileDistributionChannel": "community"})
         if label == "app":
             info.update({"QuickFileUpdatesEnabled": "NO", "SUFeedURL": "", "SUPublicEDKey": ""})
             for key in ("SUEnableAutomaticChecks", "SUAllowsAutomaticUpdates", "SUEnableSystemProfiling", "SUSendProfileInfo", "SUEnableJavaScript", "SUEnableInstallerLauncherService", "SUEnableDownloaderService"):
@@ -107,6 +107,46 @@ class CommunityArtifactTests(unittest.TestCase):
         self.assertEqual(report["scope"], "artifact only")
         self.assertEqual(report["trust"], "ad-hoc/unnotarized")
         self.assertIn("Finder integration", report["unproven"])
+
+    def test_rejects_old_or_mixed_storage_modes(self):
+        for relative in ("Contents/Info.plist", "Contents/PlugIns/FinderExtension.appex/Contents/Info.plist"):
+            path = self.app / relative
+            original = MODULE.read_plist(path)
+            for value in (None, "community", "app-group", "", True):
+                with self.subTest(component=relative, mode=value):
+                    changed = dict(original)
+                    if value is None:
+                        changed.pop("QuickFileStorageMode")
+                    else:
+                        changed["QuickFileStorageMode"] = value
+                    write_plist(path, changed)
+                    self.assertEqual(self.report()["verdict"], "fail")
+            write_plist(path, original)
+
+    def test_rejects_missing_or_wrong_channel_on_either_component(self):
+        for relative in ("Contents/Info.plist", "Contents/PlugIns/FinderExtension.appex/Contents/Info.plist"):
+            path = self.app / relative
+            original = MODULE.read_plist(path)
+            for value in (None, "developer-id", "development", True):
+                changed = dict(original)
+                if value is None:
+                    changed.pop("QuickFileDistributionChannel")
+                else:
+                    changed["QuickFileDistributionChannel"] = value
+                write_plist(path, changed)
+                self.assertEqual(self.report()["verdict"], "fail")
+            write_plist(path, original)
+
+    def test_rejects_group_and_broader_directory_access(self):
+        key = "com.apple.security.temporary-exception.files.home-relative-path.read-write"
+        for label in ("app", "finder_extension"):
+            for changes in ({"com.apple.security.application-groups": ["group.com.haoyoung.QuickFile"]},
+                            {key: ["/Library/Application Support/"]},
+                            {key: [MODULE.CONTRACT.STORAGE_PATH, "/Documents/"]}):
+                with self.subTest(component=label, changes=changes):
+                    self.runner.entitlements[label] = dict(MODULE.expected_entitlements(label), **changes)
+                    self.assertEqual(self.report()["verdict"], "fail")
+                    self.runner.entitlements.clear()
 
     def test_rejects_team_authority_missing_runtime_and_nonadhoc(self):
         for field, value in (("team", "FAKETEAM"), ("authority", "Authority=Developer ID Application: private name\n"), ("flags", "0x2(adhoc)"), ("signature", "signed")):

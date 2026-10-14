@@ -6,7 +6,8 @@ import Sparkle
 
 struct UpdateConfiguration {
     init?(info: [String: Any]) {
-        guard let enabled = info["QuickFileUpdatesEnabled"],
+        guard info["QuickFileDistributionChannel"] as? String == "developer-id",
+              let enabled = info["QuickFileUpdatesEnabled"],
               (enabled as? NSNumber)?.boolValue == true || (enabled as? String) == "YES",
               let feed = info["SUFeedURL"] as? String,
               let url = URL(string: feed),

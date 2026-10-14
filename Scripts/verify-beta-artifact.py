@@ -17,9 +17,11 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 
-EXPECTED_APP_ID = "com.haoyoung.QuickFile"
-EXPECTED_EXTENSION_ID = "com.haoyoung.QuickFile.FinderExtension"
-EXPECTED_APP_GROUP = "group.com.haoyoung.QuickFile"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import distribution_contract as CONTRACT
+
+EXPECTED_APP_ID = CONTRACT.APP_ID
+EXPECTED_EXTENSION_ID = CONTRACT.EXTENSION_ID
 EXPECTED_ARCHITECTURES = {"arm64", "x86_64"}
 EXPECTED_EXECUTABLES = {"app": "QuickFile", "finder_extension": "FinderExtension"}
 COMMAND_TIMEOUT_SECONDS = 20
@@ -231,14 +233,6 @@ def _profile_summary(
     return summary, profile, None
 
 
-def _profile_groups(profile: dict[str, Any]) -> list[Any]:
-    entitlements = profile.get("Entitlements")
-    if not isinstance(entitlements, dict):
-        return []
-    groups = entitlements.get("com.apple.security.application-groups")
-    return groups if isinstance(groups, list) else []
-
-
 def _profile_teams(profile: dict[str, Any]) -> list[Any]:
     teams = profile.get("TeamIdentifier")
     return teams if isinstance(teams, list) else []
@@ -308,6 +302,8 @@ def inspect_artifact(
     checks: list[dict[str, Any]] = []
     components: dict[str, Any] = {}
     signed_entitlements: dict[str, dict[str, Any] | None] = {}
+    channel = "developer-id" if mode == "developer-id" else "development"
+    has_updater = (app / "Contents/Frameworks/Sparkle.framework").exists()
 
     for label, bundle, expected_id in bundles:
         info = _read_plist(bundle / "Contents/Info.plist")
@@ -315,6 +311,9 @@ def inspect_artifact(
             checks.append(_check(f"{label}.bundle", None, "missing or invalid Info.plist"))
             components[label] = {"bundle_id": None, "minimum_system_version": None}
             continue
+        configuration_ok = CONTRACT.configuration_matches(info, channel)
+        checks.append(_check(f"{label}.distribution_configuration", configuration_ok,
+                             "local-shared storage and expected channel" if configuration_ok else "storage mode or distribution channel mismatch"))
         bundle_id = info.get("CFBundleIdentifier")
         minimum = info.get("LSMinimumSystemVersion")
         version = _safe_version(info.get("CFBundleShortVersionString"))
@@ -352,12 +351,30 @@ def inspect_artifact(
         runtime = metadata is not None and metadata.get("hardened_runtime") == "yes"
         checks.append(_check(f"{label}.hardened_runtime", runtime if metadata is not None else None, "enabled" if runtime else metadata_error or "missing Hardened Runtime"))
 
-        entitlements, entitlement_error = _all_architecture_values(runner, bundle, _entitlements)
+        def read_distribution_entitlements(runner, bundle, architecture):
+            values, error = _entitlements(runner, bundle, architecture)
+            if values is None:
+                return None, error
+            permission_match = CONTRACT.signed_permissions_match(
+                values, label, updater=has_updater, development=mode == "registered-devices"
+            )
+            team = components[label].get("_team")
+            identity = f"{team}.{expected_id}"
+            identity_keys = ("com.apple.application-identifier", "application-identifier")
+            claims = [values[key] for key in identity_keys if key in values]
+            require_claim = mode == "registered-devices" or (bundle / "Contents/embedded.provisionprofile").exists()
+            identity_match = (bool(claims) or not require_claim) and all(value == identity for value in claims)
+            if "com.apple.developer.team-identifier" in values:
+                identity_match = identity_match and values["com.apple.developer.team-identifier"] == team
+            # Evaluate each complete slice before intersecting values. An extra
+            # permission or mismatched optional claim must not vanish in the merge.
+            return dict(values, _permission_contract=permission_match, _identity_contract=identity_match), None
+
+        entitlements, entitlement_error = _all_architecture_values(runner, bundle, read_distribution_entitlements)
         signed_entitlements[label] = entitlements
-        groups = entitlements.get("com.apple.security.application-groups") if entitlements else None
-        group_matches = isinstance(groups, list) and groups == [EXPECTED_APP_GROUP]
-        checks.append(_check(f"{label}.app_group", group_matches if entitlements is not None else None, "matches expected App Group" if group_matches else entitlement_error or "unexpected App Group"))
-        components[label]["app_group_matches"] = group_matches
+        contract_matches = entitlements is not None and entitlements.get("_permission_contract") is True
+        checks.append(_check(f"{label}.permission_contract", contract_matches if entitlements is not None else None,
+                             "exact shared-storage permissions" if contract_matches else entitlement_error or "unexpected or missing permissions"))
 
         binary = bundle / "Contents/MacOS" / expected_executable
         binary_hash = _sha256(binary)
@@ -423,11 +440,10 @@ def inspect_artifact(
     signed_application_identifiers: dict[str, str | None] = {}
     for label, _, expected_id in bundles:
         entitlements = signed_entitlements.get(label)
-        actual = entitlements.get("com.apple.application-identifier") if entitlements else None
-        expected = f"{components.get(label, {}).get('_team')}.{expected_id}"
-        matches = isinstance(actual, str) and actual == expected
+        actual = (entitlements.get("com.apple.application-identifier") or entitlements.get("application-identifier")) if entitlements else None
+        matches = entitlements is not None and entitlements.get("_identity_contract") is True
         signed_application_identifiers[label] = actual if isinstance(actual, str) else None
-        checks.append(_check(f"{label}.signature_application_identifier", matches, "matches signing team and bundle ID" if matches else "missing or incorrect signed application identifier"))
+        checks.append(_check(f"{label}.signature_application_identifier", matches, "claims match signing identity; absent claims allowed only without a Developer ID profile" if matches else "missing or incorrect signed identity claims"))
 
     expected_certificate = "developer-id-application" if mode == "developer-id" else "apple-development"
     certificate_kinds = [components.get(label, {}).get("certificate_kind") for label in ("app", "finder_extension")]
@@ -453,18 +469,17 @@ def inspect_artifact(
         checks.append(_check(f"{label}.profile_validity", valid if error is None else None, f"at least {min_valid_days:g} days remaining" if valid else error or f"requires at least {min_valid_days:g} days remaining"))
 
     profiles_present = len(decoded_profiles) == 2
-    checks.append(_check("distribution.embedded_profiles", profiles_present, "profiles present for app and extension" if profiles_present else "app and extension profiles are required for this App Group"))
-    profile_group_match = profiles_present and all(
-        EXPECTED_APP_GROUP in _profile_groups(profile)
-        for _, profile in decoded_profiles
-    )
-    checks.append(_check("distribution.profile_app_group", profile_group_match, "profile App Groups authorize signed App Group" if profile_group_match else "profile App Group authorization is missing"))
-    profile_team_match = profiles_present and all(
+    profiles_decoded = len(decoded_profiles) == len(profiles)
+    profiles_valid = profiles_decoded and (mode == "developer-id" or profiles_present)
+    checks.append(_check("distribution.embedded_profiles", profiles_valid,
+                         "profiles optional for Developer ID; any present profile must validate" if mode == "developer-id"
+                         else "app and extension profiles required for registered-device distribution"))
+    profile_team_match = profiles_valid and all(
         components[label].get("_team") in _profile_teams(profile)
         for label, profile in decoded_profiles
     )
     checks.append(_check("distribution.profile_team", profile_team_match, "profile teams match signatures" if profile_team_match else "profile team does not match signature"))
-    profile_app_id_match = profiles_present and all(
+    profile_app_id_match = profiles_valid and all(
         _application_identifier_matches(
             _profile_application_identifier(profile),
             signed_application_identifiers.get(label),
@@ -474,6 +489,8 @@ def inspect_artifact(
     checks.append(_check("distribution.profile_application_identifier", profile_app_id_match, "profile App IDs authorize signed identifiers" if profile_app_id_match else "profile App ID authorization is missing"))
     profiles_by_label = dict(decoded_profiles)
     for label, bundle, _ in bundles:
+        if mode == "developer-id" and not (bundle / "Contents/embedded.provisionprofile").exists():
+            continue
         certificate_results = [
             (architecture, *_leaf_certificate_matches_profile(runner, bundle, profiles_by_label.get(label), architecture))
             for architecture in sorted(EXPECTED_ARCHITECTURES)

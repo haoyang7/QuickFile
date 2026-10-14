@@ -37,7 +37,7 @@ open QuickFile.xcodeproj
 
 维护者的 GitHub Actions 打包入口、五项 artifact 和不自动公开 Release 的约束见[免费自行分发流程](COMMUNITY_DISTRIBUTION.md#github-actions-打包)。
 
-证书签名构建需要自己的 Apple 开发团队及相应 App ID、扩展 ID 和 App Group 能力。将 `YOUR_TEAM_ID` 替换为有权使用这些标识的团队：
+证书签名构建需要自己的 Apple 开发团队及相应 App ID、扩展 ID。两种站外渠道均使用精确路径权限访问同一本地共享目录，不要求 App Group 能力。将 `YOUR_TEAM_ID` 替换为有权使用这些标识的团队：
 
 ```bash
 xcodebuild \
@@ -57,9 +57,10 @@ xcodebuild \
 | --- | --- |
 | 主应用 | `com.haoyoung.QuickFile` |
 | Finder 扩展 | `com.haoyoung.QuickFile.FinderExtension` |
-| App Group | `group.com.haoyoung.QuickFile` |
+| 共享存储 | `~/Library/Application Support/QuickFileCommunity/` |
+| 默认构建渠道 | `development` |
 
-两个 Target 使用同一开发团队。若自定义标识，同步修改 `project.yml`、`Shared/TemplateStore.swift` 中的配置及配置测试、校验脚本，再生成工程并自检。保留 App Sandbox 和 Hardened Runtime；扩展应嵌入 `QuickFile.app/Contents/PlugIns/FinderExtension.appex`。开发签名不能代替 Developer ID、公证和 Gatekeeper 验证。
+两个 Target 使用同一开发团队。若自定义标识，同步修改 `project.yml`、`Shared/TemplateStore.swift` 中的配置及配置测试、校验脚本，再生成工程并自检。保留 App Sandbox 和 Hardened Runtime；扩展应嵌入 `QuickFile.app/Contents/PlugIns/FinderExtension.appex`。开发签名不能代替 Developer ID、公证和 Gatekeeper 验证。Developer ID Archive 需设置 `QUICKFILE_DISTRIBUTION_CHANNEL=developer-id`；Community 构建脚本设置 `community`，两端存储模式均为 `local-shared`。
 
 ## 安装与使用
 

@@ -16,9 +16,7 @@ public struct AuthorizedDirectoryStore: Sendable {
 
     public init() {
         repository = AuthorizedDirectoryRepository(
-            containerURL: FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: QuickFileConfiguration.appGroupIdentifier
-            )
+            containerURL: QuickFileSharedStorage.directory(), localStorage: QuickFileSharedStorage.local
         )
         policy = AuthorizedDirectoryPolicy(fileManager: .default)
         bookmarkClient = .live

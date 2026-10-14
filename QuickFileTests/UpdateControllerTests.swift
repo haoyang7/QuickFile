@@ -1,10 +1,13 @@
 import XCTest
+#if !QUICKFILE_COMMUNITY
 import Sparkle
+#endif
 @testable import QuickFile
 
 final class UpdateConfigurationTests: XCTestCase {
     private var validInfo: [String: Any] {
         [
+            "QuickFileDistributionChannel": "developer-id",
             "QuickFileUpdatesEnabled": "YES",
             "SUFeedURL": "https://updates.example.org/appcast.xml",
             "SUPublicEDKey": Data(repeating: 1, count: 32).base64EncodedString()
@@ -17,6 +20,17 @@ final class UpdateConfigurationTests: XCTestCase {
         info["QuickFileUpdatesEnabled"] = false
         XCTAssertNil(UpdateConfiguration(info: info))
         info.removeValue(forKey: "QuickFileUpdatesEnabled")
+        XCTAssertNil(UpdateConfiguration(info: info))
+    }
+
+    func testOnlyDeveloperIDChannelCanEnableUpdates() {
+        for channel in ["community", "development", "", "other"] {
+            var info = validInfo
+            info["QuickFileDistributionChannel"] = channel
+            XCTAssertNil(UpdateConfiguration(info: info))
+        }
+        var info = validInfo
+        info.removeValue(forKey: "QuickFileDistributionChannel")
         XCTAssertNil(UpdateConfiguration(info: info))
     }
 
@@ -36,6 +50,7 @@ final class UpdateConfigurationTests: XCTestCase {
 
 @MainActor
 final class UpdateControllerTests: XCTestCase {
+    #if !QUICKFILE_COMMUNITY
     func testBackgroundChecksUseCurrentPreferenceAndManualChecksRemainAvailable() throws {
         let suite = "QuickFileUpdateTests-" + UUID().uuidString
         let defaults = UserDefaults(suiteName: suite)!
@@ -65,6 +80,7 @@ final class UpdateControllerTests: XCTestCase {
         XCTAssertThrowsError(try controller.updater(updater, mayPerform: .updatesInBackground))
         XCTAssertNoThrow(try controller.updater(updater, mayPerform: .updates))
     }
+    #endif
 
     func testTestBuildNeverStartsUpdaterAndBetaChoiceIsRetained() {
         let suite = "QuickFileUpdateTests-" + UUID().uuidString

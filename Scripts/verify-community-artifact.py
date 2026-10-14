@@ -14,9 +14,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-APP_ID = "com.haoyoung.QuickFile"
-EXTENSION_ID = APP_ID + ".FinderExtension"
-APP_GROUP = "group." + APP_ID
+# Scripts are also loaded by file path from the test harness.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import distribution_contract as CONTRACT
+
+APP_ID = CONTRACT.APP_ID
+EXTENSION_ID = CONTRACT.EXTENSION_ID
 ARCHITECTURES = ("arm64", "x86_64")
 SPARKLE = "Contents/Frameworks/Sparkle.framework"
 SPARKLE_COMPONENTS = (
@@ -52,21 +55,10 @@ def read_plist(path: Path) -> dict:
 
 
 def expected_entitlements(label: str) -> dict:
-    if label in ("app", "finder_extension"):
-        value = {
-            "com.apple.security.app-sandbox": True,
-            "com.apple.security.application-groups": [APP_GROUP],
-            "com.apple.security.files.bookmarks.app-scope": True,
-        }
-        if label == "app":
-            value["com.apple.security.files.user-selected.read-write"] = True
-        return value
-    return {}
+    return CONTRACT.expected_entitlements(label)
 
 
-def exact_entitlements(actual: dict, expected: dict) -> bool:
-    # Python equality treats 1 as True; entitlement types are part of the contract.
-    return plistlib.dumps(actual, sort_keys=True) == plistlib.dumps(expected, sort_keys=True)
+exact_entitlements = CONTRACT.exact_entitlements
 
 
 def signature_entitlements(result: subprocess.CompletedProcess) -> dict:
@@ -98,6 +90,8 @@ def validate_configuration(app: Path, *, allow_sparkle_services=False) -> dict:
     for values, identifier, executable in ((info, APP_ID, "QuickFile"), (extension, EXTENSION_ID, "FinderExtension")):
         if values.get("CFBundleIdentifier") != identifier or values.get("CFBundleExecutable") != executable:
             raise ValueError("unexpected QuickFile bundle identity")
+        if not CONTRACT.configuration_matches(values, "community"):
+            raise ValueError("local-shared storage and community channel must match on app and extension")
         if values.get("LSMinimumSystemVersion") != "13.0":
             raise ValueError("minimum system version must be 13.0")
         for key in ("CFBundleShortVersionString", "CFBundleVersion"):

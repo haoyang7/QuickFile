@@ -90,6 +90,7 @@ public final class TemplateStore: @unchecked Sendable {
         // Preserve all property-list values, including unexpected historical types.
         let legacyValue: Data?
         let revisionValue: Data?
+        let persistenceMarkerData: Data?
     }
 
     fileprivate struct RecoveryFileIdentity: Equatable, Sendable {
@@ -113,6 +114,15 @@ public final class TemplateStore: @unchecked Sendable {
     }
 
     private let defaults: UserDefaults?
+    private let localStorage: LocalSharedStorage?
+    private var isAvailable: Bool { defaults != nil || localStorage != nil }
+    private var persistenceMarkerURL: URL? {
+        localStorage?.root.appendingPathComponent("templates.persistence.v1.json")
+    }
+    private var protectedStorageURLs: [URL] {
+        guard let storageURL else { return [] }
+        return [storageURL, storageURL.appendingPathExtension("lock")] + [persistenceMarkerURL].compactMap { $0 }
+    }
     private let storageURL: URL?
     private let fileManager: FileManager
     private let cachesReads: Bool
@@ -192,30 +202,29 @@ public final class TemplateStore: @unchecked Sendable {
     /// Operation-scoped readers can skip cache keys and retained snapshots while
     /// keeping the same authoritative reads, migration and failure semantics.
     /// A reusable menu reader can independently retain only a digest and menu metadata.
-    public init(cachesReads: Bool = true, cachesMenuReads: Bool = false) {
-        self.cachesReads = cachesReads
-        self.cachesMenuReads = cachesMenuReads
-        fileManager = .default
-        writeTemplatesData = { try $0.write(to: $1, options: .atomic) }
-        readTemplatesData = { try Data(contentsOf: $0) }
-        decodeTemplatesData = { try JSONDecoder().decode(StoredTemplates.self, from: $0).templates }
-        decodeMenuEntriesData = { try JSONDecoder().decode(MenuEntries.self, from: $0).entries }
-        recoveryDefaultsMaximumBytes = Self.maximumRecoveryFileBytes
-        backupWriteOverride = nil
-        exportCheckpoint = nil
-        migrationCheckpoint = nil
-        storageURL = FileManager.default
-            .containerURL(
-                forSecurityApplicationGroupIdentifier: QuickFileConfiguration.appGroupIdentifier
-            )?
-            .appendingPathComponent("templates.v2.json", isDirectory: false)
-        defaults = storageURL == nil ? nil : UserDefaults(suiteName: QuickFileConfiguration.appGroupIdentifier)
-        changeNotificationName = QuickFileConfiguration.templatesDidChangeDarwinNotification
+    public convenience init(cachesReads: Bool = true, cachesMenuReads: Bool = false) {
+        let local = QuickFileSharedStorage.local
+        let directory = QuickFileSharedStorage.directory()
+        self.init(
+            defaults: directory == nil ? nil : QuickFileSharedStorage.legacyDefaults(),
+            storageURL: directory?.appendingPathComponent("templates.v2.json"),
+            localStorage: local,
+            cachesReads: cachesReads, cachesMenuReads: cachesMenuReads,
+            writeTemplatesData: { data, url in
+                if let local { try local.write(data, to: url) }
+                else { try data.write(to: url, options: .atomic) }
+            },
+            readTemplatesData: { url in
+                if let local { return try local.read(url) }
+                return try Data(contentsOf: url)
+            }
+        )
     }
 
     init(
         defaults: UserDefaults?,
         storageURL: URL? = nil,
+        localStorage: LocalSharedStorage? = nil,
         fileManager: FileManager = .default,
         cachesReads: Bool = true,
         cachesMenuReads: Bool = false,
@@ -233,7 +242,8 @@ public final class TemplateStore: @unchecked Sendable {
         exportCheckpoint: (@Sendable (TemplateTransferFile.ExportCheckpoint) throws -> Void)? = nil,
         migrationCheckpoint: (@Sendable (MigrationCheckpoint) throws -> Void)? = nil
     ) {
-        self.defaults = defaults
+        self.defaults = localStorage == nil ? defaults : nil
+        self.localStorage = localStorage
         self.storageURL = storageURL
         self.fileManager = fileManager
         self.cachesReads = cachesReads
@@ -258,12 +268,15 @@ public final class TemplateStore: @unchecked Sendable {
     }
 
     public func changeToken() throws -> ChangeToken {
-        guard let defaults else { throw StoreError.sharedDefaultsUnavailable }
+        guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
+        if let localStorage { try localStorage.prepare(localStorage.root) }
         var identity: RecoveryFileIdentity?
         if let storageURL {
             var status = stat()
-            // Normal template reads follow symbolic links; inspect the same target.
-            if stat(storageURL.path, &status) == 0 {
+            // Community reads reject links; the official route retains its existing semantics.
+            let result = localStorage == nil ? stat(storageURL.path, &status) : lstat(storageURL.path, &status)
+            if result == 0 {
+                try localStorage?.validateFile(status)
                 identity = RecoveryFileIdentity(status)
                 // Existing v2 files carry their own invalidation identity. The
                 // legacy preferences revision must not gate normal file reads.
@@ -272,7 +285,7 @@ public final class TemplateStore: @unchecked Sendable {
                 throw StoreError.readFailed(NSError(domain: NSPOSIXErrorDomain, code: Int(errno)))
             }
         }
-        return ChangeToken(revision: defaults.string(forKey: revisionKey), fileIdentity: identity)
+        return ChangeToken(revision: try currentRevision(), fileIdentity: identity)
     }
 
     public func loadTemplates() throws -> [FileTemplate] {
@@ -287,7 +300,7 @@ public final class TemplateStore: @unchecked Sendable {
     /// Reads the authoritative menu configuration without retaining all decoded bodies.
     /// Every record still passes FileTemplate's decoder, including disabled records.
     public func reloadMenuEntries() throws -> [FinderTemplateMenuEntry] {
-        guard defaults != nil else { throw StoreError.sharedDefaultsUnavailable }
+        guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
         cacheLock.lock()
         menuReadGeneration &+= 1
         let generation = menuReadGeneration
@@ -344,7 +357,7 @@ public final class TemplateStore: @unchecked Sendable {
     }
 
     public func reloadCreationSnapshot(templateID: UUID) throws -> CreationSnapshot {
-        guard defaults != nil else { throw StoreError.sharedDefaultsUnavailable }
+        guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
         if let storageURL {
             do {
                 let data = try readTemplatesData(storageURL)
@@ -455,7 +468,7 @@ public final class TemplateStore: @unchecked Sendable {
     }
 
     private func loadTemplates(allowCached: Bool) throws -> [FileTemplate] {
-        guard defaults != nil else { throw StoreError.sharedDefaultsUnavailable }
+        guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
         cacheLock.lock()
         templateLoadGeneration &+= 1
         let generation = templateLoadGeneration
@@ -463,6 +476,14 @@ public final class TemplateStore: @unchecked Sendable {
 
         if let templates = try loadTemplatesFromFile() {
             return templates
+        }
+
+        if localStorage != nil {
+            return try withStorageMutationLock {
+                if let templates = try loadTemplatesFromFile() { return templates }
+                guard try !hasSavedConfiguration() else { throw StoreError.savedConfigurationMissing }
+                return BuiltInTemplates.all
+            }
         }
 
         // File-backed reads always establish authority from bytes, with only
@@ -482,7 +503,7 @@ public final class TemplateStore: @unchecked Sendable {
             return templates
         }
 
-        guard defaults?.object(forKey: revisionKey) == nil else { throw StoreError.savedConfigurationMissing }
+        guard try !hasSavedConfiguration() else { throw StoreError.savedConfigurationMissing }
         let templates = BuiltInTemplates.all
         updateCache(templates, revision: revision, expectedLoadGeneration: generation)
         return templates
@@ -499,14 +520,12 @@ public final class TemplateStore: @unchecked Sendable {
     }
 
     private func saveTemplates(_ templates: [FileTemplate], comparingWith expectedTemplates: [FileTemplate]?) throws {
-        guard let defaults else {
-            throw StoreError.sharedDefaultsUnavailable
-        }
+        guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
 
         let revision = try withStorageMutationLock {
             // Atomic replacement must never hide unreadable or corrupt existing configuration.
             let current = try loadTemplatesFromFile() ?? loadLegacyTemplates()
-            if current == nil, defaults.object(forKey: revisionKey) != nil {
+            if current == nil, try hasSavedConfiguration() {
                 throw StoreError.savedConfigurationMissing
             }
             if let expectedTemplates,
@@ -514,7 +533,7 @@ public final class TemplateStore: @unchecked Sendable {
                 throw StoreError.configurationChanged
             }
             try Self.validateOrdinarySave(templates, replacing: current ?? BuiltInTemplates.all)
-            return try persistTemplates(templates, defaults: defaults)
+            return try persistTemplates(templates)
         }
 
         updateCache(templates, revision: revision)
@@ -610,8 +629,8 @@ public final class TemplateStore: @unchecked Sendable {
            destinationParts[backupParent.count].lowercased().hasPrefix("quickfile-template-backup-") {
             throw TemplateTransferError.protectedDestination
         }
-        guard let storageURL else { return }
-        for protected in [storageURL, storageURL.appendingPathExtension("lock")] {
+        guard storageURL != nil else { return }
+        for protected in protectedStorageURLs {
             let canonical = try canonicalExportURL(protected)
             // Missing files have no inode to compare. Conservatively protect case
             // variants too, including on the common case-insensitive APFS volume.
@@ -648,7 +667,7 @@ public final class TemplateStore: @unchecked Sendable {
         var protectedParent = stat()
         if stat(storageURL.deletingLastPathComponent().path, &protectedParent) == 0 {
             if openedParent.st_dev == protectedParent.st_dev, openedParent.st_ino == protectedParent.st_ino,
-               [storageURL.lastPathComponent, storageURL.appendingPathExtension("lock").lastPathComponent]
+               protectedStorageURLs.map(\.lastPathComponent)
                 .contains(where: { name.caseInsensitiveCompare($0) == .orderedSame }) {
                 throw TemplateTransferError.protectedDestination
             }
@@ -658,7 +677,7 @@ public final class TemplateStore: @unchecked Sendable {
         // a fresh lookup through the user's possibly retargeted parent pathname.
         var candidate = stat()
         if fstatat(parent, name, &candidate, AT_SYMLINK_NOFOLLOW) == 0 {
-            for protected in [storageURL, storageURL.appendingPathExtension("lock")] {
+            for protected in protectedStorageURLs {
                 var original = stat()
                 if stat(protected.path, &original) == 0 {
                     if candidate.st_dev == original.st_dev, candidate.st_ino == original.st_ino {
@@ -703,7 +722,7 @@ public final class TemplateStore: @unchecked Sendable {
     /// Only proven decoding corruption or a previously saved missing configuration
     /// is recoverable. Permission, directory and other I/O errors are propagated.
     public func prepareRecovery() throws -> RecoverySnapshot {
-        guard defaults != nil else { throw StoreError.sharedDefaultsUnavailable }
+        guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
         return try withStorageMutationLock {
             let state = try captureRecoveryState()
             guard let reason = recoveryReason(for: state) else { throw RecoveryError.notRecoverable }
@@ -716,7 +735,7 @@ public final class TemplateStore: @unchecked Sendable {
     public func recoverTemplates(
         _ templates: [FileTemplate], expectedRecoveryState snapshot: RecoverySnapshot
     ) throws -> RecoveryResult {
-        guard let defaults else { throw StoreError.sharedDefaultsUnavailable }
+        guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
         // Validation also bounds total encoded transfer bytes before backup/write.
         try TemplateTransfer.validateEncodedSize(TemplateTransferBundle(templates: templates))
         guard snapshot.storeIdentity == recoveryIdentity else { throw RecoveryError.configurationChanged }
@@ -731,7 +750,7 @@ public final class TemplateStore: @unchecked Sendable {
             catch { throw RecoveryError.backupFailed(error) }
             // A non-cooperating filesystem edit during backup must not be hidden.
             guard try captureRecoveryState() == current else { throw RecoveryError.configurationChanged }
-            do { revision = try persistTemplates(templates, defaults: defaults) }
+            do { revision = try persistTemplates(templates) }
             catch { throw RecoveryError.replacementFailed(backupURL: backupURL, underlying: error) }
             return backupURL
         }
@@ -741,12 +760,12 @@ public final class TemplateStore: @unchecked Sendable {
     }
 
     private func captureRecoveryState() throws -> RecoveryRawState {
-        guard let defaults else { throw StoreError.sharedDefaultsUnavailable }
+        guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
         let file: (data: Data, identity: RecoveryFileIdentity)?
         do { file = try readRecoveryFile() }
         catch { throw StoreError.readFailed(error) }
-        let legacy = defaults.object(forKey: legacyTemplatesKey)
-        let revision = defaults.object(forKey: revisionKey)
+        let legacy = defaults?.object(forKey: legacyTemplatesKey)
+        let revision = defaults?.object(forKey: revisionKey)
         do {
             var remaining = recoveryDefaultsMaximumBytes
             let legacyValue = try Self.serializedDefaultsValue(legacy, remainingBytes: &remaining)
@@ -756,7 +775,8 @@ public final class TemplateStore: @unchecked Sendable {
                 fileIdentity: file?.identity,
                 legacyData: legacy as? Data,
                 legacyValue: legacyValue,
-                revisionValue: revisionValue
+                revisionValue: revisionValue,
+                persistenceMarkerData: try readPersistenceMarker()
             )
         } catch { throw StoreError.readFailed(error) }
     }
@@ -773,6 +793,7 @@ public final class TemplateStore: @unchecked Sendable {
         defer { close(descriptor) }
         var before = stat()
         guard fstat(descriptor, &before) == 0 else { throw currentPOSIXError() }
+        try localStorage?.validateFile(before)
         guard before.st_mode & S_IFMT == S_IFREG else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
         }
@@ -853,7 +874,7 @@ public final class TemplateStore: @unchecked Sendable {
             guard let data = state.legacyData else { return .corruptLegacyData }
             return (try? JSONDecoder().decode(StoredTemplates.self, from: data).templates) == nil ? .corruptLegacyData : nil
         }
-        return state.revisionValue == nil ? nil : .missingSavedConfiguration
+        return state.revisionValue == nil && state.persistenceMarkerData == nil ? nil : .missingSavedConfiguration
     }
 
     private func writeRecoveryBackup(_ state: RecoveryRawState, reason: RecoveryReason) throws -> URL {
@@ -863,6 +884,9 @@ public final class TemplateStore: @unchecked Sendable {
         guard mkdir(directory.path, S_IRWXU) == 0 else { throw currentPOSIXError() }
         if let data = state.fileData {
             try writeExclusiveBackup(data, to: directory.appendingPathComponent("templates.original.json"))
+        }
+        if let data = state.persistenceMarkerData {
+            try writeExclusiveBackup(data, to: directory.appendingPathComponent("persistence.original.json"))
         }
         if let data = state.legacyData {
             try writeExclusiveBackup(data, to: directory.appendingPathComponent("legacy.original.data"))
@@ -917,17 +941,17 @@ public final class TemplateStore: @unchecked Sendable {
     private func migrateLegacyTemplates(
         _ initiallyLoadedTemplates: [FileTemplate], loadGeneration: UInt64
     ) throws -> [FileTemplate] {
-        guard let defaults else { throw StoreError.sharedDefaultsUnavailable }
+        guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
         try migrationCheckpoint?(.beforeStorageLock)
         let snapshot: (templates: [FileTemplate], revision: String?, didMigrate: Bool) = try withStorageMutationLock {
             // A save may have completed after the unlocked legacy read. Its v2 file wins.
             if let existingTemplates = try loadTemplatesFromFile() {
                 // Pair the revision with these bytes before another writer can publish.
-                return (existingTemplates, defaults.string(forKey: revisionKey), false)
+                return (existingTemplates, defaults?.string(forKey: revisionKey), false)
             }
 
             let legacyTemplates = try loadLegacyTemplates() ?? initiallyLoadedTemplates
-            let revision = try persistTemplates(legacyTemplates, defaults: defaults)
+            let revision = try persistTemplates(legacyTemplates)
             return (legacyTemplates, revision, true)
         }
 
@@ -939,19 +963,24 @@ public final class TemplateStore: @unchecked Sendable {
         return snapshot.templates
     }
 
-    private func persistTemplates(_ templates: [FileTemplate], defaults: UserDefaults) throws -> String {
+    private func persistTemplates(_ templates: [FileTemplate]) throws -> String {
         do {
             let data = try JSONEncoder().encode(StoredTemplates(templates: templates))
             let revision = UUID().uuidString
 
             if let storageURL {
+                if let localStorage, let marker = persistenceMarkerURL, try readPersistenceMarker() == nil {
+                    // The durable, monotonic marker precedes the first publication. A crash
+                    // or failed payload write can require recovery, never a silent reset.
+                    try localStorage.write(Data("{\"version\":1}".utf8), to: marker, durable: true)
+                }
                 try writeTemplatesData(data, storageURL)
                 invalidateDecodedFileCache()
-                defaults.set(revision, forKey: revisionKey)
-                defaults.removeObject(forKey: legacyTemplatesKey)
+                defaults?.set(revision, forKey: revisionKey)
+                defaults?.removeObject(forKey: legacyTemplatesKey)
             } else {
-                defaults.set(data, forKey: legacyTemplatesKey)
-                defaults.set(revision, forKey: revisionKey)
+                defaults?.set(data, forKey: legacyTemplatesKey)
+                defaults?.set(revision, forKey: revisionKey)
             }
             return revision
         } catch {
@@ -960,6 +989,9 @@ public final class TemplateStore: @unchecked Sendable {
     }
 
     private func withStorageMutationLock<Result>(_ operation: () throws -> Result) throws -> Result {
+        if let localStorage, let storageURL {
+            return try localStorage.withLock(at: storageURL.appendingPathExtension("lock"), operation)
+        }
         guard let storageURL else {
             Self.defaultsMutationLock.lock()
             defer { Self.defaultsMutationLock.unlock() }
@@ -1058,6 +1090,30 @@ public final class TemplateStore: @unchecked Sendable {
         } catch {
             throw StoreError.readFailed(error)
         }
+    }
+
+    private func readPersistenceMarker() throws -> Data? {
+        guard let localStorage, let url = persistenceMarkerURL else { return nil }
+        do {
+            let data = try localStorage.read(url, maximumBytes: 4096)
+            struct Marker: Decodable { let version: Int }
+            guard try JSONDecoder().decode(Marker.self, from: data).version == 1 else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            return data
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+            return nil
+        }
+    }
+
+    private func currentRevision() throws -> String? {
+        if localStorage != nil { return try readPersistenceMarker() == nil ? nil : "community-file" }
+        return defaults?.string(forKey: revisionKey)
+    }
+
+    private func hasSavedConfiguration() throws -> Bool {
+        if localStorage != nil { return try readPersistenceMarker() != nil }
+        return defaults?.object(forKey: revisionKey) != nil
     }
 
     private func cachedTemplates(for revision: String?) -> [FileTemplate]? {

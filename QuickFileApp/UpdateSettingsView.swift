@@ -1,4 +1,5 @@
 import SwiftUI
+import QuickFileInfrastructure
 
 struct UpdateSettingsView: View {
     @ObservedObject var updates: UpdateController
@@ -9,6 +10,9 @@ struct UpdateSettingsView: View {
                 .font(.title2)
                 .fontWeight(.semibold)
             Text("当前版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知")（\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "未知")）")
+                .foregroundColor(.secondary)
+
+            Text("分发渠道：\(QuickFileDistributionChannel.current?.displayName ?? "未知")")
                 .foregroundColor(.secondary)
 
             if updates.isAvailable {
