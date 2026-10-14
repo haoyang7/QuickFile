@@ -24,7 +24,7 @@ Application 不引用具体 Infrastructure 存储；通过注入操作完成用�
 
 Core **不是纯领域模型模块**：目前有 Foundation、Darwin、文件描述符、元数据读取、队列和 OSLog。它的定位是主应用与扩展都能使用的共享 macOS 基础能力。不要仅为了名字纯粹而移动安全写入代码；如果以后分离 I/O，应同时保留模型归属和依赖方向。
 
-不负责 App Group 配置持久化、书签授权记录、系统设置界面、窗口状态、用户提示操作或在线更新。
+不负责共享配置持久化、书签授权记录、系统设置界面、窗口状态、用户提示操作或在线更新。
 
 ### QuickFileApplication：用例顺序与错误分类
 
@@ -38,7 +38,13 @@ Core **不是纯领域模型模块**：目前有 Foundation、Darwin、文件描
 
 负责模板/菜单偏好存储，授权记录与书签客户端，请求队列、活动记录、诊断数据访问，以及扩展响应和首次使用验证的通信实现。
 
-Repository/Store 负责自己的读取、迁移、原子落盘、锁和错误语义。进程间数据使用 App Group 与文件锁协调，不能用 NSLock 代替跨进程锁。
+Repository/Store 负责自己的读取、迁移、原子落盘、锁和错误语义。Community 与 Developer ID 构建都由 `QuickFileSharedStorage` 使用实际用户 home 下的 `Library/Application Support/QuickFileCommunity/`；保留目录名以兼容已有安装。主 App 与扩展必须声明 `QuickFileStorageMode=local-shared`，共享文件与跨进程文件锁，不能用 NSLock 代替。生产入口不创建组偏好、不读取旧 App Group、不在失败时切换路径。`LocalSharedStorage` 使用当前用户私有权限（目录 0700、文件 0600）、不跟随链接及目录描述符绑定的操作；这不等价于 App Group 的应用身份隔离。
+
+`QuickFileDistributionChannel` 仅描述构建渠道（`community`、`developer-id`、`development`），不能证明实际签名。产物检查逐架构验证渠道、签名与精确权限。`QUICKFILE_COMMUNITY` 只控制更新器裁剪，不改变存储位置。Developer ID 无受限 App Group entitlement 时不强制嵌入 profile；任何携带的 profile 仍须通过身份、证书与有效期检查。注册设备分发保持独立的 profile 与设备范围要求。
+
+两种站外渠道使用相同 Bundle ID 覆盖安装，模板、菜单设置、授权记录与恢复文件继续使用原位置和格式。切换签名不保证书签仍然有效，按真实解析与访问结果续办授权，不能以路径提示替代授权。旧 App Group 数据通过旧版导出模板、新版预览导入承接；不自动读取、删除旧容器或导入旧权限。Mac App Store 不属于当前构建矩阵。
+
+本地共享模板保存以单向的 `templates.persistence.v1.json` 标记区分首次使用和配置丢失。校验与编码完成后，在原模板锁内先持久化标记再原子发布模板；首次保存中断可能需要显式恢复，不能静默显示默认模板。标记纳入恢复快照、原件备份和导出保护；正常模板读取继续由权威文件与文件身份决定。
 
 `FinderFirstUseVerification` 的反馈只用于引导体验：匹配路径/版本/build、目录摘要与本次请求，不是身份认证、授权依据或 Finder 已选中文件的证明。不能把它用于放宽实际写入检查。
 

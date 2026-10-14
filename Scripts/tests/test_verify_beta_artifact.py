@@ -26,8 +26,8 @@ class FakeRunner:
         self.override = override
         self.architectures = architectures or {"QuickFile": "arm64 x86_64", "FinderExtension": "arm64 x86_64"}
         self.teams = teams or {"QuickFile.app": "TEAM", "FinderExtension.appex": "TEAM"}
-        self.groups = groups or {"QuickFile.app": [MODULE.EXPECTED_APP_GROUP], "FinderExtension.appex": [MODULE.EXPECTED_APP_GROUP]}
-        self.profile_groups = profile_groups or {"QuickFile.app": [MODULE.EXPECTED_APP_GROUP], "FinderExtension.appex": [MODULE.EXPECTED_APP_GROUP]}
+        self.groups = groups or {}
+        self.profile_groups = profile_groups or {"QuickFile.app": ["group.com.haoyoung.QuickFile"], "FinderExtension.appex": ["group.com.haoyoung.QuickFile"]}
         self.profile_app_ids = profile_app_ids or {
             "QuickFile.app": "TEAM.com.haoyoung.QuickFile",
             "FinderExtension.appex": "TEAM.com.haoyoung.QuickFile.FinderExtension",
@@ -59,10 +59,12 @@ class FakeRunner:
             return MODULE.CommandResult(0, stderr=text.encode())
         if arguments[:3] == ["/usr/bin/codesign", "-d", "--entitlements"]:
             entitlements = {
-                "com.apple.security.application-groups": self.groups[path.name],
+                MODULE.CONTRACT.STORAGE_ENTITLEMENT: [MODULE.CONTRACT.STORAGE_PATH],
                 "com.apple.security.app-sandbox": True,
                 "com.apple.security.files.bookmarks.app-scope": True,
             }
+            if path.name in self.groups:
+                entitlements["com.apple.security.application-groups"] = self.groups[path.name]
             signing_app_id = self.signing_app_ids.get(path.name)
             if signing_app_id is not None:
                 entitlements["com.apple.application-identifier"] = signing_app_id
@@ -174,6 +176,8 @@ class ArtifactFixture:
             "CFBundleShortVersionString": "1.2.3",
             "CFBundleVersion": "42",
             "LSMinimumSystemVersion": "13.0",
+            "QuickFileStorageMode": "local-shared",
+            "QuickFileDistributionChannel": "developer-id",
         }
         (path / "Contents/Info.plist").write_bytes(plistlib.dumps(plist))
         (path / "Contents/MacOS" / executable).touch()
@@ -188,6 +192,10 @@ class VerifyBetaArtifactTests(unittest.TestCase):
     def inspect(self, runner=None, mode="developer-id", profiles=False):
         fixture = ArtifactFixture(profiles=profiles)
         self.addCleanup(fixture.close)
+        for path in fixture.app.rglob("Info.plist"):
+            info = plistlib.loads(path.read_bytes())
+            info["QuickFileDistributionChannel"] = "developer-id" if mode == "developer-id" else "development"
+            path.write_bytes(plistlib.dumps(info))
         return MODULE.inspect_artifact(fixture.app, mode, runner or FakeRunner(), NOW)
 
     def status(self, report, name):
@@ -207,7 +215,7 @@ class VerifyBetaArtifactTests(unittest.TestCase):
             "certificate": "distribution.certificate_kind",
             "sandbox": "app.entitlement.app-sandbox",
             "sandbox_integer": "app.entitlement.app-sandbox",
-            "app_group": "app.app_group",
+            "app_group": "app.permission_contract",
             "application_identifier": "app.signature_application_identifier",
             "leaf": "app.profile_leaf_certificate",
         }
@@ -387,12 +395,19 @@ class VerifyBetaArtifactTests(unittest.TestCase):
         self.assertEqual(self.status(report, "signing.same_team"), "fail")
 
     def test_mismatched_app_group_fails(self):
-        report = self.inspect(FakeRunner(groups={"QuickFile.app": [MODULE.EXPECTED_APP_GROUP], "FinderExtension.appex": ["wrong.group"]}), profiles=True)
-        self.assertEqual(self.status(report, "finder_extension.app_group"), "fail")
+        report = self.inspect(FakeRunner(groups={"QuickFile.app": ["group.com.haoyoung.QuickFile"], "FinderExtension.appex": ["wrong.group"]}), profiles=True)
+        self.assertEqual(self.status(report, "finder_extension.permission_contract"), "fail")
 
-    def test_profile_must_authorize_signed_app_group(self):
-        report = self.inspect(FakeRunner(profile_groups={"QuickFile.app": [MODULE.EXPECTED_APP_GROUP], "FinderExtension.appex": ["wrong.group"]}), profiles=True)
-        self.assertEqual(self.status(report, "distribution.profile_app_group"), "fail")
+    def test_rejects_broader_or_extra_permissions(self):
+        for component in ("QuickFile.app", "FinderExtension.appex"):
+            for extra in (
+                {MODULE.CONTRACT.STORAGE_ENTITLEMENT: ["/Library/Application Support/"]},
+                {"com.apple.security.temporary-exception.files.absolute-path.read-write": ["/Users/"]},
+                {"com.apple.security.network.server": True},
+                {"com.apple.security.get-task-allow": True},
+            ):
+                with self.subTest(component=component, extra=extra):
+                    self.assertEqual(self.inspect(FakeRunner(entitlement_overrides={component: extra}))["verdict"], "fail")
 
     def test_profile_must_authorize_corresponding_application_identifier(self):
         report = self.inspect(FakeRunner(profile_app_ids={"QuickFile.app": "TEAM.com.other.App", "FinderExtension.appex": "TEAM.com.haoyoung.QuickFile.FinderExtension"}), profiles=True)
@@ -430,9 +445,40 @@ class VerifyBetaArtifactTests(unittest.TestCase):
         report = self.inspect(FakeRunner(profile_app_ids={"QuickFile.app": "TEAM.com.haoyoung.*", "FinderExtension.appex": "TEAM.com.haoyoung.QuickFile.*"}), profiles=True)
         self.assertEqual(report["verdict"], "pass")
 
-    def test_non_prefixed_app_group_requires_embedded_profiles(self):
-        report = self.inspect(FakeRunner())
+    def test_developer_id_without_profiles_or_identity_entitlements_passes(self):
+        report = self.inspect(FakeRunner(signing_app_ids={}))
+        self.assertEqual(report["verdict"], "pass")
+        self.assertEqual(self.status(report, "distribution.embedded_profiles"), "pass")
+        self.assertEqual(report["profiles"], [])
+
+    def test_registered_device_distribution_still_requires_both_profiles(self):
+        report = self.inspect(FakeRunner(certificate="Apple Development: Example"), mode="registered-devices")
         self.assertEqual(self.status(report, "distribution.embedded_profiles"), "fail")
+
+    def test_single_present_developer_id_profile_is_validated(self):
+        fixture = ArtifactFixture(profiles=True)
+        self.addCleanup(fixture.close)
+        (fixture.app / "Contents/PlugIns/FinderExtension.appex/Contents/embedded.provisionprofile").unlink()
+        self.assertEqual(MODULE.inspect_artifact(fixture.app, "developer-id", FakeRunner(), NOW)["verdict"], "pass")
+        report = MODULE.inspect_artifact(fixture.app, "developer-id", FakeRunner(profile_days=-1), NOW)
+        self.assertEqual(self.status(report, "app.profile_validity"), "fail")
+
+    def test_channel_and_storage_contract_on_both_components(self):
+        fixture = ArtifactFixture()
+        self.addCleanup(fixture.close)
+        for path in fixture.app.rglob("Info.plist"):
+            original = plistlib.loads(path.read_bytes())
+            for key, value in (("QuickFileStorageMode", "app-group"), ("QuickFileStorageMode", "community"),
+                               ("QuickFileDistributionChannel", "community"), ("QuickFileDistributionChannel", "development"),
+                               ("QuickFileDistributionChannel", None)):
+                info = dict(original)
+                if value is None:
+                    info.pop(key)
+                else:
+                    info[key] = value
+                path.write_bytes(plistlib.dumps(info))
+                self.assertEqual(MODULE.inspect_artifact(fixture.app, "developer-id", FakeRunner(), NOW)["verdict"], "fail")
+            path.write_bytes(plistlib.dumps(original))
 
     def test_minimum_validity_is_configurable(self):
         fixture = ArtifactFixture(profiles=True)

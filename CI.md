@@ -27,6 +27,8 @@ macOS 脚本测试中的授权、创建边界和创建预检三组测试，在�
 
 Python 脚本测试同时运行 [架构守卫](Scripts/verify-architecture.py)，检查 Shared 源码归属及共享库依赖方向。`verify-release-readiness.sh` 在生成工程前重复执行该守卫；GitHub Actions 中还在 XcodeGen 生成前后核对受管的已跟踪工程、共享 scheme、Info.plist 和 entitlements，存在差异即失败，避免 CI 自动修正未同步的工程后继续通过。本地开发允许已有未提交改动，不使用这项 HEAD 差异门禁；SwiftPM 锁文件继续按独立哈希检查验证。
 
+站外产物检查共用 `Scripts/distribution_contract.py` 的存储与权限契约：两种渠道均为 `local-shared`，元数据分别匹配 `community` / `developer-id`；实际签名逐架构验证。Community 不含 Team、profile 或 Sparkle，Developer ID 校验公证评估和携带的 profile，注册设备模式仍要求两个 profile 及共同设备范围。构建或单元测试通过不能替代这三种产物各自的验收。
+
 构建设置查询前显式解析锁定的 SwiftPM 依赖，复用本轮包目录。仅当解析失败明确报告二进制依赖下载超时且没有其他错误时，最多尝试 3 次；每次结束都检查锁文件哈希，漂移或其他错误立即失败。下载和 checksum 验证仍由 SwiftPM 完成，构建设置查询、原生测试及 Release 构建各执行一次，失败不会触发整轮重试。
 
 [macOS 27 兼容性](.github/workflows/macos-27-compatibility.yml) 独立使用 `xcode-27` 标准 arm64 runner、真实 macOS 27、`/Applications/Xcode_27.0.app/Contents/Developer` 和 Xcode 27.0。初期只在 main 相关变更或手动触发时运行，不跟随每个 PR。它保留与主矩阵相同的脚本测试、原生 Swift 测试、Universal 构建和安全检查；失败正常标红，没有 `continue-on-error`，不依赖主 CI，也不改变 required checks 或仓库保护规则。preview 可能排队、调整镜像或工具链；失配必须修正基线，不能把 macOS 26 上的 27 SDK 冒充真实 macOS 27 主机。

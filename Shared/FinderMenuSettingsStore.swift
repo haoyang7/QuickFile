@@ -3,10 +3,11 @@ import notify
 import QuickFileCore
 
 /// Independent, atomically replaced settings file; never reads or rewrites templates.json.
-/// Resolve the App Group URL inside load/save so callers can keep all I/O off the main thread.
+/// Resolve the shared storage URL inside load/save so callers can keep all I/O off the main thread.
 public final class FinderMenuSettingsStore: @unchecked Sendable {
     public static let notificationName = "com.haoyoung.QuickFile.finder-menu-settings-did-change"
     public let changeNotificationName: String
+    private let localStorage: LocalSharedStorage?
     private let resolveStorageURL: @Sendable () -> URL?
 
     public enum StoreError: LocalizedError {
@@ -45,15 +46,21 @@ public final class FinderMenuSettingsStore: @unchecked Sendable {
     }
 
     public init() {
+        localStorage = QuickFileSharedStorage.local
         resolveStorageURL = {
-            FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: QuickFileConfiguration.appGroupIdentifier
-            )?.appendingPathComponent("finder-menu-settings.v1.json")
+            QuickFileSharedStorage.directory()?.appendingPathComponent("finder-menu-settings.v1.json")
         }
         changeNotificationName = Self.notificationName
     }
 
+    init(localStorage: LocalSharedStorage) {
+        self.localStorage = localStorage
+        resolveStorageURL = { localStorage.root.appendingPathComponent("finder-menu-settings.v1.json") }
+        changeNotificationName = Self.notificationName
+    }
+
     public init(storageURL: URL?, changeNotificationName: String = FinderMenuSettingsStore.notificationName) {
+        localStorage = nil
         resolveStorageURL = { storageURL }
         self.changeNotificationName = changeNotificationName
     }
@@ -61,7 +68,7 @@ public final class FinderMenuSettingsStore: @unchecked Sendable {
     public func load() throws -> FinderMenuDisplayLimit {
         guard let url = resolveStorageURL() else { throw StoreError.unavailable }
         let data: Data
-        do { data = try Data(contentsOf: url) }
+        do { data = try localStorage.map { try $0.read(url, maximumBytes: 4096) } ?? Data(contentsOf: url) }
         catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
             return .all
         } catch { throw StoreError.readFailed(error) }
@@ -74,7 +81,11 @@ public final class FinderMenuSettingsStore: @unchecked Sendable {
 
     public func save(_ value: FinderMenuDisplayLimit) throws {
         guard let url = resolveStorageURL() else { throw StoreError.unavailable }
-        do { try JSONEncoder().encode(Document(value)).write(to: url, options: .atomic) }
+        do {
+            let data = try JSONEncoder().encode(Document(value))
+            if let localStorage { try localStorage.write(data, to: url) }
+            else { try data.write(to: url, options: .atomic) }
+        }
         catch { throw StoreError.saveFailed(error) }
         notify_post(changeNotificationName)
     }

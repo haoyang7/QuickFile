@@ -71,20 +71,20 @@ struct DiagnosticsView: View {
                     value: embeddedExtensionIdentifiersText
                 )
                 DiagnosticValueRow(
-                    title: "App Group",
-                    value: QuickFileConfiguration.appGroupIdentifier
+                    title: "共享存储类型",
+                    value: QuickFileStorageMode.current.displayName + "（主应用与 Finder 扩展共用）"
                 )
 
                 if QuickFileConfiguration.usesPlaceholderIdentifiers {
                     Label(
-                        "当前仍使用 com.example 占位标识；Finder 扩展启用和 App Group 权限结果不能作为发布验证。",
+                        "当前仍使用 com.example 占位标识；Finder 扩展启用和共享存储结果不能作为发布验证。",
                         systemImage: "exclamationmark.triangle.fill"
                     )
                     .font(.caption)
                     .foregroundColor(.orange)
                 } else {
                     Label(
-                        "工程标识已配置；请结合当前扩展状态和活动记录验证签名与 App Group 权限。",
+                        "工程标识已配置；请结合当前扩展状态和活动记录验证签名与共享存储访问。",
                         systemImage: "checkmark.circle.fill"
                     )
                     .font(.caption)
@@ -126,7 +126,7 @@ struct DiagnosticsView: View {
                 }
 
                 if viewModel.hasLoadedActivityStoreStatus {
-                    DiagnosticBooleanRow(title: "共享存储可用", value: viewModel.isAppGroupStoreAvailable)
+                    DiagnosticBooleanRow(title: "共享存储可用", value: viewModel.isSharedStoreAvailable)
                 } else if viewModel.isRefreshingRuntimeStatus {
                     DiagnosticValueRow(title: "共享存储", value: "正在检查…")
                 } else {

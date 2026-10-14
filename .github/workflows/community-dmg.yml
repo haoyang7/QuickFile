@@ -18,6 +18,7 @@ on:
       - 'Scripts/package-community.py'
       - 'Scripts/community_dmg.py'
       - 'Scripts/verify-community-artifact.py'
+      - 'Scripts/distribution_contract.py'
       - 'Scripts/community-provenance.py'
       - 'Scripts/tests/test_community_provenance.py'
       - 'project.yml'

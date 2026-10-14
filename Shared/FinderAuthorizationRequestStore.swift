@@ -44,6 +44,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
     }
 
     private let defaults: UserDefaults?
+    private let localStorage: LocalSharedStorage?
     private let directoryURL: URL?
     private let fileManager: FileManager
     private let retentionInterval: TimeInterval
@@ -63,14 +64,17 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
 
     public init() {
         fileManager = .default
-        defaults = UserDefaults(suiteName: QuickFileConfiguration.appGroupIdentifier)
-        directoryURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: QuickFileConfiguration.appGroupIdentifier
-        )?.appendingPathComponent("finder-authorization-requests", isDirectory: true)
+        let local = QuickFileSharedStorage.local
+        localStorage = local
+        defaults = QuickFileSharedStorage.legacyDefaults()
+        directoryURL = QuickFileSharedStorage.directory()?.appendingPathComponent("finder-authorization-requests", isDirectory: true)
         retentionInterval = Self.defaultRetentionInterval
-        readRequestData = { try Self.readBoundedRequest(at: $0) }
+        readRequestData = { try Self.readBoundedRequest(at: $0, localStorage: local) }
         decodeLegacyRequest = { try JSONDecoder().decode(FinderAuthorizationRequest.self, from: $0) }
-        readPinnedRequestData = { descriptor, _ in try Self.readBoundedRequest(descriptor: descriptor) }
+        readPinnedRequestData = { descriptor, _ in
+            try local?.validateFile(descriptor: descriptor)
+            return try Self.readBoundedRequest(descriptor: descriptor)
+        }
         currentDate = Date.init
         usesPinnedReads = true
         recoveryArchiveName = { UUID().uuidString }
@@ -80,6 +84,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
     init(
         defaults: UserDefaults?,
         directoryURL: URL?,
+        localStorage: LocalSharedStorage? = nil,
         fileManager: FileManager = .default,
         retentionInterval: TimeInterval = FinderAuthorizationRequestStore.defaultRetentionInterval,
         readRequestData: ((URL) throws -> Data)? = nil,
@@ -93,13 +98,17 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
         recoveryArchiveName: @escaping () -> String = { UUID().uuidString },
         recoveryCheckpoint: ((RecoveryCheckpoint) throws -> Void)? = nil
     ) {
-        self.defaults = defaults
+        self.localStorage = localStorage
+        self.defaults = localStorage == nil ? defaults : nil
         self.directoryURL = directoryURL
         self.fileManager = fileManager
         self.retentionInterval = max(0, retentionInterval)
-        self.readRequestData = readRequestData ?? { try Self.readBoundedRequest(at: $0) }
+        self.readRequestData = readRequestData ?? { try Self.readBoundedRequest(at: $0, localStorage: localStorage) }
         self.decodeLegacyRequest = decodeLegacyRequest
-        self.readPinnedRequestData = readPinnedRequestData
+        self.readPinnedRequestData = { descriptor, url in
+            try localStorage?.validateFile(descriptor: descriptor)
+            return try readPinnedRequestData(descriptor, url)
+        }
         self.currentDate = currentDate
         self.recoveryArchiveName = recoveryArchiveName
         self.recoveryCheckpoint = recoveryCheckpoint
@@ -155,7 +164,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
                           let existing = try? JSONDecoder().decode(FinderAuthorizationRequest.self, from: data),
                           referenceDate.timeIntervalSince(existing.createdAt) > retentionInterval else { continue }
                     do {
-                        try fileManager.removeItem(at: existingURL)
+                        try removeFile(at: existingURL)
                         retainedCount -= 1
                     } catch {
                         continue
@@ -164,16 +173,18 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
             }
             guard retainedCount < Self.maximumPendingRequests else { throw StoreError.queueFull }
         }
-        try (encoded ?? JSONEncoder().encode(request)).write(to: fileURL, options: .atomic)
+        try writeData(encoded ?? JSONEncoder().encode(request), to: fileURL)
     }
 
     /// O_NONBLOCK avoids waiting for a FIFO open; regular files still may have slow
     /// underlying I/O. A byte budget does not make that I/O cancellable.
-    static func readBoundedRequest(at url: URL, maximumBytes: Int = maximumRequestBytes) throws -> Data {
+    static func readBoundedRequest(at url: URL, maximumBytes: Int = maximumRequestBytes,
+                                   localStorage: LocalSharedStorage? = nil) throws -> Data {
         precondition(maximumBytes >= 0 && maximumBytes < Int.max)
         let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         guard descriptor >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         defer { close(descriptor) }
+        try localStorage?.validateFile(descriptor: descriptor)
         return try readBoundedRequest(descriptor: descriptor, maximumBytes: maximumBytes)
     }
 
@@ -292,7 +303,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
                     } catch {
                         // Only successfully-read malformed payloads may be discarded.
                         // A cleanup failure is also isolated to this entry.
-                        try fileManager.removeItem(at: fileURL)
+                        try removeFile(at: fileURL)
                         throw error
                     }
                     // Evaluate age at consumption time unless a caller supplies a fixed reference.
@@ -300,7 +311,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
                     // A clock adjustment must not destroy a request that can become eligible later.
                     if age < 0 { continue }
                     if age > retentionInterval {
-                        try fileManager.removeItem(at: fileURL)
+                        try removeFile(at: fileURL)
                     } else {
                         pending.append((request, fileURL))
                     }
@@ -341,7 +352,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
             do {
                 // Removal is the claim commit. Never return a failed removal or a
                 // now-expired request; attempt each entry only once in this take.
-                try fileManager.removeItem(at: fileURL)
+                try removeFile(at: fileURL)
                 if age <= retentionInterval { return next.request }
             } catch {
                 if retainedError == nil { retainedError = error }
@@ -461,7 +472,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
                     switch payload {
                     case .unreadable(let error): throw error
                     case .malformed(let error):
-                        try fileManager.removeItem(at: file.url)
+                        try removeFile(at: file.url)
                         throw error
                     case .decoded(let request):
                         // Defer age decisions to the final removal/claim pass.
@@ -784,6 +795,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
 
     private func openRecoveryContext() throws -> RecoveryContext {
         guard let directoryURL else { throw RecoveryError.unavailable }
+        try localStorage?.prepare(directoryURL)
         let directory = open(directoryURL.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard directory >= 0 else { throw RecoveryError.unavailable }
         var transferred = false
@@ -949,8 +961,23 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
         }
     }
 
+    private func writeData(_ data: Data, to url: URL) throws {
+        if let localStorage { try localStorage.write(data, to: url) }
+        else { try data.write(to: url, options: .atomic) }
+    }
+
+    private func removeFile(at url: URL) throws {
+        if let localStorage { try localStorage.remove(url) }
+        else { try fileManager.removeItem(at: url) }
+    }
+
     private func withLockedQueue<Result>(_ operation: (URL) throws -> Result) throws -> Result {
         guard let directoryURL else { throw StoreError.sharedStoreUnavailable }
+        if let localStorage {
+            return try localStorage.withLock(at: directoryURL.appendingPathComponent(".queue.lock")) {
+                try operation(directoryURL)
+            }
+        }
         try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         let lockURL = directoryURL.appendingPathComponent(".queue.lock")
         let descriptor = open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
@@ -990,7 +1017,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
             do {
                 request = try decodeLegacyRequest(data)
             } catch {
-                try Data().write(to: markerURL, options: .atomic)
+                try writeData(Data(), to: markerURL)
                 defaults?.removeObject(forKey: legacyRequestKey)
                 throw error
             }
@@ -1008,7 +1035,7 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
         let markerURL = directoryURL.appendingPathComponent(".legacy-v1-migrated")
         // Commit before consumption: a crash before this point may rewrite the same queued
         // ID, but cannot resurrect a request already returned to a consumer.
-        try Data().write(to: markerURL, options: .atomic)
+        try writeData(Data(), to: markerURL)
         defaults?.removeObject(forKey: legacyRequestKey)
     }
 }

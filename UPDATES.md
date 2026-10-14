@@ -12,15 +12,16 @@
 - 自动检查默认关闭；用户开启后每天检查一次。下载与安装由用户确认，不提供后台静默安装。
 - 正式版本使用默认稳定渠道；选择“接收 Beta 版本”后，同时接收 `beta` 渠道。关闭自动检查时，改变渠道不会触发联网检查。
 - Debug 和 XCTest 不启动更新器。源码自编译默认不启用正式渠道，避免替换自编译应用的签名身份及授权环境。
-- 主 App 使用 Sparkle Installer/Downloader XPC 服务，保留原有沙盒、文件访问与 App Group 权限；Finder Extension 不嵌入更新器。
+- 主 App 使用 Sparkle Installer/Downloader XPC 服务，保留沙盒、目录书签与精确的本地共享目录权限；Finder Extension 不嵌入更新器。
 - Finder 响应探针同时核对安装路径与运行版本。旧版本仍在运行时不会被标记为当前版本已响应；用户可在诊断页按指引重新启用扩展，必要时重启 Finder。
 
 ## 配置正式更新渠道
 
-`project.yml` 是配置源，工程与 Info.plist 由 XcodeGen 生成。正式包需要在 Archive 时提供三个构建设置：
+`project.yml` 是配置源，工程与 Info.plist 由 XcodeGen 生成。正式包需要在 Archive 时提供以下构建设置：
 
 | 设置 | 默认值 | 正式包要求 |
 | --- | --- | --- |
+| `QUICKFILE_DISTRIBUTION_CHANNEL` | `development` | `developer-id` |
 | `QUICKFILE_UPDATES_ENABLED` | `NO` | `YES` |
 | `QUICKFILE_UPDATE_FEED_URL` | 空 | 固定 HTTPS appcast 地址 |
 | `QUICKFILE_UPDATE_PUBLIC_KEY` | 空 | Sparkle 生成的 Base64 EdDSA 公钥 |
@@ -41,13 +42,14 @@ xcodebuild \
   -archivePath .build/Temporary/update-release/QuickFile.xcarchive \
   -clonedSourcePackagesDirPath .build/Temporary/update-release/SourcePackages \
   DEVELOPMENT_TEAM=YOUR_TEAM \
+  QUICKFILE_DISTRIBUTION_CHANNEL=developer-id \
   QUICKFILE_UPDATES_ENABLED=YES \
   QUICKFILE_UPDATE_FEED_URL='https://YOUR_HOST/appcast.xml' \
   QUICKFILE_UPDATE_PUBLIC_KEY='YOUR_PUBLIC_KEY' \
   archive
 ```
 
-随后按既有 Developer ID 导出配置导出，完成公证与 App 装订。Archive/Export 会处理 Sparkle framework、XPC 服务与更新辅助进程的签名；只对最外层 framework 执行签名不能证明内部辅助进程已正确签名。保持主 App、扩展的发布标识、团队与 App Group 连续。
+随后按既有 Developer ID 导出配置导出，完成公证与 App 装订。Archive/Export 会处理 Sparkle framework、XPC 服务与更新辅助进程的签名；只对最外层 framework 执行签名不能证明内部辅助进程已正确签名。保持主 App、扩展的发布标识、正式签名团队和本地共享目录连续。渠道元数据只用于构建契约，实际签名仍由产物检查验证。
 
 ## 准备更新包与 appcast
 
@@ -72,7 +74,7 @@ App 内更新由 Swift 接入 Sparkle。Python 脚本负责本地发布准备和
 
 脚本在读取版本历史前获取输出目录的独占文件锁，并保持到本次准备结束。同目录另一个准备任务会立即报错，待前一个任务结束后重试。`.quickfile-update.lock` 文件保留在输出目录，锁由系统随文件关闭释放；不要删除该文件，以免进程锁住不同文件。
 
-脚本先调用 `verify-beta-artifact.py` 检查 Developer ID、App Group、描述文件、Sparkle framework 及四个辅助程序的签名与双架构、Gatekeeper，再打包、生成 appcast 并验证最终更新包的 EdDSA 签名。架构检查针对最终待发布 App，拒绝单架构、缺失程序或无法读取架构的产物。未通过时不会替换既有 appcast。默认 Gatekeeper 设置的新机器验收仍需单独完成；本机关闭 Gatekeeper 时不能通过该发布检查。
+脚本先调用 `verify-beta-artifact.py` 检查 Developer ID、渠道与共享目录权限、携带的描述文件（如有）、Sparkle framework 及四个辅助程序的签名与双架构、Gatekeeper，再打包、生成 appcast 并验证最终更新包的 EdDSA 签名。架构检查针对最终待发布 App，拒绝单架构、缺失程序或无法读取架构的产物。未通过时不会替换既有 appcast。默认 Gatekeeper 设置的新机器验收仍需单独完成；本机关闭 Gatekeeper 时不能通过该发布检查。
 
 ZIP 与校验报告写入时拒绝覆盖同名文件，最后原子替换 appcast。若在 appcast 替换成功前发生提交异常或 Ctrl+C，脚本撤回本次新增的 ZIP 与报告，保留既有 appcast 和历史产物，可以重试同一构建号。
 

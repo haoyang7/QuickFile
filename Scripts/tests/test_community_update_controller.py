@@ -201,6 +201,7 @@ class CommunityUpdateControllerTests(unittest.TestCase):
                 info.write_bytes(plistlib.dumps({
                     "CFBundleIdentifier": "org.example.QuickFile.CommunityUpdateFixture",
                     "CFBundlePackageType": "BNDL",
+                    "QuickFileDistributionChannel": "developer-id",
                     "QuickFileUpdatesEnabled": "YES",
                     "SUFeedURL": f"https://127.0.0.1:{port}/appcast.xml",
                     "SUPublicEDKey": base64.b64encode(bytes(range(32))).decode("ascii"),

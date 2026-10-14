@@ -29,5 +29,9 @@
 		<key>NSExtensionPrincipalClass</key>
 		<string>$(PRODUCT_MODULE_NAME).FinderSync</string>
 	</dict>
+	<key>QuickFileDistributionChannel</key>
+	<string>$(QUICKFILE_DISTRIBUTION_CHANNEL)</string>
+	<key>QuickFileStorageMode</key>
+	<string>$(QUICKFILE_STORAGE_MODE)</string>
 </dict>
 </plist>

@@ -31,6 +31,10 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>QuickFileDistributionChannel</key>
+	<string>$(QUICKFILE_DISTRIBUTION_CHANNEL)</string>
+	<key>QuickFileStorageMode</key>
+	<string>$(QUICKFILE_STORAGE_MODE)</string>
 	<key>QuickFileUpdatesEnabled</key>
 	<string>$(QUICKFILE_UPDATES_ENABLED)</string>
 	<key>SUAllowsAutomaticUpdates</key>

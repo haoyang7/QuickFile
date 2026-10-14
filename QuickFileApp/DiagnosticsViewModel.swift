@@ -10,7 +10,7 @@ final class DiagnosticsViewModel: ObservableObject {
     @Published private(set) var extensionSnapshot: FinderExtensionDiagnosticSnapshot?
     @Published private(set) var extensionActivity: FinderExtensionActivity?
     @Published private(set) var recentExtensionFailures: [FinderExtensionActivity] = []
-    @Published private(set) var isAppGroupStoreAvailable = false
+    @Published private(set) var isSharedStoreAvailable = false
     @Published private(set) var activityStoreMessage: String?
     @Published private(set) var activityStoreHasError = false
     @Published private(set) var authorizedDirectories: [AuthorizedDirectory] = []
@@ -216,11 +216,12 @@ final class DiagnosticsViewModel: ObservableObject {
             (store.latestActivity(), Result { try store.recentFailures() })
         }
         guard !Task.isCancelled, directoryPresentationGeneration == generation else { return }
-        isAppGroupStoreAvailable = store.isAvailable
+        isSharedStoreAvailable = false
         hasLoadedActivityStoreStatus = true
         extensionActivity = activity
         switch historyResult {
         case let .success(failures):
+            isSharedStoreAvailable = store.isAvailable
             recentExtensionFailures = failures
             activityStoreMessage = nil
             activityStoreHasError = false
@@ -246,15 +247,16 @@ final class DiagnosticsViewModel: ObservableObject {
         let identifiers = (snapshot?.embeddedIdentifiers ?? []).map(safeIdentifier).joined(separator: ", ")
         let activityTimestamp = extensionActivity.map { ISO8601DateFormatter().string(from: $0.timestamp) } ?? "none"
         return """
-        QuickFile diagnostics v1
+        QuickFile diagnostics v2
         appBundleIdentifier: \(safeIdentifier(Bundle.main.bundleIdentifier ?? "unknown"))
-        appGroupIdentifier: \(safeIdentifier(QuickFileConfiguration.appGroupIdentifier))
+        distributionChannel: \(QuickFileDistributionChannel.current?.rawValue ?? "unknown")
+        storageMode: \(QuickFileStorageMode.current.rawValue)
         embeddedIdentifiers: \(identifiers)
         state: \(snapshot?.state.rawValue ?? "unknown")
         registration: \(snapshot?.registration.rawValue ?? "unknown")
         enabled: \(isFinderExtensionEnabled)
         probeResponded: \(snapshot?.responded.map(String.init) ?? "not-tested")
-        appGroupAvailable: \(isAppGroupStoreAvailable)
+        sharedStoreAvailable: \(isSharedStoreAvailable)
         authorizedDirectoryCount: \(authorizedDirectories.count)
         unavailableAuthorizationCount: \(unavailableAuthorizedDirectories.count)
         latestActivityKind: \(extensionActivity?.kind.rawValue ?? "none")

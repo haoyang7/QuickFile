@@ -1,6 +1,6 @@
 # 免费自行分发
 
-QuickFile 提供实验性的 community 构建流程，不需要 Apple 开发者会员、签名证书或 provisioning profile。产物采用 ad-hoc 签名，保留主 App 和 Finder 扩展的 App Sandbox、Hardened Runtime、App Group 及目录书签权限。它没有 Developer ID 身份，也没有经过 Apple 公证；可构建、签名完整与普通用户机器上可运行须分别验证。
+QuickFile 提供实验性的 community 构建流程，不需要 Apple 开发者会员、签名证书或 provisioning profile。产物采用 ad-hoc 签名，保留主 App 和 Finder 扩展的 App Sandbox、Hardened Runtime 及目录书签权限；主 App 与扩展使用两种站外渠道共用的固定目录及精确路径权限。它没有 Developer ID 身份，也没有经过 Apple 公证；可构建、签名完整与普通用户机器上可运行须分别验证。
 
 ## 构建与检查
 
@@ -181,11 +181,11 @@ gh release edit "$TAG" --repo haoyang7/QuickFile --draft=false
 
 仅对可信官方发布文件且已核对校验和的手动排障可定向执行 `xattr -dr com.apple.quarantine /Applications/QuickFile.app`；`xattr -cr /Applications/QuickFile.app` 会递归清除全部扩展属性，范围更宽。二者都不是签名或公证，也不授予 Finder 目录权限，不得作为默认安全设置验收通过的依据。当前用户拥有该 App 写权限时通常无需管理员权限；若出现 `Operation not permitted`，先核对文件所有权和路径并按系统提示处理，不把 `sudo` 作为默认步骤。
 
-macOS 对没有发布身份的 App Group 访问可能再次要求用户确认，具体行为需要按系统版本、首次启动和每次升级分别记录。Finder 扩展开关和目录授权分开处理；macOS 15 及以后按“通用 → 登录项与扩展”查找，较早系统使用系统设置搜索 Finder 扩展并参阅 [Apple 官方说明](https://support.apple.com/guide/mac-help/mtusr003/mac)。授权面板取消或系统拒绝时保留错误，不通过伪造 Team、关闭沙盒、禁用动态库验证或换成普通共享目录来绕过；QuickFile 不需要完全磁盘访问。
+Community 使用 `~/Library/Application Support/QuickFileCommunity/` 共享文件，不声明 App Group，也不读取旧 App Group 或其共享偏好。Developer ID 签名版使用相同位置；两条渠道保留相同 App 标识，覆盖安装并延续数据。两端元数据为 `QuickFileStorageMode=local-shared`，本渠道另声明 `QuickFileDistributionChannel=community`。签名变化后的目录书签须实际验证，失效时重新授权，不删除旧记录。本 Beta 不自动迁移旧容器；需要模板时使用原有导出与导入。Finder 扩展开关和目录授权分开处理；macOS 15 及以后按“通用 → 登录项与扩展”查找，较早系统使用系统设置搜索 Finder 扩展并参阅 [Apple 官方说明](https://support.apple.com/guide/mac-help/mtusr003/mac)。授权面板取消或系统拒绝时保留错误，不通过伪造 Team、关闭沙盒、禁用动态库验证来绕过；QuickFile 不需要完全磁盘访问。
 
 每个最终 DMG 在默认安全设置的另一台 Mac 上至少验证：
 
-1. 浏览器下载、首次打开、App Group 访问、Finder 扩展启用。
+1. 浏览器下载、首次打开、Community 共享文件访问、Finder 扩展启用。
 2. 主 App 选择目录并创建文件；保存目录授权，退出重开后使用授权。
 3. Finder 实际创建文件；主 App 退出、Finder 重启后仍能读模板并使用授权。
 4. 覆盖升级后核对实际加载版本，确认模板、持久书签及跨进程目录授权可用。签名身份改变后可能需要重新授权，不能用旧候选测试代替。
