@@ -4,12 +4,15 @@ import SwiftUI
 @main
 struct QuickFileApp: App {
     @StateObject private var updates = UpdateController()
+    @StateObject private var creationSettings = CreationSettingsViewModel()
+    @StateObject private var languageSettings = LanguageSettingsViewModel()
     @StateObject private var finderMenuSettings = FinderMenuSettingsViewModel()
     @StateObject private var finderIntegration = FinderIntegrationViewModel()
     @StateObject private var viewModel = QuickFileViewModel(
         templates: ProcessInfo.processInfo.environment["XCTestBundlePath"] == nil ? nil : [],
         clipboardProvider: AppKitFileActions.clipboardString,
-        revealCreatedFile: AppKitFileActions.reveal
+        revealCreatedFile: AppKitFileActions.reveal,
+        automaticallyOpenCreatedFile: AppKitFileActions.automaticallyOpenCreatedFile
     )
 
     init() {
@@ -20,9 +23,15 @@ struct QuickFileApp: App {
     var body: some Scene {
         WindowGroup {
             if ProcessInfo.processInfo.environment["XCTestBundlePath"] == nil {
+                // Keep the receiving view mounted while loading preferences so
+                // cold-launch Finder URLs and an existing editor keep their owner.
                 ContentView(viewModel: viewModel, finderMenuSettings: finderMenuSettings,
                             finderIntegrationViewModel: finderIntegration)
-                    .task { viewModel.startTemplateSynchronization() }
+                    .environment(\.locale, languageSettings.locale)
+                    .task {
+                        if !languageSettings.hasLoaded { await languageSettings.reload() }
+                        viewModel.startTemplateSynchronization()
+                    }
             } else {
                 EmptyView()
             }
@@ -33,13 +42,25 @@ struct QuickFileApp: App {
         .windowStyle(.titleBar)
         .commands {
             CommandGroup(after: .appInfo) {
-                Button("检查更新…", action: updates.checkForUpdates)
+                Button(QuickFileLocalization.text(.init("检查更新…")), action: updates.checkForUpdates)
                     .disabled(!updates.canCheckForUpdates)
             }
         }
 
         Settings {
-            UpdateSettingsView(updates: updates)
+            TabView {
+                VStack(alignment: .leading, spacing: 0) {
+                    LanguageSettingsView(model: languageSettings).padding([.top, .horizontal], 24)
+                    Divider().padding(.top, 20)
+                    CreationSettingsView(model: creationSettings)
+                }
+                    .tabItem { Label("通用", systemImage: "gearshape") }
+                UpdateSettingsView(updates: updates)
+                    .tabItem { Label("更新", systemImage: "arrow.triangle.2.circlepath") }
+            }
+            .frame(width: 488, height: 490)
+            .environment(\.locale, languageSettings.locale)
+            .task { if !languageSettings.hasLoaded { await languageSettings.reload() } }
         }
     }
 }

@@ -1,3 +1,4 @@
+import QuickFileCore
 import Foundation
 import Darwin
 import os
@@ -6,7 +7,7 @@ public enum QuickFileStorageMode: String, Sendable {
     case localShared = "local-shared"
 
     public static let current: Self = .localShared
-    public var displayName: String { "本地共享存储" }
+    public var displayName: String { QuickFileLocalization.text(.init("本地共享存储")) }
 }
 
 /// Build metadata describes the channel; artifact checks verify the actual signature.
@@ -23,7 +24,7 @@ public enum QuickFileDistributionChannel: String, Sendable {
         switch self {
         case .community: return "Community"
         case .developerID: return "Developer ID"
-        case .development: return "开发构建"
+        case .development: return QuickFileLocalization.text(.init("开发构建"))
         }
     }
 }

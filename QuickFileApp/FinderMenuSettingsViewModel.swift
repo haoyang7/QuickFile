@@ -20,8 +20,21 @@ final class FinderMenuSettingsViewModel: ObservableObject {
     @Published private(set) var hasLoaded = false
     @Published private(set) var isLoading = false
     @Published private(set) var isSaving = false
-    @Published private(set) var loadError: String?
-    @Published private(set) var status: Status?
+    var loadError: String? { loadFailure?.localizedDescription }
+    @Published private var loadFailure: Error?
+    private enum Feedback {
+        case saved
+        case failure(Error)
+    }
+    @Published private var feedback: Feedback?
+    var status: Status? {
+        switch feedback {
+        case .saved:
+            return .success(QuickFileLocalization.text(.init("Finder 菜单设置已保存。")))
+        case let .failure(error): return .failure(error.localizedDescription)
+        case nil: return nil
+        }
+    }
 
     private let loadSetting: @Sendable () throws -> FinderMenuDisplayLimit
     private let saveSetting: @Sendable (FinderMenuDisplayLimit) throws -> Void
@@ -57,9 +70,9 @@ final class FinderMenuSettingsViewModel: ObservableObject {
 
     var savedSummary: String {
         if let count = savedLimit.maximumCount {
-            return "已保存：最多 \(count) 个模板"
+            return QuickFileLocalization.text(.init("已保存：最多 \(count) 个模板"))
         }
-        return "已保存：全部模板"
+        return QuickFileLocalization.text(.init("已保存：全部模板"))
     }
 
     func loadIfNeeded() async {
@@ -73,7 +86,7 @@ final class FinderMenuSettingsViewModel: ObservableObject {
         // a newer save and overwrite the saved value or the editor's draft.
         guard !isLoading, !isSaving else { return }
         isLoading = true
-        status = nil
+        feedback = nil
         defer { isLoading = false }
         let generation = draftGeneration
         let load = loadSetting
@@ -82,12 +95,12 @@ final class FinderMenuSettingsViewModel: ObservableObject {
         case let .success(value):
             savedLimit = value
             hasLoaded = true
-            loadError = nil
+            loadFailure = nil
             if generation == draftGeneration { replaceDraft(with: value) }
-            status = nil
+            feedback = nil
         case let .failure(error):
             // Retain the last successful value; retry or explicit Save can recover.
-            loadError = error.localizedDescription
+            loadFailure = error
         }
     }
 
@@ -98,13 +111,13 @@ final class FinderMenuSettingsViewModel: ObservableObject {
         do {
             value = try draftLimit()
         } catch {
-            status = .failure(error.localizedDescription)
+            feedback = .failure(error)
             return false
         }
         guard value != savedLimit || loadError != nil else { return true }
 
         isSaving = true
-        status = nil
+        feedback = nil
         defer { isSaving = false }
         let generation = draftGeneration
         let save = saveSetting
@@ -113,15 +126,15 @@ final class FinderMenuSettingsViewModel: ObservableObject {
         case .success:
             savedLimit = value
             hasLoaded = true
-            loadError = nil
+            loadFailure = nil
             if generation == draftGeneration {
                 replaceDraft(with: value)
-                status = .success("Finder 菜单设置已保存。")
+                feedback = .saved
             }
             return true
         case let .failure(error):
             // Keep the failed draft for retry, without changing the committed value.
-            status = .failure(error.localizedDescription)
+            feedback = .failure(error)
             return false
         }
     }
@@ -138,6 +151,6 @@ final class FinderMenuSettingsViewModel: ObservableObject {
 
     private func draftDidChange() {
         draftGeneration &+= 1
-        status = nil
+        feedback = nil
     }
 }

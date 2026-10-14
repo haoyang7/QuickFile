@@ -85,8 +85,8 @@ final class QuickFileViewModel: ObservableObject {
 
         var recoveryActionTitle: String? {
             switch self {
-            case .malformedConfiguration: return "修复损坏的配置…"
-            case .missingConfiguration: return "恢复缺失的配置…"
+            case .malformedConfiguration: return QuickFileLocalization.text(.init("修复损坏的配置…"))
+            case .missingConfiguration: return QuickFileLocalization.text(.init("恢复缺失的配置…"))
             default: return nil
             }
         }
@@ -96,17 +96,17 @@ final class QuickFileViewModel: ObservableObject {
         var message: String {
             switch self {
             case .configurationChanged:
-                return "模板已在其他实例修改。当前修改未保存，请保留草稿并重新加载模板后重试。"
+                return QuickFileLocalization.text(.init("模板已在其他实例修改。当前修改未保存，请保留草稿并重新加载模板后重试。"))
             case .missingConfiguration:
-                return "找不到已保存的模板配置。可恢复原配置文件后重新加载，或从备份／默认模板恢复缺失的配置。"
+                return QuickFileLocalization.text(.init("找不到已保存的模板配置。可恢复原配置文件后重新加载，或从备份／默认模板恢复缺失的配置。"))
             case .permissionDenied:
-                return "没有足够权限访问模板配置。请检查配置文件及所在文件夹的访问权限后重试。"
+                return QuickFileLocalization.text(.init("没有足够权限访问模板配置。请检查配置文件及所在文件夹的访问权限后重试。"))
             case .storageUnavailable:
-                return "暂时无法访问共享模板存储。请确认存储位置可用后重新加载模板。"
+                return QuickFileLocalization.text(.init("暂时无法访问共享模板存储。请确认存储位置可用后重新加载模板。"))
             case .malformedConfiguration:
-                return "模板配置格式无效，无法读取。可重新加载，或先备份原配置再恢复。"
+                return QuickFileLocalization.text(.init("模板配置格式无效，无法读取。可重新加载，或先备份原配置再恢复。"))
             case .unreadable:
-                return "暂时无法读取模板配置。请稍后重试；读取失败不代表配置损坏。"
+                return QuickFileLocalization.text(.init("暂时无法读取模板配置。请稍后重试；读取失败不代表配置损坏。"))
             }
         }
     }
@@ -119,14 +119,14 @@ final class QuickFileViewModel: ObservableObject {
             case .notRecoverable, .configurationChanged:
                 return recoveryError.localizedDescription
             case .backupFailed:
-                return "无法备份恢复前状态，恢复已停止，未写入替代配置。请检查存储空间和访问权限后重试。"
+                return QuickFileLocalization.text(.init("无法备份恢复前状态，恢复已停止，未写入替代配置。请检查存储空间和访问权限后重试。"))
             case .replacementFailed:
-                return "恢复前状态已备份，但恢复写入失败。请保留备份，并在检查存储空间和访问权限后重新加载。"
+                return QuickFileLocalization.text(.init("恢复前状态已备份，但恢复写入失败。请保留备份，并在检查存储空间和访问权限后重新加载。"))
             }
         }
         guard let storeError = error as? TemplateStore.StoreError else { return error.localizedDescription }
         if case .persistenceFailed = storeError {
-            return "未能保存模板，当前修改未保存。请检查存储空间和访问权限后重试，或复制草稿。"
+            return QuickFileLocalization.text(.init("未能保存模板，当前修改未保存。请检查存储空间和访问权限后重试，或复制草稿。"))
         }
         return TemplateLoadFailure(storeError).message
     }
@@ -140,16 +140,22 @@ final class QuickFileViewModel: ObservableObject {
         case failed(String)
     }
 
+    // Keep the error as a fact; the public state is a presentation in the current language.
+    private enum FinderAuthorizationOutcome {
+        case notConfirmed, saving, saved
+        case failed(Error)
+    }
+
     enum FinderAuthorizationRequestPhase: Equatable {
         case idle, readingQueue, waitingForCurrentOperation, awaitingAuthorization, creatingFile
 
         var message: String? {
             switch self {
             case .idle: return nil
-            case .readingQueue: return "正在读取 Finder 交接队列；仍可在 App 中直接创建文件。"
-            case .waitingForCurrentOperation: return "已领取一个 Finder 请求，等待当前操作完成后再确认授权…"
-            case .awaitingAuthorization: return "已领取一个 Finder 请求，正在等待授权确认…"
-            case .creatingFile: return "正在保存授权并继续本次 Finder 创建…"
+            case .readingQueue: return QuickFileLocalization.text(.init("正在读取 Finder 交接队列；仍可在 App 中直接创建文件。"))
+            case .waitingForCurrentOperation: return QuickFileLocalization.text(.init("已领取一个 Finder 请求，等待当前操作完成后再确认授权…"))
+            case .awaitingAuthorization: return QuickFileLocalization.text(.init("已领取一个 Finder 请求，正在等待授权确认…"))
+            case .creatingFile: return QuickFileLocalization.text(.init("正在保存授权并继续本次 Finder 创建…"))
             }
         }
     }
@@ -181,11 +187,11 @@ final class QuickFileViewModel: ObservableObject {
         var message: String {
             switch self {
             case .unavailable:
-                return "暂时无法访问 Finder 交接队列，自动处理已暂停。可重试读取；不会清空队列。"
+                return QuickFileLocalization.text(.init("暂时无法访问 Finder 交接队列，自动处理已暂停。可重试读取；不会清空队列。"))
             case .oversizedRequest:
-                return "Finder 交接队列中有超过大小上限的记录，原始记录仍保留，自动处理已暂停。可重试读取其他可用请求；重试不会移除超限记录。"
+                return QuickFileLocalization.text(.init("Finder 交接队列中有超过大小上限的记录，原始记录仍保留，自动处理已暂停。可重试读取其他可用请求；重试不会移除超限记录。"))
             case .unreadable:
-                return "未能读取或领取 Finder 请求，自动处理已暂停。可重试读取；不会清空队列或重新执行已领取的请求。"
+                return QuickFileLocalization.text(.init("未能读取或领取 Finder 请求，自动处理已暂停。可重试读取；不会清空队列或重新执行已领取的请求。"))
             }
         }
     }
@@ -204,15 +210,15 @@ final class QuickFileViewModel: ObservableObject {
         var message: String {
             switch reason {
             case .cancelled:
-                return "仅取消了当前 Finder 创建请求，自动确认已暂停。其他待处理请求（如有）未被取消；点击“继续处理”后再逐个确认。"
+                return QuickFileLocalization.text(.init("仅取消了当前 Finder 创建请求，自动确认已暂停。其他待处理请求（如有）未被取消；点击“继续处理”后再逐个确认。"))
             case let .readFailed(failure): return failure.message
             }
         }
 
         var actionTitle: String {
             switch reason {
-            case .cancelled: return "继续处理"
-            case .readFailed: return "重试读取"
+            case .cancelled: return QuickFileLocalization.text(.init("继续处理"))
+            case .readFailed: return QuickFileLocalization.text(.init("重试读取"))
             }
         }
     }
@@ -226,13 +232,13 @@ final class QuickFileViewModel: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .changed:
-                return "模板已在其他窗口修改，当前草稿仍保留。可复制草稿或另存为新模板。"
+                return QuickFileLocalization.text(.init("模板已在其他窗口修改，当前草稿仍保留。可复制草稿或另存为新模板。"))
             case .deleted:
-                return "此模板已被删除，当前草稿仍保留。可复制草稿或另存为新模板。"
+                return QuickFileLocalization.text(.init("此模板已被删除，当前草稿仍保留。可复制草稿或另存为新模板。"))
             case .busy:
-                return "模板操作尚未完成，请稍后重试。"
+                return QuickFileLocalization.text(.init("模板操作尚未完成，请稍后重试。"))
             case .notLoaded:
-                return "模板尚未成功读取，请先重新加载模板。"
+                return QuickFileLocalization.text(.init("模板尚未成功读取，请先重新加载模板。"))
             }
         }
     }
@@ -240,20 +246,29 @@ final class QuickFileViewModel: ObservableObject {
     @Published var destinationFolder: URL? {
         didSet {
             if oldValue != destinationFolder {
-                finderAuthorizationState = .notConfirmed
+                finderAuthorizationOutcome = .notConfirmed
                 selectedSavedAuthorizationID = nil
                 selectedSavedDirectoryIdentity = nil
             }
         }
     }
-    @Published private(set) var finderAuthorizationState: FinderAuthorizationState = .notConfirmed
+    @Published private var finderAuthorizationOutcome: FinderAuthorizationOutcome = .notConfirmed
+    var finderAuthorizationState: FinderAuthorizationState {
+        switch finderAuthorizationOutcome {
+        case .notConfirmed: return .notConfirmed
+        case .saving: return .saving
+        case .saved: return .saved
+        case let .failed(error): return .failed(error.localizedDescription)
+        }
+    }
     @Published var selectedTemplateID: FileTemplate.ID {
         didSet { if oldValue != selectedTemplateID { selectionGeneration &+= 1 } }
     }
     @Published var requestedFilename = "" {
         didSet { if !oldValue.utf8.elementsEqual(requestedFilename.utf8) { filenameGeneration &+= 1 } }
     }
-    @Published private(set) var status: Status? {
+    var status: Status? { statusPresentation?.value }
+    @Published private var statusPresentation: LocalizedPresentation<Status?>? {
         didSet { statusGeneration &+= 1 }
     }
     @Published private(set) var createdFileURL: URL?
@@ -269,6 +284,7 @@ final class QuickFileViewModel: ObservableObject {
         let query: String
         let enabledOnly: Bool
         let localeIdentifier: String
+        let languageIdentifier: String
         let indices: [Int]
     }
     private(set) var cachedTemplateFilter: TemplateFilterCache?
@@ -319,6 +335,7 @@ final class QuickFileViewModel: ObservableObject {
     private let finderAuthorizationCoordinator: FinderAuthorizationCoordinator
     private let clipboardProvider: (@MainActor () -> String?)?
     private let revealCreatedFile: @MainActor (URL) -> Void
+    private let automaticallyOpenCreatedFile: @MainActor (URL) async -> LocalizedPresentation<String>?
     private var templateRefreshObserver: TemplateRefreshObserver?
     private var templateRefreshTask: Task<Void, Never>?
     private enum TemplateRefreshPhase { case probing, loading }
@@ -344,7 +361,8 @@ final class QuickFileViewModel: ObservableObject {
         authoritativeTemplateLoader: (@Sendable () throws -> [FileTemplate])? = nil,
         templateChangeTokenReader: (@Sendable () throws -> TemplateStore.ChangeToken)? = nil,
         finderAuthorizationCoordinator: FinderAuthorizationCoordinator? = nil,
-        revealCreatedFile: @escaping @MainActor (URL) -> Void = { _ in }
+        revealCreatedFile: @escaping @MainActor (URL) -> Void = { _ in },
+        automaticallyOpenCreatedFile: @escaping @MainActor (URL) async -> LocalizedPresentation<String>? = { _ in nil }
     ) {
         let loadedTemplates = templates ?? []
         self.hasLoadedTemplates = templates != nil
@@ -364,6 +382,7 @@ final class QuickFileViewModel: ObservableObject {
         self.fileCreationService = fileCreationService
         self.clipboardProvider = clipboardProvider
         self.revealCreatedFile = revealCreatedFile
+        self.automaticallyOpenCreatedFile = automaticallyOpenCreatedFile
         self.finderAuthorizationCoordinator = finderAuthorizationCoordinator
             ?? FinderAuthorizationCoordinator(
                 loadTemplates: { [templateStore] in
@@ -407,7 +426,7 @@ final class QuickFileViewModel: ObservableObject {
         }
         // Background inventory warnings cannot replace a newer interactive result.
         if case let .failure(error) = result, initialStatusGeneration == statusGeneration {
-            status = .failure("部分 Finder 文件夹授权需要重新确认：\(error.localizedDescription)")
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("部分 Finder 文件夹授权需要重新确认：\(error.localizedDescription)"))))
         }
     }
 
@@ -500,9 +519,9 @@ final class QuickFileViewModel: ObservableObject {
                 }
                 updatedTemplates.append(template)
             }
-            try await persistTemplates(updatedTemplates, successMessage: "模板已保存。")
+            try await persistTemplates(updatedTemplates, successMessage: .init("模板已保存。"))
         } catch {
-            status = .failure(Self.templateOperationErrorMessage(error))
+            statusPresentation = LocalizedPresentation(.failure(Self.templateOperationErrorMessage(error)))
             throw error
         }
     }
@@ -526,16 +545,16 @@ final class QuickFileViewModel: ObservableObject {
                 try store.saveTemplates(updated, expectedTemplates: latest)
                 return (templates: updated, id: copy.id)
             }.get()
-            publishTemplates(result.templates, successMessage: "草稿已另存为新模板。")
+            publishTemplates(result.templates, successMessage: .init("草稿已另存为新模板。"))
             return result.id
         } catch let error as TemplateTransferError {
             // Draft validation follows the store's authoritative read and CAS checks.
             // A rejected append does not make the unchanged library unreadable.
-            status = .failure(Self.templateOperationErrorMessage(error))
+            statusPresentation = LocalizedPresentation(.failure(Self.templateOperationErrorMessage(error)))
             throw error
         } catch {
             invalidateTemplatesAfterFailure(error)
-            status = .failure(Self.templateOperationErrorMessage(error))
+            statusPresentation = LocalizedPresentation(.failure(Self.templateOperationErrorMessage(error)))
             throw error
         }
     }
@@ -544,19 +563,21 @@ final class QuickFileViewModel: ObservableObject {
     func filteredTemplates(search: String, enabledOnly: Bool = false) -> [FileTemplate] {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
         let localeIdentifier = Locale.current.identifier
+        let languageIdentifier = QuickFileLocalization.identifier
         if let cache = cachedTemplateFilter,
            cache.query == query, cache.enabledOnly == enabledOnly,
-           cache.localeIdentifier == localeIdentifier {
+           cache.localeIdentifier == localeIdentifier, cache.languageIdentifier == languageIdentifier {
             return cache.indices.map { templates[$0] }
         }
         let indices = templates.indices.filter { index in
             let template = templates[index]
             return (!enabledOnly || template.isEnabled) && (query.isEmpty
                 || template.name.localizedCaseInsensitiveContains(query)
+                || template.displayName.localizedCaseInsensitiveContains(query)
                 || template.fileExtension.localizedCaseInsensitiveContains(query))
         }
         cachedTemplateFilter = TemplateFilterCache(
-            query: query, enabledOnly: enabledOnly, localeIdentifier: localeIdentifier, indices: indices
+            query: query, enabledOnly: enabledOnly, localeIdentifier: localeIdentifier, languageIdentifier: languageIdentifier, indices: indices
         )
         return indices.map { templates[$0] }
     }
@@ -584,7 +605,7 @@ final class QuickFileViewModel: ObservableObject {
         var updated = templates
         let moved = updated.remove(at: sourceIndex)
         updated.insert(moved, at: destination)
-        return await commitTemplates(updated, successMessage: "模板顺序已更新。")
+        return await commitTemplates(updated, successMessage: .init("模板顺序已更新。"))
     }
 
     func moveTemplate(withID id: FileTemplate.ID, to position: TemplatePosition) async -> Bool {
@@ -594,7 +615,7 @@ final class QuickFileViewModel: ObservableObject {
         var updated = templates
         let moved = updated.remove(at: sourceIndex)
         updated.insert(moved, at: destination)
-        return await commitTemplates(updated, successMessage: "模板顺序已更新。")
+        return await commitTemplates(updated, successMessage: .init("模板顺序已更新。"))
     }
 
     struct TemplateImportPreview: Identifiable, Sendable {
@@ -607,20 +628,21 @@ final class QuickFileViewModel: ObservableObject {
         let id = UUID()
         let snapshot: TemplateStore.RecoverySnapshot
         let templates: [FileTemplate]
-        let sourceName: String
+        let sourceFilename: String?
+        var sourceName: String { sourceFilename ?? QuickFileLocalization.text(.init("默认模板")) }
         let clipboardCount: Int
 
         // The fresh store snapshot, not the earlier UI hint, owns this disclosure.
         var isMissingConfiguration: Bool { snapshot.reason == .missingSavedConfiguration }
-        var title: String { isMissingConfiguration ? "恢复缺失的模板配置" : "恢复损坏的模板配置" }
+        var title: String { isMissingConfiguration ? QuickFileLocalization.text(.init("恢复缺失的模板配置")) : QuickFileLocalization.text(.init("恢复损坏的模板配置")) }
         var confirmationActionTitle: String {
-            isMissingConfiguration ? "记录缺失状态并恢复" : "备份原配置并恢复"
+            isMissingConfiguration ? QuickFileLocalization.text(.init("记录缺失状态并恢复")) : QuickFileLocalization.text(.init("备份原配置并恢复"))
         }
         var explanation: String {
             if isMissingConfiguration {
-                return "原配置文件已缺失，无法备份其原始内容。将先在本地保存缺失状态记录及可用的旧配置数据，再用“\(sourceName)”恢复模板；保存记录失败则停止。这不是追加导入。"
+                return QuickFileLocalization.text(.init("原配置文件已缺失，无法备份其原始内容。将先在本地保存缺失状态记录及可用的旧配置数据，再用“\(sourceName)”恢复模板；保存记录失败则停止。这不是追加导入。"))
             }
-            return "将用“\(sourceName)”替换当前配置。先在本地保留原始配置备份，备份失败则停止恢复。这不是追加导入。"
+            return QuickFileLocalization.text(.init("将用“\(sourceName)”替换当前配置。先在本地保留原始配置备份，备份失败则停止恢复。这不是追加导入。"))
         }
     }
 
@@ -641,7 +663,7 @@ final class QuickFileViewModel: ObservableObject {
             }.get()
         } catch {
             if error is TemplateStore.StoreError { invalidateTemplatesAfterFailure(error) }
-            status = .failure(Self.templateOperationErrorMessage(error))
+            statusPresentation = LocalizedPresentation(.failure(Self.templateOperationErrorMessage(error)))
             throw error
         }
     }
@@ -660,10 +682,11 @@ final class QuickFileViewModel: ObservableObject {
             try await BackgroundWork.result {
                 try store.saveTemplates(plan.templates, expectedTemplates: plan.baseline)
             }.get()
-            publishTemplates(plan.templates, successMessage: "已追加导入 \(plan.addedCount) 个模板。")
+            let addedCount = plan.addedCount
+            publishTemplates(plan.templates, successMessage: .init("template.import.appended", defaultValue: "已追加导入 \(addedCount) 个模板。", comment: "Import completion. Count is newly added templates, not total library size."))
         } catch {
             if error is TemplateStore.StoreError { invalidateTemplatesAfterFailure(error) }
-            status = .failure(Self.templateOperationErrorMessage(error))
+            statusPresentation = LocalizedPresentation(.failure(Self.templateOperationErrorMessage(error)))
             throw error
         }
     }
@@ -685,10 +708,10 @@ final class QuickFileViewModel: ObservableObject {
                 try store.exportTemplates(bundle, to: url)
                 return latest.count
             }.get()
-            status = .success("已将全部 \(count) 个模板导出到本地：\(url.path)")
+            statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("已将全部 \(count) 个模板导出到本地：\(url.path)"))))
         } catch {
             if error is TemplateStore.StoreError { invalidateTemplatesAfterFailure(error) }
-            status = .failure(Self.templateOperationErrorMessage(error))
+            statusPresentation = LocalizedPresentation(.failure(Self.templateOperationErrorMessage(error)))
             throw error
         }
     }
@@ -703,7 +726,7 @@ final class QuickFileViewModel: ObservableObject {
         templateStateGeneration &+= 1
         defer { isLoadingTemplates = false }
         let store = templateStore
-        let previousFailureMessage = templateLoadError
+        let previousFailure = templateLoadFailure
         do {
             let preview = try await BackgroundWork.result {
                 // Store verifies a malformed or saved-but-missing configuration;
@@ -716,19 +739,19 @@ final class QuickFileViewModel: ObservableObject {
                     replacement = try TemplateTransferFile.read(from: url).templates.map { $0.makeTemplate() }
                 } else { replacement = BuiltInTemplates.all }
                 return TemplateRecoveryPreview(snapshot: snapshot, templates: replacement,
-                    sourceName: url?.lastPathComponent ?? "默认模板",
+                    sourceFilename: url?.lastPathComponent,
                     clipboardCount: replacement.filter(\.usesClipboard).count)
             }.get()
             let failure: TemplateLoadFailure = preview.isMissingConfiguration ? .missingConfiguration : .malformedConfiguration
             templateLoadFailure = failure
             templateStateGeneration &+= 1
-            if let previousFailureMessage, status == .failure(previousFailureMessage) {
-                status = .failure(failure.message)
+            if let previousFailure, status == .failure(previousFailure.message) {
+                statusPresentation = LocalizedPresentation(.failure(failure.message))
             }
             return preview
         } catch {
             invalidateTemplatesAfterRecoveryFailure(error)
-            status = .failure(Self.templateOperationErrorMessage(error))
+            statusPresentation = LocalizedPresentation(.failure(Self.templateOperationErrorMessage(error)))
             throw error
         }
     }
@@ -748,14 +771,15 @@ final class QuickFileViewModel: ObservableObject {
                 try store.recoverTemplates(preview.templates, expectedRecoveryState: preview.snapshot)
             }.get()
             recoveryBackupURL = result.backupURL.isFileURL ? result.backupURL : nil
-            publishTemplates(result.templates, successMessage: preview.isMissingConfiguration
-                ? "已记录缺失状态并恢复模板，恢复前状态记录保存在本地备份中。"
-                : "已备份原配置并恢复模板。")
+            let wasMissing = preview.isMissingConfiguration
+            publishTemplates(result.templates, successMessage: wasMissing
+                ? .init("已记录缺失状态并恢复模板，恢复前状态记录保存在本地备份中。")
+                : .init("已备份原配置并恢复模板。"))
         } catch {
             if case let TemplateStore.RecoveryError.replacementFailed(backupURL, _) = error,
                backupURL.isFileURL { recoveryBackupURL = backupURL }
             invalidateTemplatesAfterRecoveryFailure(error)
-            status = .failure(Self.templateOperationErrorMessage(error))
+            statusPresentation = LocalizedPresentation(.failure(Self.templateOperationErrorMessage(error)))
             throw error
         }
     }
@@ -867,14 +891,14 @@ final class QuickFileViewModel: ObservableObject {
                         self.templateRefreshTokenGeneration = self.templateStateGeneration
                         if snapshot.changedDuringRead { self.templateRefreshPending = true }
                         if forced, self.statusGeneration == statusVersion {
-                            self.status = .success("模板已重新加载。")
+                            self.statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("模板已重新加载。"))))
                         }
                     case let .failure(error):
                         self.templateRefreshToken = nil
                         self.templateLoadFailure = TemplateLoadFailure(error)
                         self.templateStateGeneration &+= 1
                         if forced, self.statusGeneration == statusVersion {
-                            self.status = .failure(TemplateLoadFailure(error).message)
+                            self.statusPresentation = LocalizedPresentation(.failure(TemplateLoadFailure(error).message))
                         }
                     }
                 } else {
@@ -899,7 +923,7 @@ final class QuickFileViewModel: ObservableObject {
             return false
         }
 
-        return await commitTemplates(updatedTemplates, successMessage: "模板已删除。")
+        return await commitTemplates(updatedTemplates, successMessage: .init("模板已删除。"))
     }
 
     func setTemplateEnabled(_ isEnabled: Bool, id: FileTemplate.ID) async {
@@ -909,7 +933,7 @@ final class QuickFileViewModel: ObservableObject {
 
         var updatedTemplates = templates
         updatedTemplates[index].isEnabled = isEnabled
-        _ = await commitTemplates(updatedTemplates, successMessage: "模板状态已更新。")
+        _ = await commitTemplates(updatedTemplates, successMessage: .init("模板状态已更新。"))
     }
 
     func moveTemplate(withID id: FileTemplate.ID, offset: Int) async -> Bool {
@@ -923,7 +947,7 @@ final class QuickFileViewModel: ObservableObject {
         var updatedTemplates = templates
         let template = updatedTemplates.remove(at: sourceIndex)
         updatedTemplates.insert(template, at: sourceIndex + offset)
-        return await commitTemplates(updatedTemplates, successMessage: "模板顺序已更新。")
+        return await commitTemplates(updatedTemplates, successMessage: .init("模板顺序已更新。"))
     }
 
     func canMoveTemplate(withID id: FileTemplate.ID?, offset: Int) -> Bool {
@@ -934,7 +958,7 @@ final class QuickFileViewModel: ObservableObject {
     }
 
     func restoreBuiltInTemplates() async -> Bool {
-        await commitTemplates(BuiltInTemplates.all, successMessage: "已恢复默认模板。")
+        await commitTemplates(BuiltInTemplates.all, successMessage: .init("已恢复默认模板。"))
     }
 
     /// An ordinary Open-panel selection is temporary and does not persist a Finder grant.
@@ -957,9 +981,9 @@ final class QuickFileViewModel: ObservableObject {
         destinationFolder = selectedURL
         selectedSavedAuthorizationID = nil
         selectedSavedDirectoryIdentity = nil
-        finderAuthorizationState = .notConfirmed
+        finderAuthorizationOutcome = .notConfirmed
         createdFileURL = nil
-        status = .success("已选择保存位置；本次创建无需启用 Finder 扩展。")
+        statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("已选择保存位置；本次创建无需启用 Finder 扩展。"))))
     }
 
     /// Inventory rows are hints. Resolve and admit the selected grant again before using it.
@@ -982,11 +1006,11 @@ final class QuickFileViewModel: ObservableObject {
             destinationFolder = directory.url
             selectedSavedAuthorizationID = directory.id
             selectedSavedDirectoryIdentity = identity
-            finderAuthorizationState = .saved
+            finderAuthorizationOutcome = .saved
             createdFileURL = nil
-            status = .success("已选择已授权文件夹；创建时会再次验证授权。")
+            statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("已选择已授权文件夹；创建时会再次验证授权。"))))
         case let .failure(error):
-            status = .failure(error.localizedDescription)
+            statusPresentation = LocalizedPresentation(.failure(error.localizedDescription))
         }
     }
 
@@ -1012,8 +1036,8 @@ final class QuickFileViewModel: ObservableObject {
         selectedSavedAuthorizationID = nil
         selectedSavedDirectoryIdentity = nil
         createdFileURL = nil
-        finderAuthorizationState = .saving
-        status = nil
+        finderAuthorizationOutcome = .saving
+        statusPresentation = nil
 
         let store = authorizedDirectoryStore
         let result = await BackgroundWork.result {
@@ -1022,11 +1046,11 @@ final class QuickFileViewModel: ObservableObject {
 
         switch result {
         case .success:
-            finderAuthorizationState = .saved
-            status = .success("已选择文件夹，并保存 Finder Extension 的安全授权。")
+            finderAuthorizationOutcome = .saved
+            statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("已选择文件夹，并保存 Finder Extension 的安全授权。"))))
         case let .failure(error):
-            finderAuthorizationState = .failed(error.localizedDescription)
-            status = .failure("文件夹已选择，但 Finder Extension 授权保存失败：\(error.localizedDescription)")
+            finderAuthorizationOutcome = .failed(error)
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("文件夹已选择，但 Finder Extension 授权保存失败：\(error.localizedDescription)"))))
         }
     }
 
@@ -1045,7 +1069,7 @@ final class QuickFileViewModel: ObservableObject {
         formGeneration: (selection: UInt64, filename: UInt64)
     ) async -> Bool {
         guard !isCreatingFile, !isAuthorizingDirectory else {
-            status = .failure("当前操作尚未完成，请稍后再处理 Finder 授权。")
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("当前操作尚未完成，请稍后再处理 Finder 授权。"))))
             return false
         }
 
@@ -1054,7 +1078,7 @@ final class QuickFileViewModel: ObservableObject {
         let initialFilenameGeneration = formGeneration.filename
         let initialTemplateStateGeneration = templateStateGeneration
         isCreatingFile = true
-        status = nil
+        statusPresentation = nil
         createdFileURL = nil
         defer { isCreatingFile = false }
 
@@ -1086,29 +1110,32 @@ final class QuickFileViewModel: ObservableObject {
             // reauthorization still replaces the grant and may replace target identity.
             selectedSavedAuthorizationID = completion.authorizationID
             selectedSavedDirectoryIdentity = completion.destinationIdentity
-            finderAuthorizationState = .saved
+            finderAuthorizationOutcome = .saved
             if filenameGeneration == initialFilenameGeneration {
                 requestedFilename = ""
             }
             createdFileURL = completion.creationResult.fileURL
             revealCreatedFile(completion.creationResult.fileURL)
-            let conflictNote = completion.creationResult.didRenameForConflict
-                ? "（为避免覆盖已自动改名）"
-                : ""
-            status = .success(
-                "已授权并创建 \(completion.creationResult.fileURL.lastPathComponent)\(conflictNote)"
-            )
+            let createdName = completion.creationResult.fileURL.lastPathComponent
+            let renamed = completion.creationResult.didRenameForConflict
+            func conflictNote() -> String { return renamed
+                ? QuickFileLocalization.text(.init("（为避免覆盖已自动改名）"))
+                : "" }
+            statusPresentation = LocalizedPresentation(.success(
+                QuickFileLocalization.text(.init("已授权并创建 \(createdName)\(conflictNote())"))
+            ))
+            await completeAutomaticOpen(completion.creationResult.fileURL)
             return true
         case let .failure(error):
             createdFileURL = nil
-            status = .failure(error.localizedDescription)
+            statusPresentation = LocalizedPresentation(.failure(error.localizedDescription))
             return false
         }
     }
 
     func cancelFinderAuthorizationRequest() {
         finderAuthorizationQueuePause = FinderAuthorizationQueuePause(reason: .cancelled)
-        status = .failure("本次 Finder 文件创建已取消。")
+        statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("本次 Finder 文件创建已取消。"))))
         finderAuthorizationQueueStatusGeneration = statusGeneration
     }
 
@@ -1119,7 +1146,7 @@ final class QuickFileViewModel: ObservableObject {
         // The app-wide banner always explains the pause. A late background read
         // must not replace the result of an independent creation/folder operation.
         if statusGeneration == readStatusGeneration, !isCreatingFile, !isAuthorizingDirectory {
-            status = .failure(failure.message)
+            statusPresentation = LocalizedPresentation(.failure(failure.message))
             finderAuthorizationQueueStatusGeneration = statusGeneration
         }
     }
@@ -1182,14 +1209,14 @@ final class QuickFileViewModel: ObservableObject {
                 // Remove only this pause's stale feedback, never a newer user result.
                 if let pausedStatusGeneration, self.statusGeneration == pausedStatusGeneration,
                    !self.isCreatingFile, !self.isAuthorizingDirectory {
-                    self.status = nil
+                    self.statusPresentation = nil
                 }
             },
             isPresentationAvailable: isPresentationAvailable,
             didCancelForUnavailableWindow: { _ in
                 guard self.statusGeneration == readStatusGeneration,
                       !self.isCreatingFile, !self.isAuthorizingDirectory else { return }
-                self.status = .failure("创建窗口已关闭，本次 Finder 请求已取消；请从 Finder 重新发起。其他待处理请求会在可用窗口中继续确认。")
+                self.statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("创建窗口已关闭，本次 Finder 请求已取消；请从 Finder 重新发起。其他待处理请求会在可用窗口中继续确认。"))))
             }
         )
     }
@@ -1200,11 +1227,11 @@ final class QuickFileViewModel: ObservableObject {
             return
         }
         guard hasLoadedTemplates, templateLoadError == nil else {
-            status = .failure(TemplateSaveError.notLoaded.localizedDescription)
+            statusPresentation = LocalizedPresentation(.failure(TemplateSaveError.notLoaded.localizedDescription))
             return
         }
         guard let destinationFolder, selectedTemplate != nil else {
-            status = .failure("请先选择目标文件夹和模板。")
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("请先选择目标文件夹和模板。"))))
             return
         }
 
@@ -1217,7 +1244,7 @@ final class QuickFileViewModel: ObservableObject {
         let authorizationStore = authorizedDirectoryStore
 
         isCreatingFile = true
-        status = nil
+        statusPresentation = nil
         createdFileURL = nil
         defer { isCreatingFile = false }
 
@@ -1243,7 +1270,7 @@ final class QuickFileViewModel: ObservableObject {
         case let .success(identity):
             destinationIdentity = identity
         case let .failure(error):
-            status = .failure("无法确认目标文件夹，本次未创建文件：\(error.localizedDescription)")
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("无法确认目标文件夹，本次未创建文件：\(error.localizedDescription)"))))
             return
         }
 
@@ -1257,7 +1284,7 @@ final class QuickFileViewModel: ObservableObject {
             return (templates: loaded, usesClipboard: usesClipboard)
         }
         guard templateStateGeneration == initialTemplateStateGeneration else {
-            status = .failure("模板配置已在创建期间更新，本次未创建文件。请确认当前模板后重试。")
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("模板配置已在创建期间更新，本次未创建文件。请确认当前模板后重试。"))))
             return
         }
         let authoritativeTemplates: [FileTemplate]
@@ -1275,14 +1302,14 @@ final class QuickFileViewModel: ObservableObject {
         case let .failure(error):
             templateLoadFailure = TemplateLoadFailure(error)
             templateStateGeneration &+= 1
-            status = .failure("无法确认最新模板配置，本次未创建文件：\(TemplateLoadFailure(error).message)")
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("无法确认最新模板配置，本次未创建文件：\(TemplateLoadFailure(error).message)"))))
             return
         }
 
         guard let authoritativeTemplate = authoritativeTemplates.first(where: {
             $0.id == requestedTemplateID && $0.isEnabled
         }) else {
-            status = .failure("所选模板已被删除或停用，请重新选择模板后再试。")
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("所选模板已被删除或停用，请重新选择模板后再试。"))))
             return
         }
 
@@ -1307,25 +1334,34 @@ final class QuickFileViewModel: ObservableObject {
         switch result {
         case let .success(result):
             createdFileURL = result.fileURL
-            let conflictNote = result.didRenameForConflict ? "（为避免覆盖已自动改名）" : ""
-            status = .success("已创建 \(result.fileURL.lastPathComponent)\(conflictNote)")
+            func conflictNote() -> String { return result.didRenameForConflict ? QuickFileLocalization.text(.init("（为避免覆盖已自动改名）")) : "" }
+            statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("已创建 \(result.fileURL.lastPathComponent)\(conflictNote())"))))
+            await completeAutomaticOpen(result.fileURL)
         case let .failure(error):
             createdFileURL = nil
-            status = .failure(error.localizedDescription)
+            statusPresentation = LocalizedPresentation(.failure(error.localizedDescription))
         }
     }
 
-    private func commitTemplates(_ updatedTemplates: [FileTemplate], successMessage: String) async -> Bool {
+    private func completeAutomaticOpen(_ url: URL) async {
+        let generation = statusGeneration
+        if let message = await automaticallyOpenCreatedFile(url), statusGeneration == generation {
+            // Publication succeeded even when Launch Services cannot open the document.
+            statusPresentation = LocalizedPresentation(.success(message.value))
+        }
+    }
+
+    private func commitTemplates(_ updatedTemplates: [FileTemplate], successMessage: LocalizedStringResource) async -> Bool {
         do {
             try await persistTemplates(updatedTemplates, successMessage: successMessage)
             return true
         } catch {
-            status = .failure(Self.templateOperationErrorMessage(error))
+            statusPresentation = LocalizedPresentation(.failure(Self.templateOperationErrorMessage(error)))
             return false
         }
     }
 
-    private func persistTemplates(_ updatedTemplates: [FileTemplate], successMessage: String) async throws {
+    private func persistTemplates(_ updatedTemplates: [FileTemplate], successMessage: LocalizedStringResource) async throws {
         guard hasLoadedTemplates, templateLoadError == nil else { throw TemplateSaveError.notLoaded }
         guard !isLoadingTemplates, !isSavingTemplates else { throw TemplateSaveError.busy }
         isSavingTemplates = true
@@ -1352,7 +1388,7 @@ final class QuickFileViewModel: ObservableObject {
         publishTemplates(updatedTemplates, successMessage: successMessage)
     }
 
-    private func publishTemplates(_ snapshot: [FileTemplate], successMessage: String) {
+    private func publishTemplates(_ snapshot: [FileTemplate], successMessage: LocalizedStringResource) {
         templates = snapshot
         persistedTemplates = snapshot
         hasLoadedTemplates = true
@@ -1360,7 +1396,7 @@ final class QuickFileViewModel: ObservableObject {
         templateStateGeneration &+= 1
         // Repair unavailable selections while preserving a newer valid selection.
         ensureSelectedTemplateIsAvailable()
-        status = .success(successMessage)
+        statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(successMessage)))
     }
 
     private func invalidateTemplatesAfterRecoveryFailure(_ error: Error) {

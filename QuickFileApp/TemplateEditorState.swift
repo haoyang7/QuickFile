@@ -27,7 +27,8 @@ struct TemplateEditorState {
     private let baseline: TemplateDraft
     private let isCopy: Bool
     private(set) var isSaving = false
-    private(set) var errorMessage: String?
+    private var saveError: Error?
+    var errorMessage: String? { saveError.map(QuickFileViewModel.templateOperationErrorMessage) }
     private(set) var offersConflictRecovery = false
     private(set) var didCopyDraft = false
 
@@ -74,18 +75,18 @@ struct TemplateEditorState {
     mutating func beginSave() -> Bool {
         guard !isSaving else { return false }
         isSaving = true
-        errorMessage = nil
+        saveError = nil
         return true
     }
 
     mutating func finishSave(error: Error? = nil) {
         isSaving = false
         guard let error else {
-            errorMessage = nil
+            saveError = nil
             offersConflictRecovery = false
             return
         }
-        errorMessage = QuickFileViewModel.templateOperationErrorMessage(error)
+        saveError = error
         if let error = error as? QuickFileViewModel.TemplateSaveError {
             switch error {
             case .changed, .deleted, .notLoaded: offersConflictRecovery = true
@@ -99,8 +100,8 @@ struct TemplateEditorState {
 
     /// Copies literal draft values; this never evaluates variables or reads the pasteboard.
     var copyText: String {
-        let documentDescription = draft.officeFormat.map { "\n文档类型：\($0.blankDocumentDescription)" } ?? ""
-        return "模板名称：\(draft.name)\n文件扩展名：\(draft.fileExtension)\n默认文件名：\(draft.defaultFilename)\n启用：\(draft.isEnabled ? "是" : "否")\(documentDescription)\n\n\(draft.content)"
+        let documentDescription = draft.officeFormat.map { QuickFileLocalization.text(.init("\n文档类型：\($0.blankDocumentDescription)")) } ?? ""
+        return QuickFileLocalization.text(.init("模板名称：\(draft.name)\n文件扩展名：\(draft.fileExtension)\n默认文件名：\(draft.defaultFilename)\n启用：\(draft.isEnabled ? QuickFileLocalization.text(.init("是")) : QuickFileLocalization.text(.init("否")))\(documentDescription)\n\n\(draft.content)"))
     }
 
     mutating func copyDraft(using copy: (String) -> Void) {

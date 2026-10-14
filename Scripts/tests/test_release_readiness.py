@@ -32,6 +32,9 @@ class ReleaseReadinessTests(unittest.TestCase):
         (self.scripts / "verify-architecture.py").write_text(
             "import os\nraise SystemExit(int(os.environ.get('ARCHITECTURE_EXIT', '0')))\n"
         )
+        (self.scripts / "verify-localizations.py").write_text(
+            "import os\nraise SystemExit(int(os.environ.get('LOCALIZATION_EXIT', '0')))\n"
+        )
         self.lock = self.root / "QuickFile.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
         self.lock.parent.mkdir(parents=True)
         self.lock.write_text("committed pinned packages\n")
@@ -295,7 +298,7 @@ else:
                         locked.chmod(0o700)
 
     def test_lock_and_security_gates_still_fail_and_cleanup(self):
-        for setting in ("LOCK_DRIFT", "UNSAFE_SETTINGS", "PROJECT_DRIFT", "ARCHITECTURE_EXIT"):
+        for setting in ("LOCK_DRIFT", "UNSAFE_SETTINGS", "PROJECT_DRIFT", "ARCHITECTURE_EXIT", "LOCALIZATION_EXIT"):
             with self.subTest(gate=setting):
                 if setting != "LOCK_DRIFT":
                     self.temporary.cleanup()

@@ -14,6 +14,26 @@ final class FinderMenuPresentationTests: XCTestCase {
             openCreateAction: openCreate, openTemplatesAction: openTemplates)
     }
 
+    func testExplicitLanguageChangesCachedMenuWithoutTranslatingSavedTemplateNames() throws {
+        defer { QuickFileLocalization.apply(.system) }
+        FinderMenuPresentation.prepareLocalization()
+        let template = FileTemplate(name: "我的模板", fileExtension: "txt", content: "")
+        let originalDefaults = BuiltInTemplates.all
+        for (language, title) in [(QuickFileLanguage.english, "New File"), (.simplifiedChinese, "新建文件")] {
+            QuickFileLocalization.apply(language)
+            let menu = presenter.templates(FinderMenuModelBuilder().presentation(from: [template])) { _ in [1] }
+            XCTAssertEqual(menu.items.first?.title, title)
+            XCTAssertEqual(menu.items.first?.submenu?.items.first?.title, "我的模板 (.txt)")
+            let unavailable = presenter.unavailable(.templatesLoading)
+            XCTAssertEqual(unavailable.items.first?.title, title)
+            XCTAssertEqual(unavailable.items.first?.submenu?.items.first?.title,
+                language == .english ? "Loading templates…" : "正在加载模板…")
+            XCTAssertEqual(BuiltInTemplates.all.map(\.id), originalDefaults.map(\.id))
+            XCTAssertEqual(BuiltInTemplates.all.first?.name, language == .english ? "Word Document" : "Word 文档")
+        }
+        XCTAssertEqual(originalDefaults.first?.name, "Word 文档")
+    }
+
     private func submenu(_ menu: NSMenu) throws -> NSMenu {
         XCTAssertEqual(menu.items.count, 1)
         XCTAssertEqual(menu.items.first?.title, "新建文件")

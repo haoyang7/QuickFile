@@ -619,6 +619,38 @@ final class AuthorizedDirectoryStoreTests: XCTestCase {
         XCTAssertEqual(try otherStore.loadAuthorizedDirectories(), [explicitlyReauthorized])
     }
 
+    func testAsyncAccessRetainsScopeUntilConsumerFinishesAndReleaseIsIdempotent() throws {
+        let starts = LockedTestValue(0)
+        let stops = LockedTestValue(0)
+        let store = makeStore(startAccessing: { _ in starts.update { $0 += 1 }; return true },
+                              stopAccessing: { _ in stops.update { $0 += 1 } })
+        let directory = try XCTUnwrap(temporaryDirectory)
+        let authorization = try store.authorize(directory)
+        starts.update { $0 = 0 }; stops.update { $0 = 0 }
+        let access = try store.beginAccess(to: directory, authorizationID: authorization.id)
+        XCTAssertEqual(starts.value, 1)
+        XCTAssertEqual(stops.value, 0)
+        // An admitted handoff can finish, but revocation denies the next one.
+        try store.revoke(authorization.id)
+        XCTAssertThrowsError(try store.beginAccess(to: directory, authorizationID: authorization.id))
+        XCTAssertEqual(stops.value, 0)
+        DispatchQueue.concurrentPerform(iterations: 20) { _ in access.release() }
+        XCTAssertEqual(stops.value, 1)
+    }
+
+    func testAbandonedAsyncAccessReleasesItsScope() throws {
+        let stops = LockedTestValue(0)
+        let store = makeStore(stopAccessing: { _ in stops.update { $0 += 1 } })
+        let directory = try XCTUnwrap(temporaryDirectory)
+        _ = try store.authorize(directory)
+        stops.update { $0 = 0 }
+        var access: AuthorizedDirectoryStore.Access? = try store.beginAccess(to: directory)
+        XCTAssertNotNil(access)
+        XCTAssertEqual(stops.value, 0)
+        access = nil
+        XCTAssertEqual(stops.value, 1)
+    }
+
     func testRevokesAuthorization() throws {
         let store = makeStore()
         let authorization = try store.authorize(temporaryDirectory)

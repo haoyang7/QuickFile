@@ -127,6 +127,9 @@ import sys
 if hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() != sys.argv[2]:
     raise SystemExit("error: Package.resolved changed during the build")
 PY
+python3 Scripts/verify-localizations.py \
+    --derived-data "$TASK_DIRECTORY/DerivedData" \
+    --app "$TASK_DIRECTORY/DerivedData/Build/Products/Release/QuickFile.app"
 PACKAGE_ARGUMENTS=(
     --app "$TASK_DIRECTORY/DerivedData/Build/Products/Release/QuickFile.app"
     --output "$OUTPUT_DIRECTORY"

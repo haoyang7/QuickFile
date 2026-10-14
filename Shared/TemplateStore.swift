@@ -31,15 +31,15 @@ public final class TemplateStore: @unchecked Sendable {
         public var errorDescription: String? {
             switch self {
             case .configurationChanged:
-                return "模板已在其他实例修改。当前修改未保存，请重新加载模板后重试。"
+                return QuickFileLocalization.text(.init("模板已在其他实例修改。当前修改未保存，请重新加载模板后重试。"))
             case .sharedDefaultsUnavailable:
-                return "无法访问 QuickFile 的共享模板存储。"
+                return QuickFileLocalization.text(.init("无法访问 QuickFile 的共享模板存储。"))
             case let .readFailed(error):
-                return "无法读取 QuickFile 模板，原配置未被替换：\(error.localizedDescription)"
+                return QuickFileLocalization.text(.init("无法读取 QuickFile 模板，原配置未被替换：\(error.localizedDescription)"))
             case .savedConfigurationMissing:
-                return "已保存的模板配置文件不可用。请恢复文件后重新加载模板。"
+                return QuickFileLocalization.text(.init("已保存的模板配置文件不可用。请恢复文件后重新加载模板。"))
             case let .persistenceFailed(error):
-                return "无法保存 QuickFile 模板：\(error.localizedDescription)"
+                return QuickFileLocalization.text(.init("无法保存 QuickFile 模板：\(error.localizedDescription)"))
             }
         }
     }
@@ -72,13 +72,13 @@ public final class TemplateStore: @unchecked Sendable {
         public var errorDescription: String? {
             switch self {
             case .notRecoverable:
-                return "当前配置未确认损坏，不能执行恢复。请先重新加载。"
+                return QuickFileLocalization.text(.init("当前配置未确认损坏，不能执行恢复。请先重新加载。"))
             case .configurationChanged:
-                return "配置已在恢复预览后发生变化。未替换任何配置，请重新加载。"
+                return QuickFileLocalization.text(.init("配置已在恢复预览后发生变化。未替换任何配置，请重新加载。"))
             case let .backupFailed(error):
-                return "无法备份原配置，恢复已停止，原配置未被替换：\(error.localizedDescription)"
+                return QuickFileLocalization.text(.init("无法备份原配置，恢复已停止，原配置未被替换：\(error.localizedDescription)"))
             case let .replacementFailed(_, error):
-                return "原配置已备份，但恢复写入失败：\(error.localizedDescription)"
+                return QuickFileLocalization.text(.init("原配置已备份，但恢复写入失败：\(error.localizedDescription)"))
             }
         }
     }

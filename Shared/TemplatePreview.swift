@@ -51,8 +51,8 @@ public enum TemplatePreview {
         let context = TemplateRenderingContext(
             // 2026-01-01 12:00:00 UTC.
             date: Date(timeIntervalSince1970: 1_767_268_800),
-            folderName: "示例文件夹",
-            clipboard: "示例剪贴板内容（预览不会读取系统剪贴板）",
+            folderName: QuickFileLocalization.text(.init("示例文件夹")),
+            clipboard: QuickFileLocalization.text(.init("示例剪贴板内容（预览不会读取系统剪贴板）")),
             sequence: 1
         )
 

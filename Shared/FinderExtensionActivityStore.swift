@@ -13,7 +13,7 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
         public var errorDescription: String? {
             switch self {
             case .sharedDefaultsUnavailable:
-                return "无法访问 QuickFile 的 Finder Extension 活动存储。"
+                return QuickFileLocalization.text(.init("无法访问 QuickFile 的 Finder Extension 活动存储。"))
             }
         }
     }

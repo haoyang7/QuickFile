@@ -1,3 +1,4 @@
+import QuickFileCore
 import Combine
 import Foundation
 import QuickFileInfrastructure
@@ -44,10 +45,10 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
 
         var message: String {
             switch self {
-            case .inspecting: return "正在检查有限数量的队列记录…"
-            case .preparing: return "正在重新核对所选原始记录…"
-            case .confirming: return "等待归档确认；取消会保留原始记录。"
-            case .archiving: return "正在归档原件，请等待结果…"
+            case .inspecting: return QuickFileLocalization.text(.init("正在检查有限数量的队列记录…"))
+            case .preparing: return QuickFileLocalization.text(.init("正在重新核对所选原始记录…"))
+            case .confirming: return QuickFileLocalization.text(.init("等待归档确认；取消会保留原始记录。"))
+            case .archiving: return QuickFileLocalization.text(.init("正在归档原件，请等待结果…"))
             }
         }
     }
@@ -61,9 +62,9 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
             switch self {
             case let .information(message), let .failure(message): return message
             case .archived(false):
-                return "已将所选原始记录移至本机的隐藏私有归档目录，移出待办。没有创建文件或恢复自动处理。关闭后可在暂停提示中点击“重试读取”。"
+                return QuickFileLocalization.text(.init("已将所选原始记录移至本机的隐藏私有归档目录，移出待办。没有创建文件或恢复自动处理。关闭后可在暂停提示中点击“重试读取”。"))
             case .archived(true):
-                return "原始记录已移至归档并移出待办，但未能完整确认归档的位置或持久化状态。不要重复归档本条记录；请先保留当前状态并检查本机存储。自动处理仍暂停，没有创建文件。"
+                return QuickFileLocalization.text(.init("原始记录已移至归档并移出待办，但未能完整确认归档的位置或持久化状态。不要重复归档本条记录；请先保留当前状态并检查本机存储。自动处理仍暂停，没有创建文件。"))
             }
         }
     }
@@ -74,13 +75,14 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
     @Published private(set) var legacyRecoveryUnsupported = false
     @Published private(set) var hasInspected = false
     @Published private(set) var operation: Operation?
-    @Published private(set) var status: Status?
+    var status: Status? { statusPresentation?.value }
+    @Published private var statusPresentation: LocalizedPresentation<Status?>?
     @Published private(set) var selectedCandidateID: String?
     // Exactly one committed receipt survives sheet close/reopen. It is separate
     // from generation-scoped inspection and never reselects or retries a request.
     @Published private(set) var lastArchive: ArchiveResult?
 
-    private static let finishingMessage = "上次操作仍在结束。结束后可点击“重新检查”；关闭窗口不会强行中断磁盘操作。"
+    private static var finishingMessage: String { QuickFileLocalization.text(.init("上次操作仍在结束。结束后可点击“重新检查”；关闭窗口不会强行中断磁盘操作。")) }
     private let backend: Backend
     private let canOperate: @MainActor () -> Bool
     private var generation = UUID()
@@ -109,8 +111,8 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
         generation = UUID()
         isPresented = true
         clearInspection()
-        status = isOperationInFlight
-            ? .information(Self.finishingMessage)
+        statusPresentation = isOperationInFlight
+            ? LocalizedPresentation(.information(Self.finishingMessage))
             : nil
     }
 
@@ -119,7 +121,7 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
         isPresented = false
         cancelPreparedTicket()
         clearInspection()
-        status = nil
+        statusPresentation = nil
         // Deliberately do not clear operation. BackgroundWork is not cancellable:
         // a closed/reopened sheet cannot admit a second operation before it ends.
     }
@@ -129,7 +131,7 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
         generation = UUID()
         cancelPreparedTicket()
         selectedCandidateID = candidateID.flatMap { id in candidates.contains { $0.id == id } ? id : nil }
-        status = nil
+        statusPresentation = nil
     }
 
     func inspect() async {
@@ -139,7 +141,7 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
         cancelPreparedTicket()
         operation = .inspecting
         clearInspection()
-        status = nil
+        statusPresentation = nil
         defer { finishOperation() }
         let inspect = backend.inspect
         let result = await BackgroundWork.result { try inspect() }
@@ -151,7 +153,7 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
             legacyRecoveryUnsupported = inspection.legacyRecoveryUnsupported
             hasInspected = true
         case let .failure(error):
-            status = .failure(Self.safeMessage(for: error))
+            statusPresentation = LocalizedPresentation(.failure(Self.safeMessage(for: error)))
         }
     }
 
@@ -171,7 +173,7 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
         guard !Task.isCancelled, canInspect else { return false }
         let id = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard id.utf8.count <= 64, UUID(uuidString: id) != nil else {
-            status = .failure("请输入完整的请求标识（UUID），不含路径或 .json 后缀。")
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("请输入完整的请求标识（UUID），不含路径或 .json 后缀。"))))
             return false
         }
         // Preserve exact spelling: case-sensitive queues may contain both forms.
@@ -185,7 +187,7 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
     ) async -> Bool {
         let currentGeneration = generation
         operation = .preparing
-        status = nil
+        statusPresentation = nil
         defer { finishOperation() }
         let prepare = backend.prepare
         let preparation = await BackgroundWork.result { try prepare(selectedID) }
@@ -195,7 +197,7 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
         case let .failure(error):
             if isCurrent(currentGeneration), !Task.isCancelled {
                 clearInspection()
-                status = .failure(Self.safeMessage(for: error))
+                statusPresentation = LocalizedPresentation(.failure(Self.safeMessage(for: error)))
             }
             return false
         }
@@ -205,7 +207,7 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
             backend.cancel(ticket)
             if isCurrent(currentGeneration), !Task.isCancelled {
                 clearInspection()
-                status = .failure("当前操作或所选记录已变化。原件未归档；请重新检查后再选择。")
+                statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("当前操作或所选记录已变化。原件未归档；请重新检查后再选择。"))))
             }
             return false
         }
@@ -220,13 +222,13 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
             backend.cancel(ticket)
             if isCurrent(currentGeneration), !Task.isCancelled {
                 clearInspection()
-                status = .failure("应用状态已变化，本次归档未提交。请稍后重新检查。")
+                statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("应用状态已变化，本次归档未提交。请稍后重新检查。"))))
             }
             return false
         }
         guard approved else {
             cancelPreparedTicket()
-            status = .information("已取消归档，所选原始记录未改动。自动处理仍暂停。")
+            statusPresentation = LocalizedPresentation(.information(QuickFileLocalization.text(.init("已取消归档，所选原始记录未改动。自动处理仍暂停。"))))
             return false
         }
 
@@ -257,11 +259,11 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
         case let .success(receipt):
             candidates.removeAll { $0.id == selectedID }
             selectedCandidateID = nil
-            status = .archived(durabilityWarning: receipt.durabilityWarning)
+            statusPresentation = LocalizedPresentation(.archived(durabilityWarning: receipt.durabilityWarning))
             return true
         case let .failure(error):
             clearInspection()
-            status = .failure(Self.safeMessage(for: error))
+            statusPresentation = LocalizedPresentation(.failure(Self.safeMessage(for: error)))
             return false
         }
     }
@@ -269,7 +271,7 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
     private func finishOperation() {
         operation = nil
         if isPresented, status == .information(Self.finishingMessage) {
-            status = .information("上次操作已结束。请重新检查当前队列；自动处理仍暂停。")
+            statusPresentation = LocalizedPresentation(.information(QuickFileLocalization.text(.init("上次操作已结束。请重新检查当前队列；自动处理仍暂停。"))))
         }
     }
 
@@ -297,6 +299,6 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
         }
         // Arbitrary errors can include file paths or payloads. Only the store's
         // closed recovery error vocabulary is safe to show in this limited UI.
-        return "未能完成此次恢复操作。不会改用删除或清空队列；请保留原始数据并重新检查。"
+        return QuickFileLocalization.text(.init("未能完成此次恢复操作。不会改用删除或清空队列；请保留原始数据并重新检查。"))
     }
 }

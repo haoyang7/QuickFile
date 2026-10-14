@@ -21,6 +21,8 @@ on:
       - 'Scripts/distribution_contract.py'
       - 'Scripts/community-provenance.py'
       - 'Scripts/tests/test_community_provenance.py'
+      - 'Resources/**'
+      - 'Scripts/verify-localizations.py'
       - 'project.yml'
       - 'QuickFile.xcodeproj/**'
 

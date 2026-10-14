@@ -369,6 +369,41 @@ final class QuickFileViewModelTests: XCTestCase {
         XCTAssertTrue(try grants.loadAuthorizedDirectories().isEmpty)
     }
 
+    func testAutomaticOpenRunsOnlyForPublishedFinalURLAndFailureDoesNotUndoCreation() async throws {
+        let store = TemplateStore(defaults: defaults)
+        var template = FileTemplate(name: "Plain", fileExtension: "txt", content: "new")
+        try store.saveTemplates([template])
+        let original = temporaryDirectory.appendingPathComponent("example.txt")
+        try Data("keep".utf8).write(to: original)
+        var opened: [URL] = []
+        let model = QuickFileViewModel(
+            templateStore: store, templates: [template],
+            authorizedDirectoryStore: makeAuthorizationStore(defaults: defaults),
+            automaticallyOpenCreatedFile: { url in
+                XCTAssertTrue(Thread.isMainThread)
+                XCTAssertEqual(try? String(contentsOf: url), "new")
+                opened.append(url)
+                return LocalizedPresentation("opening failed; file retained")
+            }
+        )
+        await model.selectDestinationFolder(temporaryDirectory)
+        model.requestedFilename = "example"
+        await model.createFile()
+        let created = try XCTUnwrap(model.createdFileURL)
+        XCTAssertEqual(created.lastPathComponent, "example 2.txt")
+        XCTAssertEqual(opened, [created])
+        XCTAssertEqual(try String(contentsOf: original), "keep")
+        guard case .success("opening failed; file retained") = model.status else {
+            return XCTFail("Opening failure must not claim that creation failed")
+        }
+        template.isEnabled = false
+        try store.saveTemplates([template])
+        await model.createFile()
+        XCTAssertEqual(opened, [created])
+        XCTAssertNil(model.createdFileURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryDirectory.appendingPathComponent("example 3.txt").path))
+    }
+
     func testSavedGrantSelectionResolvesOnlySelectedIDAndSkipsBlockedUnrelatedResolver() async throws {
         let selectedURL = temporaryDirectory.appendingPathComponent("Selected")
         let unrelatedURL = temporaryDirectory.appendingPathComponent("Offline")
@@ -2474,6 +2509,7 @@ final class QuickFileViewModelTests: XCTestCase {
         try store.saveTemplates([template])
         var clipboardReads = 0
         var revealed: [URL] = []
+        var opened: [URL] = []
         let model = QuickFileViewModel(
             templateStore: store,
             authorizedDirectoryStore: makeAuthorizationStore(defaults: defaults),
@@ -2482,7 +2518,8 @@ final class QuickFileViewModelTests: XCTestCase {
                 clipboardReads += 1
                 return "copied"
             },
-            revealCreatedFile: { revealed.append($0) }
+            revealCreatedFile: { revealed.append($0) },
+            automaticallyOpenCreatedFile: { opened.append($0); return nil }
         )
         await model.loadTemplatesIfNeeded()
         template.content = "{{clipboard}}"
@@ -2495,6 +2532,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let result = try XCTUnwrap(model.createdFileURL)
         XCTAssertEqual(result.lastPathComponent, "未命名 2.txt")
         XCTAssertEqual(revealed, [result])
+        XCTAssertEqual(opened, [result])
         XCTAssertEqual(clipboardReads, 1)
         XCTAssertEqual(try String(contentsOf: result, encoding: .utf8), "copied")
         XCTAssertEqual(try String(contentsOf: original, encoding: .utf8), "keep")
@@ -2504,6 +2542,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let rejected = await model.completeFinderAuthorizationRequest(request, authorizedDirectory: temporaryDirectory)
         XCTAssertFalse(rejected)
         XCTAssertEqual(revealed, [result])
+        XCTAssertEqual(opened, [result])
         XCTAssertEqual(clipboardReads, 1)
     }
 

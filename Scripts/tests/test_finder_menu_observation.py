@@ -31,7 +31,7 @@ class FinderMenuObservationTests(unittest.TestCase):
     def loading_titles(self):
         titles = []
         for state in ("destinationLoading", "templatesLoading"):
-            match = re.search(r'case \.' + state + r':\s*return "([^"\\]*)"', self.presentation)
+            match = re.search(r'case \.' + state + r':\s*return String\(localized: "([^"\\]*)", bundle: bundle\)', self.presentation)
             self.assertIsNotNone(match, "Product loading state changed; review the observation contract")
             titles.append(match[1])
         return titles

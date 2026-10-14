@@ -1,4 +1,5 @@
 import Foundation
+import os
 import QuickFileCore
 
 // Immutable dependencies carry their own concurrency contracts: repository transactions
@@ -9,6 +10,23 @@ public struct AuthorizedDirectoryStore: Sendable {
     typealias BookmarkResolver = SecurityScopedBookmarkClient.BookmarkResolver
     typealias SecurityScopeStarter = SecurityScopedBookmarkClient.SecurityScopeStarter
     typealias SecurityScopeStopper = SecurityScopedBookmarkClient.SecurityScopeStopper
+
+    /// Retains an admitted scope across an asynchronous system handoff.
+    /// Releasing is idempotent; abandoning the handoff also releases the scope.
+    public final class Access: @unchecked Sendable {
+        private let releaseOperation: OSAllocatedUnfairLock<(@Sendable () -> Void)?>
+        fileprivate init(release: @escaping @Sendable () -> Void) {
+            releaseOperation = OSAllocatedUnfairLock(initialState: release)
+        }
+        public func release() {
+            let operation = releaseOperation.withLock { operation in
+                defer { operation = nil }
+                return operation
+            }
+            operation?()
+        }
+        deinit { release() }
+    }
 
     private let repository: AuthorizedDirectoryRepository
     private let policy: AuthorizedDirectoryPolicy
@@ -280,6 +298,25 @@ public struct AuthorizedDirectoryStore: Sendable {
     ) throws -> Result {
         timing?.mark("authorization.begin")
         defer { timing?.mark("authorization.end") }
+        let access = try acquireAccess(to: destinationFolder, authorizationID: authorizationID, timing: timing)
+        defer { access.release() }
+        return try operation()
+    }
+
+    /// Resolve and verify on a worker queue; keep the returned access until the
+    /// asynchronous consumer has accepted the URL. Does not hold a repository lock.
+    public func beginAccess(
+        to destinationFolder: URL,
+        authorizationID: AuthorizedDirectory.ID? = nil
+    ) throws -> Access {
+        try acquireAccess(to: destinationFolder, authorizationID: authorizationID, timing: nil)
+    }
+
+    private func acquireAccess(
+        to destinationFolder: URL,
+        authorizationID: AuthorizedDirectory.ID?,
+        timing: CreationTiming?
+    ) throws -> Access {
         let destinationFolder = AuthorizedDirectoryPolicy.canonicalURL(destinationFolder)
         var firstResolutionError: Error?
         var resolvedAuthorizationCount = 0
@@ -287,7 +324,7 @@ public struct AuthorizedDirectoryStore: Sendable {
         var matchingAuthorizationCount = 0
 
         var authorizationChanged = false
-        func tryAccess(record: StoredDirectoryAuthorization, url: URL) throws -> Result? {
+        func tryAccess(record: StoredDirectoryAuthorization, url: URL) throws -> Access? {
             let currentBeforeScope = try {
                 timing?.mark("authorization.revision.before-scope.begin")
                 defer { timing?.mark("authorization.revision.before-scope.end") }
@@ -311,7 +348,7 @@ public struct AuthorizedDirectoryStore: Sendable {
                 return nil
             }
             timing?.mark("authorization.scope.started")
-            defer {
+            let access = Access { [bookmarkClient] in
                 bookmarkClient.stopAccessing(url)
                 timing?.mark("authorization.scope.stopped")
             }
@@ -336,7 +373,7 @@ public struct AuthorizedDirectoryStore: Sendable {
                 return nil
             }
             timing?.mark("authorization.admitted")
-            return .some(try operation())
+            return access
         }
 
         let authorizations = try {

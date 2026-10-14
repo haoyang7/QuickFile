@@ -90,23 +90,23 @@ public enum FileCreationError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .destinationIsNotFileURL:
-            return "目标位置不是本地文件夹。"
+            return QuickFileLocalization.text(.init("目标位置不是本地文件夹。"))
         case let .destinationDoesNotExist(url):
-            return "目标文件夹不存在：\(url.path)"
+            return QuickFileLocalization.text(.init("目标文件夹不存在：\(url.path)"))
         case let .destinationIsNotDirectory(url):
-            return "目标位置不是文件夹：\(url.path)"
+            return QuickFileLocalization.text(.init("目标位置不是文件夹：\(url.path)"))
         case .destinationIdentityChanged:
-            return "原目标文件夹已变化或无法确认身份，本次未创建文件。请从 Finder 重新发起创建。"
+            return QuickFileLocalization.text(.init("原目标文件夹已变化或无法确认身份，本次未创建文件。请从 Finder 重新发起创建。"))
         case .invalidFilename:
-            return "文件名无效，请换一个名称后重试。"
+            return QuickFileLocalization.text(.init("文件名无效，请换一个名称后重试。"))
         case .conflictLimitReached:
-            return "同名文件过多，无法生成可用文件名。"
+            return QuickFileLocalization.text(.init("同名文件过多，无法生成可用文件名。"))
         case let .renderedContentTooLarge(maximumUTF8Bytes):
-            return "模板展开后的内容超过 \(maximumUTF8Bytes) 字节的 UTF-8 上限，本次未创建文件。请缩短模板内容或剪贴板文本。"
+            return QuickFileLocalization.text(.init("模板展开后的内容超过 \(maximumUTF8Bytes) 字节的 UTF-8 上限，本次未创建文件。请缩短模板内容或剪贴板文本。"))
         case let .createdFileLocationUnavailable(filename, error):
-            return "文件 \(filename) 已保存，但无法确认当前位置：\(error.localizedDescription)。请先检查目标文件夹，避免重复创建。"
+            return QuickFileLocalization.text(.init("文件 \(filename) 已保存，但无法确认当前位置：\(error.localizedDescription)。请先检查目标文件夹，避免重复创建。"))
         case let .writeFailed(url, error):
-            return "无法写入 \(url.lastPathComponent)：\(error.localizedDescription)"
+            return QuickFileLocalization.text(.init("无法写入 \(url.lastPathComponent)：\(error.localizedDescription)"))
         }
     }
 }

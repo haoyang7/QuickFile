@@ -3,6 +3,7 @@ import QuickFileInfrastructure
 import SwiftUI
 
 struct CreateFileView: View {
+    @Environment(\.locale) private var quickFileLocale
     @ObservedObject var viewModel: QuickFileViewModel
     @ObservedObject var finderIntegrationViewModel: FinderIntegrationViewModel
     var showTemplateManager: () -> Void = {}
@@ -17,7 +18,7 @@ struct CreateFileView: View {
                     Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
                         .disabled(viewModel.isLoadingTemplates || viewModel.isSavingTemplates)
                 }
-                if viewModel.isLoadingTemplates { ProgressView("正在加载模板…") }
+                if viewModel.isLoadingTemplates { ProgressView(QuickFileLocalization.text(.init("正在加载模板…"))) }
                 destinationSection
                 fileSection
                 actionSection
@@ -74,7 +75,7 @@ struct CreateFileView: View {
                         Text("当前：\(finderIntegrationViewModel.statusText)")
                             .foregroundColor(.secondary)
                         Spacer()
-                        Menu("扩展帮助") {
+                        Menu(QuickFileLocalization.text(.init("扩展帮助"))) {
                             Button("检查扩展响应") { Task { await finderIntegrationViewModel.refresh() } }
                                 .disabled(finderIntegrationViewModel.isRefreshing)
                             Button("打开扩展设置…") { finderIntegrationViewModel.openManagement() }
@@ -129,12 +130,12 @@ struct CreateFileView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "folder")
                         .foregroundColor(.secondary)
-                    Text(viewModel.destinationFolder?.path ?? "尚未选择文件夹")
+                    Text(viewModel.destinationFolder?.path ?? QuickFileLocalization.text(.init("尚未选择文件夹")))
                         .lineLimit(2)
                         .truncationMode(.middle)
                         .foregroundColor(viewModel.destinationFolder == nil ? .secondary : .primary)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .help(viewModel.destinationFolder?.path ?? "选择用于创建文件的文件夹")
+                        .help(viewModel.destinationFolder?.path ?? QuickFileLocalization.text(.init("选择用于创建文件的文件夹")))
                 }
 
                 Button {
@@ -151,10 +152,10 @@ struct CreateFileView: View {
                     }
                 }
                 .disabled(viewModel.isBusy)
-                .help("选择后即可在这里创建文件；不会自动保存 Finder 授权。")
+                .help(QuickFileLocalization.text(.init("选择后即可在这里创建文件；不会自动保存 Finder 授权。")))
             }
 
-            DisclosureGroup("使用已保存的文件夹授权", isExpanded: $showsSavedAuthorizations) {
+            DisclosureGroup(QuickFileLocalization.text(.init("使用已保存的文件夹授权")), isExpanded: $showsSavedAuthorizations) {
                 savedAuthorizationMenu
                     .padding(.top, 6)
             }
@@ -166,9 +167,9 @@ struct CreateFileView: View {
     private var savedAuthorizationMenu: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Menu("选择已授权文件夹") {
+                Menu(QuickFileLocalization.text(.init("选择已授权文件夹"))) {
                     ForEach(finderIntegrationViewModel.authorizedDirectories) { directory in
-                        Button(directory.url.path + (directory.isBookmarkStale ? "（需重新授权）" : "")) {
+                        Button(directory.url.path + (directory.isBookmarkStale ? QuickFileLocalization.text(.init("（需重新授权）")) : "")) {
                             finderIntegrationViewModel.cancelVerification()
                             Task { await viewModel.selectAuthorizedDirectory(directory) }
                         }
@@ -223,8 +224,10 @@ struct CreateFileView: View {
                 Text("模板")
                     .frame(width: 60, alignment: .leading)
                 Picker("模板", selection: $viewModel.selectedTemplateID) {
-                    ForEach(viewModel.enabledTemplates) { template in
-                        Text(template.name).tag(template.id)
+                    // Resolve before ForEach so locale changes update its input;
+                    // unchanged templates would otherwise reuse cached labels.
+                    ForEach(viewModel.enabledTemplates.map { (id: $0.id, title: $0.displayName) }, id: \.id) { option in
+                        Text(option.title).tag(option.id)
                     }
                 }
                 .labelsHidden()
@@ -241,7 +244,7 @@ struct CreateFileView: View {
                 Text("文件名")
                     .frame(width: 60, alignment: .leading)
                 TextField(defaultFilenameHint, text: $viewModel.requestedFilename)
-                    .accessibilityLabel("文件名")
+                    .accessibilityLabel(QuickFileLocalization.text(.init("文件名")))
                     .onSubmit {
                         guard viewModel.canCreate else { return }
                         Task { await viewModel.createFile() }
@@ -262,7 +265,7 @@ struct CreateFileView: View {
 
     private var defaultFilenameHint: String {
         let filename = viewModel.selectedTemplate?.defaultFilename ?? ""
-        return filename.isEmpty ? "未命名" : filename
+        return filename.isEmpty ? QuickFileLocalization.text(.init("未命名")) : filename
     }
 
     private var actionSection: some View {
@@ -311,7 +314,7 @@ struct CreateFileView: View {
             return (message, "exclamationmark.triangle.fill", .red)
         case nil:
             return (
-                viewModel.isBusy ? "正在处理…" : "选择目标文件夹和模板后即可创建文件。",
+                viewModel.isBusy ? QuickFileLocalization.text(.init("正在处理…")) : QuickFileLocalization.text(.init("选择目标文件夹和模板后即可创建文件。")),
                 "info.circle",
                 .secondary
             )

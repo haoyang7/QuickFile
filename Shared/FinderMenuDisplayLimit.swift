@@ -7,7 +7,7 @@ public struct FinderMenuDisplayLimit: Equatable, Sendable {
 
     public enum ValidationError: LocalizedError {
         case positiveIntegerRequired
-        public var errorDescription: String? { "请输入大于 0 的整数，或选择“全部”。" }
+        public var errorDescription: String? { QuickFileLocalization.text(.init("请输入大于 0 的整数，或选择“全部”。")) }
     }
 
     private init() { maximumCount = nil }

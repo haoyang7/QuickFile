@@ -47,17 +47,17 @@ public enum TemplateTransferError: LocalizedError, Equatable {
 
     public var errorDescription: String? {
         switch self {
-        case .invalidLimits: return "模板文件的大小限制无效。"
-        case .invalidFormat: return "此文件不是 QuickFile 模板文件。"
-        case let .unsupportedVersion(version): return "暂不支持模板文件版本 \(version)。"
-        case .malformedFile: return "模板文件格式不完整或 JSON 无效，未导入任何模板。"
-        case let .fileTooLarge(maximum): return "模板文件超过大小上限（\(maximum) 字节）。"
-        case let .tooManyTemplates(maximum): return "模板文件最多包含 \(maximum) 个模板。"
-        case let .invalidTemplate(index, reason): return "第 \(index + 1) 个模板无效：\(reason)"
+        case .invalidLimits: return QuickFileLocalization.text(.init("模板文件的大小限制无效。"))
+        case .invalidFormat: return QuickFileLocalization.text(.init("此文件不是 QuickFile 模板文件。"))
+        case let .unsupportedVersion(version): return QuickFileLocalization.text(.init("暂不支持模板文件版本 \(version)。"))
+        case .malformedFile: return QuickFileLocalization.text(.init("模板文件格式不完整或 JSON 无效，未导入任何模板。"))
+        case let .fileTooLarge(maximum): return QuickFileLocalization.text(.init("模板文件超过大小上限（\(maximum) 字节）。"))
+        case let .tooManyTemplates(maximum): return QuickFileLocalization.text(.init("模板文件最多包含 \(maximum) 个模板。"))
+        case let .invalidTemplate(index, reason): return QuickFileLocalization.text(.init("第 \(index + 1) 个模板无效：\(reason)"))
         case let .fieldTooLarge(index, field, maximum):
-            return "第 \(index + 1) 个模板的\(field)超过上限（\(maximum) 字节）。"
-        case .nonLocalFile: return "请选择本地模板文件。"
-        case .protectedDestination: return "不能用导出文件覆盖 QuickFile 的配置、锁文件或恢复备份，请选择其他位置。"
+            return QuickFileLocalization.text(.init("第 \(index + 1) 个模板的\(field)超过上限（\(maximum) 字节）。"))
+        case .nonLocalFile: return QuickFileLocalization.text(.init("请选择本地模板文件。"))
+        case .protectedDestination: return QuickFileLocalization.text(.init("不能用导出文件覆盖 QuickFile 的配置、锁文件或恢复备份，请选择其他位置。"))
         }
     }
 }
@@ -249,13 +249,13 @@ public enum TemplateTransfer {
             if names.contains(name) {
                 var suffixNumber = 1
                 repeat {
-                    let suffix = suffixNumber == 1 ? "（导入）" : "（导入 \(suffixNumber)）"
+                    let suffix = suffixNumber == 1 ? QuickFileLocalization.text(.init("（导入）")) : QuickFileLocalization.text(.init("（导入 \(suffixNumber)）"))
                     // A long valid name must remain within the exported-name limit
                     // after suffixing. Shorten only the previewed imported name.
                     name = fittingName(source.name, suffix: suffix, maximumBytes: limits.maximumNameBytes)
                     guard !name.isEmpty else {
                         throw TemplateTransferError.fieldTooLarge(
-                            index: index, field: "改名后的名称", maximumBytes: limits.maximumNameBytes
+                            index: index, field: QuickFileLocalization.text(.init("改名后的名称")), maximumBytes: limits.maximumNameBytes
                         )
                     }
                     suffixNumber += 1
@@ -305,10 +305,10 @@ public enum TemplateTransfer {
 
     private static func validate(_ template: TransferTemplate, index: Int, limits: TemplateTransferLimits) throws {
         for (value, field, maximum) in [
-            (template.name, "名称", limits.maximumNameBytes),
-            (template.defaultFilename, "默认文件名", limits.maximumNameBytes),
-            (template.fileExtension, "扩展名", limits.maximumExtensionBytes),
-            (template.content, "正文", limits.maximumContentBytes)
+            (template.name, QuickFileLocalization.text(.init("名称")), limits.maximumNameBytes),
+            (template.defaultFilename, QuickFileLocalization.text(.init("默认文件名")), limits.maximumNameBytes),
+            (template.fileExtension, QuickFileLocalization.text(.init("扩展名")), limits.maximumExtensionBytes),
+            (template.content, QuickFileLocalization.text(.init("正文")), limits.maximumContentBytes)
         ] {
             guard value.utf8.count <= maximum else {
                 throw TemplateTransferError.fieldTooLarge(index: index, field: field, maximumBytes: maximum)
@@ -357,12 +357,12 @@ public enum TemplateTransfer {
                 let template = try values.decode(TransferTemplate.self)
                 guard version != 1 || template.defaultFilename.isEmpty else {
                     throw TemplateTransferError.invalidTemplate(
-                        index: templates.count, reason: "默认文件名需要模板文件版本 2。"
+                        index: templates.count, reason: QuickFileLocalization.text(.init("默认文件名需要模板文件版本 2。"))
                     )
                 }
                 guard version >= 3 || template.officeFormat == nil else {
                     throw TemplateTransferError.invalidTemplate(
-                        index: templates.count, reason: "Office 模板需要模板文件版本 3。"
+                        index: templates.count, reason: QuickFileLocalization.text(.init("Office 模板需要模板文件版本 3。"))
                     )
                 }
                 try TemplateTransfer.validate(template, index: templates.count, limits: limits)

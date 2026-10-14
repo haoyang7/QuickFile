@@ -9,7 +9,7 @@ struct FinderMenuPresentation {
     }
 
     /// Slow preparation offers an immediate way to continue in the containing app.
-    enum UnavailableState: CaseIterable, Equatable {
+    enum UnavailableState: CaseIterable, Hashable {
         case operationInProgress
         case sidebarSelectionUnavailable
         case mixedSelection
@@ -21,28 +21,36 @@ struct FinderMenuPresentation {
         case templateReadFailed
         case noEnabledTemplates
 
-        var explanation: String {
+        var explanation: String { Self.explanations[QuickFileLocalization.identifier]![self]! }
+
+        private static let explanations = Dictionary(uniqueKeysWithValues: QuickFileLanguage.supportedIdentifiers.map { language in
+            let bundle = QuickFileLocalization.resourceBundle(for: language)
+            return (language, Dictionary(uniqueKeysWithValues:
+                allCases.map { ($0, $0.localizedExplanation(bundle: bundle)) }))
+        })
+
+        private func localizedExplanation(bundle: Bundle) -> String {
             switch self {
             case .operationInProgress:
-                return "已有文件请求正在处理，请稍后重新打开菜单"
+                return String(localized: "已有文件请求正在处理，请稍后重新打开菜单", bundle: bundle)
             case .sidebarSelectionUnavailable:
-                return "请先打开边栏中的文件夹，再右键创建"
+                return String(localized: "请先打开边栏中的文件夹，再右键创建", bundle: bundle)
             case .mixedSelection:
-                return "所选项目来自不同文件夹，请先打开要创建文件的文件夹"
+                return String(localized: "所选项目来自不同文件夹，请先打开要创建文件的文件夹", bundle: bundle)
             case .destinationMissing:
-                return "当前位置不可用，请重新选择文件夹"
+                return String(localized: "当前位置不可用，请重新选择文件夹", bundle: bundle)
             case .destinationLoading:
-                return "正在确认创建位置…"
+                return String(localized: "正在确认创建位置…", bundle: bundle)
             case .destinationBusy:
-                return "创建位置暂时繁忙"
+                return String(localized: "创建位置暂时繁忙", bundle: bundle)
             case .destinationUnavailable:
-                return "无法确认当前位置，请打开文件夹后重新右键"
+                return String(localized: "无法确认当前位置，请打开文件夹后重新右键", bundle: bundle)
             case .templatesLoading:
-                return "正在加载模板…"
+                return String(localized: "正在加载模板…", bundle: bundle)
             case .templateReadFailed:
-                return "暂时无法加载模板，请在 QuickFile 中重新加载"
+                return String(localized: "暂时无法加载模板，请在 QuickFile 中重新加载", bundle: bundle)
             case .noEnabledTemplates:
-                return "暂无启用的模板，请添加或启用模板"
+                return String(localized: "暂无启用的模板，请添加或启用模板", bundle: bundle)
             }
         }
 
@@ -56,6 +64,27 @@ struct FinderMenuPresentation {
                 return nil
             }
         }
+    }
+
+    private struct Titles {
+        let root: String
+        let create: String
+        let templates: String
+    }
+    private static let titles = Dictionary(uniqueKeysWithValues: QuickFileLanguage.supportedIdentifiers.map { language in
+        let bundle = QuickFileLocalization.resourceBundle(for: language)
+        return (language, Titles(root: String(localized: "新建文件", bundle: bundle),
+                                 create: String(localized: "在 QuickFile 中创建…", bundle: bundle),
+                                 templates: String(localized: "打开模板管理…", bundle: bundle)))
+    })
+    private static var currentTitles: Titles { titles[QuickFileLocalization.identifier]! }
+
+    /// Resolve catalog resources at extension startup, outside the menu callback.
+    static func prepareLocalization() {
+        _ = titles
+        BuiltInTemplates.prepareLocalization()
+        FinderTemplateMenuEntry.prepareLocalization()
+        for state in UnavailableState.allCases { _ = state.explanation }
     }
 
     let target: AnyObject
@@ -91,8 +120,8 @@ struct FinderMenuPresentation {
 
     private func rootMenu() -> (NSMenu, NSMenu) {
         let menu = NSMenu(title: "QuickFile")
-        let root = NSMenuItem(title: "新建文件", action: nil, keyEquivalent: "")
-        let submenu = NSMenu(title: "新建文件")
+        let root = NSMenuItem(title: Self.currentTitles.root, action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: Self.currentTitles.root)
         submenu.autoenablesItems = false
         root.submenu = submenu
         menu.addItem(root)
@@ -111,10 +140,10 @@ struct FinderMenuPresentation {
         switch route {
         case .create:
             action = openCreateAction
-            title = QuickFileAppRoute.create.menuTitle
+            title = Self.currentTitles.create
         case .templates:
             action = openTemplatesAction
-            title = QuickFileAppRoute.templates.menuTitle
+            title = Self.currentTitles.templates
         }
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = target

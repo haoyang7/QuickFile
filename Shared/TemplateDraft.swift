@@ -65,17 +65,17 @@ public enum TemplateValidationError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .emptyName:
-            return "模板名称不能为空。"
+            return QuickFileLocalization.text(.init("模板名称不能为空。"))
         case .invalidName:
-            return "模板名称不能包含控制字符。"
+            return QuickFileLocalization.text(.init("模板名称不能包含控制字符。"))
         case .emptyExtension:
-            return "文件扩展名不能为空。"
+            return QuickFileLocalization.text(.init("文件扩展名不能为空。"))
         case .invalidDefaultFilename:
-            return "默认文件名不能包含路径分隔符或控制字符。"
+            return QuickFileLocalization.text(.init("默认文件名不能包含路径分隔符或控制字符。"))
         case .invalidExtension:
-            return "文件扩展名不能包含路径分隔符或控制字符。"
+            return QuickFileLocalization.text(.init("文件扩展名不能包含路径分隔符或控制字符。"))
         case .invalidOfficeTemplate:
-            return "Office 模板只能创建对应格式的空白文档，不能修改扩展名或预填文本。"
+            return QuickFileLocalization.text(.init("Office 模板只能创建对应格式的空白文档，不能修改扩展名或预填文本。"))
         }
     }
 }

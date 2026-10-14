@@ -5,6 +5,7 @@ import SwiftUI
 /// One review sheet for a single immutable plan. A failure never rebuilds or retries that plan.
 @MainActor
 struct TemplateTransferPreviewView: View {
+    @Environment(\.locale) private var quickFileLocale
     @Environment(\.presentationMode) private var presentationMode
     @State private var isCommitting = false
     @State private var errorMessage: String?
@@ -24,7 +25,7 @@ struct TemplateTransferPreviewView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title).font(.title2).fontWeight(.semibold)
             Text(explanation).fixedSize(horizontal: false, vertical: true)
-            Text("\(isRecovery ? "恢复" : "新增") \(templates.count) 个 · 改名 \(renamedNames.count) 个 · 跳过重复 \(skippedCount) 个")
+            Text("\(isRecovery ? QuickFileLocalization.text(.init("恢复")) : QuickFileLocalization.text(.init("新增"))) \(templates.count) 个 · 改名 \(renamedNames.count) 个 · 跳过重复 \(skippedCount) 个")
             Text("启用 \(templates.filter(\.isEnabled).count) 个 · 停用 \(templates.filter { !$0.isEnabled }.count) 个")
                 .font(.caption).foregroundColor(.secondary)
             if clipboardCount > 0 {
@@ -35,11 +36,11 @@ struct TemplateTransferPreviewView: View {
             }
             List(templates) { template in
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(template.name)
+                    Text(template.displayName)
                     if let original = renamedNames[template.id] {
                         Text("原名称：\(original)").font(.caption).foregroundColor(.secondary)
                     }
-                    Text("\(template.fileExtension.isEmpty ? "无扩展名" : "." + template.fileExtension) · \(template.isEnabled ? "启用" : "停用")")
+                    Text("\(template.fileExtension.isEmpty ? QuickFileLocalization.text(.init("无扩展名")) : "." + template.fileExtension) · \(template.isEnabled ? QuickFileLocalization.text(.init("启用")) : QuickFileLocalization.text(.init("停用")))")
                         .font(.caption).foregroundColor(.secondary)
                     if !template.defaultFilename.isEmpty {
                         Text("默认文件名：\(template.defaultFilename)")
@@ -53,12 +54,12 @@ struct TemplateTransferPreviewView: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             HStack {
-                if isCommitting { ProgressView("正在保存…").controlSize(.small) }
+                if isCommitting { ProgressView(QuickFileLocalization.text(.init("正在保存…"))).controlSize(.small) }
                 Spacer()
                 Button("取消") { presentationMode.wrappedValue.dismiss() }
                     .keyboardShortcut(.cancelAction)
                     .disabled(isCommitting)
-                Button(confirmationActionTitle ?? (isRecovery ? "备份原配置并恢复" : "确认追加导入")) {
+                Button(confirmationActionTitle ?? (isRecovery ? QuickFileLocalization.text(.init("备份原配置并恢复")) : QuickFileLocalization.text(.init("确认追加导入")))) {
                     Task { await commit() }
                 }
                 .keyboardShortcut(.defaultAction)

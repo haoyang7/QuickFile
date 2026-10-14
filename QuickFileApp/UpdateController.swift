@@ -1,3 +1,4 @@
+import QuickFileCore
 import Combine
 import Foundation
 #if !QUICKFILE_COMMUNITY
@@ -89,7 +90,7 @@ extension UpdateController: SPUUpdaterDelegate {
         // Sparkle can resume a delayed channel-change check after automatic checks are turned off.
         if updateCheck == .updatesInBackground && !updater.automaticallyChecksForUpdates {
             throw NSError(domain: "com.haoyoung.QuickFile.Updates", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "自动检查更新已关闭。"])
+                          userInfo: [NSLocalizedDescriptionKey: QuickFileLocalization.text(.init("自动检查更新已关闭。"))])
         }
     }
 

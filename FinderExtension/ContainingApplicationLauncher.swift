@@ -8,7 +8,7 @@ enum ContainingApplicationLauncher {
         case applicationUnavailable
 
         var errorDescription: String? {
-            "无法定位当前扩展所属的 QuickFile。请从“应用程序”打开 QuickFile 后继续。"
+            QuickFileLocalization.text(.init("无法定位当前扩展所属的 QuickFile。请从“应用程序”打开 QuickFile 后继续。"))
         }
     }
 

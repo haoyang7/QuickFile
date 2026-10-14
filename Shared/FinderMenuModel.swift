@@ -21,7 +21,19 @@ public enum FinderMenuSelectionPreflight {
 
 public struct FinderTemplateMenuEntry: Equatable, Identifiable, Sendable {
     public let id: FileTemplate.ID
-    public let title: String
+    private static let untitledNames = Dictionary(uniqueKeysWithValues: QuickFileLanguage.supportedIdentifiers.map {
+        ($0, String(localized: "未命名模板", bundle: QuickFileLocalization.resourceBundle(for: $0)))
+    })
+    public static func prepareLocalization() { _ = untitledNames }
+    private let storedName: String
+    private let isNameEmpty: Bool
+    private let fileExtension: String
+
+    public var title: String {
+        let name = BuiltInTemplates.displayName(id: id, storedName: storedName)
+        let displayName = isNameEmpty ? Self.untitledNames[QuickFileLocalization.identifier]! : name
+        return fileExtension.isEmpty ? displayName : "\(displayName) (.\(fileExtension))"
+    }
 
     /// A menu owns display metadata only. Creation resolves this ID against a
     /// fresh authoritative load; no menu entry keeps a template body alive.
@@ -29,19 +41,11 @@ public struct FinderTemplateMenuEntry: Equatable, Identifiable, Sendable {
         id = template.id
         // Older stored templates can bypass draft validation. Keep their identity and
         // contents intact while removing controls from the display projection.
-        let safeName = template.name.components(separatedBy: TemplateNameCharacters.forbiddenControls).joined()
-        let displayName = safeName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "未命名模板" : safeName
-        let fileExtension = template.fileExtension
+        storedName = template.name.components(separatedBy: TemplateNameCharacters.forbiddenControls).joined()
+        isNameEmpty = storedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        fileExtension = template.fileExtension
             .components(separatedBy: TemplateNameCharacters.forbiddenFilenameCharacters).joined()
-            .trimmingCharacters(
-                in: CharacterSet(charactersIn: ". ").union(.whitespacesAndNewlines)
-            )
-        guard !fileExtension.isEmpty else {
-            title = displayName
-            return
-        }
-        title = "\(displayName) (.\(fileExtension))"
+            .trimmingCharacters(in: CharacterSet(charactersIn: ". ").union(.whitespacesAndNewlines))
     }
 }
 

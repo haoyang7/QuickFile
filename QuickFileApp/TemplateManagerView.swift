@@ -49,6 +49,7 @@ struct TemplatePresentationLifetime {
 
 @MainActor
 struct TemplateManagerView: View {
+    @Environment(\.locale) private var quickFileLocale
     @ObservedObject var viewModel: QuickFileViewModel
     @StateObject private var finderMenuSettings: FinderMenuSettingsViewModel
     @State private var selectedTemplateID: FileTemplate.ID?
@@ -86,14 +87,14 @@ struct TemplateManagerView: View {
 
     private var emptyListMessage: String {
         if viewModel.templateLoadError != nil {
-            return "模板暂不可用，请按上方提示处理后重新加载。"
+            return QuickFileLocalization.text(.init("模板暂不可用，请按上方提示处理后重新加载。"))
         }
-        if viewModel.isLoadingTemplates { return "正在读取模板…" }
-        if viewModel.templates.isEmpty { return "暂无模板。点击“新增”添加模板。" }
+        if viewModel.isLoadingTemplates { return QuickFileLocalization.text(.init("正在读取模板…")) }
+        if viewModel.templates.isEmpty { return QuickFileLocalization.text(.init("暂无模板。点击“新增”添加模板。")) }
         if enabledOnly && !viewModel.templates.contains(where: \.isEnabled) {
-            return "暂无启用的模板。取消“仅启用”以查看全部模板。"
+            return QuickFileLocalization.text(.init("暂无启用的模板。取消“仅启用”以查看全部模板。"))
         }
-        return "没有匹配的模板。"
+        return QuickFileLocalization.text(.init("没有匹配的模板。"))
     }
 
     var body: some View {
@@ -134,8 +135,8 @@ struct TemplateManagerView: View {
                     Button("显示备份") { AppKitFileActions.reveal(backupURL) }
                 }
             }
-            if viewModel.isLoadingTemplates { ProgressView("正在读取模板…") }
-            if viewModel.isSavingTemplates { ProgressView("正在保存模板…") }
+            if viewModel.isLoadingTemplates { ProgressView(QuickFileLocalization.text(.init("正在读取模板…"))) }
+            if viewModel.isSavingTemplates { ProgressView(QuickFileLocalization.text(.init("正在保存模板…"))) }
             statusView
         }
         .padding(24)
@@ -169,7 +170,7 @@ struct TemplateManagerView: View {
         }
         .sheet(item: $importPreview) { preview in
             TemplateTransferPreviewView(
-                title: "导入模板预览", explanation: "确认后追加到现有模板末尾，保留原模板与排序。重复项将跳过。",
+                title: QuickFileLocalization.text(.init("导入模板预览")), explanation: QuickFileLocalization.text(.init("确认后追加到现有模板末尾，保留原模板与排序。重复项将跳过。")),
                 templates: preview.plan.additions.map(\.template),
                 renamedNames: Dictionary(uniqueKeysWithValues: preview.plan.additions.filter(\.wasRenamed).map { ($0.id, $0.originalName) }),
                 skippedCount: preview.plan.skippedCount, clipboardCount: preview.clipboardCount,
@@ -244,15 +245,15 @@ struct TemplateManagerView: View {
                 if let id = selectedTemplate?.id { copyTemplate(withID: id) }
             }.disabled(selectedTemplate == nil)
             Button("删除") {
-                if let selectedTemplate { confirmation = .delete(selectedTemplate.id, selectedTemplate.name) }
+                if let selectedTemplate { confirmation = .delete(selectedTemplate.id, selectedTemplate.displayName) }
             }.disabled(selectedTemplate == nil)
             Divider().frame(height: 16)
             Button("上移") { moveSelected(offset: -1) }
                 .disabled(!viewModel.canMoveTemplate(withID: selectedTemplate?.id, offset: -1))
-                .help("在完整模板列表中上移")
+                .help(QuickFileLocalization.text(.init("在完整模板列表中上移")))
             Button("下移") { moveSelected(offset: 1) }
                 .disabled(!viewModel.canMoveTemplate(withID: selectedTemplate?.id, offset: 1))
-                .help("在完整模板列表中下移")
+                .help(QuickFileLocalization.text(.init("在完整模板列表中下移")))
             Spacer()
             Text("显示 \(visibleTemplates.count) / 共 \(viewModel.templates.count) 个模板")
                 .font(.caption)
@@ -262,7 +263,7 @@ struct TemplateManagerView: View {
     }
 
     private var templateActionsMenu: some View {
-        Menu("更多") {
+        Menu(QuickFileLocalization.text(.init("更多"))) {
             Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
             Divider()
             Button("导入模板…", action: chooseImport)
@@ -276,7 +277,7 @@ struct TemplateManagerView: View {
             Button("恢复默认模板…", role: .destructive) { confirmation = .restoreDefaults }
         }
         .fixedSize()
-        .accessibilityLabel("更多模板操作")
+        .accessibilityLabel(QuickFileLocalization.text(.init("更多模板操作")))
     }
 
     private func templateRecoverySection(failure: QuickFileViewModel.TemplateLoadFailure) -> some View {
@@ -302,26 +303,26 @@ struct TemplateManagerView: View {
         // Deferred row callbacks need only these values, not the template body.
         // Keep the displayed name for delete confirmation; editing resolves the ID afresh.
         let id = template.id
-        let name = template.name
+        let name = template.displayName
         let isEnabled = template.isEnabled
         return HStack(spacing: 12) {
             Image(systemName: "line.3.horizontal")
                 .foregroundColor(.secondary)
                 .padding(.vertical, 8)
                 .contentShape(Rectangle())
-                .accessibilityLabel("拖动排序“\(name)”")
-                .help("拖动调整顺序，也可使用下方的上移和下移按钮")
+                .accessibilityLabel(QuickFileLocalization.text(.init("拖动排序“\(name)”")))
+                .help(QuickFileLocalization.text(.init("拖动调整顺序，也可使用下方的上移和下移按钮")))
                 .onDrag { beginReorder(withID: id) }
             Toggle("", isOn: Binding(get: { isEnabled }, set: { enabled in
                 Task { await viewModel.setTemplateEnabled(enabled, id: id) }
             }))
             .labelsHidden()
-            .accessibilityLabel("启用模板“\(name)”")
-            .help(isEnabled ? "在创建菜单中停用" : "在创建菜单中启用")
+            .accessibilityLabel(QuickFileLocalization.text(.init("启用模板“\(name)”")))
+            .help(isEnabled ? QuickFileLocalization.text(.init("在创建菜单中停用")) : QuickFileLocalization.text(.init("在创建菜单中启用")))
             VStack(alignment: .leading, spacing: 2) {
-                Text(template.name)
+                Text(template.displayName)
                 Text(template.officeFormat?.blankDocumentDescription
-                     ?? (template.content.isEmpty ? "不预填内容" : contentSummary(template.content)))
+                     ?? (template.content.isEmpty ? QuickFileLocalization.text(.init("不预填内容")) : contentSummary(template.content)))
                     .font(.caption).foregroundColor(.secondary).lineLimit(1)
             }
             Spacer()

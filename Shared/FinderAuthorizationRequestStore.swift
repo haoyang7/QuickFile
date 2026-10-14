@@ -32,13 +32,13 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
         public var errorDescription: String? {
             switch self {
             case .sharedStoreUnavailable:
-                return "无法访问 QuickFile 的快捷授权请求。"
+                return QuickFileLocalization.text(.init("无法访问 QuickFile 的快捷授权请求。"))
             case .queueFull:
-                return "Finder 的快捷授权请求已达上限（64 个），请先处理待办请求后重试。"
+                return QuickFileLocalization.text(.init("Finder 的快捷授权请求已达上限（64 个），请先处理待办请求后重试。"))
             case .requestTooLarge:
-                return "Finder 的快捷授权请求超过大小上限，请从 Finder 重新发起。"
+                return QuickFileLocalization.text(.init("Finder 的快捷授权请求超过大小上限，请从 Finder 重新发起。"))
             case .persistenceFailed:
-                return "无法保存或读取 Finder 的快捷授权请求。"
+                return QuickFileLocalization.text(.init("无法保存或读取 Finder 的快捷授权请求。"))
             }
         }
     }
@@ -495,12 +495,12 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
 
         public var localizedDescription: String {
             switch self {
-            case .oversized: return "请求文件超过读取大小上限"
-            case .malformed: return "请求文件格式无效"
-            case .futureDated: return "请求时间晚于当前时间"
-            case .expired: return "请求已过期"
-            case .unreadable: return "无法读取原件，暂不能安全归档"
-            case .unsafeEntry: return "文件类型或元数据不安全，暂不能归档"
+            case .oversized: return QuickFileLocalization.text(.init("请求文件超过读取大小上限"))
+            case .malformed: return QuickFileLocalization.text(.init("请求文件格式无效"))
+            case .futureDated: return QuickFileLocalization.text(.init("请求时间晚于当前时间"))
+            case .expired: return QuickFileLocalization.text(.init("请求已过期"))
+            case .unreadable: return QuickFileLocalization.text(.init("无法读取原件，暂不能安全归档"))
+            case .unsafeEntry: return QuickFileLocalization.text(.init("文件类型或元数据不安全，暂不能归档"))
             }
         }
     }
@@ -536,14 +536,14 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
 
         public var errorDescription: String? {
             switch self {
-            case .busy: return "另一项检查或归档仍在进行，请完成或取消后重试。"
-            case .changed: return "所选请求已变化或已被处理。原位置未作更改，请重新检查。"
-            case .healthyRequest: return "所选请求当前可以正常续办，不能归档移出。请重试处理待办请求。"
-            case .unsafeEntry: return "无法安全确认所选原件或存储位置，未移出请求。"
-            case .unreadable: return "无法安全读取并确认所选原件，未移出请求。"
-            case .unavailable: return "暂时无法检查授权请求，请稍后重试。"
-            case .archiveFailed: return "归档未完成，所选请求仍保留在待办队列。"
-            case .invalidTicket: return "本次确认已失效，请重新检查并选择请求。"
+            case .busy: return QuickFileLocalization.text(.init("另一项检查或归档仍在进行，请完成或取消后重试。"))
+            case .changed: return QuickFileLocalization.text(.init("所选请求已变化或已被处理。原位置未作更改，请重新检查。"))
+            case .healthyRequest: return QuickFileLocalization.text(.init("所选请求当前可以正常续办，不能归档移出。请重试处理待办请求。"))
+            case .unsafeEntry: return QuickFileLocalization.text(.init("无法安全确认所选原件或存储位置，未移出请求。"))
+            case .unreadable: return QuickFileLocalization.text(.init("无法安全读取并确认所选原件，未移出请求。"))
+            case .unavailable: return QuickFileLocalization.text(.init("暂时无法检查授权请求，请稍后重试。"))
+            case .archiveFailed: return QuickFileLocalization.text(.init("归档未完成，所选请求仍保留在待办队列。"))
+            case .invalidTicket: return QuickFileLocalization.text(.init("本次确认已失效，请重新检查并选择请求。"))
             }
         }
     }

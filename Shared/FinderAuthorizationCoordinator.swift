@@ -8,9 +8,9 @@ public enum FinderAuthorizationCompletionError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .authorizedDirectoryDoesNotContainDestination:
-            return "所选授权范围不包含 Finder 请求的目标文件夹，请重新发起创建。"
+            return QuickFileLocalization.text(.init("所选授权范围不包含 Finder 请求的目标文件夹，请重新发起创建。"))
         case .templateUnavailable:
-            return "Finder 请求使用的模板已不可用，请重新打开 Finder 菜单。"
+            return QuickFileLocalization.text(.init("Finder 请求使用的模板已不可用，请重新打开 Finder 菜单。"))
         }
     }
 }

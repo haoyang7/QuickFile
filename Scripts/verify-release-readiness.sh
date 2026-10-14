@@ -271,6 +271,7 @@ print -- "Building unsigned universal Release"
     build
 
 APP_BUNDLE="${RELEASE_DERIVED_DATA}/Build/Products/Release/QuickFile.app"
+python3 Scripts/verify-localizations.py --derived-data "${RELEASE_DERIVED_DATA}" --app "${APP_BUNDLE}"
 EXTENSION_BUNDLE="${APP_BUNDLE}/Contents/PlugIns/FinderExtension.appex"
 APP_BINARY="${APP_BUNDLE}/Contents/MacOS/QuickFile"
 EXTENSION_BINARY="${EXTENSION_BUNDLE}/Contents/MacOS/FinderExtension"

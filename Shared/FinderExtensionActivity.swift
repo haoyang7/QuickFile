@@ -9,13 +9,13 @@ public enum FinderExtensionActivityKind: String, Codable, Equatable, Sendable {
     public var displayName: String {
         switch self {
         case .launched:
-            return "扩展已启动"
+            return QuickFileLocalization.text(.init("扩展已启动"))
         case .menuPrepared:
-            return "Finder 菜单已生成"
+            return QuickFileLocalization.text(.init("Finder 菜单已生成"))
         case .fileCreated:
-            return "扩展已创建文件"
+            return QuickFileLocalization.text(.init("扩展已创建文件"))
         case .fileCreationFailed:
-            return "扩展创建文件失败"
+            return QuickFileLocalization.text(.init("扩展创建文件失败"))
         }
     }
 }
@@ -42,39 +42,39 @@ public enum FinderExtensionFailureReason: String, Codable, Equatable, Sendable {
     public var displayName: String {
         switch self {
         case .menuContextUnavailable:
-            return "Finder 菜单上下文不可用"
+            return QuickFileLocalization.text(.init("Finder 菜单上下文不可用"))
         case .templateUnavailable:
-            return "模板不可用"
+            return QuickFileLocalization.text(.init("模板不可用"))
         case .templateReadFailed:
-            return "模板配置读取失败"
+            return QuickFileLocalization.text(.init("模板配置读取失败"))
         case .templateStorageUnavailable:
-            return "模板共享存储不可用"
+            return QuickFileLocalization.text(.init("模板共享存储不可用"))
         case .templateWriteFailed:
-            return "模板配置保存失败"
+            return QuickFileLocalization.text(.init("模板配置保存失败"))
         case .destinationUnavailable:
-            return "目标文件夹不可用"
+            return QuickFileLocalization.text(.init("目标文件夹不可用"))
         case .operationInProgress:
-            return "已有文件请求正在处理"
+            return QuickFileLocalization.text(.init("已有文件请求正在处理"))
         case .destinationMissing:
-            return "目标文件夹不存在"
+            return QuickFileLocalization.text(.init("目标文件夹不存在"))
         case .invalidFilename:
-            return "文件名无效"
+            return QuickFileLocalization.text(.init("文件名无效"))
         case .conflictLimitReached:
-            return "重名数量超过限制"
+            return QuickFileLocalization.text(.init("重名数量超过限制"))
         case .renderedContentTooLarge:
-            return "模板展开后的内容过大，未创建文件"
+            return QuickFileLocalization.text(.init("模板展开后的内容过大，未创建文件"))
         case .directoryNotAuthorized:
-            return "目标文件夹尚未授权"
+            return QuickFileLocalization.text(.init("目标文件夹尚未授权"))
         case .authorizationUnavailable:
-            return "已保存的目录授权不可用"
+            return QuickFileLocalization.text(.init("已保存的目录授权不可用"))
         case .permissionDenied:
-            return "沙箱或文件权限拒绝写入"
+            return QuickFileLocalization.text(.init("沙箱或文件权限拒绝写入"))
         case .readOnlyVolume:
-            return "目标卷只读"
+            return QuickFileLocalization.text(.init("目标卷只读"))
         case .writeFailed:
-            return "文件写入失败"
+            return QuickFileLocalization.text(.init("文件写入失败"))
         case .createdFileLocationUnavailable:
-            return "文件已创建，当前位置无法确认"
+            return QuickFileLocalization.text(.init("文件已创建，当前位置无法确认"))
         }
     }
 }

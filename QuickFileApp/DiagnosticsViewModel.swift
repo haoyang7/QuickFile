@@ -6,24 +6,29 @@ import QuickFileInfrastructure
 @MainActor
 final class DiagnosticsViewModel: ObservableObject {
     @Published private(set) var isFinderExtensionEnabled = false
-    @Published private(set) var runtimeStatusMessage: String?
+    var runtimeStatusMessage: String? { runtimeStatusMessagePresentation?.value }
+    @Published private var runtimeStatusMessagePresentation: LocalizedPresentation<String?>?
     @Published private(set) var extensionSnapshot: FinderExtensionDiagnosticSnapshot?
     @Published private(set) var extensionActivity: FinderExtensionActivity?
     @Published private(set) var recentExtensionFailures: [FinderExtensionActivity] = []
     @Published private(set) var isSharedStoreAvailable = false
-    @Published private(set) var activityStoreMessage: String?
+    var activityStoreMessage: String? { activityStoreMessagePresentation?.value }
+    @Published private var activityStoreMessagePresentation: LocalizedPresentation<String?>?
     @Published private(set) var activityStoreHasError = false
     @Published private(set) var authorizedDirectories: [AuthorizedDirectory] = []
-    @Published private(set) var authorizationMessage: String?
+    var authorizationMessage: String? { authorizationMessagePresentation?.value }
+    @Published private(set) var authorizationMessagePresentation: LocalizedPresentation<String?>?
     @Published private(set) var authorizationHasError = false
     @Published private(set) var report: DirectoryDiagnosticReport?
     @Published private(set) var isInspectingDirectory = false
-    @Published private(set) var directoryInspectionMessage: String?
+    var directoryInspectionMessage: String? { directoryInspectionMessagePresentation?.value }
+    @Published private var directoryInspectionMessagePresentation: LocalizedPresentation<String?>?
     @Published private(set) var unavailableAuthorizedDirectories: [UnavailableAuthorizedDirectory] = []
     @Published private(set) var isRefreshingRuntimeStatus = false
     @Published private(set) var isManagingAuthorizations = false
     @Published private(set) var isLoadingAuthorizationInventory = false
-    @Published private(set) var authorizationInventoryMessage: String?
+    var authorizationInventoryMessage: String? { authorizationInventoryMessagePresentation?.value }
+    @Published private var authorizationInventoryMessagePresentation: LocalizedPresentation<String?>?
     @Published private(set) var hasLoadedActivityStoreStatus = false
 
     private let extensionEnabledProvider: () -> Bool
@@ -84,9 +89,10 @@ final class DiagnosticsViewModel: ObservableObject {
             self.authorizedDirectories.removeAll { ids.contains($0.id) }
             let unavailableCount = self.unavailableAuthorizedDirectories.count
             self.unavailableAuthorizedDirectories.removeAll { ids.contains($0.id) }
-            if self.authorizationInventoryMessage == "有 \(unavailableCount) 个目录授权暂不可用。" {
-                self.authorizationInventoryMessage = self.unavailableAuthorizedDirectories.isEmpty ? nil
-                    : "有 \(self.unavailableAuthorizedDirectories.count) 个目录授权暂不可用。"
+            if self.authorizationInventoryMessage == QuickFileLocalization.text(.init("有 \(unavailableCount) 个目录授权暂不可用。")) {
+                let remainingCount = self.unavailableAuthorizedDirectories.count
+                self.authorizationInventoryMessagePresentation = LocalizedPresentation(remainingCount == 0 ? nil
+                    : QuickFileLocalization.text(.init("有 \(remainingCount) 个目录授权暂不可用。")))
             }
         }
     }
@@ -132,7 +138,7 @@ final class DiagnosticsViewModel: ObservableObject {
            runtimeStatusMessage == nil {
             // Keep the two-pass bound even if the enabled state never settles.
             // The page's refresh action can start another bounded attempt.
-            runtimeStatusMessage = "扩展状态持续变化，请稍后刷新。"
+            runtimeStatusMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("扩展状态持续变化，请稍后刷新。")))
         }
     }
 
@@ -190,12 +196,12 @@ final class DiagnosticsViewModel: ObservableObject {
         if enabledAtStart != isFinderExtensionEnabled { extensionSnapshot = nil }
         isFinderExtensionEnabled = enabledAtStart
         guard runtimeReadGate.tryBegin() else {
-            runtimeStatusMessage = "另一项扩展状态检查仍在进行，请稍后刷新。"
+            runtimeStatusMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("另一项扩展状态检查仍在进行，请稍后刷新。")))
             return
         }
         defer { runtimeReadGate.finish() }
-        runtimeStatusMessage = nil
-        extensionSnapshot = nil
+        // Keep the last completed result visible during a same-state refresh.
+        // Clearing it collapses the retained page whenever its tab reappears.
         let snapshot: FinderExtensionDiagnosticSnapshot
         if let runtimeProvider {
             snapshot = await runtimeProvider(enabledAtStart)
@@ -206,9 +212,11 @@ final class DiagnosticsViewModel: ObservableObject {
         let enabledAfterProbe = extensionEnabledProvider()
         isFinderExtensionEnabled = enabledAfterProbe
         guard enabledAfterProbe == enabledAtStart else {
+            extensionSnapshot = nil
             pendingRuntimeRefreshGeneration = generation
             return
         }
+        runtimeStatusMessagePresentation = nil
         extensionSnapshot = snapshot
 
         let store = extensionActivityStore
@@ -223,10 +231,10 @@ final class DiagnosticsViewModel: ObservableObject {
         case let .success(failures):
             isSharedStoreAvailable = store.isAvailable
             recentExtensionFailures = failures
-            activityStoreMessage = nil
+            activityStoreMessagePresentation = nil
             activityStoreHasError = false
         case let .failure(error):
-            activityStoreMessage = "无法读取失败历史：\(error.localizedDescription)"
+            activityStoreMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("无法读取失败历史：\(error.localizedDescription)")))
             activityStoreHasError = true
         }
         let enabledAtEnd = extensionEnabledProvider()
@@ -270,7 +278,7 @@ final class DiagnosticsViewModel: ObservableObject {
         guard !Task.isCancelled, let generation = directoryPresentationGeneration,
               !isRefreshingRuntimeStatus else { return }
         guard runtimeReadGate.tryBegin() else {
-            activityStoreMessage = "另一项扩展状态检查或历史清理仍在进行，请稍后重试。"
+            activityStoreMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("另一项扩展状态检查或历史清理仍在进行，请稍后重试。")))
             return
         }
         isRefreshingRuntimeStatus = true
@@ -285,22 +293,22 @@ final class DiagnosticsViewModel: ObservableObject {
         switch result {
         case .success:
             recentExtensionFailures = []
-            activityStoreMessage = "失败历史已清空；最近扩展活动状态仍保留。"
+            activityStoreMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("失败历史已清空；最近扩展活动状态仍保留。")))
             activityStoreHasError = false
         case let .failure(error):
-            activityStoreMessage = error.localizedDescription
+            activityStoreMessagePresentation = LocalizedPresentation(error.localizedDescription)
             activityStoreHasError = true
         }
     }
 
     func openConsole(using opener: () -> Bool) {
         guard opener() else {
-            activityStoreMessage = "无法打开 Console，请从“应用程序 > 实用工具”手动打开。"
+            activityStoreMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("无法打开 Console，请从“应用程序 > 实用工具”手动打开。")))
             activityStoreHasError = true
             return
         }
 
-        activityStoreMessage = "Console 已打开，请筛选子系统 com.haoyoung.QuickFile。"
+        activityStoreMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("Console 已打开，请筛选子系统 com.haoyoung.QuickFile。")))
         activityStoreHasError = false
     }
 
@@ -337,12 +345,12 @@ final class DiagnosticsViewModel: ObservableObject {
     private func beginDirectoryInspection() -> UUID? {
         guard let generation = directoryPresentationGeneration, !isInspectingDirectory else { return nil }
         guard writeProbeGate.tryBegin() else {
-            directoryInspectionMessage = "另一项文件夹写入测试仍在进行，请稍后重试。"
+            directoryInspectionMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("另一项文件夹写入测试仍在进行，请稍后重试。")))
             return nil
         }
 
         isInspectingDirectory = true
-        directoryInspectionMessage = nil
+        directoryInspectionMessagePresentation = nil
         return generation
     }
 
@@ -388,7 +396,7 @@ final class DiagnosticsViewModel: ObservableObject {
                 authorizedDirectories.sort {
                     $0.url.path.localizedStandardCompare($1.url.path) == .orderedAscending
                 }
-                authorizationMessage = "目录授权已保存。"
+                authorizationMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("目录授权已保存。")))
                 authorizationHasError = false
             }
             isLoadingAuthorizationInventory = true
@@ -400,7 +408,7 @@ final class DiagnosticsViewModel: ObservableObject {
             apply(inventoryResult, for: read)
         case let .failure(error):
             // Another window's removal does not supersede this operation's error.
-            authorizationMessage = error.localizedDescription
+            authorizationMessagePresentation = LocalizedPresentation(error.localizedDescription)
             authorizationHasError = true
         }
     }
@@ -423,19 +431,23 @@ final class DiagnosticsViewModel: ObservableObject {
         switch result {
         case .success:
             Self.committedRevocations.send([authorizationID])
-            if let removedDirectory, let overlap = authorizationOverlapMessage(for: removedDirectory) {
-                authorizationMessage = "目录授权已移除。" + overlap
+            if let removedDirectory, let overlap = authorizationOverlapPresentation(for: removedDirectory) {
+                authorizationMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("目录授权已移除。")) + " " + (overlap.value ?? ""))
             } else {
-                authorizationMessage = "目录授权已移除。"
+                authorizationMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("目录授权已移除。")))
             }
             authorizationHasError = false
         case let .failure(error):
-            authorizationMessage = error.localizedDescription
+            authorizationMessagePresentation = LocalizedPresentation(error.localizedDescription)
             authorizationHasError = true
         }
     }
 
     func authorizationOverlapMessage(for directory: AuthorizedDirectory) -> String? {
+        authorizationOverlapPresentation(for: directory)?.value
+    }
+
+    private func authorizationOverlapPresentation(for directory: AuthorizedDirectory) -> LocalizedPresentation<String?>? {
         // These canonical paths came from completed bookmark inventory/grants.
         // Compare components only: resolving symlinks or bookmarks here could
         // block MainActor. This is qualified UI evidence, never permission.
@@ -444,10 +456,10 @@ final class DiagnosticsViewModel: ObservableObject {
             $0.id != directory.id && components.starts(with: $0.url.pathComponents)
         }
         if !directory.isBookmarkStale, let other = covering.first(where: { !$0.isBookmarkStale }) {
-            return "最近读取的记录中，此位置也由“\(other.url.path)”授权；该记录仍会保留，实际写入时会重新验证。"
+            return LocalizedPresentation(QuickFileLocalization.text(.init("最近读取的记录中，此位置也由“\(other.url.path)”授权；该记录仍会保留，实际写入时会重新验证。")))
         }
         if !covering.isEmpty {
-            return "另有路径重叠的授权记录，但书签需要更新，无法确认此位置是否仍获授权。"
+            return LocalizedPresentation(QuickFileLocalization.text(.init("另有路径重叠的授权记录，但书签需要更新，无法确认此位置是否仍获授权。")))
         }
         return nil
     }
@@ -475,20 +487,20 @@ final class DiagnosticsViewModel: ObservableObject {
                 Self.committedRevocations.send(removedIDs)
             }
             if removedIDs.count == candidateIDs.count {
-                authorizationMessage = "已移除 \(removedIDs.count) 个不可用授权。"
+                authorizationMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("已移除 \(removedIDs.count) 个不可用授权。")))
             } else {
-                authorizationMessage = "已移除 \(removedIDs.count) 个不可用授权；其余记录可能已恢复或更新，请刷新状态查看。"
+                authorizationMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("已移除 \(removedIDs.count) 个不可用授权；其余记录可能已恢复或更新，请刷新状态查看。")))
             }
             authorizationHasError = false
         case let .failure(error):
-            authorizationMessage = error.localizedDescription
+            authorizationMessagePresentation = LocalizedPresentation(error.localizedDescription)
             authorizationHasError = true
         }
     }
 
     private func beginInventoryRead() -> Bool {
         guard inventoryReadGate.tryBegin() else {
-            authorizationInventoryMessage = "另一项目录授权检查仍在进行，请稍后刷新或重试。"
+            authorizationInventoryMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("另一项目录授权检查仍在进行，请稍后刷新或重试。")))
             return false
         }
         return true
@@ -505,14 +517,14 @@ final class DiagnosticsViewModel: ObservableObject {
             )
             authorizedDirectories = filtered.availableDirectories
             unavailableAuthorizedDirectories = filtered.unavailableDirectories
-            authorizationInventoryMessage = filtered.unavailableDirectories.isEmpty ? nil
-                : "有 \(filtered.unavailableDirectories.count) 个目录授权暂不可用。"
+            authorizationInventoryMessagePresentation = LocalizedPresentation(filtered.unavailableDirectories.isEmpty ? nil
+                : QuickFileLocalization.text(.init("有 \(filtered.unavailableDirectories.count) 个目录授权暂不可用。")))
         case let .failure(error):
             // A repository read failure says nothing about a completed mutation.
             // Keep known rows (including the newly committed grant) and report
             // this separately rather than turning a saved grant into a failure.
             guard read.revision == authorizationRevision else { return }
-            authorizationInventoryMessage = "无法刷新目录授权列表：\(error.localizedDescription)"
+            authorizationInventoryMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("无法刷新目录授权列表：\(error.localizedDescription)")))
         }
     }
 

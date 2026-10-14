@@ -37,7 +37,7 @@ struct NormalizedFilename: Equatable, Sendable {
 }
 
 struct FilenameNormalizer: Sendable {
-    private let fallbackBaseName = "未命名"
+    private var fallbackBaseName: String { QuickFileLocalization.text(.init("未命名")) }
     private let forbiddenCharacters = TemplateNameCharacters.forbiddenFilenameCharacters
 
     func normalize(_ requestedFilename: String?, requiredExtension: String) throws -> NormalizedFilename {

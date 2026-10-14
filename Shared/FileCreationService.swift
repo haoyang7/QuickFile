@@ -195,10 +195,10 @@ public struct FileCreationService: @unchecked Sendable {
         let description: String
         if flags & UInt32(MNT_RDONLY) != 0 {
             code = EROFS
-            description = "目标卷为只读，无法创建文件。"
+            description = QuickFileLocalization.text(.init("目标卷为只读，无法创建文件。"))
         } else if flags & UInt32(MNT_UNKNOWNPERMISSIONS) != 0 {
             code = ENOTSUP
-            description = "目标卷忽略文件所有权，无法保护私有暂存目录，当前不能安全创建文件。"
+            description = QuickFileLocalization.text(.init("目标卷忽略文件所有权，无法保护私有暂存目录，当前不能安全创建文件。"))
         } else {
             return
         }
