@@ -30,7 +30,7 @@ def capture_contract_violations(source):
     preamble, separator, _ = row.partition("return HStack")
     preamble = re.sub(r"//[^\n]*", "", preamble)
     if not separator or re.sub(r"\s+", "", preamble) != (
-        "letid=template.idletname=template.nameletisEnabled=template.isEnabled"
+        "letid=template.idletname=template.displayNameletisEnabled=template.isEnabled"
     ):
         violations.append("row snapshots must contain only ID, name, and Bool")
 
@@ -171,6 +171,12 @@ class TemplateRowCaptureContractTests(unittest.TestCase):
         self.assert_rejected_mutation(
             "let isEnabled = template.isEnabled",
             "let isEnabled = template.isEnabled\n        let retainedTemplate = template",
+            "row snapshots must contain only ID, name, and Bool",
+        )
+
+    def test_guard_rejects_unlocalized_confirmation_name(self):
+        self.assert_rejected_mutation(
+            "let name = template.displayName", "let name = template.name",
             "row snapshots must contain only ID, name, and Bool",
         )
 
