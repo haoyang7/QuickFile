@@ -102,4 +102,4 @@ An old Finder extension can remain running after an update. Save your work befor
 
 ## Advanced troubleshooting
 
-Most users should use the steps above. The [technical installation reference (中文)](INSTALLATION.md#技术排障参考) covers quarantine attributes, storage recovery and signing differences. Removing a quarantine attribute does not sign the app, grant folder access or prove that installation works with default security settings.
+Most users should use the steps above. The [technical installation reference](INSTALLATION.md#技术排障参考) is available in Simplified Chinese and covers quarantine attributes, storage recovery and signing differences. Removing a quarantine attribute does not sign the app, grant folder access or prove that installation works with default security settings.
