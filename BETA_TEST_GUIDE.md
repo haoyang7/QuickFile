@@ -15,7 +15,7 @@
 ## 自有团队签名入口
 
 1. 使用自己的 Apple 账号和团队，确认两个 Bundle ID 对该账号可用。个人团队的能力和注册设备范围取决于 Apple 账号状态，项目不保证所有个人团队都支持这些配置。
-2. 按 [README 构建说明](README.md) 运行 `xcodegen generate`，再用自己的 `DEVELOPMENT_TEAM` 做 Clean Release 构建。遇到 App ID 或 entitlement 错误时检查账号能力，如账号无权使用默认标识，按 README 一致替换为自己有权使用的标识并更新配置断言，保留 App Sandbox，不重签陌生包。
+2. 按 [本地构建说明](CONTRIBUTING.md#本地构建与测试) 运行 `xcodegen generate`，再用自己的 `DEVELOPMENT_TEAM` 做 Clean Release 构建。遇到 App ID 或 entitlement 错误时检查账号能力，如账号无权使用默认标识，按构建说明一致替换为自己有权使用的标识并更新配置断言，保留 App Sandbox，不重签陌生包。
 3. 只读核对 `QuickFile.app/Contents/PlugIns/FinderExtension.appex` 已嵌入，主 App 与扩展版本/build 一致、Bundle ID 分别匹配各自 Target 且属于统一命名体系、共享存储与渠道元数据一致，两个架构均存在，并通过 `codesign --verify --deep --strict`。记录自己的产物哈希、系统版本和签名检查时间，不记录 Team、证书、描述文件内容、设备标识或个人路径。
 4. 在系统默认安全设置下安装到“应用程序”，启动并启用 Finder Extension。若系统拒绝安装/启动，保留错误原文并停止该项；不要关闭 Gatekeeper、移除隔离属性、重新签名或执行注册修复命令来把失败算作通过。
 5. 首次右键创建 Markdown，在系统面板只授权测试所需目录。核对创建位置、名称和内容，确认 Finder 选中新文件，再继续核心操作与恢复检查。
