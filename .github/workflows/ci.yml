@@ -63,8 +63,16 @@ jobs:
                   "git", "diff", "--name-only", "--no-renames", "-z", f"{base}...{head}", "--",
               ]).split(b"\0")
               paths = [path for path in changed if path]
+              def is_documentation(path):
+                  return (
+                      path == b"LICENSE"
+                      or (b"/" not in path and path.endswith(b".md"))
+                      or path == b"Screenshots/README.md"
+                      or (path.startswith(b"Screenshots/") and path.count(b"/") == 1
+                          and path.endswith((b".png", b".jpg", b".jpeg")))
+                  )
               run_checks = any(
-                  not (path == b"LICENSE" or (b"/" not in path and path.endswith(b".md")))
+                  not is_documentation(path)
                   for path in paths
               )
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
@@ -72,7 +80,8 @@ jobs:
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
               summary.write("### Verification scope\n\n")
               summary.write("Full Linux and macOS validation required.\n" if run_checks else
-                            "Only root Markdown/LICENSE changes; Linux and macOS tests are skipped, not tested.\n")
+                            "Only root Markdown/LICENSE or product screenshot documentation changes; "
+                            "Linux and macOS tests are skipped, not tested.\n")
           PY
 
   scripts:

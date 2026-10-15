@@ -88,7 +88,7 @@ xcodebuild \
 
 工作流、矩阵及证据边界见 [CI.md](CI.md)。主 CI 覆盖 Linux 脚本、macOS 15 arm64/Intel 和 macOS 26 arm64；macOS 27 兼容性独立运行，AX 系统基线仅手动调查。
 
-检查必须绑定 PR head、base、实际 checkout SHA、run URL 和各 job 结论。PR 默认验证临时合并结果；base 变化时重新核对，合并后检查最终 main。PR 仅修改根目录 Markdown 或 LICENSE 时，`CI required` 明确验收跳过范围，应记为“门禁通过，测试未执行”；main push 等被路径过滤的运行仍记为“CI 未触发”。
+检查必须绑定 PR head、base、实际 checkout SHA、run URL 和各 job 结论。PR 默认验证临时合并结果；base 变化时重新核对，合并后检查最终 main。PR 仅修改根目录 Markdown、LICENSE 或 [CI 文档](CI.md#工作流范围)列出的产品截图文件时，`CI required` 明确验收跳过范围，应记为“门禁通过，测试未执行”；main push 等被路径过滤的运行仍记为“CI 未触发”。
 
 合并要求目的明确、相关检查完成、没有已知回归，并准确记录未验证范围。单人维护可记录自审结论，不将其称为独立审批。main 是开发主线；合并不等于发布。正式发布按 [29 项清单](RELEASE_CHECKLIST.md) 验收，并以版本标签固定最终源码。
 
