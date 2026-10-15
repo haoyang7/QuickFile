@@ -75,39 +75,11 @@ class CIRequiredTests(unittest.TestCase):
         self.assertEqual(output, "run_checks=false\n")
         self.assertIn("skipped, not tested", self.summary.read_text())
 
-    def test_screenshot_documents_and_images_are_explicitly_not_tested(self):
-        for path in ("Screenshots/README.md", "Screenshots/example.png", "Screenshots/example.jpg",
-                     "Screenshots/example.jpeg"):
-            with self.subTest(path=path):
-                self.git("reset", "--hard", self.base)
-                self.write(path, "initial screenshot\n")
-                base = self.commit()
-                self.write(path, "updated screenshot\n")
-                head = self.commit()
-                (self.repo / path).unlink()
-                deleted = self.commit()
-                for start, end in ((self.base, base), (base, head), (head, deleted)):
-                    result, output = self.classify(base=start, head=end)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(output, "run_checks=false\n")
-                    self.assertIn("skipped, not tested", self.summary.read_text())
-
-    def test_screenshots_cannot_hide_mixed_code_changes(self):
-        self.write("Screenshots/example.jpg", "new screenshot\n")
-        self.write("README.md", "new guide\n")
-        self.write("Shared/example.swift", "changed code\n")
-        self.commit()
-        result, output = self.classify()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(output, "run_checks=true\n")
-
-    def test_code_config_other_nested_docs_assets_and_unknown_paths_require_validation(self):
+    def test_code_config_nested_docs_assets_and_unknown_paths_require_validation(self):
         paths = ("Shared/example.swift", "FinderExtension/file.swift", "QuickFileApp/file.swift",
                  "QuickFileTests/file.swift", "QuickFile.xcodeproj/project.pbxproj", "project.yml",
                  ".github/workflows/example.yml", "Scripts/example.md", "Release/example.md",
-                 "docs/example.md", "Resources/example.png", "Screenshots/script.py",
-                 "Screenshots/config.yml", "Screenshots/nested/example.png", "Screenshots/example.jpg.swift",
-                 "Screenshots-other/example.png", "root-script.py", "new-uppercase.MD",
+                 "docs/example.md", "Screenshots/example.png", "root-script.py", "new-uppercase.MD",
                  "Shared/new\nline.swift")
         for path in paths:
             with self.subTest(path=path):
@@ -118,15 +90,13 @@ class CIRequiredTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(output, "run_checks=true\n")
 
-    def test_deleted_or_renamed_code_cannot_be_hidden_as_documentation(self):
-        for destination in (None, "former-code.md", "Screenshots/former-code.png"):
-            with self.subTest(destination=destination):
+    def test_deleted_or_renamed_code_cannot_be_hidden_as_root_documentation(self):
+        for rename in (False, True):
+            with self.subTest(rename=rename):
                 self.git("reset", "--hard", self.base)
                 source = self.repo / "Shared/example.swift"
-                if destination:
-                    target = self.repo / destination
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    source.rename(target)
+                if rename:
+                    source.rename(self.repo / "former-code.md")
                 else:
                     source.unlink()
                 self.commit()
