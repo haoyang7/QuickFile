@@ -107,6 +107,13 @@ struct AuthorizedDirectoryRepository: @unchecked Sendable {
         }
     }
 
+    var storageDirectoryURL: URL? { localStorage?.root }
+
+    func repairStoragePermissions() throws {
+        guard let localStorage else { throw POSIXError(.ENOTSUP) }
+        try localStorage.repairAuthorizationPermissions()
+    }
+
     // Tests inject a private directory and legacy defaults; production migration reads
     // the on-disk App Group plist, never a process-local preferences cache.
     init(defaults: UserDefaults?, storageDirectory: URL?, didDecodeSnapshot: (@Sendable () -> Void)? = nil) {

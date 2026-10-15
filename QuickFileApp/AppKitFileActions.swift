@@ -149,25 +149,24 @@ enum AppKitFileActions {
         NSWorkspace.shared.activateFileViewerSelecting([fileURL])
     }
 
+    static func confirmStoragePermissionRepair(details: String? = nil) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = QuickFileLocalization.text(.init("修复本地存储权限？"))
+        alert.informativeText = details ?? QuickFileLocalization.text(.init("将 QuickFile 存储文件夹及模板、标记和锁文件恢复为仅当前用户可读写，不替换文件内容。链接、所有者异常或目录身份变化时停止。修复失败也可能已调整部分权限。"))
+        let cancel = alert.addButton(withTitle: QuickFileLocalization.text(.init("取消")))
+        cancel.keyEquivalent = "\r"
+        alert.window.defaultButtonCell = cancel.cell as? NSButtonCell
+        alert.addButton(withTitle: QuickFileLocalization.text(.init("修复权限")))
+        return AppModalPresentationGate.shared.present { alert.runModal() } == .alertSecondButtonReturn
+    }
+
     /// Only called after successful publication. Failure here must never retry creation.
-    static func automaticallyOpenCreatedFile(_ fileURL: URL) async -> LocalizedPresentation<String>? {
-        let enabled = await BackgroundWork.result { try FileCreationSettingsStore().loadAutomaticallyOpen() }
-        guard case .success(true) = enabled else { return nil }
-        // A saved-directory creation may already have ended its write scope.
-        // Direct panel selections can retain their own access without a saved grant.
-        let access = await BackgroundWork.result {
-            try AuthorizedDirectoryStore().beginAccess(to: fileURL.deletingLastPathComponent())
-        }
-        let openingAccess = try? access.get()
-        return await withCheckedContinuation { continuation in
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.promptsUserIfNeeded = false
-            NSWorkspace.shared.open(fileURL, configuration: configuration) { _, error in
-                openingAccess?.release()
-                continuation.resume(returning: error.map {
-                    LocalizedPresentation(QuickFileLocalization.text(.init("文件已创建，但无法自动打开：\($0.localizedDescription)")))
-                })
-            }
+    static func automaticallyOpenCreatedFile(_ fileURL: URL, authorizationID: AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>? {
+        let error = await AutomaticFileOpener.shared.openCreatedFile(
+            fileURL, authorizationID: authorizationID, requiresAuthorization: false
+        )
+        return error.map { error in
+            LocalizedPresentation(QuickFileLocalization.text(.init("文件已创建，但无法自动打开：\(error.localizedDescription)")))
         }
     }
 

@@ -14,7 +14,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
         try Data("existing".utf8).write(to: destination.appendingPathComponent(".env"))
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { _ in template },
-            performWithAccess: { _, operation in try operation() },
+            performWithAccess: { _, operation in try operation(UUID()) },
             createFile: { try FileCreationService().createFile(for: $0) },
             requiresAuthorization: { _ in false }
         )
@@ -22,7 +22,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
             templateID: template.id, context: .container, destinationFolder: destination,
             destinationIdentity: DirectoryIdentity.capture(at: destination)
         ))
-        XCTAssertEqual(result.fileURL.lastPathComponent, ".env 2")
+        XCTAssertEqual(result.creationResult.fileURL.lastPathComponent, ".env 2")
         XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent(".env"), encoding: .utf8), "existing")
     }
 
@@ -102,7 +102,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
         let createdTemplates = LockedTestValue<[FileTemplate]>([])
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { id in authoritativeTemplates.value.first { $0.id == id && $0.isEnabled } },
-            performWithAccess: { _, operation in try operation() },
+            performWithAccess: { _, operation in try operation(UUID()) },
             createFile: { request in
                 createdTemplates.update { $0.append(request.template) }
                 return FileCreationResult(fileURL: destination.appendingPathComponent("created.txt"), didRenameForConflict: false)
@@ -136,7 +136,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
             loadTemplate: { _ in template },
             performWithAccess: { url, operation in
                 accessedURL.value = url
-                return try operation()
+                return try operation(UUID())
             },
             createFile: { request in
                 receivedRequest.value = request
@@ -154,7 +154,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(result, expectedResult)
+        XCTAssertEqual(result.creationResult, expectedResult)
         XCTAssertEqual(accessedURL.value, destination)
         XCTAssertEqual(receivedRequest.value?.template, template)
         XCTAssertEqual(receivedRequest.value?.destinationFolder, destination)
@@ -181,7 +181,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
             loadTemplate: { _ in template },
             performWithAccess: { _, operation in
                 accessedCount.update { $0 += 1 }
-                return try operation()
+                return try operation(UUID())
             },
             createFile: { request in
                 requests.update { $0.append(request) }
@@ -318,7 +318,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
             },
             performWithAccess: { _, operation in
                 didRequestAccess.value = true
-                return try operation()
+                return try operation(UUID())
             },
             createFile: {
                 didCreate.value = true
@@ -353,7 +353,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
             loadTemplate: { _ in XCTFail("Unavailable identity must not load templates"); return template },
             performWithAccess: { _, operation in
                 XCTFail("Unavailable identity must not request access")
-                return try operation()
+                return try operation(UUID())
             },
             createFile: { _ in XCTFail("Unavailable identity must not create"); throw TestError.writeFailed },
             requiresAuthorization: { _ in XCTFail("Must preserve the original permission error"); return false }
@@ -459,7 +459,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
         defer { release.signal() }
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { _ in template },
-            performWithAccess: { _, operation in try operation() },
+            performWithAccess: { _, operation in try operation(UUID()) },
             createFile: { request in
                 XCTAssertEqual(request.destinationFolder, directory)
                 return FileCreationResult(fileURL: directory.appendingPathComponent("created.txt"), didRenameForConflict: false)
@@ -509,7 +509,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
         try FileManager.default.removeItem(at: item)
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { _ in template },
-            performWithAccess: { _, operation in XCTFail("Invalid selection must not request access"); return try operation() },
+            performWithAccess: { _, operation in XCTFail("Invalid selection must not request access"); return try operation(UUID()) },
             createFile: { _ in XCTFail("Invalid selection must not create"); throw TestError.writeFailed },
             requiresAuthorization: { _ in false }
         )
@@ -537,14 +537,14 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
             loadTemplate: { _ in template },
             performWithAccess: { url, operation in
                 XCTAssertEqual(url, sidebar.standardizedFileURL)
-                return try operation()
+                return try operation(UUID())
             },
             createFile: { try service.createFile(for: $0) },
             requiresAuthorization: { _ in false }
         )
         let result = try coordinator.createFile(for: XCTUnwrap(registry.takeAction(for: tag)))
-        XCTAssertEqual(result.fileURL.deletingLastPathComponent().resolvingSymlinksInPath(), sidebar.resolvingSymlinksInPath())
-        XCTAssertEqual(try String(contentsOf: result.fileURL), "sidebar content")
+        XCTAssertEqual(result.creationResult.fileURL.deletingLastPathComponent().resolvingSymlinksInPath(), sidebar.resolvingSymlinksInPath())
+        XCTAssertEqual(try String(contentsOf: result.creationResult.fileURL), "sidebar content")
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: window.path).isEmpty)
     }
 
@@ -552,7 +552,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
         let template = FileTemplate(name: "Markdown", fileExtension: "md", content: "")
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { _ in template },
-            performWithAccess: { _, operation in XCTFail("Missing sidebar selection must not request access"); return try operation() },
+            performWithAccess: { _, operation in XCTFail("Missing sidebar selection must not request access"); return try operation(UUID()) },
             createFile: { _ in XCTFail("Missing sidebar selection must not create"); throw TestError.writeFailed },
             requiresAuthorization: { _ in false }
         )
@@ -594,7 +594,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
                 }
                 return template
             },
-            performWithAccess: { _, operation in try operation() },
+            performWithAccess: { _, operation in try operation(UUID()) },
             createFile: { try service.createFile(for: $0) },
             requiresAuthorization: { AuthorizedDirectoryFailureClassifier.requiresAuthorization($0) }
         )
@@ -667,7 +667,7 @@ final class FinderFileCreationCoordinatorTests: XCTestCase {
     private func makeCoordinator(templates: [FileTemplate]) -> FinderFileCreationCoordinator {
         FinderFileCreationCoordinator(
             loadTemplate: { id in templates.first { $0.id == id && $0.isEnabled } },
-            performWithAccess: { _, operation in try operation() },
+            performWithAccess: { _, operation in try operation(UUID()) },
             createFile: { request in
                 FileCreationResult(
                     fileURL: request.destinationFolder.appendingPathComponent("created"),

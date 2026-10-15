@@ -291,6 +291,7 @@ final class QuickFileViewModel: ObservableObject {
     @Published private(set) var templateLoadFailure: TemplateLoadFailure?
     // Compatibility projection; there is no second mutable error state.
     var templateLoadError: String? { templateLoadFailure?.message }
+    var templateStorageDirectoryURL: URL? { templateStore.storageDirectoryURL }
     @Published private(set) var recoveryBackupURL: URL?
     @Published private(set) var isLoadingTemplates = false {
         didSet { if !isLoadingTemplates { drainTemplateRefresh() } }
@@ -335,7 +336,8 @@ final class QuickFileViewModel: ObservableObject {
     private let finderAuthorizationCoordinator: FinderAuthorizationCoordinator
     private let clipboardProvider: (@MainActor () -> String?)?
     private let revealCreatedFile: @MainActor (URL) -> Void
-    private let automaticallyOpenCreatedFile: @MainActor (URL) async -> LocalizedPresentation<String>?
+    private let automaticallyOpenCreatedFile: @MainActor (URL, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>?
+    private(set) var automaticOpenTask: Task<Void, Never>?
     private var templateRefreshObserver: TemplateRefreshObserver?
     private var templateRefreshTask: Task<Void, Never>?
     private enum TemplateRefreshPhase { case probing, loading }
@@ -362,7 +364,7 @@ final class QuickFileViewModel: ObservableObject {
         templateChangeTokenReader: (@Sendable () throws -> TemplateStore.ChangeToken)? = nil,
         finderAuthorizationCoordinator: FinderAuthorizationCoordinator? = nil,
         revealCreatedFile: @escaping @MainActor (URL) -> Void = { _ in },
-        automaticallyOpenCreatedFile: @escaping @MainActor (URL) async -> LocalizedPresentation<String>? = { _ in nil }
+        automaticallyOpenCreatedFile: @escaping @MainActor (URL, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>? = { _, _ in nil }
     ) {
         let loadedTemplates = templates ?? []
         self.hasLoadedTemplates = templates != nil
@@ -1124,7 +1126,7 @@ final class QuickFileViewModel: ObservableObject {
             statusPresentation = LocalizedPresentation(.success(
                 QuickFileLocalization.text(.init("已授权并创建 \(createdName)\(conflictNote())"))
             ))
-            await completeAutomaticOpen(completion.creationResult.fileURL)
+            startAutomaticOpen(completion.creationResult.fileURL, authorizationID: completion.authorizationID)
             return true
         case let .failure(error):
             createdFileURL = nil
@@ -1336,18 +1338,45 @@ final class QuickFileViewModel: ObservableObject {
             createdFileURL = result.fileURL
             func conflictNote() -> String { return result.didRenameForConflict ? QuickFileLocalization.text(.init("（为避免覆盖已自动改名）")) : "" }
             statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("已创建 \(result.fileURL.lastPathComponent)\(conflictNote())"))))
-            await completeAutomaticOpen(result.fileURL)
+            startAutomaticOpen(result.fileURL, authorizationID: savedAuthorizationID)
         case let .failure(error):
             createdFileURL = nil
             statusPresentation = LocalizedPresentation(.failure(error.localizedDescription))
         }
     }
 
-    private func completeAutomaticOpen(_ url: URL) async {
+    private func startAutomaticOpen(_ url: URL, authorizationID: AuthorizedDirectory.ID?) {
+        // Opening is optional post-publication work. Keep one in-flight handoff,
+        // without blocking creation/Finder requests or accumulating stalled tasks.
+        guard automaticOpenTask == nil else {
+            statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("文件已创建。上一次自动打开仍在进行，可在 Finder 中打开此文件。"))))
+            return
+        }
         let generation = statusGeneration
-        if let message = await automaticallyOpenCreatedFile(url), statusGeneration == generation {
-            // Publication succeeded even when Launch Services cannot open the document.
-            statusPresentation = LocalizedPresentation(.success(message.value))
+        let open = automaticallyOpenCreatedFile
+        automaticOpenTask = Task { [weak self] in
+            let message = await open(url, authorizationID)
+            guard let self else { return }
+            self.automaticOpenTask = nil
+            if let message, self.statusGeneration == generation {
+                // A late callback must not overwrite a later creation or user action.
+                self.statusPresentation = LocalizedPresentation(.success(message.value))
+            }
+        }
+    }
+
+    func repairTemplateStoragePermissions() async {
+        guard !isLoadingTemplates, !isSavingTemplates, !isBusy else { return }
+        isSavingTemplates = true
+        templateStateGeneration &+= 1
+        let store = templateStore
+        let result = await BackgroundWork.result { try store.repairStoragePermissions() }
+        isSavingTemplates = false
+        switch result {
+        case .success:
+            await reloadTemplates()
+        case .failure:
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("未能完成权限修复。文件内容未更改，部分权限可能已调整。请在 Finder 的“显示简介 → 共享与权限”中检查当前用户的读写权限，再重试。"))))
         }
     }
 

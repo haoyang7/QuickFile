@@ -379,7 +379,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let model = QuickFileViewModel(
             templateStore: store, templates: [template],
             authorizedDirectoryStore: makeAuthorizationStore(defaults: defaults),
-            automaticallyOpenCreatedFile: { url in
+            automaticallyOpenCreatedFile: { url, _ in
                 XCTAssertTrue(Thread.isMainThread)
                 XCTAssertEqual(try? String(contentsOf: url), "new")
                 opened.append(url)
@@ -389,6 +389,7 @@ final class QuickFileViewModelTests: XCTestCase {
         await model.selectDestinationFolder(temporaryDirectory)
         model.requestedFilename = "example"
         await model.createFile()
+        await model.automaticOpenTask?.value
         let created = try XCTUnwrap(model.createdFileURL)
         XCTAssertEqual(created.lastPathComponent, "example 2.txt")
         XCTAssertEqual(opened, [created])
@@ -402,6 +403,72 @@ final class QuickFileViewModelTests: XCTestCase {
         XCTAssertEqual(opened, [created])
         XCTAssertNil(model.createdFileURL)
         XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryDirectory.appendingPathComponent("example 3.txt").path))
+    }
+
+    func testPendingAutomaticOpenKeepsCreationAvailableAndPreservesAuthorizationID() async throws {
+        let store = TemplateStore(defaults: defaults)
+        let template = FileTemplate(name: "Text", fileExtension: "txt", content: "new")
+        try store.saveTemplates([template])
+        let grants = makeAuthorizationStore(defaults: defaults)
+        let selected = try grants.authorize(temporaryDirectory)
+        let started = expectation(description: "opening began")
+        var completion: CheckedContinuation<LocalizedPresentation<String>?, Never>?
+        var opened: [URL] = []
+        let model = QuickFileViewModel(templateStore: store, templates: [template],
+            authorizedDirectoryStore: grants, automaticallyOpenCreatedFile: { url, id in
+                XCTAssertEqual(id, selected.id)
+                opened.append(url)
+                started.fulfill()
+                return await withCheckedContinuation { completion = $0 }
+            })
+        await model.selectAuthorizedDirectory(selected)
+        await model.createFile()
+        XCTAssertFalse(model.isCreatingFile)
+        await fulfillment(of: [started], timeout: 2)
+        let first = try XCTUnwrap(model.createdFileURL)
+        await model.createFile()
+        XCTAssertFalse(model.isCreatingFile)
+        XCTAssertNotEqual(model.createdFileURL, first)
+        XCTAssertEqual(opened, [first], "A pending handoff must not accumulate more opening tasks")
+        let latest = model.status
+        let task = model.automaticOpenTask
+        completion?.resume(returning: LocalizedPresentation("late opening failure"))
+        await task?.value
+        XCTAssertNil(model.automaticOpenTask)
+        XCTAssertEqual(model.status, latest, "A late opener must not replace the next creation result")
+    }
+
+    func testPermissionRepairReloadsExistingTemplatesWithoutReplacingThem() async throws {
+        // /var is a symlink even after Foundation URL normalization. Use the same
+        // real repository path as other strict no-follow local-storage fixtures.
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        for name in ["templates.v2.json", "templates.persistence.v1.json", "templates.v2.json.lock"] {
+            let storage = LocalSharedStorage(root: repository.appendingPathComponent(".build/Temporary/permission-repair-\(UUID())"))
+            defer { try? FileManager.default.removeItem(at: storage.root) }
+            let file = storage.root.appendingPathComponent("templates.v2.json")
+            let store = TemplateStore(defaults: nil, storageURL: file, localStorage: storage,
+                writeTemplatesData: { try storage.write($0, to: $1) }, readTemplatesData: { try storage.read($0) })
+            let templates = [FileTemplate(name: "Keep", fileExtension: "txt", content: "private content")]
+            try store.saveTemplates(templates, expectedTemplates: BuiltInTemplates.all)
+            let original = try storage.read(file)
+            try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: storage.root.appendingPathComponent(name).path)
+            let model = QuickFileViewModel(templateStore: store)
+            await model.loadTemplatesIfNeeded()
+            if name == "templates.v2.json" {
+                XCTAssertEqual(model.templateLoadFailure, .permissionDenied)
+            } else {
+                XCTAssertNil(model.templateLoadFailure, "A read failure banner cannot be the only repair entry")
+                let deleted = await model.deleteTemplate(withID: templates[0].id)
+                XCTAssertFalse(deleted)
+            }
+            XCTAssertEqual(model.templateStorageDirectoryURL, storage.root)
+            await model.repairTemplateStoragePermissions()
+            XCTAssertNil(model.templateLoadFailure)
+            XCTAssertEqual(model.templates, templates)
+            XCTAssertEqual(try storage.read(file), original)
+            let deleted = await model.deleteTemplate(withID: templates[0].id)
+            XCTAssertTrue(deleted, "Saving must work again after repair")
+        }
     }
 
     func testSavedGrantSelectionResolvesOnlySelectedIDAndSkipsBlockedUnrelatedResolver() async throws {
@@ -2519,7 +2586,7 @@ final class QuickFileViewModelTests: XCTestCase {
                 return "copied"
             },
             revealCreatedFile: { revealed.append($0) },
-            automaticallyOpenCreatedFile: { opened.append($0); return nil }
+            automaticallyOpenCreatedFile: { url, _ in opened.append(url); return nil }
         )
         await model.loadTemplatesIfNeeded()
         template.content = "{{clipboard}}"
@@ -2529,6 +2596,7 @@ final class QuickFileViewModelTests: XCTestCase {
         let request = FinderAuthorizationRequest(templateID: template.id, destinationFolder: temporaryDirectory)
         let didComplete = await model.completeFinderAuthorizationRequest(request, authorizedDirectory: temporaryDirectory)
         XCTAssertTrue(didComplete)
+        await model.automaticOpenTask?.value
         let result = try XCTUnwrap(model.createdFileURL)
         XCTAssertEqual(result.lastPathComponent, "未命名 2.txt")
         XCTAssertEqual(revealed, [result])

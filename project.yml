@@ -16,7 +16,7 @@ settings:
     ARCHS: "arm64 x86_64"
     ONLY_ACTIVE_ARCH: "NO"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "92"
+    CURRENT_PROJECT_VERSION: "94"
     QUICKFILE_STORAGE_MODE: "local-shared"
     QUICKFILE_DISTRIBUTION_CHANNEL: "development"
 
@@ -190,6 +190,7 @@ targets:
     platform: macOS
     deploymentTarget: "13.0"
     sources:
+      - path: QuickFileApp/AutomaticFileOpener.swift
       - path: FinderExtension
         excludes:
           - "**/*.entitlements"
@@ -233,6 +234,7 @@ targets:
     deploymentTarget: "13.0"
     sources:
       - path: QuickFileTests
+      - path: FinderExtension/FinderSync.swift
       - path: FinderExtension/FinderTemplateCache.swift
       - path: FinderExtension/FinderMenuSettingsCache.swift
       - path: FinderExtension/FinderLanguageSettings.swift
@@ -244,6 +246,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.haoyoung.QuickFileTests
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) QUICKFILE_FINDER_TESTS"
         PRODUCT_NAME: QuickFileTests
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/QuickFile.app/Contents/MacOS/QuickFile"

@@ -498,6 +498,25 @@ final class DiagnosticsViewModel: ObservableObject {
         }
     }
 
+    var authorizationStorageURL: URL? { authorizedDirectoryStore.storageDirectoryURL }
+
+    func repairAuthorizationPermissions(confirm: () -> Bool) async {
+        guard !isManagingAuthorizations, !isLoadingAuthorizationInventory, confirm() else { return }
+        guard !isManagingAuthorizations, !isLoadingAuthorizationInventory else { return }
+        isManagingAuthorizations = true
+        defer { isManagingAuthorizations = false }
+        let store = authorizedDirectoryStore
+        let result = await BackgroundWork.result { try store.repairStoragePermissions() }
+        switch result {
+        case .success:
+            authorizationHasError = false
+            authorizationMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("授权记录权限已修复，原始书签未更改。请刷新授权列表；不可用目录仍需重新授权。")))
+        case .failure:
+            authorizationHasError = true
+            authorizationMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("未能完成权限修复。文件内容未更改，部分权限可能已调整。请在 Finder 的“显示简介 → 共享与权限”中检查当前用户的读写权限，再重试。")))
+        }
+    }
+
     private func beginInventoryRead() -> Bool {
         guard inventoryReadGate.tryBegin() else {
             authorizationInventoryMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("另一项目录授权检查仍在进行，请稍后刷新或重试。")))

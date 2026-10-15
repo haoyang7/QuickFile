@@ -322,7 +322,7 @@ def validate_summary(value):
     require(type(value["schema"]) is int and value["schema"] == 1 and value["protocol"] == PROTOCOL and value["public_limit_bytes"] == PUBLIC_LIMIT)
     require(value["single_group_growth_verdict"] == "not-evaluated")
     validate_identity(value["identity"])
-    require(value["temporary_cleanup"] in ("not-run", "complete", "retained-unconfirmed", "failed"))
+    require(value["temporary_cleanup"] in ("not-run", "complete", "retained-unconfirmed", "retained-evidence", "failed"))
     expected = None
     if value["build"] is not None:
         build = value["build"]; fields(build, ("process_run", "manifest", "manifest_sha256")); reader.validate_process(build["process_run"])
@@ -408,13 +408,17 @@ def campaign(root):
     env = dict(os.environ)
     for key in (*reader.ENVIRONMENT["host"], "QUICKFILE_DISABLE_AX_COMPATIBILITY", INSTALL_ENV): env.pop(key, None)
     cleanup_known = True
+    exception_pending = False
+    evidence_preserved = True
     try:
         prepared = private / "prepared"
         process = run_owned([sys.executable, str(ROOT / "Scripts/Investigations/verify-ax-compatibility.py"), "--prepare-install-gate-fixture",
             "--work-directory", str(prepared), "--records-directory", str(private / "build-records")], private / "build.log", env, timeout=RUN_TIMEOUT)
         summary["build"] = {"process_run": process, "manifest": None, "manifest_sha256": None}
         cleanup_known = process["cleanup"]["complete"]; save_summary(public, summary)
-        if process["return_code"] != 0 or not cleanup_known: return 1
+        if process["return_code"] != 0 or not cleanup_known:
+            evidence_preserved = False
+            return 1
         sources = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in fixture_sources("install-gate")}
         manifest = load_prepared_build(prepared, sources, "install-gate")
         require(read_bytes(prepared / "fixture-build.json", 16384) == canonical(manifest))
@@ -446,23 +450,36 @@ def campaign(root):
                 row["measurement"] = project_trial(records, process, manifest["executables"], control, mode, sources)
                 row["projection_reason"] = "none"
                 for key in ("classification_verdict", "growth_verdict"): row[key] = row["measurement"][key]
-            except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError): row["projection_reason"] = "invalid"
+            except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
+                row["projection_reason"] = "invalid"
+                evidence_preserved = False
             save_summary(public, summary)
             print(json.dumps({"block": block, "order": order, "timing_control": control, "install_gate": mode,
                 "classification": row["classification_verdict"], "growth": row["growth_verdict"], "cleanup_confirmed": cleanup_known}), flush=True)
             if not cleanup_known: return 1
-    except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError): return 1
+    except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
+        evidence_preserved = False
+        return 1
+    except BaseException:
+        exception_pending = True
+        raise
     finally:
-        if cleanup_known:
-            try:
-                save_summary(public, summary); summary["temporary_cleanup"] = "complete"; encode_summary(summary)
+        # Unexpected failures retain raw evidence and the last durable summary.
+        if not exception_pending:
+            if cleanup_known and evidence_preserved:
+                try:
+                    save_summary(public, summary); summary["temporary_cleanup"] = "complete"; encode_summary(summary)
+                except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
+                    print("Public summary unavailable; private evidence retained", file=sys.stderr)
+                    return 1
+                try: shutil.rmtree(private)
+                except OSError: summary["temporary_cleanup"] = "failed"
+            elif not cleanup_known: summary["temporary_cleanup"] = "retained-unconfirmed"
+            else: summary["temporary_cleanup"] = "retained-evidence"
+            try: save_summary(public, summary)
             except (ValueError, RuntimeError, OSError, TypeError, KeyError, UnicodeError):
-                print("Public summary unavailable; private evidence retained", file=sys.stderr)
+                print("Public summary unavailable; private evidence retained when not already fully projected", file=sys.stderr)
                 return 1
-            try: shutil.rmtree(private)
-            except OSError: summary["temporary_cleanup"] = "failed"
-        else: summary["temporary_cleanup"] = "retained-unconfirmed"
-        save_summary(public, summary)
     return 0 if all(summary[key] for key in ("completed", "evidence_checks_passed", "classification_checks_passed", "growth_checks_passed")) and summary["temporary_cleanup"] == "complete" else 1
 
 

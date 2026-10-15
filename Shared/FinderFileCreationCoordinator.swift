@@ -26,13 +26,23 @@ public enum FinderFileCreationError: LocalizedError, Equatable {
 
 // Dependencies may be called from background work. Sendable callbacks make their
 // capture safety part of the contract; execution and access lifetimes stay synchronous.
+public struct FinderFileCreationCompletion: Equatable, Sendable {
+    public let creationResult: FileCreationResult
+    public let authorizationID: UUID
+
+    public init(creationResult: FileCreationResult, authorizationID: UUID) {
+        self.creationResult = creationResult
+        self.authorizationID = authorizationID
+    }
+}
+
 public struct FinderFileCreationCoordinator: Sendable {
     public typealias TemplateLoader = @Sendable (UUID) throws -> FileTemplate?
-    public typealias AccessOperation = @Sendable () throws -> FileCreationResult
+    public typealias AccessOperation = @Sendable (UUID) throws -> FinderFileCreationCompletion
     public typealias AccessPerformer = @Sendable (
         URL,
         AccessOperation
-    ) throws -> FileCreationResult
+    ) throws -> FinderFileCreationCompletion
     public typealias FileCreator = @Sendable (FileCreationRequest) throws -> FileCreationResult
     public typealias AuthorizationRequirementEvaluator = @Sendable (Error) -> Bool
     public typealias SelectionResolver = @Sendable (FinderMenuContext, URL?, [URL]) -> URL?
@@ -61,7 +71,7 @@ public struct FinderFileCreationCoordinator: Sendable {
         self.resolveSelection = resolveSelection
     }
 
-    public func createFile(for action: FinderMenuAction, timing: CreationTiming? = nil) throws -> FileCreationResult {
+    public func createFile(for action: FinderMenuAction, timing: CreationTiming? = nil) throws -> FinderFileCreationCompletion {
         let (prepared, destinationFolder) = try {
             timing?.mark("destination.validation.begin")
             defer { timing?.mark("destination.validation.end") }
@@ -112,8 +122,8 @@ public struct FinderFileCreationCoordinator: Sendable {
         }()
 
         do {
-            return try performWithAccess(destinationFolder) {
-                try createFile(
+            return try performWithAccess(destinationFolder) { authorizationID in
+                let result = try createFile(
                     FileCreationRequest(
                         template: template,
                         destinationFolder: destinationFolder,
@@ -122,6 +132,7 @@ public struct FinderFileCreationCoordinator: Sendable {
                         timing: timing
                     )
                 )
+                return FinderFileCreationCompletion(creationResult: result, authorizationID: authorizationID)
             }
         } catch {
             guard requiresAuthorization(error) else {

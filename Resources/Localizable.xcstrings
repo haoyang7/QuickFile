@@ -899,6 +899,24 @@
         }
       }
     },
+    "上一次自动打开仍在等待系统响应。请在 Finder 中打开此文件；如持续无响应，请重新启动 QuickFile 或 Finder。": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The previous automatic open is still waiting for the system. Open this file in Finder. If the operation remains unresponsive, restart QuickFile or Finder."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上一次自动打开仍在等待系统响应。请在 Finder 中打开此文件；如持续无响应，请重新启动 QuickFile 或 Finder。"
+          }
+        }
+      }
+    },
     "上次操作仍在结束。结束后可点击“重新检查”；关闭窗口不会强行中断磁盘操作。": {
       "comment": "Finder request recovery: inspection/archive feedback. Archiving does not create a file or resume the queue.",
       "extractionState": "manual",
@@ -1385,6 +1403,24 @@
         }
       }
     },
+    "修复存储权限…": {
+      "comment": "Template load failure action that opens the permission repair confirmation.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Repair Storage Permissions…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "修复存储权限…"
+          }
+        }
+      }
+    },
     "修复损坏的配置…": {
       "comment": "Main app: file creation or template-library operation feedback and recovery guidance.",
       "extractionState": "manual",
@@ -1399,6 +1435,78 @@
           "stringUnit": {
             "state": "translated",
             "value": "修复损坏的配置…"
+          }
+        }
+      }
+    },
+    "修复授权记录权限…": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Repair Authorization Permissions…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "修复授权记录权限…"
+          }
+        }
+      }
+    },
+    "修复本地存储权限？": {
+      "comment": "Confirmation title for explicitly tightening the local shared storage permissions.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Repair Local Storage Permissions?"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "修复本地存储权限？"
+          }
+        }
+      }
+    },
+    "修复权限": {
+      "comment": "Confirmation action that tightens permissions after the user explicitly approves.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Repair Permissions"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "修复权限"
+          }
+        }
+      }
+    },
+    "修复请求队列权限…": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Repair Request Queue Permissions…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "修复请求队列权限…"
           }
         }
       }
@@ -2519,6 +2627,42 @@
         }
       }
     },
+    "在 Finder 中显示存储文件夹": {
+      "comment": "Recovery action that reveals the existing local shared storage folder without deleting data.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show Storage Folder in Finder"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在 Finder 中显示存储文件夹"
+          }
+        }
+      }
+    },
+    "在 Finder 中显示存储目录": {
+      "comment": "Storage recovery action: reveal the local shared folder in Finder for manual inspection.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show Storage Folder in Finder"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在 Finder 中显示存储目录"
+          }
+        }
+      }
+    },
     "在 Finder 中验证": {
       "comment": "Finder setup: extension activation, permissions and first-creation verification.",
       "extractionState": "manual",
@@ -2789,6 +2933,24 @@
         }
       }
     },
+    "存储修复": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Storage Repair"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "存储修复"
+          }
+        }
+      }
+    },
     "完成": {
       "comment": "Diagnostics screen, including folder access management and extension health.",
       "extractionState": "manual",
@@ -3055,6 +3217,60 @@
           "stringUnit": {
             "state": "translated",
             "value": "导出模板配置，不会读取剪贴板，也不包含 Finder 文件夹授权。模板正文可能包含你自行写入的私人信息。"
+          }
+        }
+      }
+    },
+    "将 QuickFile 存储文件夹及模板、标记和锁文件恢复为仅当前用户可读写，不替换文件内容。链接、所有者异常或目录身份变化时停止。修复失败也可能已调整部分权限。": {
+      "comment": "Permission repair confirmation: fixed scope, refusal conditions, and partial-change disclosure.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restore owner-only access to the QuickFile storage folder and its template, marker, and lock files without replacing contents. Stop on links, unexpected ownership, or changed directory identity. A failed repair may still change some permissions."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "将 QuickFile 存储文件夹及模板、标记和锁文件恢复为仅当前用户可读写，不替换文件内容。链接、所有者异常或目录身份变化时停止。修复失败也可能已调整部分权限。"
+          }
+        }
+      }
+    },
+    "将本地共享目录、请求队列及其归档目录、队列锁和最多 256 条请求记录恢复为仅当前用户可读写。不改变原始内容、不修改归档文件、不移出待办，也不恢复自动处理。链接、所有者异常或目录身份变化时停止，失败时可能已调整部分权限。": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restore owner-only access for local shared storage, the request queue and its archive directory, the queue lock, and up to 256 requests. Original contents and archived files remain unchanged. Requests stay pending and automatic processing stays paused. Stop on links, unexpected ownership, or changed directory identity; some permissions may already have changed if repair fails."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "将本地共享目录、请求队列及其归档目录、队列锁和最多 256 条请求记录恢复为仅当前用户可读写。不改变原始内容、不修改归档文件、不移出待办，也不恢复自动处理。链接、所有者异常或目录身份变化时停止，失败时可能已调整部分权限。"
+          }
+        }
+      }
+    },
+    "将本地共享目录及授权记录、迁移标记和锁文件恢复为仅当前用户可读写。不会删除、替换或解析书签。链接、所有者异常或目录身份变化时停止，失败时可能已调整部分权限。": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Restore owner-only access to the local shared folder, authorization records, migration marker, and lock file. No bookmarks are deleted, replaced, or resolved. Stop on links, unexpected ownership, or changed directory identity. Some permissions may already have changed if repair fails."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "将本地共享目录及授权记录、迁移标记和锁文件恢复为仅当前用户可读写。不会删除、替换或解析书签。链接、所有者异常或目录身份变化时停止，失败时可能已调整部分权限。"
           }
         }
       }
@@ -5237,6 +5453,24 @@
         }
       }
     },
+    "授权记录权限已修复，原始书签未更改。请刷新授权列表；不可用目录仍需重新授权。": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Authorization permissions repaired. Original bookmarks are unchanged. Refresh the list; unavailable folders may still need authorization."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "授权记录权限已修复，原始书签未更改。请刷新授权列表；不可用目录仍需重新授权。"
+          }
+        }
+      }
+    },
     "授权需要更新，请重新添加此目录。": {
       "comment": "Diagnostics screen, including folder access management and extension health.",
       "extractionState": "manual",
@@ -5683,6 +5917,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "文件夹授权已被其他操作更新，请重新选择该文件夹。"
+          }
+        }
+      }
+    },
+    "文件已创建。上一次自动打开仍在进行，可在 Finder 中打开此文件。": {
+      "comment": "Creation result when the single automatic-open handoff is still occupied. The file already exists.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The file was created. The previous automatic open is still in progress; you can open this file in Finder."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文件已创建。上一次自动打开仍在进行，可在 Finder 中打开此文件。"
           }
         }
       }
@@ -6421,6 +6673,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "无法确认目标文件夹，本次未创建文件：%@"
+          }
+        }
+      }
+    },
+    "无法自动恢复时，请保留现有文件。在 Finder 的“显示简介 → 共享与权限”中检查当前用户的读写权限，或取回原始配置，再重新加载。": {
+      "comment": "Help for the manual recovery route when automatic repair cannot safely proceed.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "If automatic recovery cannot proceed, preserve the existing files. In Finder, check your read and write access in Get Info → Sharing & Permissions, or retrieve the original configuration, then reload."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法自动恢复时，请保留现有文件。在 Finder 的“显示简介 → 共享与权限”中检查当前用户的读写权限，或取回原始配置，再重新加载。"
           }
         }
       }
@@ -7429,6 +7699,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "未能保存模板，当前修改未保存。请检查存储空间和访问权限后重试，或复制草稿。"
+          }
+        }
+      }
+    },
+    "未能完成权限修复。文件内容未更改，部分权限可能已调整。请在 Finder 的“显示简介 → 共享与权限”中检查当前用户的读写权限，再重试。": {
+      "comment": "Failure after explicit storage permission repair. Partial permission changes are possible; contents remain intact.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permission repair could not finish. File contents were not changed; some permissions may have changed. In Finder, use Get Info → Sharing & Permissions to check your read and write access, then retry."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "未能完成权限修复。文件内容未更改，部分权限可能已调整。请在 Finder 的“显示简介 → 共享与权限”中检查当前用户的读写权限，再重试。"
           }
         }
       }
@@ -8563,6 +8851,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "正在保存菜单设置"
+          }
+        }
+      }
+    },
+    "正在修复请求队列权限…": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Repairing request queue permissions…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在修复请求队列权限…"
           }
         }
       }
@@ -10187,6 +10493,24 @@
         }
       }
     },
+    "自动打开等待系统响应超时，文件已保留。请在 Finder 中打开；为避免积累系统请求，收到响应前暂停后续自动打开。": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Automatic opening timed out while waiting for the system. Your file is saved and can be opened in Finder. Further automatic opens are paused until a response arrives to avoid accumulating system requests."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自动打开等待系统响应超时，文件已保留。请在 Finder 中打开；为避免积累系统请求，收到响应前暂停后续自动打开。"
+          }
+        }
+      }
+    },
     "自动检查更新": {
       "comment": "Settings: application version, distribution channel and update availability.",
       "extractionState": "manual",
@@ -11353,6 +11677,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "重试读取"
+          }
+        }
+      }
+    },
+    "队列权限已修复，原始记录未更改，自动处理仍暂停。可重新检查并归档异常记录，或关闭后点击“重试读取”。": {
+      "comment": "Storage recovery or optional file opening: user-facing status, action, or explicit confirmation; do not imply that file creation failed or that requests resume automatically.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Queue permissions repaired. Original records are unchanged and automatic processing is still paused. Inspect again to archive invalid records, or close this window and choose Retry Reading."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "队列权限已修复，原始记录未更改，自动处理仍暂停。可重新检查并归档异常记录，或关闭后点击“重试读取”。"
           }
         }
       }

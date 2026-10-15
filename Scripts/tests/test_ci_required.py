@@ -177,6 +177,14 @@ class CIRequiredTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", self.workflow)
         self.assertNotIn("secrets.", self.workflow)
 
+    def test_required_matrix_includes_a_non_optional_ax_coverage_baseline(self):
+        block = self.workflow.split('      - name: Require actual AX coverage on the macOS 26 baseline\n', 1)[1]
+        block = block.split('      - name:', 1)[0]
+        self.assertIn("        if: matrix.macos_major == '26'\n", block)
+        self.assertIn('python3 Scripts/ci-evidence.py require-ax-coverage "$CI_EVIDENCE_ROOT"', block)
+        self.assertNotIn('continue-on-error', block)
+        self.assertIn("macos_major: '26'", self.workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

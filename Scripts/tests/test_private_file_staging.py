@@ -46,6 +46,11 @@ class PrivateFileStagingTests(unittest.TestCase):
             self.assertTrue(report['parent_open'])
             return report
 
+    def test_cross_device_replacement_is_rejected_and_reclaimed(self):
+        report = self.run_case('cross-device')
+        self.assertEqual(report['errors'][-1], {'domain': 'NSPOSIXErrorDomain', 'code': errno.EXDEV})
+        self.assertEqual(report['entries'], {})
+
     def test_normal_probe_removes_its_directory(self):
         report = self.run_case('normal')
         self.assertEqual(report['errors'], [])

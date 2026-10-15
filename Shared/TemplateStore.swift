@@ -292,6 +292,14 @@ public final class TemplateStore: @unchecked Sendable {
         try loadTemplates(allowCached: true)
     }
 
+    public var storageDirectoryURL: URL? { localStorage?.root }
+
+    /// Requires explicit UI confirmation; does not replace templates or reset markers.
+    public func repairStoragePermissions() throws {
+        guard let localStorage else { throw StoreError.sharedDefaultsUnavailable }
+        try localStorage.repairTemplatePermissions()
+    }
+
     /// Execution paths read the file even when the cross-process revision has not propagated yet.
     public func reloadTemplates() throws -> [FileTemplate] {
         try loadTemplates(allowCached: false)
@@ -969,7 +977,7 @@ public final class TemplateStore: @unchecked Sendable {
             let revision = UUID().uuidString
 
             if let storageURL {
-                if let localStorage, let marker = persistenceMarkerURL, try readPersistenceMarker() == nil {
+                if let localStorage, let marker = persistenceMarkerURL, try !hasPersistenceMarker() {
                     // The durable, monotonic marker precedes the first publication. A crash
                     // or failed payload write can require recovery, never a silent reset.
                     try localStorage.write(Data("{\"version\":1}".utf8), to: marker, durable: true)
@@ -1095,24 +1103,26 @@ public final class TemplateStore: @unchecked Sendable {
     private func readPersistenceMarker() throws -> Data? {
         guard let localStorage, let url = persistenceMarkerURL else { return nil }
         do {
-            let data = try localStorage.read(url, maximumBytes: 4096)
-            struct Marker: Decodable { let version: Int }
-            guard try JSONDecoder().decode(Marker.self, from: data).version == 1 else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            return data
+            // The marker records existence, not a versioned configuration. Preserve
+            // opaque bytes for recovery, including malformed or future contents.
+            return try localStorage.read(url, maximumBytes: Self.maximumRecoveryFileBytes)
         } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
             return nil
         }
     }
 
+    private func hasPersistenceMarker() throws -> Bool {
+        guard let localStorage, let url = persistenceMarkerURL else { return false }
+        return try localStorage.containsFile(at: url)
+    }
+
     private func currentRevision() throws -> String? {
-        if localStorage != nil { return try readPersistenceMarker() == nil ? nil : "community-file" }
+        if localStorage != nil { return try hasPersistenceMarker() ? "community-file" : nil }
         return defaults?.string(forKey: revisionKey)
     }
 
     private func hasSavedConfiguration() throws -> Bool {
-        if localStorage != nil { return try readPersistenceMarker() != nil }
+        if localStorage != nil { return try hasPersistenceMarker() }
         return defaults?.object(forKey: revisionKey) != nil
     }
 

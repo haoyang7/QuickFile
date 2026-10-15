@@ -54,7 +54,7 @@ def main():
     views = ["BackgroundWork", "LocalizedPresentation", "AppModalPresentationGate", "FinderAuthorizationRequestPump", "QuickFileViewModel", "TemplateRefreshObserver", "CreateFileView", "TemplateManagerView",
              "FinderMenuSettingsSection", "TemplateContentPreview",
              "TemplateEditorView", "TemplateEditorState", "TemplatePreviewController", "TemplateTransferPreviewView", "FinderMenuSettingsViewModel", "FinderIntegrationViewModel", "FinderIntegrationAdapter",
-             "FinderExtensionDiagnostics", "AppKitFileActions",
+             "FinderExtensionDiagnostics", "AppKitFileActions", "AutomaticFileOpener",
              "AppTabsView", "DiagnosticsView", "DiagnosticsViewModel"]
     sources = [f"QuickFileApp/{name}.swift" for name in views] + [f"Scripts/Investigations/{name}.swift"]
     inputs += sources

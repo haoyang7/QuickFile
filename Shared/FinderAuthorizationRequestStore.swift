@@ -551,6 +551,17 @@ public struct FinderAuthorizationRequestStore: @unchecked Sendable {
     static let maximumRecoveryDirectoryEntries = 256
     // One process-wide permit covers actual synchronous I/O AND the sole prepared
     // lease. Canceling an async UI wait cannot release running I/O's permit.
+    public var storageDirectoryURL: URL? { localStorage?.root }
+
+    /// Explicit user action; the normal queue lock also excludes producers/consumers.
+    /// A prepared archive keeps its permit and cannot be modified beneath confirmation.
+    public func repairStoragePermissions() throws {
+        guard Self.recoveryAdmission.wait(timeout: .now()) == .success else { throw RecoveryError.busy }
+        defer { Self.recoveryAdmission.signal() }
+        guard let localStorage else { throw RecoveryError.unavailable }
+        try localStorage.repairRequestPermissions()
+    }
+
     private static let recoveryAdmission = DispatchSemaphore(value: 1)
     private static let recoveryLeaseLock = NSLock()
     // Access only while holding recoveryLeaseLock. Descriptors are transferred,

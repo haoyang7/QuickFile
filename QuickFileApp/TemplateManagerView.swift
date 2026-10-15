@@ -275,6 +275,13 @@ struct TemplateManagerView: View {
                 .disabled(!viewModel.canMoveTemplate(withID: selectedTemplate?.id, offset: 1))
             Divider()
             Button("恢复默认模板…", role: .destructive) { confirmation = .restoreDefaults }
+            if let directory = viewModel.templateStorageDirectoryURL {
+                Divider()
+                // Marker/lock permissions can prevent saves while reads still succeed.
+                Button("修复存储权限…", action: repairStoragePermissions)
+                    .disabled(viewModel.isBusy)
+                Button("在 Finder 中显示存储文件夹") { AppKitFileActions.reveal(directory) }
+            }
         }
         .fixedSize()
         .accessibilityLabel(QuickFileLocalization.text(.init("更多模板操作")))
@@ -294,9 +301,22 @@ struct TemplateManagerView: View {
                     }
                     .fixedSize()
                 }
+                if failure == .permissionDenied, viewModel.templateStorageDirectoryURL != nil {
+                    Button("修复存储权限…", action: repairStoragePermissions)
+                        .disabled(viewModel.isBusy)
+                }
+                if let directory = viewModel.templateStorageDirectoryURL {
+                    Button("在 Finder 中显示存储文件夹") { AppKitFileActions.reveal(directory) }
+                        .help("无法自动恢复时，请保留现有文件。在 Finder 的“显示简介 → 共享与权限”中检查当前用户的读写权限，或取回原始配置，再重新加载。")
+                }
             }
             .disabled(viewModel.isLoadingTemplates || viewModel.isSavingTemplates)
         }
+    }
+
+    private func repairStoragePermissions() {
+        guard AppKitFileActions.confirmStoragePermissionRepair() else { return }
+        Task { await viewModel.repairTemplateStoragePermissions() }
     }
 
     private func templateRow(_ template: FileTemplate) -> some View {

@@ -123,6 +123,19 @@ struct FinderRequestRecoveryView: View {
             HStack {
                 Button("重新检查") { Task { await model.inspect() } }
                     .disabled(!model.canInspect)
+                Menu("存储修复") {
+                    Button("修复请求队列权限…") {
+                        Task {
+                            await model.repairPermissions {
+                                AppKitFileActions.confirmStoragePermissionRepair(details: QuickFileLocalization.text(.init("将本地共享目录、请求队列及其归档目录、队列锁和最多 256 条请求记录恢复为仅当前用户可读写。不改变原始内容、不修改归档文件、不移出待办，也不恢复自动处理。链接、所有者异常或目录身份变化时停止，失败时可能已调整部分权限。")))
+                            }
+                        }
+                    }
+                    .disabled(!model.canInspect)
+                    if let url = model.storageURL {
+                        Button("在 Finder 中显示存储目录") { AppKitFileActions.reveal(url) }
+                    }
+                }
                 Spacer()
                 Button("关闭") { model.close() }
                     .keyboardShortcut(.cancelAction)
