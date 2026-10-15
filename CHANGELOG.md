@@ -4,7 +4,7 @@
 
 QuickFile 提供本机文件创建与 Finder 模板菜单。目标平台为 macOS 13+，构建包含 Intel 与 Apple Silicon；实机兼容性和完整发布准入仍需按 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) 验收。
 
-此版本按 `v0.1.0-beta.2` 固定源码，通过 GitHub Actions 构建 Community DMG，采用 ad-hoc 签名、未经公证并手动覆盖升级。它是保留下述验收缺口的实验性预发布；实际发布状态、最终包校验和和来源收据以 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 为准。
+此版本已于 2026-10-15 作为 Community Beta 公开发布，按 `v0.1.0-beta.2` 固定源码，通过 GitHub Actions 构建 DMG，采用 ad-hoc 签名、未经公证并手动覆盖升级。下载、最终包校验和、来源收据及已验证范围见[该版本发布页](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.2)。下述验收缺口仍保留，Beta 发布不表示稳定版准入已完成。
 
 ### 功能
 
@@ -41,7 +41,7 @@ QuickFile 提供本机文件创建与 Finder 模板菜单。目标平台为 macO
 
 ### 发布限制
 
-完整内存稳定性和 Finder 端到端性能尚未通过。完整诊断 UI、无 Finder 窗口的 Desktop、Mac 重启/注销、其他系统与 Intel 的安装及 Finder 实测、真实 iCloud/外接/网络卷、默认安全设置的干净机器及残余 AX 内存增长归因仍需验收。Community beta 的 DMG 仅为实验候选；稳定版的最终 DMG 安装与手动覆盖升级尚未放行。Developer ID、公证/装订及 Sparkle 更新属于单独的证书签名分发路线，也未完成发布验收。功能摘要不代表发布承诺。
+完整内存稳定性和 Finder 端到端性能尚未通过。完整诊断 UI、无 Finder 窗口的 Desktop、Mac 重启/注销、其他系统与 Intel 的安装及 Finder 实测、真实 iCloud/外接/网络卷、默认安全设置的干净机器及残余 AX 内存增长归因仍需验收。已发布的 Community Beta 保留这些限制；稳定版的最终 DMG 安装与手动覆盖升级尚未放行。Developer ID、公证/装订及 Sparkle 更新属于单独的证书签名分发路线，也未完成发布验收。功能摘要不代表所有场景已通过验收。
 
 ## 历史候选：0.1.0-beta.1（内部 build 78）
 

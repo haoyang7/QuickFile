@@ -65,4 +65,5 @@
 
 ## 参与开发
 
-[构建与贡献](CONTRIBUTING.md) · [架构说明](ARCHITECTURE.md) · [翻译指南](LOCALIZATION.md) · [变更记录](CHANGELOG.md) · [MIT 许可](LICENSE)
+- 中文：[构建与贡献](CONTRIBUTING.md) · [架构说明](ARCHITECTURE.md) · [变更记录](CHANGELOG.md)
+- 英文：[翻译指南](LOCALIZATION.md) · [MIT 许可](LICENSE)

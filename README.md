@@ -51,7 +51,7 @@ In **QuickFile → Settings → General**, you can choose English, Simplified Ch
 - **Mac requirements:** macOS 13 or later; one download for Apple Silicon and Intel. This is a Beta, and not every Mac or macOS version has been tested. See the [release notes](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.2) for the tested range.
 - **First launch:** this Community build has not been notarized by Apple. macOS may ask you to approve opening it. The [installation guide](INSTALLATION.en.md) shows the steps.
 - **Updates:** download and install new versions yourself; this build has no automatic updater.
-- **Privacy:** no account, ads or usage tracking. Templates and settings stay on your Mac. Folder access is granted when you choose a folder. See the [privacy details (中文)](PRIVACY.md).
+- **Privacy:** no account, ads or usage tracking. Templates and settings stay on your Mac. Folder access is granted when you choose a folder. See the [privacy details in Simplified Chinese](PRIVACY.md).
 
 Try your first file in a test folder. Cloud folders, external drives and network drives still need more testing.
 
@@ -65,4 +65,5 @@ See [installation and troubleshooting](INSTALLATION.en.md), or [open an issue](h
 
 ## For contributors
 
-[Build and contribute (中文)](CONTRIBUTING.md) · [Architecture (中文)](ARCHITECTURE.md) · [Translation guide (中文)](LOCALIZATION.md) · [Changelog (中文)](CHANGELOG.md) · [MIT License](LICENSE)
+- English: [Translation guide](LOCALIZATION.md) · [MIT License](LICENSE)
+- Simplified Chinese: [Build and contribute](CONTRIBUTING.md) · [Architecture](ARCHITECTURE.md) · [Changelog](CHANGELOG.md)
