@@ -10,7 +10,7 @@ QuickFile 是 macOS Finder 的新建文件工具。支持模板、变量替换�
 
 Community DMG 只从 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 对应发布页取得；发布状态以 GitHub Releases 为准，需要核对构建身份时再查看该页的 `build-provenance.json`；没有对应发布页时不视为已经发布。普通安装只需下载 DMG 和对应 `.sha256` 并先核对 SHA-256；`artifact-check.json`、`INSTALL.txt` 和 `build-provenance.json` 是按需查看的收据与说明。随后退出旧版并备份，拖到“应用程序”、推出 DMG，最后从“应用程序”打开。完整的未公证 App 首次打开、Finder 扩展、目录授权、升级和 `xattr` 排障步骤见[安装指南](INSTALLATION.md)。
 
-`v0.1.0-beta.1` 的发布说明记录了从开发签名版本覆盖安装后持续加载的受阻场景，原因尚未确定。签名路线切换的权限与数据迁移未完成验收；已有可用安装的用户应先阅读[升级与恢复](INSTALLATION.md#升级与恢复)，在可恢复的测试环境验证。
+Community 与 Developer ID 构建使用相同应用标识和本地共享目录，覆盖安装时延续模板与设置；签名变化后的书签权限仍须单独验证。较早的 App Group 版本通过导出、预览导入迁移模板。已有可用安装的用户应先阅读[升级与恢复](INSTALLATION.md#升级与恢复)。
 
 ## 构建与测试
 
@@ -35,7 +35,7 @@ open QuickFile.xcodeproj
 ./Scripts/build-community.sh --output .build/Packages/community-candidate
 ```
 
-生成带发布标签的候选时追加 `--release-tag v0.1.0-beta.1`；该标签用于对外 DMG 文件名，内部 build 只写入 About 和收据。
+生成带发布标签的候选时追加 `--release-tag v0.1.0-beta.2`（示例）；参数用于对外 DMG 文件名，不创建 Git 标签或发布 Release。内部 build 以应用和收据为准。
 
 维护者的 GitHub Actions 打包入口、五项 artifact 和不自动公开 Release 的约束见[免费自行分发流程](COMMUNITY_DISTRIBUTION.md#github-actions-打包)。
 
@@ -68,7 +68,7 @@ xcodebuild \
 
 普通用户安装和权限排障请先阅读[安装指南](INSTALLATION.md)；以下步骤用于安装后的基本功能验收。
 
-1. 启动 QuickFile，在系统扩展设置中启用 Finder 扩展。在主应用选择目标目录，或首次从 Finder 创建时通过系统面板授权。
+1. 启动 QuickFile，在系统扩展设置中启用 Finder 扩展。主应用“选择文件夹”用于当前创建，不自动保存 Finder 授权；需要持久授权时，在创建页的 Finder 设置或诊断页添加，或在首次 Finder 创建时确认系统授权面板。
 2. 在 Finder 文件夹背景右键，选择“新建文件 → Markdown”，确认生成并选中 `未命名.md`。
 3. 升级后核对实际加载的主应用和扩展版本。旧扩展仍在运行时，保存当前工作后重新启动 Finder，再验证菜单。
 
@@ -100,6 +100,7 @@ xcodebuild \
 
 - 菜单未出现：先核对安装副本和扩展开关，再打开 Finder 菜单并检查响应。未收到响应不等于扩展崩溃；扩展进程由 macOS 管理。
 - 权限错误：重新确认目录授权，检查卷权限与可用空间。卷改名后可能需要刷新授权或通过系统面板重新授权。
+- 授权记录无法读取或保存：在“文件夹授权 → 授权存储维护”中修复记录权限或显示存储目录；列表读取失败时直接显示修复入口。权限修复不修改书签，也不代替文件夹重新授权。
 - 文件已创建但无法定位：先检查目标目录，避免重复创建。Finder 定位失败不会删除已创建文件。
 - 模板不可用：在主应用重新加载或修复配置，不通过删除原配置掩盖读取失败。
 

@@ -9,14 +9,14 @@ QuickFile 提供实验性的 community 构建流程，不需要 Apple 开发者�
 ```bash
 ./Scripts/build-community.sh \
   --output .build/Packages/community-candidate \
-  --release-tag v0.1.0-beta.1
+  --release-tag v0.1.0-beta.2
 ```
 
-输出目录必须尚不存在。脚本锁定已有 `Package.resolved`，构建 arm64 / x86_64 Release，使用 `QUICKFILE_COMMUNITY` 排除 Sparkle 调用，并在确认两个架构都只链接系统动态库后移除副本中的 Sparkle。主应用不再需要 Sparkle 的 Mach 服务例外权限。不能将普通构建直接重签后视为 community 包：Hardened Runtime 的动态库验证可能阻止 ad-hoc 主程序加载第三方 framework。
+输出目录必须尚不存在。上面的标签仅为命名示例，须替换为本次候选标签；此命令不创建 Git 标签或发布 Release。脚本锁定已有 `Package.resolved`，构建 arm64 / x86_64 Release，使用 `QUICKFILE_COMMUNITY` 排除 Sparkle 调用，并在确认两个架构都只链接系统动态库后移除副本中的 Sparkle。主应用不再需要 Sparkle 的 Mach 服务例外权限。不能将普通构建直接重签后视为 community 包：Hardened Runtime 的动态库验证可能阻止 ad-hoc 主程序加载第三方 framework。
 
 打包脚本拒绝带 profile 或已完成应用签名的输入。`CODE_SIGNING_ALLOWED=NO` 构建可能保留链接器生成的 ad-hoc 标记；仅在它没有 Team、证书、权限、Info 绑定或资源封装时接受。脚本先签扩展、后签宿主，逐架构检查签名、权限、版本与动态库依赖。它不修改输入 App，不覆盖已有输出；DMG 只读挂载复验成功、镜像卸载后才发布本地输出目录，包含：
 
-- `QuickFile-<tag>.dmg`：压缩只读镜像，当前候选对外文件名为 `QuickFile-v0.1.0-beta.1.dmg`，其中 `<tag>` 本身包含 `v`；新构建内含 `QuickFile.app`、指向 `/Applications` 的快捷方式及可直接打开的 `安装说明.txt`
+- `QuickFile-<tag>.dmg`：压缩只读镜像，例如 `QuickFile-v0.1.0-beta.2.dmg`，其中 `<tag>` 本身包含 `v`；内含 `QuickFile.app`、指向 `/Applications` 的快捷方式及可直接打开的 `安装说明.txt`
 - 对应 `.sha256` 校验文件
 - `artifact-check.json`：脱敏产物检查收据
 - `INSTALL.txt`：安装与验证范围说明，与镜像内的 `安装说明.txt` 使用同一份 UTF-8 内容
@@ -45,6 +45,8 @@ python3 Scripts/verify-community-artifact.py \
 
 `.github/workflows/community-dmg.yml` 复用 `Scripts/build-community.sh --release-tag ...` 生成发布候选。入口包括 `workflow_dispatch`（输入 `release_tag`，默认 `v0.1.0-beta.1`；工作流先存在于默认分支后，Actions 界面才可手动运行）、推送 `v*` 标签，以及首次 `codex/**` 分支对列出的构建文件进行 bootstrap 的 push；分支 push 受 workflow 的 `paths` 过滤。每次只上传一个包含五项文件的 Actions artifact，不自动创建或公开 GitHub Release。维护者应从该 artifact 取出 `build-provenance.json`，核对源码 SHA、run、工具链和四项主要资产哈希，再决定是否把同一组文件上传到草稿 Release。
 
+手动构建新 Beta 时必须显式填写本次 `release_tag`，不要沿用表单的历史默认值。分支自动生成的 `v<营销版本>` 包不能只改文件名充当 Beta 发布包；标签、收据与包内容须来自同一次候选构建。
+
 ## GitHub Releases 发布流程
 
 GitHub Releases 只承载维护者手动发布的 community 候选；Actions artifact 只是打包结果，不是公开 Release、自动更新或准入判断流程。正式 v0.1 只有在[发布清单](RELEASE_CHECKLIST.md)的全部 P0 已在同一候选上补齐，且没有待测、受阻或不通过时才能发布。实验预发布若保留缺口，维护者必须在候选记录和发布说明中逐项写明并明确接受；这不改变正式版 P0 门槛。`artifact-check.json` 只证明产物层，artifact-only 回执、签名完整或绿色 CI 均不能直接放行。
@@ -53,9 +55,9 @@ GitHub Releases 只承载维护者手动发布的 community 候选；Actions art
 
 ```bash
 set -euo pipefail
-TAG='v0.1.0-beta.1'
+TAG='v0.1.0-beta.2' # Example; set the accepted candidate tag.
 VERSION=0.1.0
-BUILD='78'  # internal build in About and receipts; not part of the public DMG name
+: "${BUILD:?Set BUILD to the independently verified candidate build before running}"
 OUTPUT=.build/Packages/community-candidate
 DMG="QuickFile-${TAG}.dmg"
 
@@ -149,7 +151,7 @@ Release notes 必须直接提供可照做的“下载与安装”步骤：选择
 
 详细排障和恢复流程链接到 [INSTALLATION.md](INSTALLATION.md)；镜像内的 `安装说明.txt` 和单独交付的 `INSTALL.txt` 保留同源的简短安装指引，作为离线补充。[发布清单](RELEASE_CHECKLIST.md) 留在仓库供维护者逐项验收，Release notes 只汇总本候选的实际结果和缺口。
 
-实验预发布必须使用带 `-beta.N` 的独立标签（例如 `v0.1.0-beta.1`）并在创建草稿时设置 `--prerelease`；不得复用稳定的 `v0.1.0` 标签。发布前还要确认远端 `isPrerelease` 与 `$EXPECTED_PRERELEASE` 一致，最后的 `--draft=false` 只发布已核对的当前类型。
+实验预发布必须使用带 `-beta.N` 的独立标签（例如 `v0.1.0-beta.2`）并在创建草稿时设置 `--prerelease`；不得复用稳定的 `v0.1.0` 标签。发布前还要确认远端 `isPrerelease` 与 `$EXPECTED_PRERELEASE` 一致，最后的 `--draft=false` 只发布已核对的当前类型。
 
 维护者先检查草稿仍处于 draft、资产数量恰为五项，再从远端下载同一组资产复核校验和；校验失败、资产缺失或说明范围不准确时不得发布：
 

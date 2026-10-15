@@ -1,21 +1,16 @@
 # QuickFile 变更记录
 
-## 0.1.0-beta.1（Community 实验候选，内部 build 78）
-
-对外 DMG 名为 `QuickFile-v0.1.0-beta.1.dmg`。对应 [GitHub Releases 页面](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.1)的草稿或公开状态以 GitHub 为准；源码提交、Actions run、工具链和四项资产哈希以该页的 `build-provenance.json` 为准。本条目记录实验性 Community DMG，采用 ad-hoc 签名、未经公证并手动覆盖升级，不代表稳定版 0.1.0 已验收或发布。
-
-干净机器、完整 Finder 矩阵、默认安全设置、Mac 重启/注销、完整内存与端到端性能及残余 AX 内存增长归因仍需验收。具体范围和当前候选结果见 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)。
-
-## 0.1.0（稳定版，尚未发布）
+## 未发布（0.1 开发主线）
 
 QuickFile 提供本机文件创建与 Finder 模板菜单。目标平台为 macOS 13+，构建包含 Intel 与 Apple Silicon；实机兼容性和完整发布准入仍需按 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) 验收。
+
+下列变更尚未按公开版本归档，不代表 `v0.1.0-beta.2` 或稳定版已经发布。实际公开版本以 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 为准；发布时按固定标签、build 和最终包收据整理对应版本说明。
 
 ### 功能
 
 - 简体中文与英文界面，设置中可选择跟随系统或指定语言；切换语言保留用户模板、选择与草稿。
 - 创建后可选用默认应用打开文件，默认关闭；自动打开失败不撤销或重复创建文件。
 - Community 与 Developer ID 共用本地共享存储；提供模板配置备份恢复、显式权限修复及 Finder 定位入口。
-
 - 主 App 选择文件夹、模板及名称后创建文件，并可在 Finder 中显示结果；Finder 背景、文件、文件夹及边栏入口按上下文确定目标，跨目录多选明确拒绝。
 - 八个内置模板：Word、Excel、PowerPoint、文本、Markdown、JSON、YAML、Shell。Office 模板生成空白文档，正文在对应应用中编辑；已有模板库不会自动插入新项。支持新增、编辑、复制、排序、启用/停用、删除和恢复默认，配置在主 App 与扩展间本地同步。
 - 模板变量支持日期、时间、年份、目录名、剪贴板和序号；替换内容不再次解释为变量，仅在实际使用剪贴板变量时读取剪贴板。Shell 模板不自动授予执行权限。
@@ -27,6 +22,8 @@ QuickFile 提供本机文件创建与 Finder 模板菜单。目标平台为 macO
 
 ### 关键改进
 
+- 三个页签的操作行按窗口宽度适配，突出创建和新增模板入口；无可用模板时可直接进入模板管理。Finder 菜单设置移除重复摘要，数量输入支持回车保存。
+- 诊断页将授权存储维护改为默认折叠的独立区域，读取授权列表失败时直接显示修复入口；复制诊断摘要后显示完成反馈。
 - 补齐授权记录、Finder 请求队列及其归档目录的确认式权限修复；原始数据保留，队列仍需显式重试或归档。
 - 主 App 与 Finder 扩展自动打开改为共享、有界的系统交接，15 秒超时提示不会中断创建或释放仍被系统使用的作用域。
 - Finder 自动打开延续创建时采用的授权 ID，避免重复解析无关书签；增加生产扩展菜单动作与回调测试。共享存储在后续写入时有界回收过期、未被写入锁占用的临时碎片。
@@ -43,4 +40,8 @@ QuickFile 提供本机文件创建与 Finder 模板菜单。目标平台为 macO
 
 ### 发布限制
 
-完整内存稳定性和 Finder 端到端性能尚未通过。完整诊断 UI、无 Finder 窗口的 Desktop、Mac 重启/注销、其他系统与 Intel、真实 iCloud/外接/网络卷、默认安全设置的干净机器及残余 AX 内存增长归因仍需验收。Community beta 的 DMG 仅为实验候选；稳定版的最终 DMG 安装与手动覆盖升级尚未放行。Developer ID、公证/装订及 Sparkle 更新属于独立历史证书路线，也未完成发布验收。功能摘要不代表发布承诺。
+完整内存稳定性和 Finder 端到端性能尚未通过。完整诊断 UI、无 Finder 窗口的 Desktop、Mac 重启/注销、其他系统与 Intel 的安装及 Finder 实测、真实 iCloud/外接/网络卷、默认安全设置的干净机器及残余 AX 内存增长归因仍需验收。Community beta 的 DMG 仅为实验候选；稳定版的最终 DMG 安装与手动覆盖升级尚未放行。Developer ID、公证/装订及 Sparkle 更新属于单独的证书签名分发路线，也未完成发布验收。功能摘要不代表发布承诺。
+
+## 历史候选：0.1.0-beta.1（内部 build 78）
+
+曾准备对外命名为 `QuickFile-v0.1.0-beta.1.dmg` 的 Community 实验候选，采用 ad-hoc 签名、未经公证并手动覆盖升级。此记录保留候选身份，不表示存在可下载的公开 Release，也不作为当前源码或新候选的验收依据。
