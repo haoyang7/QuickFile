@@ -1,20 +1,20 @@
 # QuickFile Beta 测试指南
 
-稳定版 0.1.0 尚未完成验收，也没有面向普通用户的已放行稳定包。当前 Community 实验候选为 `v0.1.0-beta.1`（内部 build `78`，对外 DMG 名为 `QuickFile-v0.1.0-beta.1.dmg`），对应 [GitHub Releases 页面](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.1)的草稿或公开状态以 GitHub 为准；源码提交、Actions run、工具链和四项资产哈希以该页的 `build-provenance.json` 为准。无需 Apple 开发者会员的 Community DMG 和使用自己 Apple 团队的证书签名构建是两条独立测试路线；Community 采用 ad-hoc 签名、未经公证并手动覆盖升级，Developer ID 和公证不是它的既有能力。
+本指南复用于每一份候选，不能用旧版结果代替本次验收。公开下载以 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 为准；未发布候选须由提供方明确版本/build、包哈希与验证范围。GitHub Actions 产物另以 `build-provenance.json` 记录源码、run、工具链和四项资产哈希。Community DMG 与证书签名构建分别验收；Community 采用 ad-hoc 签名、未经公证并手动覆盖升级，Developer ID 和公证不是它的既有能力。
 
 ## Community DMG 入口
 
 1. 按[免费自行分发流程](COMMUNITY_DISTRIBUTION.md) 构建候选，或取得候选提供方固定的 DMG、对应 SHA-256 和验证范围说明。核对下载字节与校验和；签名检查通过不代表系统已信任发布者。
 2. 备份现有应用和数据，退出旧版，打开 DMG，将 `QuickFile.app` 拖到“应用程序”，推出镜像后从“应用程序”启动。保持下载时的隔离属性及默认安全设置；系统提供“隐私与安全性 → 仍要打开”时，由测试者确认来源后逐应用批准。记录提示与实际结果，不以 `xattr -cr`、重签或全局关闭 Gatekeeper 代替验收；手动排障边界见[安装指南](INSTALLATION.md)。
 3. 核对主 App 与嵌入扩展的版本/build、双架构、ad-hoc 签名及权限，并确认实际加载的是本次安装副本。Community 无 Team 和 profile，按 `verify-community-artifact.py` 检查，不套用证书签名路线的 Team 要求。
-4. 记录首次启动及覆盖升级时的 Community 共享文件访问与 Finder 扩展启用结果。取消授权或系统拒绝时保留错误并停止该项；不得关闭沙盒、临时放宽目录权限或执行注册修复来把失败算作通过。
+4. 记录首次启动及覆盖升级时的本地共享存储访问与 Finder 扩展启用结果。取消授权或系统拒绝时保留结果，取消应不创建文件或新授权；被拒绝的操作不得按成功记录，也不得关闭沙盒、临时放宽目录权限或执行注册修复来把失败算作通过。
 5. 在专用目录完成主 App 创建、Finder 创建、持久目录授权及退出重开闭环，再继续下述核心操作、恢复和重启检查。Community 当前手动覆盖升级，不提供在线版本检查或 Sparkle 自动更新；升级前备份模板和目录授权，升级后重新核对实际加载版本及数据。
 
 最终 DMG 在默认安全设置的干净机器、完整 Finder 矩阵上的验收与本机构建验收分开记录。完整内存与端到端性能、残余 AX 内存增长归因、诊断 UI、无 Finder 窗口的 Desktop、Mac 重启/注销及普通用户分发门槛仍需完成；尚未完成的范围保持待测，不能以本机开发环境的成功代替。
 
 ## 自有团队签名入口
 
-1. 使用自己的 Apple 账号和团队，确认两个 Bundle ID对该账号可用。个人团队的能力和注册设备范围取决于 Apple 账号状态，项目不保证所有个人团队都支持这些配置。
+1. 使用自己的 Apple 账号和团队，确认两个 Bundle ID 对该账号可用。个人团队的能力和注册设备范围取决于 Apple 账号状态，项目不保证所有个人团队都支持这些配置。
 2. 按 [README 构建说明](README.md) 运行 `xcodegen generate`，再用自己的 `DEVELOPMENT_TEAM` 做 Clean Release 构建。遇到 App ID 或 entitlement 错误时检查账号能力，如账号无权使用默认标识，按 README 一致替换为自己有权使用的标识并更新配置断言，保留 App Sandbox，不重签陌生包。
 3. 只读核对 `QuickFile.app/Contents/PlugIns/FinderExtension.appex` 已嵌入，主 App 与扩展版本/build 一致、Bundle ID 分别匹配各自 Target 且属于统一命名体系、共享存储与渠道元数据一致，两个架构均存在，并通过 `codesign --verify --deep --strict`。记录自己的产物哈希、系统版本和签名检查时间，不记录 Team、证书、描述文件内容、设备标识或个人路径。
 4. 在系统默认安全设置下安装到“应用程序”，启动并启用 Finder Extension。若系统拒绝安装/启动，保留错误原文并停止该项；不要关闭 Gatekeeper、移除隔离属性、重新签名或执行注册修复命令来把失败算作通过。

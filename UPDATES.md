@@ -1,6 +1,6 @@
 # QuickFile 更新发布说明
 
-稳定版 QuickFile 0.1.0 尚未完成发布验收，也未公开发布。当前 Community 实验候选为 `v0.1.0-beta.1`（内部 build `78`，对外 DMG 名为 `QuickFile-v0.1.0-beta.1.dmg`），对应 [GitHub Releases 页面](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.1)的草稿或公开状态以 GitHub 为准；源码提交、Actions run、工具链和四项资产哈希以该页的 `build-provenance.json` 为准。它采用 ad-hoc 签名、未经公证并手动覆盖升级。下文为独立的证书签名路线，不代表当前 Community 候选已启用或已发布。源码版本以 [project.yml](project.yml) 为准，发布门槛见 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)。
+Community 采用 ad-hoc 签名、未经公证并手动覆盖升级，不包含 Sparkle。已公开版本与下载资产以 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 为准；源码版本见 [project.yml](project.yml)，候选身份见对应 `build-provenance.json`。本页说明 Developer ID 渠道的更新配置，不表示候选已经启用更新或通过 [发布验收](RELEASE_CHECKLIST.md)。
 
 证书签名更新路线使用 Sparkle 2，默认构建不启用在线更新。正式更新源和签名公钥尚未确定；Developer ID、公证、真实 HTTPS 跨版本升级和完整运行准入仍需完成，尚未对外发布。
 

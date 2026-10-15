@@ -1,10 +1,12 @@
 # QuickFile v0.1 Beta 冻结与分发规则
 
-稳定版 QuickFile 0.1.0 仍未完成发布验收，也未公开发布。当前 Community 实验候选为 `v0.1.0-beta.1`（内部 build `78`，对外 DMG 名为 `QuickFile-v0.1.0-beta.1.dmg`），对应 [GitHub Releases 页面](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.1)的草稿或公开状态以 GitHub 为准；源码提交、Actions run、工具链和四项资产哈希以该页的 `build-provenance.json` 为准。该候选采用 ad-hoc 签名、未经公证并手动覆盖升级。下文为独立的证书签名路线，面向 Developer ID、公证发布和注册设备测试；两类产物不能互相继承签名或运行验收。源码版本以 [project.yml](project.yml) 为准，不能据此推断已安装产物或验收状态。
+QuickFile 0.1 仍处于发布验收阶段。已公开版本以 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 为准；本地候选、合并到 main 或 Actions 打包成功均不表示已发布。每份候选以固定源码、版本/build、包哈希及实际验收范围登记，不在本规则中固定“最新”构建号。源码版本见 [project.yml](project.yml)。
+
+Community 采用 ad-hoc 签名、未经公证并手动覆盖升级，构建和上传步骤见 [Community 分发流程](COMMUNITY_DISTRIBUTION.md)。以下冻结与安全规则适用于两条渠道，证书签名章节仅用于 Developer ID、公证发布和注册设备测试；两类产物不能互相继承签名或运行验收。Community 不以持有 Developer ID 证书为准入条件，仍须按 [发布清单](RELEASE_CHECKLIST.md) 补齐验收或明确登记并接受实验预发布的具体缺口。
 
 ## 冻结范围与安全边界
 
-冻结期间只接收文件安全、创建位置、权限、扩展不可用、崩溃和阻塞核心流程的修复。新入口及工具扩展留待后续版本。
+维护者确定候选基线并开始冻结后，只接收文件安全、创建位置、权限、扩展不可用、崩溃和阻塞核心流程的修复。新入口及工具扩展留待后续版本；开发主线合并不自动宣告候选已冻结或放行。
 
 目标平台为 macOS 13+，构建包含 Intel 与 Apple Silicon；具体系统、架构和存储兼容性须分别实机验收。本地文件夹、iCloud、外接卷和网络卷不能合并为同一项通过。Finder 菜单采用默认文件名；精确 `.gitignore` 等名称可由主 App 的无扩展名模板输入。
 
