@@ -4,7 +4,7 @@ QuickFile 提供实验性的 community 构建流程，不需要 Apple 开发者�
 
 ## 构建与检查
 
-使用 [README](README.md) 中的 Xcode、XcodeGen 工具链，在仓库根目录执行：
+使用[本地构建说明](CONTRIBUTING.md#本地构建与测试)中的 Xcode、XcodeGen 工具链，在仓库根目录执行：
 
 ```bash
 ./Scripts/build-community.sh \
