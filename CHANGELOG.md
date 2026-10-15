@@ -1,10 +1,10 @@
 # QuickFile 变更记录
 
-## 未发布（0.1 开发主线）
+## 0.1.0-beta.2（Community，内部 build 98）
 
 QuickFile 提供本机文件创建与 Finder 模板菜单。目标平台为 macOS 13+，构建包含 Intel 与 Apple Silicon；实机兼容性和完整发布准入仍需按 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) 验收。
 
-下列变更尚未按公开版本归档，不代表 `v0.1.0-beta.2` 或稳定版已经发布。实际公开版本以 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 为准；发布时按固定标签、build 和最终包收据整理对应版本说明。
+此版本按 `v0.1.0-beta.2` 固定源码，通过 GitHub Actions 构建 Community DMG，采用 ad-hoc 签名、未经公证并手动覆盖升级。它是保留下述验收缺口的实验性预发布；实际发布状态、最终包校验和和来源收据以 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 为准。
 
 ### 功能
 
@@ -22,6 +22,7 @@ QuickFile 提供本机文件创建与 Finder 模板菜单。目标平台为 macO
 
 ### 关键改进
 
+- Finder 扩展未启用时，即使 App 内注册查询受限，也保留已确认的未启用状态并提供开启开关、完成和刷新的操作指引；未执行响应探针时不显示响应说明。注册查询成功且精确返回 `(no matches)` 时，正确显示未找到注册记录。
 - 三个页签的操作行按窗口宽度适配，突出创建和新增模板入口；无可用模板时可直接进入模板管理。Finder 菜单设置移除重复摘要，数量输入支持回车保存。
 - 诊断页将授权存储维护改为默认折叠的独立区域，读取授权列表失败时直接显示修复入口；复制诊断摘要后显示完成反馈。
 - 补齐授权记录、Finder 请求队列及其归档目录的确认式权限修复；原始数据保留，队列仍需显式重试或归档。

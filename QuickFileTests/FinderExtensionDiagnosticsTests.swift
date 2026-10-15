@@ -5,6 +5,24 @@ import QuickFileInfrastructure
 
 final class FinderExtensionDiagnosticsTests: XCTestCase {
     @MainActor
+    func testDisabledInstallationDoesNotProbeAndPreservesUnavailableRegistration() async {
+        let result = await FinderExtensionRuntimeInspector.snapshot(
+            enabled: false,
+            probe: { _ in
+                XCTFail("A disabled extension must not be probed")
+                return false
+            },
+            registrationQuery: { _, _ in (.unknown, "query unavailable") }
+        )
+        XCTAssertEqual(result.state, .disabled)
+        XCTAssertFalse(result.enabled)
+        XCTAssertNil(result.responded)
+        XCTAssertEqual(result.registration, .unknown)
+        XCTAssertEqual(result.registrationEvidence, "query unavailable")
+        XCTAssertNotNil(result.state.recoveryGuidance)
+    }
+
+    @MainActor
     func testRespondingInstallationDoesNotRequireRegistrationCommand() async {
         let result = await FinderExtensionRuntimeInspector.snapshot(
             enabled: true,
@@ -66,7 +84,8 @@ final class FinderExtensionDiagnosticsTests: XCTestCase {
         XCTAssertEqual(snapshot(known: false).state, .unknown)
         XCTAssertEqual(snapshot(registration: .notRegistered).state, .notRegistered)
         XCTAssertEqual(snapshot(registration: .registered).state, .disabled)
-        XCTAssertEqual(snapshot(registration: .unknown).state, .unknown)
+        XCTAssertEqual(snapshot(registration: .unknown).state, .disabled)
+        XCTAssertEqual(snapshot(known: false, registration: .unknown).state, .unknown)
         XCTAssertEqual(snapshot(registration: .unknown, enabled: true, responded: false).state, .noResponse)
         XCTAssertEqual(snapshot(enabled: true, responded: true).state, .responding)
         XCTAssertEqual(snapshot(enabled: true, responded: nil).state, .unknown)
@@ -84,6 +103,23 @@ final class FinderExtensionDiagnosticsTests: XCTestCase {
         XCTAssertEqual(inspect(0, "", identifier, directory).0, .notRegistered)
         XCTAssertEqual(inspect(0, "unexpected output", identifier, directory).0, .unknown)
         XCTAssertEqual(inspect(0, "+ \(identifier)(1.0)\n /old/QuickFile.app/Contents/PlugIns/FinderExtension.appex", identifier, directory).0, .unknown)
+    }
+
+    func testNoMatchesRequiresSuccessfulQueryAndExactOutput() {
+        let identifier = "com.haoyoung.QuickFile.FinderExtension"
+        for output in ["(no matches)", "  (no matches)\n", "\n\t(no matches)\r\n"] {
+            XCTAssertEqual(FinderExtensionInstallationInspector.interpretRegistration(
+                exitCode: 0, output: output, identifier: identifier
+            ).0, .notRegistered)
+            XCTAssertEqual(FinderExtensionInstallationInspector.interpretRegistration(
+                exitCode: 1, output: output, identifier: identifier
+            ).0, .unknown)
+        }
+        for output in ["warning: (no matches)", "(no matches)\nconnection invalid", "(no matches)\n(no matches)"] {
+            XCTAssertEqual(FinderExtensionInstallationInspector.interpretRegistration(
+                exitCode: 0, output: output, identifier: identifier
+            ).0, .unknown, output)
+        }
     }
 
     func testRegistrationComparesCompleteParentPathsIncludingSpaces() {

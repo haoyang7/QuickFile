@@ -118,9 +118,11 @@ struct DiagnosticsView: View {
                     Spacer()
                 }
 
-                Text("响应仅确认当前安装版本的扩展收到检查请求，不代表目录可写；未响应也不等于崩溃。")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                if viewModel.extensionSnapshot?.responded != nil {
+                    Text("响应仅确认当前安装版本的扩展收到检查请求，不代表目录可写；未响应也不等于崩溃。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
                 if let guidance = viewModel.extensionSnapshot?.state.recoveryGuidance {
                     Text(guidance)
                         .font(.caption)

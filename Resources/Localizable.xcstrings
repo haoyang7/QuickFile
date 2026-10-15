@@ -4913,6 +4913,24 @@
         }
       }
     },
+    "打开扩展管理，开启 QuickFile 开关并点击“完成”，然后返回刷新状态。启用前不会检查扩展响应。": {
+      "comment": "Finder diagnostics: enable the system extension toggle before checking runtime response. This does not grant folder access.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open Extension Management, turn on QuickFile, and click Done. Then return and refresh the status. Response checks run only after the extension is enabled."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开扩展管理，开启 QuickFile 开关并点击“完成”，然后返回刷新状态。启用前不会检查扩展响应。"
+          }
+        }
+      }
+    },
     "打开扩展设置…": {
       "comment": "Finder setup: extension activation, permissions and first-creation verification. New File screen: destination selection, template choice and Finder setup.",
       "extractionState": "manual",
