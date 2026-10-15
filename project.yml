@@ -228,6 +228,17 @@ targets:
       - target: QuickFileInfrastructure
       - target: QuickFileApplication
 
+  QuickFileStorageWriterFixture:
+    type: tool
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: Scripts/tests/fixtures/LocalSharedStorageWriter.c
+    settings:
+      base:
+        PRODUCT_NAME: QuickFileStorageWriterFixture
+        SKIP_INSTALL: YES
+
   QuickFileTests:
     type: bundle.unit-test
     platform: macOS
@@ -253,6 +264,11 @@ targets:
         BUNDLE_LOADER: "$(TEST_HOST)"
     dependencies:
       - target: QuickFile
+      - target: QuickFileStorageWriterFixture
+        link: false
+        embed: true
+        copy:
+          destination: executables
 
 schemes:
   QuickFile:

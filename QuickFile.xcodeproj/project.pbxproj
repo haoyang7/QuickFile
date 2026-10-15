@@ -8,12 +8,14 @@
 
 /* Begin PBXBuildFile section */
 		005713EEC505D6263B90A0EF /* libQuickFileApplication.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C058277EF946BDFC2E3817D /* libQuickFileApplication.a */; };
+		00772A454EFD09B90A8B8359 /* QuickFileStorageWriterFixture in Embed Dependencies */ = {isa = PBXBuildFile; fileRef = CE41D2C92A362825F2E94439 /* QuickFileStorageWriterFixture */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		0094153E43B4E9972F7CC60E /* AppKitFileActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2AFAB2021FA25A0D0E1BC41 /* AppKitFileActions.swift */; };
 		03DCF5A566D7CAB5DF1692F5 /* FinderExtensionFailureClassifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E6217B91AC37990D4E7EBE /* FinderExtensionFailureClassifier.swift */; };
 		05698A54362E0A165E8A43CA /* AuthorizedDirectoryStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD2E95C3D552962F9200D752 /* AuthorizedDirectoryStoreTests.swift */; };
 		05AC79DA7B95B2067DE57D3F /* LanguageSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91E480520D89BE3C54247E52 /* LanguageSettingsView.swift */; };
 		05BCF8303F4333B5A7503FC6 /* TemplatePreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B623807526438610365CB48 /* TemplatePreview.swift */; };
 		06F61DF8EEA7C0C1A396711E /* LanguageSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1DA588AE275FD08CD61EA08 /* LanguageSettingsTests.swift */; };
+		07821CD01739605370BADB4E /* LocalSharedStorageWriter.c in Sources */ = {isa = PBXBuildFile; fileRef = 553BB4134979F54CEDCDF102 /* LocalSharedStorageWriter.c */; };
 		080DF2D6BC7AC6582583CF05 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 64C4F1DBD9B50D4CAC4EF89F /* Localizable.xcstrings */; };
 		099059456123B1EC1DCA29F7 /* FinderExtensionDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57A1450871EF1F2AB65F4AD5 /* FinderExtensionDiagnostics.swift */; };
 		0D873745AAA2B67D9F3EC532 /* SecurityScopedBookmarkClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC523DB167769877F7912977 /* SecurityScopedBookmarkClient.swift */; };
@@ -243,9 +245,27 @@
 			remoteGlobalIDString = 1796DDD695A8ED35BF082CFC;
 			remoteInfo = QuickFileApplication;
 		};
+		FD8834A5A64F9F29873C7CB8 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 11DB7F0D2F8DC5D5A793AA9E /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 75F22E78DED3584CA3C7BC25;
+			remoteInfo = QuickFileStorageWriterFixture;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
+		0981FAEACC409E5F112B8E20 /* Embed Dependencies */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 6;
+			files = (
+				00772A454EFD09B90A8B8359 /* QuickFileStorageWriterFixture in Embed Dependencies */,
+			);
+			name = "Embed Dependencies";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		84BF960C83D141394C213406 /* Embed Foundation Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
@@ -306,6 +326,7 @@
 		48448018DB0436AD4C4D9626 /* FinderRequestRecoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderRequestRecoveryTests.swift; sourceTree = "<group>"; };
 		4AA55D4D110759399EDB8C81 /* TemplateStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateStore.swift; sourceTree = "<group>"; };
 		4AE4BED2D31CD9584FFA478D /* UpdateSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateSettingsView.swift; sourceTree = "<group>"; };
+		553BB4134979F54CEDCDF102 /* LocalSharedStorageWriter.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = LocalSharedStorageWriter.c; sourceTree = "<group>"; };
 		55E9CE1A69C2EC8B87B05599 /* FinderAuthorizationRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderAuthorizationRequest.swift; sourceTree = "<group>"; };
 		56618164CEDF42291F03F953 /* AXCompatibility.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AXCompatibility.h; sourceTree = "<group>"; };
 		568830A921BCC2DD577254B0 /* TemplateRefreshObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateRefreshObserver.swift; sourceTree = "<group>"; };
@@ -386,6 +407,7 @@
 		CB08CFD5F41349A6263CAAF3 /* FinderDirectoryMonitorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderDirectoryMonitorTests.swift; sourceTree = "<group>"; };
 		CBA322E74429B8AE8094B53E /* QuickFile-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "QuickFile-Bridging-Header.h"; sourceTree = "<group>"; };
 		CD259B1E801D56557F215A25 /* CreationSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CreationSettingsView.swift; sourceTree = "<group>"; };
+		CE41D2C92A362825F2E94439 /* QuickFileStorageWriterFixture */ = {isa = PBXFileReference; includeInIndex = 0; path = QuickFileStorageWriterFixture; sourceTree = BUILT_PRODUCTS_DIR; };
 		D26E135E50634FFDBF4128EC /* FinderAuthorizationRequestPump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderAuthorizationRequestPump.swift; sourceTree = "<group>"; };
 		D2E789F838945EFCADA49AAD /* AuthorizedDirectoryRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthorizedDirectoryRepository.swift; sourceTree = "<group>"; };
 		D477985883430AB3E9EFCBD1 /* TemplateTransferTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateTransferTests.swift; sourceTree = "<group>"; };
@@ -446,9 +468,18 @@
 				3A28E5D4B634388568E34A6E /* QuickFileApp */,
 				488F92585467058801CAEF42 /* QuickFileTests */,
 				999AEB4559DAD39906B8AD99 /* Resources */,
+				2EB99C31D3080D2EEEF467CC /* Scripts */,
 				69F75FB260FCA94121B947A3 /* Shared */,
 				E7BCFB5A55A0A4010AA09B94 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		2EB99C31D3080D2EEEF467CC /* Scripts */ = {
+			isa = PBXGroup;
+			children = (
+				D27F8D0FA7E16DA892A440BD /* tests */,
+			);
+			path = Scripts;
 			sourceTree = "<group>";
 		};
 		3A28E5D4B634388568E34A6E /* QuickFileApp */ = {
@@ -616,6 +647,22 @@
 			path = Resources;
 			sourceTree = "<group>";
 		};
+		C6BA382197AC4D4032EB43CC /* fixtures */ = {
+			isa = PBXGroup;
+			children = (
+				553BB4134979F54CEDCDF102 /* LocalSharedStorageWriter.c */,
+			);
+			path = fixtures;
+			sourceTree = "<group>";
+		};
+		D27F8D0FA7E16DA892A440BD /* tests */ = {
+			isa = PBXGroup;
+			children = (
+				C6BA382197AC4D4032EB43CC /* fixtures */,
+			);
+			path = tests;
+			sourceTree = "<group>";
+		};
 		D83B6A46F6FB21ADAB791E97 /* FinderExtension */ = {
 			isa = PBXGroup;
 			children = (
@@ -640,6 +687,7 @@
 				983F2ADBF848B498171035BA /* libQuickFileCore.a */,
 				3E87B775E3D456A48D41BDDD /* libQuickFileInfrastructure.a */,
 				8C2FB76A62991EDF063B4710 /* QuickFile.app */,
+				CE41D2C92A362825F2E94439 /* QuickFileStorageWriterFixture */,
 				3AD1602B053B978FE1A61EEC /* QuickFileTests.xctest */,
 			);
 			name = Products;
@@ -726,16 +774,35 @@
 			productReference = 3E87B775E3D456A48D41BDDD /* libQuickFileInfrastructure.a */;
 			productType = "com.apple.product-type.library.static";
 		};
+		75F22E78DED3584CA3C7BC25 /* QuickFileStorageWriterFixture */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7C634DCB55AFF5F68CF0F64E /* Build configuration list for PBXNativeTarget "QuickFileStorageWriterFixture" */;
+			buildPhases = (
+				1C52AFD4A462559191786967 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = QuickFileStorageWriterFixture;
+			packageProductDependencies = (
+			);
+			productName = QuickFileStorageWriterFixture;
+			productReference = CE41D2C92A362825F2E94439 /* QuickFileStorageWriterFixture */;
+			productType = "com.apple.product-type.tool";
+		};
 		9A3377A16D493D8C300D6FB2 /* QuickFileTests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 589926AA58ABFB31F2AA385B /* Build configuration list for PBXNativeTarget "QuickFileTests" */;
 			buildPhases = (
 				CC66DB19705F2B297BC33921 /* Sources */,
+				0981FAEACC409E5F112B8E20 /* Embed Dependencies */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 				1A94A534BCAC303509C6A6DF /* PBXTargetDependency */,
+				98B14811C7D83BA198966A83 /* PBXTargetDependency */,
 			);
 			name = QuickFileTests;
 			packageProductDependencies = (
@@ -809,6 +876,7 @@
 				1796DDD695A8ED35BF082CFC /* QuickFileApplication */,
 				DBE00E78B0B8C8DD564AB3FA /* QuickFile */,
 				0DE100ACC9CCE8288EC309C9 /* FinderExtension */,
+				75F22E78DED3584CA3C7BC25 /* QuickFileStorageWriterFixture */,
 				9A3377A16D493D8C300D6FB2 /* QuickFileTests */,
 			);
 		};
@@ -928,6 +996,14 @@
 				C7D3CE099D246604A550866E /* TemplateStore.swift in Sources */,
 				5AF42B8397FF39B3E21354F9 /* TemplateStoreFailureClassifier.swift in Sources */,
 				4E0D258425AFDC2EDF84094E /* TemplateTransferFile.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1C52AFD4A462559191786967 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				07821CD01739605370BADB4E /* LocalSharedStorageWriter.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1132,6 +1208,11 @@
 			isa = PBXTargetDependency;
 			target = 506899E7B0AA2BC9EBFFFE0B /* QuickFileInfrastructure */;
 			targetProxy = 8838D4534F407D922D41B5EA /* PBXContainerItemProxy */;
+		};
+		98B14811C7D83BA198966A83 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 75F22E78DED3584CA3C7BC25 /* QuickFileStorageWriterFixture */;
+			targetProxy = FD8834A5A64F9F29873C7CB8 /* PBXContainerItemProxy */;
 		};
 		A86D69E65DF18D9384FAEB84 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
@@ -1368,6 +1449,22 @@
 			};
 			name = Debug;
 		};
+		9701FBA31DD727DE6C1C35BA /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.haoyoung.QuickFileStorageWriterFixture;
+				PRODUCT_NAME = QuickFileStorageWriterFixture;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
 		AF82089EDAE7B8F5AE710D52 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -1381,6 +1478,22 @@
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.haoyoung.QuickFileCore;
 				PRODUCT_NAME = QuickFileCore;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		B6A0F739D5B3BE070E64A6FF /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.haoyoung.QuickFileStorageWriterFixture;
+				PRODUCT_NAME = QuickFileStorageWriterFixture;
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
 			};
@@ -1572,6 +1685,15 @@
 			buildConfigurations = (
 				3FB41ED49C4D4F5969BD63D2 /* Debug */,
 				C7BDA3D805B03415A9146009 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		7C634DCB55AFF5F68CF0F64E /* Build configuration list for PBXNativeTarget "QuickFileStorageWriterFixture" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B6A0F739D5B3BE070E64A6FF /* Debug */,
+				9701FBA31DD727DE6C1C35BA /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

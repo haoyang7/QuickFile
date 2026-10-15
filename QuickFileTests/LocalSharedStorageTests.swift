@@ -375,16 +375,13 @@ final class LocalSharedStorageTests: XCTestCase {
         let fragment = storage.root.appendingPathComponent(".quickfile-write-" + UUID().uuidString)
         let ready = directory.appendingPathComponent("writer-ready")
         let diagnostics = directory.appendingPathComponent("writer-stderr")
-        let process = try startWriter(executable: "/usr/bin/python3", arguments: ["-c", """
-        import os, sys, time
-        fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_EXLOCK, 0o600)
-        os.write(fd, b'unpublished')
-        os.utime(sys.argv[1], (time.time() - 172800, time.time() - 172800))
-        open(sys.argv[2], 'w').close()
-        while True: time.sleep(1)
-        """, fragment.path, ready.path], diagnostics: diagnostics)
+        // Xcode embeds this test-only tool in the test bundle. Starting it
+        // requires neither the system Python shim nor runtime compiler discovery.
+        let executable = try XCTUnwrap(Bundle(for: Self.self)
+            .url(forAuxiliaryExecutable: "QuickFileStorageWriterFixture"))
+        let process = try startWriter(executable: executable.path,
+            arguments: [fragment.path, ready.path], diagnostics: diagnostics)
         defer { stopWriter(process) }
-        // Cold interpreter startup under parallel CI load is not the behavior under test.
         // Fail here with startup evidence, before asserting anything about the file lock.
         try waitForWriter(process, ready: ready, diagnostics: diagnostics)
         let output = storage.root.appendingPathComponent("saved")
