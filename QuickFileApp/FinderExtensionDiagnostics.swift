@@ -22,8 +22,14 @@ enum ExtensionRuntimeState: String, Sendable {
     }
 
     var recoveryGuidance: String? {
-        guard self == .noResponse else { return nil }
-        return QuickFileLocalization.text(.init("先在 Finder 中重新打开右键菜单，再检查响应。更新后可能仍有旧版扩展运行；请打开扩展设置，关闭再开启 QuickFile，然后重新检查。若仍未恢复，可在方便时重启 Finder。扩展进程由 macOS 管理，重开主 App 不保证重启扩展。"))
+        switch self {
+        case .disabled:
+            return QuickFileLocalization.text(.init("打开扩展管理，开启 QuickFile 开关并点击“完成”，然后返回刷新状态。启用前不会检查扩展响应。", comment: "Finder diagnostics: enable the system extension toggle before checking runtime response. This does not grant folder access."))
+        case .noResponse:
+            return QuickFileLocalization.text(.init("先在 Finder 中重新打开右键菜单，再检查响应。更新后可能仍有旧版扩展运行；请打开扩展设置，关闭再开启 QuickFile，然后重新检查。若仍未恢复，可在方便时重启 Finder。扩展进程由 macOS 管理，重开主 App 不保证重启扩展。"))
+        default:
+            return nil
+        }
     }
 }
 
@@ -93,9 +99,10 @@ struct FinderExtensionDiagnosticSnapshot: Sendable {
             return responded ? .responding : .noResponse
         }
         switch registration {
-        case .registered: return .disabled
         case .notRegistered: return .notRegistered
-        case .unknown: return .unknown
+        // A failed registration query cannot erase the independent system
+        // enablement result. Keep registration unknown in the technical evidence.
+        case .registered, .unknown: return .disabled
         }
     }
 }
@@ -246,7 +253,8 @@ enum FinderExtensionInstallationInspector {
         if foundIdentifier {
             return (.unknown, .otherCopy)
         }
-        if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedOutput.isEmpty || trimmedOutput == "(no matches)" {
             return (.notRegistered, .notRegistered)
         }
         return (.unknown, .unrecognized)

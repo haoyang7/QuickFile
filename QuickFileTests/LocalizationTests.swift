@@ -196,6 +196,24 @@ final class LocalizationSwitchingTests: XCTestCase {
         XCTAssertEqual(evidence.0, .unknown)
     }
 
+    func testDisabledExtensionGuidanceFollowsLanguageWithoutChangingEvidence() throws {
+        let snapshot = FinderExtensionDiagnosticSnapshot(
+            embeddedIdentifiers: ["test.extension"], embeddingKnown: true,
+            registration: .unknown, evidence: .queryFailed(1, .unknownFailure),
+            enabled: false, responded: nil
+        )
+        QuickFileLocalization.apply(.simplifiedChinese)
+        let chinese = try XCTUnwrap(snapshot.state.recoveryGuidance)
+        XCTAssertTrue(chinese.contains("开启 QuickFile 开关"))
+        QuickFileLocalization.apply(.english)
+        let english = try XCTUnwrap(snapshot.state.recoveryGuidance)
+        XCTAssertTrue(english.contains("turn on QuickFile"))
+        XCTAssertNotEqual(english, chinese)
+        XCTAssertEqual(snapshot.state, .disabled)
+        XCTAssertEqual(snapshot.registration, .unknown)
+        XCTAssertNil(snapshot.responded)
+    }
+
     func testLanguageChoicesAreExactlyShippedResourcesAndKeepVersionOneEncoding() throws {
         let identifiers = Set(Bundle.main.localizations.filter { $0 != "Base" })
         XCTAssertEqual(Set(QuickFileLanguage.allCases.filter { $0 != .system }.map(\.rawValue)), identifiers)

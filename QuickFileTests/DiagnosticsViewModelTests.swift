@@ -120,6 +120,40 @@ final class DiagnosticsViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.authorizedDirectories.map(\.url), [temporaryDirectory.standardizedFileURL])
     }
 
+    func testEnablingExtensionReplacesDisabledStateWithoutClaimingRegistrationSucceeded() async {
+        var enabled = false
+        let model = DiagnosticsViewModel(
+            extensionEnabledProvider: { enabled },
+            runtimeProvider: { enabled in
+                FinderExtensionDiagnosticSnapshot(
+                    embeddedIdentifiers: ["test.extension"], embeddingKnown: true,
+                    registration: .unknown,
+                    evidence: enabled ? .probeResponse : .queryFailed(1, .unknownFailure),
+                    enabled: enabled, responded: enabled ? true : nil
+                )
+            },
+            extensionActivityStore: FinderExtensionActivityStore(defaults: defaults,
+                failureHistoryFileURL: temporaryDirectory.appendingPathComponent("failures.json")),
+            authorizedDirectoryStore: makeAuthorizationStore(), inventoryReadGate: inventoryReadGate
+        )
+        await model.refreshRuntimeStatus()
+        XCTAssertEqual(model.extensionSnapshot?.state, .disabled)
+        XCTAssertNotNil(model.extensionSnapshot?.state.recoveryGuidance)
+        XCTAssertTrue(model.diagnosticSummary.contains("state: disabled\n"))
+        XCTAssertTrue(model.diagnosticSummary.contains("registration: unknown\n"))
+        XCTAssertTrue(model.diagnosticSummary.contains("enabled: false\n"))
+        XCTAssertTrue(model.diagnosticSummary.contains("probeResponded: not-tested\n"))
+
+        enabled = true
+        await model.refreshRuntimeStatus()
+        XCTAssertEqual(model.extensionSnapshot?.state, .responding)
+        XCTAssertNil(model.extensionSnapshot?.state.recoveryGuidance)
+        XCTAssertTrue(model.diagnosticSummary.contains("state: responding\n"))
+        XCTAssertTrue(model.diagnosticSummary.contains("registration: unknown\n"))
+        XCTAssertTrue(model.diagnosticSummary.contains("enabled: true\n"))
+        XCTAssertTrue(model.diagnosticSummary.contains("probeResponded: true\n"))
+    }
+
     func testReopenedPageRetainsLastSnapshotUntilRefreshCompletes() async {
         var probeCount = 0
         var continuation: CheckedContinuation<Void, Never>?

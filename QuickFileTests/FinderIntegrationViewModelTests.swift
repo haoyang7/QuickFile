@@ -118,7 +118,9 @@ final class FinderIntegrationViewModelTests: XCTestCase {
             managementOpener: {}
         )
         await viewModel.refresh()
-        XCTAssertEqual(viewModel.statusText, "尚未启用；安装或注册状态待确认")
+        XCTAssertEqual(viewModel.statusText, "扩展未获用户启用")
+        XCTAssertEqual(viewModel.snapshot?.registration, .unknown)
+        XCTAssertNotNil(viewModel.snapshot?.state.recoveryGuidance)
         XCTAssertFalse(viewModel.isResponding)
     }
 
