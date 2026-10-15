@@ -55,7 +55,7 @@ def main():
              "FinderMenuSettingsSection", "TemplateContentPreview",
              "TemplateEditorView", "TemplateEditorState", "TemplatePreviewController", "TemplateTransferPreviewView", "FinderMenuSettingsViewModel", "FinderIntegrationViewModel", "FinderIntegrationAdapter",
              "FinderExtensionDiagnostics", "AppKitFileActions", "AutomaticFileOpener",
-             "AppTabsView", "DiagnosticsView", "DiagnosticsViewModel"]
+             "AppTabsView", "DiagnosticsView", "DiagnosticsViewModel", "AdaptiveActionRow"]
     sources = [f"QuickFileApp/{name}.swift" for name in views] + [f"Scripts/Investigations/{name}.swift"]
     inputs += sources
     overrides = {}

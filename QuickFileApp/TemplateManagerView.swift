@@ -232,6 +232,7 @@ struct TemplateManagerView: View {
             }
             Spacer()
             Button("新增") { editorPresentation = TemplateEditorPresentation(template: nil) }
+                .buttonStyle(.borderedProminent)
                 .disabled(templatesUnavailable)
             templateActionsMenu
                 .disabled(templatesUnavailable)
@@ -239,22 +240,24 @@ struct TemplateManagerView: View {
     }
 
     private var selectedTemplateActions: some View {
-        HStack(spacing: 10) {
-            Button("编辑") { editSelected() }.disabled(selectedTemplate == nil)
-            Button("复制") {
-                if let id = selectedTemplate?.id { copyTemplate(withID: id) }
-            }.disabled(selectedTemplate == nil)
-            Button("删除") {
-                if let selectedTemplate { confirmation = .delete(selectedTemplate.id, selectedTemplate.displayName) }
-            }.disabled(selectedTemplate == nil)
-            Divider().frame(height: 16)
-            Button("上移") { moveSelected(offset: -1) }
-                .disabled(!viewModel.canMoveTemplate(withID: selectedTemplate?.id, offset: -1))
-                .help(QuickFileLocalization.text(.init("在完整模板列表中上移")))
-            Button("下移") { moveSelected(offset: 1) }
-                .disabled(!viewModel.canMoveTemplate(withID: selectedTemplate?.id, offset: 1))
-                .help(QuickFileLocalization.text(.init("在完整模板列表中下移")))
-            Spacer()
+        AdaptiveActionRow {
+            HStack(spacing: 8) {
+                Button("编辑") { editSelected() }.disabled(selectedTemplate == nil)
+                Button("复制") {
+                    if let id = selectedTemplate?.id { copyTemplate(withID: id) }
+                }.disabled(selectedTemplate == nil)
+                Button("删除") {
+                    if let selectedTemplate { confirmation = .delete(selectedTemplate.id, selectedTemplate.displayName) }
+                }.disabled(selectedTemplate == nil)
+            }
+            HStack(spacing: 8) {
+                Button("上移") { moveSelected(offset: -1) }
+                    .disabled(!viewModel.canMoveTemplate(withID: selectedTemplate?.id, offset: -1))
+                    .help(QuickFileLocalization.text(.init("在完整模板列表中上移")))
+                Button("下移") { moveSelected(offset: 1) }
+                    .disabled(!viewModel.canMoveTemplate(withID: selectedTemplate?.id, offset: 1))
+                    .help(QuickFileLocalization.text(.init("在完整模板列表中下移")))
+            }
             Text("显示 \(visibleTemplates.count) / 共 \(viewModel.templates.count) 个模板")
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -292,7 +295,7 @@ struct TemplateManagerView: View {
             Label(failure.message, systemImage: "exclamationmark.triangle.fill")
                 .foregroundColor(.red)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack {
+            AdaptiveActionRow {
                 Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
                 if let recoveryTitle = failure.recoveryActionTitle {
                     Menu(recoveryTitle) {

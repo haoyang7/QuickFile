@@ -216,13 +216,30 @@ final class LocalSharedStorageTests: XCTestCase {
         let url = storage.root.appendingPathComponent("authorizedDirectories.v2.json")
         let original = try storage.read(url)
         XCTAssertEqual(chmod(url.path, 0o644), 0)
-        let model = DiagnosticsViewModel(extensionEnabledProvider: { false }, authorizedDirectoryStore: store)
+        let model = DiagnosticsViewModel(
+            extensionEnabledProvider: { false },
+            runtimeProvider: { _ in
+                FinderExtensionDiagnosticSnapshot(embeddedIdentifiers: [], embeddingKnown: true,
+                    registration: .unknown, registrationEvidence: "fixture", enabled: false, responded: nil)
+            },
+            extensionActivityStore: FinderExtensionActivityStore(defaults: nil,
+                failureHistoryFileURL: directory.appendingPathComponent("history.json")),
+            authorizedDirectoryStore: store, inventoryReadGate: DiagnosticsInventoryReadGate()
+        )
+        await model.refreshRuntimeStatus()
+        XCTAssertTrue(model.authorizationInventoryReadFailed)
         await model.repairAuthorizationPermissions { false }
         XCTAssertThrowsError(try storage.read(url))
+        await model.refreshRuntimeStatus()
+        XCTAssertTrue(model.authorizationInventoryReadFailed, "Cancellation keeps the direct recovery entry visible")
         await model.repairAuthorizationPermissions { true }
         XCTAssertFalse(model.authorizationHasError)
+        XCTAssertTrue(model.authorizationInventoryReadFailed, "Repair alone does not prove a readable inventory")
         XCTAssertEqual(try storage.read(url), original)
         XCTAssertEqual(try store.loadAuthorizedDirectories().map(\.id), [authorization.id])
+        await model.refreshRuntimeStatus()
+        XCTAssertFalse(model.authorizationInventoryReadFailed)
+        XCTAssertEqual(model.authorizedDirectories.map(\.id), [authorization.id])
     }
 
     func testAuthorizationPermissionRepairPreservesAllBookmarkBytes() throws {
