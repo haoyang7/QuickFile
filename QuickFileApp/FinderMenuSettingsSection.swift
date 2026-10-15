@@ -46,25 +46,8 @@ struct FinderMenuSettingsSection: View {
 
     private var controls: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Text("显示数量")
-                Picker("显示数量", selection: $viewModel.showsAll) {
-                    Text("全部").tag(true)
-                    Text("最多").tag(false)
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 140)
-                .disabled(!viewModel.canEdit)
-
-                TextField("正整数", text: $viewModel.maximumCountText)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 80)
-                    .accessibilityLabel(QuickFileLocalization.text(.init("Finder 菜单最多显示的模板数")))
-                    .disabled(viewModel.showsAll || !viewModel.canEdit)
-                Text("个模板")
-                    .foregroundColor(.secondary)
-
+            AdaptiveActionRow {
+                countControls
                 Button("保存") {
                     Task { await viewModel.save() }
                 }
@@ -73,17 +56,11 @@ struct FinderMenuSettingsSection: View {
                 if isBusy {
                     progress
                 }
-                Spacer(minLength: 0)
             }
             Text("按上方列表顺序显示启用的模板；此设置不影响主应用中的模板列表。")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
-            if viewModel.hasLoaded {
-                Text(viewModel.savedSummary)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
             if let error = viewModel.loadError {
                 Text("无法读取 Finder 菜单设置：\(error) 可重新加载，或保存设置以修复。")
                     .font(.caption)
@@ -103,6 +80,32 @@ struct FinderMenuSettingsSection: View {
                         .foregroundColor(.red)
                 }
             }
+        }
+    }
+
+    private var countControls: some View {
+        HStack(spacing: 8) {
+            Text("显示数量")
+            Picker("显示数量", selection: $viewModel.showsAll) {
+                Text("全部").tag(true)
+                Text("最多").tag(false)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 140)
+            .disabled(!viewModel.canEdit)
+
+            TextField("正整数", text: $viewModel.maximumCountText)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 80)
+                .accessibilityLabel(QuickFileLocalization.text(.init("Finder 菜单最多显示的模板数")))
+                .disabled(viewModel.showsAll || !viewModel.canEdit)
+                .onSubmit {
+                    guard viewModel.canSave else { return }
+                    Task { await viewModel.save() }
+                }
+            Text("个模板")
+                .foregroundColor(.secondary)
         }
     }
 }

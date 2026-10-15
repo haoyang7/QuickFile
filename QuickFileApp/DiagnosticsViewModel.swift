@@ -27,6 +27,7 @@ final class DiagnosticsViewModel: ObservableObject {
     @Published private(set) var isRefreshingRuntimeStatus = false
     @Published private(set) var isManagingAuthorizations = false
     @Published private(set) var isLoadingAuthorizationInventory = false
+    @Published private(set) var authorizationInventoryReadFailed = false
     var authorizationInventoryMessage: String? { authorizationInventoryMessagePresentation?.value }
     @Published private var authorizationInventoryMessagePresentation: LocalizedPresentation<String?>?
     @Published private(set) var hasLoadedActivityStoreStatus = false
@@ -536,6 +537,7 @@ final class DiagnosticsViewModel: ObservableObject {
             )
             authorizedDirectories = filtered.availableDirectories
             unavailableAuthorizedDirectories = filtered.unavailableDirectories
+            authorizationInventoryReadFailed = false
             authorizationInventoryMessagePresentation = LocalizedPresentation(filtered.unavailableDirectories.isEmpty ? nil
                 : QuickFileLocalization.text(.init("有 \(filtered.unavailableDirectories.count) 个目录授权暂不可用。")))
         case let .failure(error):
@@ -543,6 +545,7 @@ final class DiagnosticsViewModel: ObservableObject {
             // Keep known rows (including the newly committed grant) and report
             // this separately rather than turning a saved grant into a failure.
             guard read.revision == authorizationRevision else { return }
+            authorizationInventoryReadFailed = true
             authorizationInventoryMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("无法刷新目录授权列表：\(error.localizedDescription)")))
         }
     }

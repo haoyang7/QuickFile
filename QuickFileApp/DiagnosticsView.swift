@@ -11,6 +11,8 @@ struct DiagnosticsView: View {
     @State private var isManagingDirectories = false
     @State private var showsDirectoryTest = false
     @State private var showsAdvancedDetails = false
+    @State private var showsAuthorizationMaintenance = false
+    @State private var didCopySummary = false
 
     init(viewModel: DiagnosticsViewModel? = nil) {
         _viewModel = StateObject(
@@ -40,6 +42,7 @@ struct DiagnosticsView: View {
         }
         .onAppear { viewModel.directoryDiagnosticsDidAppear() }
         .onDisappear { viewModel.directoryDiagnosticsDidDisappear() }
+        .onChange(of: viewModel.diagnosticSummary) { _ in didCopySummary = false }
         .onChange(of: scenePhase) { newPhase in
             if newPhase == .active {
                 Task {
@@ -132,7 +135,7 @@ struct DiagnosticsView: View {
                     DiagnosticValueRow(title: QuickFileLocalization.text(.init("共享存储")), value: QuickFileLocalization.text(.init("尚未检测")))
                 }
 
-                HStack {
+                AdaptiveActionRow {
                     Button("刷新状态") {
                         Task {
                             await viewModel.refreshRuntimeStatus()
@@ -142,16 +145,18 @@ struct DiagnosticsView: View {
                     Button("打开扩展管理…") {
                         FIFinderSyncController.showExtensionManagementInterface()
                     }
-                    Button("复制诊断摘要") {
+                    Button {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(viewModel.diagnosticSummary, forType: .string)
+                        didCopySummary = NSPasteboard.general.setString(viewModel.diagnosticSummary, forType: .string)
+                    } label: {
+                        Label("复制诊断摘要", systemImage: didCopySummary ? "checkmark" : "doc.on.doc")
                     }
+                    .accessibilityValue(didCopySummary ? QuickFileLocalization.text(.init("已复制")) : "")
                     .help(QuickFileLocalization.text(.init("仅复制状态、标识和计数，不含路径、错误原文、书签或模板内容。")))
                     ProgressView()
                         .controlSize(.small)
                         .opacity(viewModel.isRefreshingRuntimeStatus ? 1 : 0)
                         .accessibilityHidden(!viewModel.isRefreshingRuntimeStatus)
-                    Spacer()
                 }
 
                 if let message = viewModel.runtimeStatusMessage {
@@ -244,7 +249,7 @@ struct DiagnosticsView: View {
         GroupBox(label: Label("文件夹授权", systemImage: "folder.badge.gearshape")) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text(authorizationCount == 0 ? QuickFileLocalization.text(.init("尚未保存 Finder 目录授权")) : QuickFileLocalization.text(.init("已保存 \(authorizationCount) 个目录授权")))
+                    Text(authorizationCountText)
                         .foregroundColor(.secondary)
                     if authorizationsNeedingAttention > 0 {
                         Label("\(authorizationsNeedingAttention) 个需处理", systemImage: "exclamationmark.triangle")
@@ -258,7 +263,7 @@ struct DiagnosticsView: View {
                     }
                 }
 
-                HStack {
+                AdaptiveActionRow {
                     Button("添加授权目录…") {
                         chooseAuthorizedDirectory()
                     }
@@ -268,27 +273,12 @@ struct DiagnosticsView: View {
                         isManagingDirectories = true
                     }
 
-                    Menu("存储修复") {
-                        Button("修复授权记录权限…") {
-                            Task {
-                                await viewModel.repairAuthorizationPermissions {
-                                    AppKitFileActions.confirmStoragePermissionRepair(details: QuickFileLocalization.text(.init("将本地共享目录及授权记录、迁移标记和锁文件恢复为仅当前用户可读写。不会删除、替换或解析书签。链接、所有者异常或目录身份变化时停止，失败时可能已调整部分权限。")))
-                                }
-                            }
-                        }
-                        .disabled(viewModel.isManagingAuthorizations || viewModel.isLoadingAuthorizationInventory)
-                        if let url = viewModel.authorizationStorageURL {
-                            Button("在 Finder 中显示存储目录") { AppKitFileActions.reveal(url) }
-                        }
-                    }
-
                     ProgressView()
                         .controlSize(.small)
                         .opacity(viewModel.isLoadingAuthorizationInventory ? 1 : 0)
                         .accessibilityLabel(QuickFileLocalization.text(.init("正在刷新目录授权列表…")))
                         .accessibilityHidden(!viewModel.isLoadingAuthorizationInventory)
 
-                    Spacer()
                 }
 
                 Text("Finder 只在明确授权的目录及其子目录中写入；创建时也可按提示授权。授权仅保存在本机，不会上传。")
@@ -305,6 +295,9 @@ struct DiagnosticsView: View {
                     Label(message, systemImage: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
                 }
+                if viewModel.authorizationInventoryReadFailed {
+                    authorizationRepairButton
+                }
                 if let authorizationMessage = viewModel.authorizationMessage {
                     Label(
                         authorizationMessage,
@@ -314,9 +307,48 @@ struct DiagnosticsView: View {
                     )
                     .foregroundColor(viewModel.authorizationHasError ? .red : .green)
                 }
+
+                Divider()
+                DisclosureGroup("授权存储维护", isExpanded: $showsAuthorizationMaintenance) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("仅在授权记录无法读取或保存时使用。权限修复不会更改书签，也不会为文件夹重新授权。")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        AdaptiveActionRow {
+                            if !viewModel.authorizationInventoryReadFailed {
+                                authorizationRepairButton
+                            }
+                            if let url = viewModel.authorizationStorageURL {
+                                Button("在 Finder 中显示存储目录") { AppKitFileActions.reveal(url) }
+                            }
+                        }
+                    }
+                    .padding(.top, 8)
+                }
+                .font(.callout)
             }
             .padding(.vertical, 6)
         }
+    }
+
+    private var authorizationCountText: String {
+        if authorizationCount == 0 && viewModel.authorizationInventoryReadFailed {
+            return QuickFileLocalization.text(.init("无法读取已保存的授权"))
+        }
+        return authorizationCount == 0
+            ? QuickFileLocalization.text(.init("尚未保存 Finder 目录授权"))
+            : QuickFileLocalization.text(.init("已保存 \(authorizationCount) 个目录授权"))
+    }
+
+    private var authorizationRepairButton: some View {
+        Button("修复授权记录权限…") {
+            Task {
+                await viewModel.repairAuthorizationPermissions {
+                    AppKitFileActions.confirmStoragePermissionRepair(details: QuickFileLocalization.text(.init("将本地共享目录及授权记录、迁移标记和锁文件恢复为仅当前用户可读写。不会删除、替换或解析书签。链接、所有者异常或目录身份变化时停止，失败时可能已调整部分权限。")))
+                }
+            }
+        }
+        .disabled(viewModel.isManagingAuthorizations || viewModel.isLoadingAuthorizationInventory)
     }
 
     private var directorySection: some View {

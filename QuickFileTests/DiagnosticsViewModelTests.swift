@@ -654,6 +654,7 @@ final class DiagnosticsViewModelTests: XCTestCase {
         )
         XCTAssertNotNil(viewModel.authorizationInventoryMessage)
         XCTAssertFalse(viewModel.authorizationHasError)
+        XCTAssertFalse(viewModel.authorizationInventoryReadFailed, "An offline bookmark is not a storage read failure")
 
         await viewModel.revokeAuthorization(authorization.id)
 
@@ -1265,6 +1266,7 @@ final class DiagnosticsViewModelTests: XCTestCase {
         XCTAssertFalse(model.authorizationHasError)
         XCTAssertEqual(model.authorizedDirectories.map(\.url), [temporaryDirectory.standardizedFileURL])
         XCTAssertTrue(model.authorizationInventoryMessage?.hasPrefix("无法刷新目录授权列表：") == true)
+        XCTAssertTrue(model.authorizationInventoryReadFailed)
         XCTAssertFalse(model.isLoadingAuthorizationInventory)
         XCTAssertFalse(inventoryReadGate.isReading)
     }

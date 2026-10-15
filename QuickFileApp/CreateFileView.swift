@@ -15,8 +15,11 @@ struct CreateFileView: View {
                 header
                 if let error = viewModel.templateLoadError {
                     Text(error).foregroundColor(.red)
-                    Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
-                        .disabled(viewModel.isLoadingTemplates || viewModel.isSavingTemplates)
+                    AdaptiveActionRow {
+                        Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
+                            .disabled(viewModel.isLoadingTemplates || viewModel.isSavingTemplates)
+                        Button("打开模板管理", action: showTemplateManager)
+                    }
                 }
                 if viewModel.isLoadingTemplates { ProgressView(QuickFileLocalization.text(.init("正在加载模板…"))) }
                 destinationSection
@@ -32,9 +35,14 @@ struct CreateFileView: View {
     }
 
     private var header: some View {
-        Text("新建文件")
-            .font(.title2)
-            .fontWeight(.semibold)
+        VStack(alignment: .leading, spacing: 3) {
+            Text("新建文件")
+                .font(.title2)
+                .fontWeight(.semibold)
+            Text("选择文件夹和模板，即可创建文件。")
+                .font(.callout)
+                .foregroundColor(.secondary)
+        }
     }
 
     private var hasActiveFinderVerification: Bool {
@@ -166,7 +174,7 @@ struct CreateFileView: View {
 
     private var savedAuthorizationMenu: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack {
+            AdaptiveActionRow {
                 Menu(QuickFileLocalization.text(.init("选择已授权文件夹"))) {
                     ForEach(finderIntegrationViewModel.authorizedDirectories) { directory in
                         Button(directory.url.path + (directory.isBookmarkStale ? QuickFileLocalization.text(.init("（需重新授权）")) : "")) {
@@ -176,6 +184,7 @@ struct CreateFileView: View {
                         .disabled(directory.isBookmarkStale)
                     }
                 }
+                .fixedSize()
                 .disabled(viewModel.isBusy
                     || finderIntegrationViewModel.authorizedDirectories.isEmpty
                     || finderIntegrationViewModel.authorizationInventoryState != .loaded)
@@ -223,20 +232,21 @@ struct CreateFileView: View {
             HStack(spacing: 12) {
                 Text("模板")
                     .frame(width: 60, alignment: .leading)
-                Picker("模板", selection: $viewModel.selectedTemplateID) {
-                    // Resolve before ForEach so locale changes update its input;
-                    // unchanged templates would otherwise reuse cached labels.
-                    ForEach(viewModel.enabledTemplates.map { (id: $0.id, title: $0.displayName) }, id: \.id) { option in
-                        Text(option.title).tag(option.id)
-                    }
-                }
-                .labelsHidden()
-                .frame(maxWidth: 280)
-
                 if viewModel.enabledTemplates.isEmpty {
+                    Button("打开模板管理", action: showTemplateManager)
                     Text("请先在“模板管理”中启用模板")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                } else {
+                    Picker("模板", selection: $viewModel.selectedTemplateID) {
+                        // Resolve before ForEach so locale changes update its input;
+                        // unchanged templates would otherwise reuse cached labels.
+                        ForEach(viewModel.enabledTemplates.map { (id: $0.id, title: $0.displayName) }, id: \.id) { option in
+                            Text(option.title).tag(option.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 280)
                 }
             }
 
@@ -287,6 +297,7 @@ struct CreateFileView: View {
                         Text("创建文件")
                     }
                 }
+                .buttonStyle(.borderedProminent)
                 .disabled(!viewModel.canCreate)
 
                 Button("在 Finder 中显示") {

@@ -55,6 +55,40 @@ final class AppTabControllerTests: XCTestCase {
                          diagnosticsViewModel: diagnostics, scenePhase: .active)
     }
 
+    func testDiagnosticsExposesRepairAfterReadFailureWithoutExpandingMaintenance() async throws {
+        QuickFileLocalization.apply(.english)
+        defer { QuickFileLocalization.apply(.system) }
+        let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previous = NSApp.accessibilityAttributeValue(enhanced)
+        NSApp.accessibilitySetValue(true, forAttribute: enhanced)
+        defer { NSApp.accessibilitySetValue(previous, forAttribute: enhanced) }
+
+        let grantsURL = directory.appendingPathComponent("grants/authorizedDirectories.v2.json")
+        try FileManager.default.createDirectory(at: grantsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("unreadable inventory".utf8).write(to: grantsURL)
+        await diagnostics.refreshRuntimeStatus()
+        let host = NSHostingView(rootView: DiagnosticsView(viewModel: diagnostics)
+            .environment(\.locale, Locale(identifier: "en")))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 600),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.orderFront(nil)
+        defer { window.close() }
+        await settleLayout(host)
+        let failedText = accessibilityText(host).joined(separator: "\n")
+        XCTAssertTrue(failedText.contains("Saved folder access could not be read"))
+        XCTAssertTrue(failedText.contains("Repair Authorization Permissions"), failedText)
+        XCTAssertFalse(failedText.contains("No Finder folder access saved"))
+
+        try FileManager.default.removeItem(at: grantsURL)
+        await diagnostics.refreshRuntimeStatus()
+        await settleLayout(host)
+        let recoveredText = accessibilityText(host).joined(separator: "\n")
+        XCTAssertTrue(recoveredText.contains("No Finder folder access saved"), recoveredText)
+        XCTAssertFalse(recoveredText.contains("Repair Authorization Permissions"), "Healthy inventory leaves maintenance collapsed")
+    }
+
     func testUnrecognizedTabIdentifierReturnsNoSelectionInsteadOfCrashing() {
         let controller = controller()
         _ = controller.view

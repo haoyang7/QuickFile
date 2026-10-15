@@ -1133,6 +1133,24 @@
         }
       }
     },
+    "仅在授权记录无法读取或保存时使用。权限修复不会更改书签，也不会为文件夹重新授权。": {
+      "comment": "Diagnostics: explains the limited purpose of the folder access storage maintenance actions.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Use only if saved access records cannot be read or saved. Repairing permissions preserves the records and does not grant folder access again."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "仅在授权记录无法读取或保存时使用。权限修复不会更改书签，也不会为文件夹重新授权。"
+          }
+        }
+      }
+    },
     "仅复制状态、标识和计数，不含路径、错误原文、书签或模板内容。": {
       "comment": "Diagnostics screen, including folder access management and extension health.",
       "extractionState": "manual",
@@ -3707,6 +3725,24 @@
         }
       }
     },
+    "已复制": {
+      "comment": "Accessibility feedback after the diagnostic summary has been copied successfully.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Copied"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已复制"
+          }
+        }
+      }
+    },
     "已复制草稿": {
       "comment": "Template editor: fields, validation, content limits and unsaved drafts.",
       "extractionState": "manual",
@@ -5363,6 +5399,24 @@
         }
       }
     },
+    "授权存储维护": {
+      "comment": "Diagnostics: collapsed maintenance section for saved folder access records, separate from everyday add/remove actions.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Folder Access Storage"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "授权存储维护"
+          }
+        }
+      }
+    },
     "授权并创建": {
       "comment": "Native file/folder selection or confirmation panel in the main app.",
       "extractionState": "manual",
@@ -6925,6 +6979,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "无法读取失败历史：%@"
+          }
+        }
+      }
+    },
+    "无法读取已保存的授权": {
+      "comment": "Diagnostics: inventory read failed; do not claim there are no saved grants.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Saved folder access could not be read"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法读取已保存的授权"
           }
         }
       }
@@ -11353,6 +11425,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "选择文件夹不会自动保存 Finder 授权；新增授权需在下方 Finder 设置中明确确认。"
+          }
+        }
+      }
+    },
+    "选择文件夹和模板，即可创建文件。": {
+      "comment": "Creation page subtitle introducing the main task.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choose a folder and template to create a file."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择文件夹和模板，即可创建文件。"
           }
         }
       }
