@@ -15,12 +15,16 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
     typealias ArchiveResult = FinderAuthorizationRequestStore.RecoveryResult
 
     struct Backend: Sendable {
+        let repairPermissions: @Sendable () throws -> Void
+        let storageURL: URL?
         let inspect: @Sendable () throws -> Inspection
         let prepare: @Sendable (String) throws -> Ticket
         let cancel: @Sendable (Ticket) -> Void
         let commit: @Sendable (Ticket) throws -> ArchiveResult
 
         init(store: FinderAuthorizationRequestStore) {
+            repairPermissions = { try store.repairStoragePermissions() }
+            storageURL = store.storageDirectoryURL
             inspect = { try store.inspectRecoveryCandidates() }
             prepare = { try store.prepareRecovery(candidateID: $0) }
             cancel = { store.cancelRecovery($0) }
@@ -31,8 +35,12 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
             inspect: @escaping @Sendable () throws -> Inspection,
             prepare: @escaping @Sendable (String) throws -> Ticket,
             cancel: @escaping @Sendable (Ticket) -> Void,
-            commit: @escaping @Sendable (Ticket) throws -> ArchiveResult
+            commit: @escaping @Sendable (Ticket) throws -> ArchiveResult,
+            repairPermissions: @escaping @Sendable () throws -> Void = { throw FinderAuthorizationRequestStore.RecoveryError.unavailable },
+            storageURL: URL? = nil
         ) {
+            self.repairPermissions = repairPermissions
+            self.storageURL = storageURL
             self.inspect = inspect
             self.prepare = prepare
             self.cancel = cancel
@@ -41,10 +49,11 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
     }
 
     enum Operation: Equatable {
-        case inspecting, preparing, confirming, archiving
+        case inspecting, preparing, confirming, archiving, repairing
 
         var message: String {
             switch self {
+            case .repairing: return QuickFileLocalization.text(.init("正在修复请求队列权限…"))
             case .inspecting: return QuickFileLocalization.text(.init("正在检查有限数量的队列记录…"))
             case .preparing: return QuickFileLocalization.text(.init("正在重新核对所选原始记录…"))
             case .confirming: return QuickFileLocalization.text(.init("等待归档确认；取消会保留原始记录。"))
@@ -132,6 +141,26 @@ final class FinderRequestRecoveryViewModel: ObservableObject {
         cancelPreparedTicket()
         selectedCandidateID = candidateID.flatMap { id in candidates.contains { $0.id == id } ? id : nil }
         statusPresentation = nil
+    }
+
+    var storageURL: URL? { backend.storageURL }
+
+    func repairPermissions(confirm: @MainActor () -> Bool) async {
+        guard !Task.isCancelled, canInspect else { return }
+        let currentGeneration = generation
+        guard confirm(), isCurrent(currentGeneration), canInspect else { return }
+        operation = .repairing
+        defer { finishOperation() }
+        let repair = backend.repairPermissions
+        let result = await BackgroundWork.result { try repair() }
+        guard isCurrent(currentGeneration), !Task.isCancelled else { return }
+        clearInspection()
+        switch result {
+        case .success:
+            statusPresentation = LocalizedPresentation(.information(QuickFileLocalization.text(.init("队列权限已修复，原始记录未更改，自动处理仍暂停。可重新检查并归档异常记录，或关闭后点击“重试读取”。"))))
+        case .failure:
+            statusPresentation = LocalizedPresentation(.failure(QuickFileLocalization.text(.init("未能完成权限修复。文件内容未更改，部分权限可能已调整。请在 Finder 的“显示简介 → 共享与权限”中检查当前用户的读写权限，再重试。"))))
+        }
     }
 
     func inspect() async {

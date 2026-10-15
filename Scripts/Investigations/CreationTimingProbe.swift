@@ -80,14 +80,14 @@ struct CreationTimingProbe {
             tracing = timing != nil
             let coordinator = FinderFileCreationCoordinator(
                 loadTemplate: { _ in template },
-                performWithAccess: { url, operation in try store.withAccess(to: url, timing: timing, perform: operation) },
+                performWithAccess: { url, operation in try store.withIdentifiedAccess(to: url, timing: timing, perform: operation) },
                 createFile: { try service.createFile(for: $0) },
                 requiresAuthorization: { AuthorizedDirectoryFailureClassifier.requiresAuthorization($0) }
             )
             timing?.mark("probe.begin")
             let result = CreationTimingProbeSample.run(create: {
                 let result = try coordinator.createFile(for: action, timing: timing)
-                return result.fileURL
+                return result.creationResult.fileURL
             }, didCreate: { timing?.mark("probe.return") })
             timing?.finish(outcome: result.traceOutcome)
             CreationTiming.waitForPendingReports()

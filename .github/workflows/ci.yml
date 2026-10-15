@@ -180,6 +180,11 @@ jobs:
         env:
           CI_EVIDENCE_ROOT: ${{ steps.identity.outputs.root }}
         run: python3 Scripts/ci-evidence.py run-native "$CI_EVIDENCE_ROOT" -- ./Scripts/verify-release-readiness.sh
+      - name: Require actual AX coverage on the macOS 26 baseline
+        if: matrix.macos_major == '26'
+        env:
+          CI_EVIDENCE_ROOT: ${{ steps.identity.outputs.root }}
+        run: python3 Scripts/ci-evidence.py require-ax-coverage "$CI_EVIDENCE_ROOT"
       - name: Prepare allowlisted verification receipts
         id: evidence
         if: always() && steps.identity.outputs.root != ''

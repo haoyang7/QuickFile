@@ -268,6 +268,20 @@ struct DiagnosticsView: View {
                         isManagingDirectories = true
                     }
 
+                    Menu("存储修复") {
+                        Button("修复授权记录权限…") {
+                            Task {
+                                await viewModel.repairAuthorizationPermissions {
+                                    AppKitFileActions.confirmStoragePermissionRepair(details: QuickFileLocalization.text(.init("将本地共享目录及授权记录、迁移标记和锁文件恢复为仅当前用户可读写。不会删除、替换或解析书签。链接、所有者异常或目录身份变化时停止，失败时可能已调整部分权限。")))
+                                }
+                            }
+                        }
+                        .disabled(viewModel.isManagingAuthorizations || viewModel.isLoadingAuthorizationInventory)
+                        if let url = viewModel.authorizationStorageURL {
+                            Button("在 Finder 中显示存储目录") { AppKitFileActions.reveal(url) }
+                        }
+                    }
+
                     ProgressView()
                         .controlSize(.small)
                         .opacity(viewModel.isLoadingAuthorizationInventory ? 1 : 0)

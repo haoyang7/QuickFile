@@ -61,6 +61,23 @@ final class FileCreationServiceTests: XCTestCase {
         temporaryDirectory = nil
     }
 
+    func testFlushFailureDoesNotPublishAndReclaimsStagedPayload() throws {
+        let staging = FlushTestPath()
+        let service = FileCreationService(synchronize: { descriptor in
+            var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            XCTAssertEqual(fcntl(descriptor, F_GETPATH, &path), 0)
+            staging.set(URL(fileURLWithPath: String(cString: path)).deletingLastPathComponent())
+            throw POSIXError(.EIO)
+        })
+        XCTAssertThrowsError(try service.createFile(for: .init(
+            template: FileTemplate(name: "Flush", fileExtension: "txt", content: "payload"),
+            destinationFolder: temporaryDirectory, requestedFilename: "result"
+        )))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporaryDirectory.path), [])
+        let directory = try XCTUnwrap(staging.get())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
     func testCreatesFileWithRenderedContentAndAutomaticExtension() throws {
         let timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
         let service = FileCreationService(
@@ -1026,4 +1043,11 @@ private final class FileCreationCallCounter: @unchecked Sendable {
         defer { lock.unlock() }
         return value
     }
+}
+
+private final class FlushTestPath: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: URL?
+    func set(_ url: URL) { lock.lock(); defer { lock.unlock() }; value = url }
+    func get() -> URL? { lock.lock(); defer { lock.unlock() }; return value }
 }

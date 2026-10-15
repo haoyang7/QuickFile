@@ -179,14 +179,15 @@ final class AppTabController: NSTabViewController {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("Use init(viewModel:finderIntegrationViewModel:diagnosticsViewModel:scenePhase:)") }
 
-    var selectedTab: AppTab {
+    var selectedTab: AppTab? {
         get {
             _ = view
-            return AppTab(rawValue: tabView.selectedTabViewItem!.identifier as! String)!
+            guard let identifier = tabView.selectedTabViewItem?.identifier as? String else { return nil }
+            return AppTab(rawValue: identifier)
         }
         set {
             _ = view
-            let item = tabViewItems[AppTab.allCases.firstIndex(of: newValue)!]
+            guard let newValue, let item = tabViewItems.first(where: { ($0.identifier as? String) == newValue.rawValue }) else { return }
             // The visible NSTabView item is authoritative. Finder authorization
             // can enter a modal run loop immediately after SwiftUI navigation.
             if tabView.selectedTabViewItem !== item { tabView.selectTabViewItem(item) }

@@ -390,7 +390,7 @@ class CampaignTests(TemporaryTests):
                 for key in ("evidence_checks_passed", "classification_checks_passed", "growth_checks_passed"): self.assertFalse(value[key])
                 if argument == "partial_index": self.assertEqual(len(value["trials"][4]["measurement"]["checkpoints"]), 2)
                 else: self.assertIsNone(value["trials"][4]["measurement"])
-                self.assertFalse((root / "private").exists())
+                self.assertEqual((root / "private").exists(), argument == "corrupt_index")
                 shutil.rmtree(root)
 
     def test_unknown_fixture_or_owned_group_cleanup_stops_and_retains(self):

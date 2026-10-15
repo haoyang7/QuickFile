@@ -4,18 +4,22 @@ import OSLog
 import QuickFileApplication
 import QuickFileCore
 import QuickFileInfrastructure
+#if QUICKFILE_FINDER_TESTS
+// Only the adapter is recompiled in XCTest; its opener comes from the actual App module.
+@testable import QuickFile
+#endif
 
 final class FinderSync: FIFinderSync {
     private let menuModelBuilder = FinderMenuModelBuilder()
     private let menuActionRegistry = FinderMenuActionRegistry()
-    private let templateCache = FinderTemplateCache()
-    private let menuSettingsCache = FinderMenuSettingsCache()
-    private let languageSettings = FinderLanguageSettings()
+    private let templateCache: FinderTemplateCache
+    private let menuSettingsCache: FinderMenuSettingsCache
+    private let languageSettings: FinderLanguageSettings
     private let destinationCache = FinderMenuDestinationCache()
     private var directoryMonitor: FinderDirectoryMonitor?
-    private let activityRecorder = FinderActivityRecorder()
+    private let activityRecorder: FinderActivityRecorder
     @MainActor private var diagnosticResponder: FinderExtensionProbeResponder?
-    private let authorizationRequestStore = FinderAuthorizationRequestStore()
+    private let authorizationRequestStore: FinderAuthorizationRequestStore
     private let failureClassifier = FinderExtensionFailureClassifier(
         authorizationFailureClassifier: AuthorizedDirectoryFailureClassifier.activityFailure,
         templateFailureClassifier: TemplateStoreFailureClassifier.activityFailure
@@ -25,11 +29,13 @@ final class FinderSync: FIFinderSync {
         category: "FinderExtension"
     )
     private let operationScheduler = FinderOperationScheduler()
-    private let authorizedDirectoryStore = AuthorizedDirectoryStore()
-    private let fileCreationService = FileCreationService(clipboardProvider: {
-        // FileCreationService calls this only for an actual clipboard variable, after access checks.
-        DispatchQueue.main.sync { NSPasteboard.general.string(forType: .string) }
-    })
+    private let authorizedDirectoryStore: AuthorizedDirectoryStore
+    private let fileCreationService: FileCreationService
+    private let selection: () -> (target: URL?, items: [URL])
+    private let reveal: @MainActor (URL) -> Void
+    private let openCreatedFile: @MainActor (URL, UUID) async -> Error?
+    private let presentAlert: @MainActor (NSAlert) -> NSApplication.ModalResponse
+    private let launchApplication: @MainActor (QuickFileAppRoute, @escaping @MainActor @Sendable (Error?) -> Void) -> Void
 
     override var toolbarItemName: String {
         "QuickFile"
@@ -48,9 +54,63 @@ final class FinderSync: FIFinderSync {
         QuickFileLocalization.text(.init("使用 QuickFile 新建文件"))
     }
 
-    override init() {
+    override convenience init() {
+        self.init(
+            templateCache: FinderTemplateCache(), menuSettingsCache: FinderMenuSettingsCache(),
+            languageSettings: FinderLanguageSettings(), activityRecorder: FinderActivityRecorder(),
+            authorizationRequestStore: FinderAuthorizationRequestStore(), authorizedDirectoryStore: AuthorizedDirectoryStore(),
+            fileCreationService: FileCreationService(clipboardProvider: {
+                // Clipboard reads occur only after the template and grant have been validated.
+                DispatchQueue.main.sync { NSPasteboard.general.string(forType: .string) }
+            }),
+            selection: {
+                let controller = FIFinderSyncController.default()
+                return (controller.targetedURL(), controller.selectedItemURLs() ?? [])
+            },
+            reveal: { NSWorkspace.shared.activateFileViewerSelecting([$0]) },
+            openCreatedFile: { url, id in
+                await AutomaticFileOpener.shared.openCreatedFile(url, authorizationID: id, requiresAuthorization: true)
+            },
+            presentAlert: { alert in
+                alert.window.level = .modalPanel
+                alert.window.collectionBehavior.insert(.moveToActiveSpace)
+                NSApp.activate(ignoringOtherApps: true)
+                alert.window.orderFrontRegardless()
+                return alert.runModal()
+            },
+            launchApplication: { ContainingApplicationLauncher.open($0, completion: $1) },
+            registerWithFinder: true
+        )
+    }
+
+    // Inject system edges so tests exercise this adapter's real selectors and completion
+    // path without registering a second extension or touching the user's shared storage.
+    init(templateCache: FinderTemplateCache, menuSettingsCache: FinderMenuSettingsCache,
+         languageSettings: FinderLanguageSettings, activityRecorder: FinderActivityRecorder,
+         authorizationRequestStore: FinderAuthorizationRequestStore, authorizedDirectoryStore: AuthorizedDirectoryStore,
+         fileCreationService: FileCreationService,
+         selection: @escaping () -> (target: URL?, items: [URL]),
+         reveal: @escaping @MainActor (URL) -> Void,
+         openCreatedFile: @escaping @MainActor (URL, UUID) async -> Error?,
+         presentAlert: @escaping @MainActor (NSAlert) -> NSApplication.ModalResponse,
+         launchApplication: @escaping @MainActor (QuickFileAppRoute, @escaping @MainActor @Sendable (Error?) -> Void) -> Void,
+         registerWithFinder: Bool) {
+        self.templateCache = templateCache
+        self.menuSettingsCache = menuSettingsCache
+        self.languageSettings = languageSettings
+        self.activityRecorder = activityRecorder
+        self.authorizationRequestStore = authorizationRequestStore
+        self.authorizedDirectoryStore = authorizedDirectoryStore
+        self.fileCreationService = fileCreationService
+        self.selection = selection
+        self.reveal = reveal
+        self.openCreatedFile = openCreatedFile
+        self.presentAlert = presentAlert
+        self.launchApplication = launchApplication
         super.init()
         FinderMenuPresentation.prepareLocalization()
+
+        guard registerWithFinder else { return }
 
         // 根目录不能覆盖其他挂载卷；卷挂载、卸载或改名时同步 Finder 监听范围。
         // 监听不授予写入权限，创建仍须通过安全作用域授权。
@@ -84,15 +144,13 @@ final class FinderSync: FIFinderSync {
         let timing = CreationTiming.begin("menu")
         timing?.mark("menu.callback")
         defer { timing?.finish(outcome: "menu-returned") }
-        let controller = FIFinderSyncController.default()
         guard let context = finderMenuContext(for: menuKind) else {
             return nil
         }
         guard operationScheduler.hasCreationCapacity else {
             return unavailableMenu(.operationInProgress)
         }
-        let selectedURLs = controller.selectedItemURLs() ?? []
-        let targetedURL = controller.targetedURL()
+        let (targetedURL, selectedURLs) = selection()
         if context == .sidebar, selectedURLs.count != 1 {
             return unavailableMenu(.sidebarSelectionUnavailable)
         }
@@ -188,8 +246,8 @@ final class FinderSync: FIFinderSync {
             diagnosticResponder?.verificationAttempt(in: $0.identity)
         }
         let coordinator = makeFileCreationCoordinator(timing: timing)
-        let completion: @MainActor @Sendable (Result<FileCreationResult, Error>, Result<AuthorizedDirectoryStore.Access, Error>?) -> Void = {
-            [weak self] result, openingAccess in
+        let completion: @MainActor @Sendable (Result<FinderFileCreationCompletion, Error>) -> Void = {
+            [weak self] result in
             timing?.mark("main.completion.entered")
             guard let self else {
                 timing?.finish(outcome: "owner-ended")
@@ -200,12 +258,13 @@ final class FinderSync: FIFinderSync {
                     context: action.context, targetedURL: targetedURL, selectedItemURLs: selectedItemURLs
                 ))
             }
-            self.finishCreation(result, destinationIdentity: action.preparedDestination?.identity,
+            self.finishCreation(result.map(\.creationResult), destinationIdentity: action.preparedDestination?.identity,
                                 verificationAttempt: verificationAttempt, timing: timing)
-            if let openingAccess, case let .success(created) = result {
-                switch openingAccess {
-                case let .success(access): self.openCreatedFile(created.fileURL, access: access)
-                case let .failure(error): self.presentAutomaticOpenError(error)
+            if case let .success(created) = result {
+                Task { [weak self] in
+                    if let error = await self?.openCreatedFile(created.creationResult.fileURL, created.authorizationID) {
+                        self?.presentAutomaticOpenError(error)
+                    }
                 }
             }
             switch result {
@@ -214,24 +273,15 @@ final class FinderSync: FIFinderSync {
             }
         }
         timing?.mark("background.submit")
-        let authorizationStore = authorizedDirectoryStore
         let admission = operationScheduler.submitCreation(action) {
             timing?.mark("background.entered")
             let result = Result {
                 try coordinator.createFile(for: action, timing: timing)
             }
-            // This optional action is read only after creation, never in the menu callback.
-            let openingAccess: Result<AuthorizedDirectoryStore.Access, Error>?
-            if case let .success(created) = result,
-               (try? FileCreationSettingsStore().loadAutomaticallyOpen()) == true {
-                openingAccess = Result { try authorizationStore.beginAccess(to: created.fileURL.deletingLastPathComponent()) }
-            } else {
-                openingAccess = nil
-            }
             timing?.mark("background.work.finished")
             timing?.mark("main.completion.enqueued")
             Task { @MainActor in
-                completion(result, openingAccess)
+                completion(result)
             }
         }
         if admission != .accepted {
@@ -249,7 +299,7 @@ final class FinderSync: FIFinderSync {
                 try templateCache.templateForCreation(id: id)
             },
             performWithAccess: { [authorizedDirectoryStore] destinationFolder, operation in
-                try authorizedDirectoryStore.withAccess(to: destinationFolder, timing: timing, perform: operation)
+                try authorizedDirectoryStore.withIdentifiedAccess(to: destinationFolder, timing: timing, perform: operation)
             },
             createFile: { request in
                 try service.createFile(for: request)
@@ -275,7 +325,7 @@ final class FinderSync: FIFinderSync {
                 diagnosticResponder?.reportSuccessfulCreation(in: destinationIdentity, attemptNonce: verificationAttempt)
             }
             timing?.mark("finder.reveal.request")
-            NSWorkspace.shared.activateFileViewerSelecting([result.fileURL])
+            reveal(result.fileURL)
             timing?.mark("finder.reveal.return")
             recordActivity(.fileCreated)
         case let .failure(error):
@@ -300,31 +350,16 @@ final class FinderSync: FIFinderSync {
     }
 
     @MainActor
-    private func openCreatedFile(_ url: URL, access: AuthorizedDirectoryStore.Access) {
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.promptsUserIfNeeded = false
-        NSWorkspace.shared.open(url, configuration: configuration) { [weak self] _, error in
-            access.release()
-            guard let error else { return }
-            Task { @MainActor in self?.presentAutomaticOpenError(error) }
-        }
-    }
-
-    @MainActor
     private func presentAutomaticOpenError(_ error: Error) {
         let nsError = error as NSError
         logger.error("Created file could not be opened: domain=\(nsError.domain, privacy: .public) code=\(nsError.code)")
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
             let alert = NSAlert()
             alert.alertStyle = .warning
             alert.messageText = QuickFileLocalization.text(.init("文件已创建，但无法自动打开"))
             alert.informativeText = error.localizedDescription
             alert.addButton(withTitle: QuickFileLocalization.text(.init("好")))
-            alert.window.level = .modalPanel
-            alert.window.collectionBehavior.insert(.moveToActiveSpace)
-            NSApp.activate(ignoringOtherApps: true)
-            alert.window.orderFrontRegardless()
-            alert.runModal()
+            _ = self?.presentAlert(alert)
         }
     }
 
@@ -365,12 +400,7 @@ final class FinderSync: FIFinderSync {
         let recoveryRoute = failureClassifier.classify(error).reason.recoveryRoute
         alert.addButton(withTitle: recoveryRoute.recoveryTitle)
 
-        alert.window.level = .modalPanel
-        alert.window.collectionBehavior.insert(.moveToActiveSpace)
-        NSApp.activate(ignoringOtherApps: true)
-        alert.window.orderFrontRegardless()
-
-        if alert.runModal() == .alertSecondButtonReturn {
+        if presentAlert(alert) == .alertSecondButtonReturn {
             openContainingApplication(route: recoveryRoute)
         }
     }
@@ -410,9 +440,7 @@ final class FinderSync: FIFinderSync {
         alert.informativeText = error.localizedDescription
         alert.addButton(withTitle: QuickFileLocalization.text(.init("好")))
         alert.addButton(withTitle: QuickFileAppRoute.diagnostics.recoveryTitle)
-        alert.window.level = .modalPanel
-        alert.window.collectionBehavior.insert(.moveToActiveSpace)
-        if alert.runModal() == .alertSecondButtonReturn {
+        if presentAlert(alert) == .alertSecondButtonReturn {
             openContainingApplication(route: .diagnostics)
         }
     }
@@ -422,7 +450,7 @@ final class FinderSync: FIFinderSync {
         route: QuickFileAppRoute,
         notifyAuthorization: Bool = false
     ) {
-        ContainingApplicationLauncher.open(route) { [weak self] error in
+        launchApplication(route) { [weak self] error in
             if let error {
                 if notifyAuthorization {
                     self?.presentAuthorizationTransferError(error)
@@ -448,9 +476,7 @@ final class FinderSync: FIFinderSync {
         alert.messageText = QuickFileLocalization.text(.init("无法打开 QuickFile"))
         alert.informativeText = error.localizedDescription
         alert.addButton(withTitle: QuickFileLocalization.text(.init("好")))
-        alert.window.level = .modalPanel
-        alert.window.collectionBehavior.insert(.moveToActiveSpace)
-        alert.runModal()
+        _ = presentAlert(alert)
     }
 
     private func recordActivity(

@@ -42,7 +42,7 @@ struct CreationPreflightTimingCases {
                 if scenario == "template-disabled" { current.isEnabled = false }
                 return current
             },
-            performWithAccess: { _, operation in state.increment("accesses"); return try operation() },
+            performWithAccess: { _, operation in state.increment("accesses"); return try operation(UUID()) },
             createFile: { request in
                 state.increment("creates")
                 return try FileCreationService().createFile(for: request)
@@ -63,7 +63,7 @@ struct CreationPreflightTimingCases {
         var outcome = "created"
         do {
             let result = try coordinator.createFile(for: action, timing: timing)
-            guard try String(contentsOf: result.fileURL, encoding: .utf8) == "owned" else { throw FixtureError.ownedFailure }
+            guard try String(contentsOf: result.creationResult.fileURL, encoding: .utf8) == "owned" else { throw FixtureError.ownedFailure }
         } catch FinderFileCreationError.destinationUnavailable { outcome = "destination-unavailable" }
         catch FileCreationError.destinationIdentityChanged { outcome = "identity-changed" }
         catch FinderFileCreationError.templateUnavailable { outcome = "template-unavailable" }

@@ -14,8 +14,10 @@ public struct AuthorizedDirectoryStore: Sendable {
     /// Retains an admitted scope across an asynchronous system handoff.
     /// Releasing is idempotent; abandoning the handoff also releases the scope.
     public final class Access: @unchecked Sendable {
+        public let authorizationID: UUID
         private let releaseOperation: OSAllocatedUnfairLock<(@Sendable () -> Void)?>
-        fileprivate init(release: @escaping @Sendable () -> Void) {
+        fileprivate init(authorizationID: UUID, release: @escaping @Sendable () -> Void) {
+            self.authorizationID = authorizationID
             releaseOperation = OSAllocatedUnfairLock(initialState: release)
         }
         public func release() {
@@ -32,6 +34,11 @@ public struct AuthorizedDirectoryStore: Sendable {
     private let policy: AuthorizedDirectoryPolicy
     private let bookmarkClient: SecurityScopedBookmarkClient
 
+    public var storageDirectoryURL: URL? { repository.storageDirectoryURL }
+
+    /// Explicit permission repair only; never resolves, removes or replaces a bookmark.
+    public func repairStoragePermissions() throws { try repository.repairStoragePermissions() }
+
     public init() {
         repository = AuthorizedDirectoryRepository(
             containerURL: QuickFileSharedStorage.directory(), localStorage: QuickFileSharedStorage.local
@@ -43,6 +50,7 @@ public struct AuthorizedDirectoryStore: Sendable {
     init(
         defaults: UserDefaults?,
         storageDirectory: URL? = nil,
+        localStorage: LocalSharedStorage? = nil,
         fileManager: FileManager = .default,
         persistentBookmarkCreator: @escaping BookmarkCreator,
         transferBookmarkCreator: @escaping BookmarkCreator,
@@ -51,7 +59,8 @@ public struct AuthorizedDirectoryStore: Sendable {
         startAccessing: @escaping SecurityScopeStarter = { $0.startAccessingSecurityScopedResource() },
         stopAccessing: @escaping SecurityScopeStopper = { $0.stopAccessingSecurityScopedResource() }
     ) {
-        repository = AuthorizedDirectoryRepository(defaults: defaults, storageDirectory: storageDirectory)
+        repository = localStorage.map { AuthorizedDirectoryRepository(containerURL: $0.root, localStorage: $0) }
+            ?? AuthorizedDirectoryRepository(defaults: defaults, storageDirectory: storageDirectory)
         policy = AuthorizedDirectoryPolicy(fileManager: fileManager)
         bookmarkClient = SecurityScopedBookmarkClient(
             createPersistentBookmark: persistentBookmarkCreator,
@@ -296,11 +305,23 @@ public struct AuthorizedDirectoryStore: Sendable {
         timing: CreationTiming? = nil,
         perform operation: () throws -> Result
     ) throws -> Result {
+        try withIdentifiedAccess(to: destinationFolder, authorizationID: authorizationID, timing: timing) { _ in
+            try operation()
+        }
+    }
+
+    /// Carries the admitted grant into subsequent operations without searching unrelated bookmarks again.
+    public func withIdentifiedAccess<Result>(
+        to destinationFolder: URL,
+        authorizationID: AuthorizedDirectory.ID? = nil,
+        timing: CreationTiming? = nil,
+        perform operation: (UUID) throws -> Result
+    ) throws -> Result {
         timing?.mark("authorization.begin")
         defer { timing?.mark("authorization.end") }
         let access = try acquireAccess(to: destinationFolder, authorizationID: authorizationID, timing: timing)
         defer { access.release() }
-        return try operation()
+        return try operation(access.authorizationID)
     }
 
     /// Resolve and verify on a worker queue; keep the returned access until the
@@ -348,7 +369,7 @@ public struct AuthorizedDirectoryStore: Sendable {
                 return nil
             }
             timing?.mark("authorization.scope.started")
-            let access = Access { [bookmarkClient] in
+            let access = Access(authorizationID: record.id) { [bookmarkClient] in
                 bookmarkClient.stopAccessing(url)
                 timing?.mark("authorization.scope.stopped")
             }

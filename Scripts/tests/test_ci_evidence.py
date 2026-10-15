@@ -45,12 +45,12 @@ def write_ax_records(records, unsupported_kind=None):
     original = FailureEvidenceTests()
     original.records = records
     records.mkdir()
-    startup = original.startup()
+    startup = original.startup() if unsupported_kind not in ('all', 'ordinary') else None
     for kind in policy.KINDS:
         directory = records if kind == 'ordinary' else records.with_name(records.name + '-' + kind)
         if kind != 'ordinary':
             directory.mkdir()
-        unsupported = kind == unsupported_kind
+        unsupported = unsupported_kind == 'all' or kind == unsupported_kind
         inputs = {'sources': policy.source_manifest(policy.ROOT, kind),
                   'baseline_protocol': policy.evidence.startup.PROTOCOL,
                   'capabilities': {'status': 'unsupported-images' if unsupported else 'enabled', 'enabled': not unsupported},
@@ -100,6 +100,43 @@ class CIEvidenceTests(unittest.TestCase):
             f"raise SystemExit({code})",
         ])
         return MODULE.run_native(root, [sys.executable, "-c", program])
+
+    def test_required_ax_baseline_rejects_unsupported_missing_and_wrong_checkout(self):
+        _, root, _ = self.initialize()
+        records = root / 'ax-records'
+        write_ax_records(records)
+        evidence = MODULE.ax_module()
+        lifecycle = MODULE.lifecycle_module()
+        original = evidence.collect(records)
+        acceptance = lifecycle.collect(records, 'a' * 40, original)
+        directory = root / 'upload'
+        MODULE.write_json(directory / 'ax-evidence.json', original, evidence.PUBLIC_LIMIT, compact=True)
+        MODULE.write_json(directory / 'ax-lifecycle.json', acceptance, lifecycle.LIMIT)
+        MODULE.require_ax_coverage(root)
+        def replace_acceptance(value):
+            (directory / "ax-lifecycle.json").unlink()
+            MODULE.write_json(directory / "ax-lifecycle.json", value, lifecycle.LIMIT)
+        for status in ('unavailable', 'not_attempted'):
+            replace_acceptance(lifecycle.empty('a' * 40, status))
+            with self.assertRaises(ValueError): MODULE.require_ax_coverage(root)
+        changed = copy.deepcopy(acceptance)
+        changed['checkout_sha'] = 'f' * 40
+        replace_acceptance(changed)
+        with self.assertRaises(ValueError): MODULE.require_ax_coverage(root)
+        # Real collectors produce a valid, mutually bound unsupported receipt;
+        # only the additional baseline coverage policy should reject it.
+        unsupported_records = root / 'unsupported-records'
+        write_ax_records(unsupported_records, 'all')
+        unsupported_original = evidence.collect(unsupported_records)
+        unsupported = lifecycle.collect(unsupported_records, 'a' * 40, unsupported_original)
+        self.assertEqual(unsupported['status'], 'unsupported')
+        (directory / 'ax-evidence.json').unlink()
+        MODULE.write_json(directory / 'ax-evidence.json', unsupported_original, evidence.PUBLIC_LIMIT, compact=True)
+        replace_acceptance(unsupported)
+        with self.assertRaisesRegex(ValueError, 'did not provide actual coverage'):
+            MODULE.require_ax_coverage(root)
+        (directory / 'ax-lifecycle.json').unlink()
+        with self.assertRaises(OSError): MODULE.require_ax_coverage(root)
 
     def finish(self, root):
         with patch.object(MODULE, "optional_tool", return_value="Version: 2.46.0"):
@@ -680,9 +717,19 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", self.preview)
         self.assertNotIn("required", self.preview)
 
-    def test_mac_steps_are_identical_and_keep_existing_security_checks(self):
+    def test_mac_steps_share_checks_with_explicit_baseline_coverage_policy(self):
         main_macos = self.main.split("  macos:\n", 1)[1].split("\n  required:\n", 1)[0]
-        self.assertEqual(main_macos.rsplit("    steps:\n", 1)[1].rstrip(), self.preview.rsplit("    steps:\n", 1)[1].rstrip())
+        baseline_step = main_macos.split("      - name: Require actual AX", 1)[1].split("      - name: Prepare allowlisted", 1)[0]
+        self.assertIn("if: matrix.macos_major == '26'", baseline_step)
+        self.assertIn("require-ax-coverage", baseline_step)
+        self.assertNotIn("require-ax-coverage", self.preview)
+        # A matrix condition must name an actual lane, otherwise it silently skips.
+        for workflow in (self.main, self.preview):
+            majors = {row[1] for row in self.rows(workflow)}
+            for major in re.findall(r"if: matrix\.macos_major == '([0-9]+)'", workflow):
+                self.assertIn(major, majors)
+        shared_main = main_macos.replace("      - name: Require actual AX" + baseline_step, "")
+        self.assertEqual(shared_main.rsplit("    steps:\n", 1)[1].rstrip(), self.preview.rsplit("    steps:\n", 1)[1].rstrip())
         for text in (self.main, self.preview):
             self.assertIn("permissions:\n  contents: read\n", text)
             self.assertIn("persist-credentials: false", text)

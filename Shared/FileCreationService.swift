@@ -12,6 +12,7 @@ public struct FileCreationService: @unchecked Sendable {
     private let templateRenderer: TemplateRenderer
     private let dateProvider: DateProvider
     private let clipboardProvider: ClipboardProvider
+    private let synchronize: @Sendable (Int32) throws -> Void
     private let beforeCommit: (@Sendable (URL) throws -> Void)?
 
     public init(clipboardProvider: @escaping ClipboardProvider = { nil }) {
@@ -20,6 +21,7 @@ public struct FileCreationService: @unchecked Sendable {
         templateRenderer = TemplateRenderer()
         dateProvider = { Date() }
         self.clipboardProvider = clipboardProvider
+        synchronize = { try Self.synchronizePayload($0) }
         beforeCommit = nil
     }
 
@@ -29,7 +31,8 @@ public struct FileCreationService: @unchecked Sendable {
         templateRenderer: TemplateRenderer = TemplateRenderer(),
         dateProvider: @escaping DateProvider = { Date() },
         clipboardProvider: @escaping ClipboardProvider = { nil },
-        beforeCommit: (@Sendable (URL) throws -> Void)? = nil
+        beforeCommit: (@Sendable (URL) throws -> Void)? = nil,
+        synchronize: @escaping @Sendable (Int32) throws -> Void = { try Self.synchronizePayload($0) }
     ) {
         self.fileManager = fileManager
         self.filenameNormalizer = filenameNormalizer
@@ -37,6 +40,7 @@ public struct FileCreationService: @unchecked Sendable {
         self.dateProvider = dateProvider
         self.clipboardProvider = clipboardProvider
         self.beforeCommit = beforeCommit
+        self.synchronize = synchronize
     }
 
     public func createFile(for request: FileCreationRequest) throws -> FileCreationResult {
@@ -237,6 +241,9 @@ public struct FileCreationService: @unchecked Sendable {
             guard written > 0 else { throw posixError(fallback: EIO) }
             offset += written
         }
+        // Refuse publication if the payload cannot be flushed. This does not promise
+        // power-loss durability of the eventual directory entry or drive caches.
+        try synchronize(descriptor)
         // Capture identity before the final writer close. A duplicated descriptor
         // would postpone that close and could hide a writeback failure until publication.
         var identity = stat()
@@ -263,6 +270,12 @@ public struct FileCreationService: @unchecked Sendable {
         }
         if errno == EEXIST { return nil }
         throw posixError()
+    }
+
+    static func synchronizePayload(_ descriptor: Int32) throws {
+        while fsync(descriptor) != 0 {
+            guard errno == EINTR else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        }
     }
 
     private func committedURL(named filename: String, in directoryFD: Int32, identity: stat) throws -> URL {

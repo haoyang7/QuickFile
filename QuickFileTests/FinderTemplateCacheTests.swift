@@ -81,7 +81,7 @@ final class FinderTemplateCacheTests: XCTestCase {
         let cache = makeCache(store, initialTemplates: [original])
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { try cache.templateForCreation(id: $0) },
-            performWithAccess: { _, operation in try operation() },
+            performWithAccess: { _, operation in try operation(UUID()) },
             createFile: { try FileCreationService().createFile(for: $0) },
             requiresAuthorization: { _ in
                 XCTFail("Template loading failures must not trigger directory authorization")
@@ -111,7 +111,7 @@ final class FinderTemplateCacheTests: XCTestCase {
         recovered.content = "recovered"
         try JSONEncoder().encode([recovered]).write(to: storageURL, options: .atomic)
         let result = try coordinator.createFile(for: action)
-        XCTAssertEqual(try String(contentsOf: result.fileURL, encoding: .utf8), "recovered")
+        XCTAssertEqual(try String(contentsOf: result.creationResult.fileURL, encoding: .utf8), "recovered")
     }
 
     func testCreationRejectsDisabledTemplateAndReadsEditedContentDespiteStaleMenu() throws {
@@ -123,7 +123,7 @@ final class FinderTemplateCacheTests: XCTestCase {
         XCTAssertTrue(waitForSemaphore(fileReads.readStarted))
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { try cache.templateForCreation(id: $0) },
-            performWithAccess: { _, operation in try operation() },
+            performWithAccess: { _, operation in try operation(UUID()) },
             createFile: { try FileCreationService().createFile(for: $0) },
             requiresAuthorization: { _ in false }
         )
@@ -146,7 +146,7 @@ final class FinderTemplateCacheTests: XCTestCase {
         edited.content = "updated"
         try JSONEncoder().encode([edited]).write(to: storageURL, options: .atomic)
         let result = try coordinator.createFile(for: action)
-        XCTAssertEqual(try String(contentsOf: result.fileURL, encoding: .utf8), "updated")
+        XCTAssertEqual(try String(contentsOf: result.creationResult.fileURL, encoding: .utf8), "updated")
     }
 
     func testSaveNotificationRefreshesSnapshotWithoutMenuRead() throws {

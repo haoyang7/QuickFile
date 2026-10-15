@@ -55,6 +55,17 @@ final class AppTabControllerTests: XCTestCase {
                          diagnosticsViewModel: diagnostics, scenePhase: .active)
     }
 
+    func testUnrecognizedTabIdentifierReturnsNoSelectionInsteadOfCrashing() {
+        let controller = controller()
+        _ = controller.view
+        controller.tabView.selectedTabViewItem?.identifier = 42
+        XCTAssertNil(controller.selectedTab)
+        controller.tabView.selectedTabViewItem?.identifier = "unrecognized"
+        XCTAssertNil(controller.selectedTab)
+        controller.selectedTab = .diagnostics
+        XCTAssertEqual(controller.selectedTab, .diagnostics)
+    }
+
     func testVisibleSavedMenuSummaryTracksLanguageWithoutReloadingOrSaving() async {
         QuickFileLocalization.apply(.english)
         defer { QuickFileLocalization.apply(.system) }

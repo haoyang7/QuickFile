@@ -6,6 +6,7 @@ private enum Fault {
     static var root: URL!
     static var openInjected = false
     static var identityInjected = false
+    static var destinationDescriptor: Int32 = -1
 }
 
 // Same-module overloads inject faults into the unmodified production source.
@@ -45,6 +46,24 @@ func fstatat(_ parent: Int32, _ name: String, _ value: UnsafeMutablePointer<stat
     return Darwin.fstatat(parent, name, value, flags)
 }
 
+func fstat(_ descriptor: Int32, _ value: UnsafeMutablePointer<stat>) -> Int32 {
+    let result = Darwin.fstat(descriptor, value)
+    if result == 0, Fault.scenario == "cross-device", descriptor == Fault.destinationDescriptor {
+        value.pointee.st_dev &+= 1
+    }
+    return result
+}
+
+private final class ReplacementFileManager: FileManager, @unchecked Sendable {
+    override func url(for directory: FileManager.SearchPathDirectory, in domain: FileManager.SearchPathDomainMask,
+                      appropriateFor url: URL?, create shouldCreate: Bool) throws -> URL {
+        precondition(directory == .itemReplacementDirectory)
+        let replacement = Fault.root.appendingPathComponent("replacement", isDirectory: true)
+        try createDirectory(at: replacement, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        return replacement
+    }
+}
+
 @main
 struct StagingFailureCases {
     static func main() throws {
@@ -73,7 +92,10 @@ struct StagingFailureCases {
 
         var failure: NSError?
         do {
-            let staging = try PrivateFileStagingDirectory.probeDirectory(in: parent, folderURL: Fault.root)
+            Fault.destinationDescriptor = parent
+            let staging = try Fault.scenario == "cross-device"
+                ? PrivateFileStagingDirectory.replacementDirectory(for: Fault.root, directoryDescriptor: parent, fileManager: ReplacementFileManager())
+                : PrivateFileStagingDirectory.probeDirectory(in: parent, folderURL: Fault.root)
             try staging.remove()
         } catch { failure = error as NSError }
         for descriptor in occupied { close(descriptor) }

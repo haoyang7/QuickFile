@@ -369,6 +369,23 @@ def check_upload(root):
         raise ValueError("AX lifecycle checkout mismatch")
 
 
+def require_ax_coverage(root):
+    """One required baseline must actually execute AX checks, not report unsupported."""
+    directory = Path(root) / "upload"
+    identity = read_json(directory / "identity.json")
+    validate_identity(identity)
+    lifecycle = lifecycle_module()
+    acceptance = read_json(directory / "ax-lifecycle.json", lifecycle.LIMIT)
+    lifecycle.validate_public(acceptance)
+    evidence = ax_module()
+    original = read_json(directory / "ax-evidence.json", evidence.PUBLIC_LIMIT)
+    evidence.validate_public(original)
+    lifecycle.bind_original(acceptance, original)
+    if acceptance["checkout_sha"] != identity["source"]["checkout_sha"] or acceptance["status"] != "passed":
+        raise ValueError("required AX baseline did not provide actual coverage")
+    print("AX lifecycle coverage verified; whole-heap growth attribution: " + acceptance["growth_attribution"])
+
+
 def finish(root, env):
     root = Path(root)
     identity = read_json(root / "upload" / "identity.json")
@@ -431,7 +448,7 @@ def main():
         run = commands.add_parser(name)
         run.add_argument("root")
         run.add_argument("command", nargs=argparse.REMAINDER)
-    for name in ("finish", "check-upload"):
+    for name in ("finish", "check-upload", "require-ax-coverage"):
         commands.add_parser(name).add_argument("root")
     args = parser.parse_args()
     try:
@@ -446,6 +463,8 @@ def main():
             return (run_native if args.action == "run-native" else run_scripts)(args.root, command)
         elif args.action == "finish":
             return finish(args.root, os.environ)
+        elif args.action == "require-ax-coverage":
+            require_ax_coverage(args.root)
         else:
             check_upload(args.root)
         return 0

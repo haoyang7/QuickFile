@@ -11,9 +11,51 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'Scripts/Investigations'))
 import ax_reference_campaign as reference
 import ax_shadow_campaign as shadow
+import test_ax_scan_timing_campaign as timing_tests
+import test_ax_reader_exit_campaign as exit_tests
 
 
 class CampaignExceptionRetentionTests(unittest.TestCase):
+    def test_timing_and_exit_schema_exceptions_preserve_raw_evidence_and_prior_summary(self):
+        temporary = ROOT / '.build/Temporary'
+        temporary.mkdir(parents=True, exist_ok=True)
+        for module, field in ((timing_tests, 'checkpoints'), (exit_tests, 'scans')):
+            with self.subTest(campaign=module.C.__name__), tempfile.TemporaryDirectory(dir=temporary) as directory:
+                case = module.CampaignTests('runTest')
+                case.root = Path(directory)
+                original = module.raw_fixture
+                def malformed(records, *args, **kwargs):
+                    value = original(records, *args, **kwargs)
+                    value[field][0] = 'schema-drift'
+                    module.save(records / 'trial.json', value)
+                    return value
+                with mock.patch.object(module, 'raw_fixture', side_effect=malformed):
+                    with self.assertRaises(AttributeError):
+                        case.run_campaign()
+                campaign = case.root / 'campaign'
+                raw = list((campaign / 'private').glob('*/records/trial.json'))
+                self.assertEqual(len(raw), 1)
+                self.assertEqual(json.loads(raw[0].read_text())[field][0], 'schema-drift')
+                summary = json.loads((campaign / 'summary.json').read_text())
+                self.assertEqual(summary['temporary_cleanup'], 'not-run')
+                self.assertFalse(summary['completed'])
+                self.assertEqual(module.C.main(['--work-directory', str(campaign), '--validate-public']), 0)
+
+    def test_timing_and_exit_interrupts_preserve_build_diagnostics(self):
+        temporary = ROOT / '.build/Temporary'
+        temporary.mkdir(parents=True, exist_ok=True)
+        for module in (timing_tests, exit_tests):
+            with self.subTest(campaign=module.C.__name__), tempfile.TemporaryDirectory(dir=temporary) as directory:
+                root = Path(directory) / 'campaign'
+                def interrupted(command, log, *args, **kwargs):
+                    log.write_text('owned private diagnostics')
+                    raise KeyboardInterrupt()
+                with mock.patch.object(module.C, 'identity', side_effect=module.identity), \
+                        mock.patch.object(module.C, 'run_owned', side_effect=interrupted):
+                    with self.assertRaises(KeyboardInterrupt): module.C.campaign(root)
+                self.assertEqual((root / 'private/build.log').read_text(), 'owned private diagnostics')
+                self.assertEqual(json.loads((root / 'summary.json').read_text())['temporary_cleanup'], 'not-run')
+
     def exercise(self, campaign, error, *, write_failure=False, persistent=False):
         temporary = ROOT / '.build/Temporary'
         temporary.mkdir(parents=True, exist_ok=True)

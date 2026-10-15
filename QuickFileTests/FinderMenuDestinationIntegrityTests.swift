@@ -29,8 +29,8 @@ final class FinderMenuDestinationIntegrityTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
         let coordinator = coordinator(template, store: store)
         let result = try coordinator.createFile(for: XCTUnwrap(registry.takeAction(for: tag)))
-        XCTAssertEqual(result.fileURL.deletingLastPathComponent().resolvingSymlinksInPath(), target.resolvingSymlinksInPath())
-        XCTAssertEqual(try String(contentsOf: result.fileURL), "prepared content")
+        XCTAssertEqual(result.creationResult.fileURL.deletingLastPathComponent().resolvingSymlinksInPath(), target.resolvingSymlinksInPath())
+        XCTAssertEqual(try String(contentsOf: result.creationResult.fileURL), "prepared content")
         XCTAssertEqual(try String(contentsOf: target.appendingPathComponent("existing.txt")), "sentinel")
     }
 
@@ -45,7 +45,7 @@ final class FinderMenuDestinationIntegrityTests: XCTestCase {
         ]
         let coordinator = FinderFileCreationCoordinator(
             loadTemplate: { _ in XCTFail("An unprepared menu must not load templates"); return template },
-            performWithAccess: { _, operation in XCTFail("An unprepared menu must not request access"); return try operation() },
+            performWithAccess: { _, operation in XCTFail("An unprepared menu must not request access"); return try operation(UUID()) },
             createFile: { _ in XCTFail("An unprepared menu must not write"); throw FinderFileCreationError.destinationUnavailable },
             requiresAuthorization: { _ in XCTFail("An unprepared menu must not offer authorization"); return false },
             resolveSelection: { _, _, _ in XCTFail("An unprepared action must not resolve a replacement"); return root }
@@ -77,7 +77,7 @@ final class FinderMenuDestinationIntegrityTests: XCTestCase {
             guard case FileCreationError.destinationIdentityChanged = $0 else { return XCTFail("Unexpected error: \($0)") }
         }
         let result = try coordinator.createFile(for: XCTUnwrap(registry.takeAction(for: newTag)))
-        XCTAssertEqual(try String(contentsOf: result.fileURL), "new menu")
+        XCTAssertEqual(try String(contentsOf: result.creationResult.fileURL), "new menu")
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: moved.path).isEmpty)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: target.path).count, 1)
     }
@@ -148,7 +148,7 @@ final class FinderMenuDestinationIntegrityTests: XCTestCase {
     private func coordinator(_ template: FileTemplate, store: AuthorizedDirectoryStore) -> FinderFileCreationCoordinator {
         FinderFileCreationCoordinator(
             loadTemplate: { _ in template },
-            performWithAccess: { url, operation in try store.withAccess(to: url, perform: operation) },
+            performWithAccess: { url, operation in try store.withIdentifiedAccess(to: url, perform: operation) },
             createFile: { try FileCreationService().createFile(for: $0) },
             requiresAuthorization: { AuthorizedDirectoryFailureClassifier.requiresAuthorization($0) }
         )
