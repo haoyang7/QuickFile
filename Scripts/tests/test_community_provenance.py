@@ -1,6 +1,8 @@
 """Exercise delivery identity, exact asset boundaries and source drift rejection."""
+from contextlib import redirect_stderr
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -10,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+TEMPORARY = ROOT / ".build/Temporary"
 SPEC = importlib.util.spec_from_file_location("community_provenance", ROOT / "Scripts/community-provenance.py")
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
@@ -17,9 +20,8 @@ SPEC.loader.exec_module(MODULE)
 
 class CommunityProvenanceTests(unittest.TestCase):
     def setUp(self):
-        temporary = ROOT / ".build/Temporary"
-        temporary.mkdir(parents=True, exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(prefix="community-provenance-tests-", dir=temporary)
+        TEMPORARY.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(prefix="community-provenance-tests-", dir=TEMPORARY)
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name).resolve()
         self.delivery = self.base / "delivery"
@@ -32,7 +34,7 @@ class CommunityProvenanceTests(unittest.TestCase):
         (self.delivery / (self.image + ".sha256")).write_text(self.sha + "  " + self.image + "\n")
         (self.delivery / "INSTALL.txt").write_text("synthetic instructions")
         self.receipt = {"verdict": "pass", "trust": "ad-hoc/unnotarized", "version": "0.1.0", "build": "78",
-                        "archive": self.image, "archive_sha256": self.sha, "archive_bytes": len(data)}
+                        "release_tag": self.tag, "archive": self.image, "archive_sha256": self.sha, "archive_bytes": len(data)}
         self.write_receipt()
         self.env = dict(RELEASE_TAG=self.tag, GITHUB_SHA="a" * 40, WORKFLOW_SHA="a" * 40,
                         GITHUB_REF="refs/heads/codex/example", GITHUB_EVENT_NAME="push",
@@ -53,6 +55,15 @@ class CommunityProvenanceTests(unittest.TestCase):
     def write(self):
         with patch.object(MODULE, "output", side_effect=lambda command: self.commands[tuple(command)]):
             return MODULE.write(self.delivery, self.env)
+
+    def write_cli(self):
+        errors = io.StringIO()
+        with patch.object(MODULE.os, "environ", self.env), \
+                patch.object(sys, "argv", ["community-provenance.py", "write", "--directory", str(self.delivery)]), \
+                patch.object(MODULE, "output", side_effect=lambda command: self.commands[tuple(command)]), \
+                redirect_stderr(errors):
+            result = MODULE.main()
+        return result, errors.getvalue()
 
     def test_branch_resolves_artifact_tag_after_marketing_version_increases(self):
         project = self.base / "project.yml"
@@ -134,6 +145,39 @@ class CommunityProvenanceTests(unittest.TestCase):
         outputs = Path(self.env["GITHUB_OUTPUT"]).read_text()
         self.assertIn("quickfile-community-" + "a" * 40 + "-123-attempt-2", outputs)
 
+    def test_non_object_artifact_receipts_fail_cleanly_without_changing_delivery(self):
+        for receipt in ([], 12, "DO-NOT-PUBLISH", None, True):
+            with self.subTest(receipt=receipt):
+                (self.delivery / "artifact-check.json").write_text(json.dumps(receipt))
+                before = {path.name: path.read_bytes() for path in self.delivery.iterdir()}
+                result, errors = self.write_cli()
+                self.assertEqual(result, 1)
+                self.assertEqual(errors, "Community provenance failed: artifact receipt must contain an object\n")
+                self.assertEqual(before, {path.name: path.read_bytes() for path in self.delivery.iterdir()})
+                self.assertFalse(Path(self.env["GITHUB_OUTPUT"]).exists())
+
+    def test_missing_or_invalid_output_does_not_leave_receipt_and_retry_succeeds(self):
+        valid_output = self.env["GITHUB_OUTPUT"]
+        before = {path.name: path.read_bytes() for path in self.delivery.iterdir()}
+        for value in (None, "", False, 12, [], "private\0DO-NOT-PUBLISH", str(self.base),
+                      str(self.base / "DO-NOT-PUBLISH" / "missing")):
+            with self.subTest(output=value):
+                if value is None:
+                    self.env.pop("GITHUB_OUTPUT", None)
+                else:
+                    self.env["GITHUB_OUTPUT"] = value
+                result, errors = self.write_cli()
+                self.assertEqual(result, 1)
+                self.assertIn("Community provenance failed:", errors)
+                self.assertNotIn("Traceback", errors)
+                self.assertNotIn(str(self.base), errors)
+                self.assertNotIn("DO-NOT-PUBLISH", errors)
+                self.assertEqual(before, {path.name: path.read_bytes() for path in self.delivery.iterdir()})
+                self.assertFalse(Path(valid_output).exists())
+        self.env["GITHUB_OUTPUT"] = valid_output
+        self.assertEqual(self.write_cli(), (0, ""))
+        self.assertEqual(len(list(self.delivery.iterdir())), 5)
+
     def test_rejects_extra_missing_and_nonregular_assets(self):
         extra = self.delivery / "private-build.log"
         extra.write_text("private")
@@ -174,6 +218,38 @@ class CommunityProvenanceTests(unittest.TestCase):
         (self.delivery / (self.image + ".sha256")).write_text("incorrect checksum")
         with self.assertRaises(ValueError):
             self.write()
+
+    def test_rejects_missing_invalid_or_mismatched_receipt_release_tags_before_writing(self):
+        for present, tag in ((False, None), (True, None), (True, ""), (True, False), (True, 12),
+                             (True, "v0.1.0-beta.2"), (True, "v0.1.0"), (True, "v0.2.0-beta.1")):
+            with self.subTest(present=present, tag=tag):
+                if present:
+                    self.receipt["release_tag"] = tag
+                else:
+                    self.receipt.pop("release_tag")
+                self.write_receipt()
+                before = {path.name: path.read_bytes() for path in self.delivery.iterdir()}
+                with self.assertRaisesRegex(ValueError, "artifact receipt release tag"):
+                    self.write()
+                self.assertEqual(before, {path.name: path.read_bytes() for path in self.delivery.iterdir()})
+                self.assertFalse(Path(self.env["GITHUB_OUTPUT"]).exists())
+
+    def test_stable_action_requires_stable_receipt_before_writing_provenance(self):
+        tag = "v0.1.0"
+        image = f"QuickFile-{tag}.dmg"
+        (self.delivery / self.image).rename(self.delivery / image)
+        (self.delivery / (self.image + ".sha256")).rename(self.delivery / (image + ".sha256"))
+        (self.delivery / (image + ".sha256")).write_text(self.sha + "  " + image + "\n")
+        self.receipt["archive"] = image
+        self.write_receipt()
+        self.env["RELEASE_TAG"] = tag
+        with self.assertRaisesRegex(ValueError, "artifact receipt release tag"):
+            self.write()
+        self.assertFalse((self.delivery / "build-provenance.json").exists())
+        self.assertFalse(Path(self.env["GITHUB_OUTPUT"]).exists())
+        self.receipt["release_tag"] = tag
+        self.write_receipt()
+        self.assertEqual(self.write()["release_tag"], tag)
 
     def test_refuses_event_commit_mismatch_and_tracked_or_untracked_drift(self):
         self.commands[("git", "rev-parse", "--verify", "HEAD")] = "b" * 40

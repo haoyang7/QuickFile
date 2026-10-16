@@ -319,6 +319,132 @@ class PrepareUpdateTests(unittest.TestCase):
                     versions = [item.findtext(MODULE.SPARKLE + "version") for item in ET.parse(feed).findall("./channel/item")]
                     self.assertEqual(versions, ["7", "8"] if history else ["8"])
 
+    def test_rollback_preserves_artifacts_replaced_after_promotion(self):
+        real_link = os.link
+        real_replace = Path.replace
+        for failure, suffix in (("report", ".zip"), ("feed", ".zip"), ("feed", ".artifact-check.json")):
+            with self.subTest(failure=failure, suffix=suffix):
+                arguments = self.arguments(output_name=f"replaced-{failure}-{suffix}")
+                output = arguments.output
+                target = output / ("QuickFile-0.1.0-8" + suffix)
+                feed = output / "appcast.xml"
+                previous = feed.read_bytes()
+
+                def replace_artifact():
+                    identity = target.stat()
+                    replacement = output / "external-artifact"
+                    replacement.write_bytes(b"independent writer data")
+                    real_replace(replacement, target)
+                    self.assertFalse(os.path.samestat(identity, target.stat()))
+                    raise OSError("fixture commit failure after external replacement")
+
+                def link(source, destination):
+                    if failure == "report" and Path(source).name == "artifact-check.json":
+                        replace_artifact()
+                    return real_link(source, destination)
+
+                def replace_feed(source, destination):
+                    replace_artifact()
+
+                with patch.object(MODULE.subprocess, "run", side_effect=run_successful_tools), \
+                        patch.object(os, "link", side_effect=link), \
+                        patch.object(Path, "replace", replace_feed):
+                    with self.assertRaisesRegex(OSError, "fixture commit failure after external replacement"):
+                        MODULE.prepare(arguments)
+                self.assertTrue(target.is_file(), "rollback must preserve an independent replacement inode")
+                self.assertEqual(target.read_bytes(), b"independent writer data")
+                self.assertEqual(feed.read_bytes(), previous)
+                self.assertEqual({path.name for path in output.iterdir()}, {
+                    target.name, feed.name, ".quickfile-update.lock",
+                })
+
+    def test_rollback_preserves_a_symlink_to_the_promoted_inode(self):
+        for suffix in (".zip", ".artifact-check.json"):
+            with self.subTest(suffix=suffix):
+                arguments = self.arguments(output_name=f"symlink-{suffix}")
+                output = arguments.output
+                target = output / ("QuickFile-0.1.0-8" + suffix)
+                alias = self.directory / ("external-alias" + suffix)
+                feed = output / "appcast.xml"
+                previous = feed.read_bytes()
+
+                def replace_feed(source, destination):
+                    identity = target.stat()
+                    os.link(target, alias)
+                    target.unlink()
+                    target.symlink_to(alias)
+                    self.assertTrue(os.path.samestat(identity, target.stat()))
+                    self.assertFalse(os.path.samestat(identity, target.lstat()))
+                    raise OSError("fixture feed commit failure after symlink replacement")
+
+                with patch.object(MODULE.subprocess, "run", side_effect=run_successful_tools), \
+                        patch.object(Path, "replace", replace_feed):
+                    with self.assertRaisesRegex(OSError, "fixture feed commit failure after symlink replacement"):
+                        MODULE.prepare(arguments)
+                self.assertTrue(target.is_symlink(), "following the link must not authorize deleting its replacement")
+                self.assertEqual(target.readlink(), alias)
+                self.assertEqual(alias.read_bytes(), b"final archive" if suffix == ".zip" else b'{"status": "passed"}')
+                self.assertEqual(feed.read_bytes(), previous)
+                self.assertEqual({path.name for path in output.iterdir()}, {
+                    target.name, feed.name, ".quickfile-update.lock",
+                })
+
+    def test_rollback_continues_when_a_promoted_artifact_is_already_deleted(self):
+        for suffix in (".zip", ".artifact-check.json"):
+            with self.subTest(suffix=suffix):
+                arguments = self.arguments(output_name=f"deleted-{suffix}")
+                output = arguments.output
+                target = output / ("QuickFile-0.1.0-8" + suffix)
+                feed = output / "appcast.xml"
+                previous = feed.read_bytes()
+
+                def replace_feed(source, destination):
+                    target.unlink()
+                    raise OSError("fixture feed commit failure after external deletion")
+
+                with patch.object(MODULE.subprocess, "run", side_effect=run_successful_tools), \
+                        patch.object(Path, "replace", replace_feed):
+                    with self.assertRaisesRegex(OSError, "fixture feed commit failure after external deletion"):
+                        MODULE.prepare(arguments)
+                self.assertEqual(feed.read_bytes(), previous)
+                self.assertEqual({path.name for path in output.iterdir()}, {
+                    feed.name, ".quickfile-update.lock",
+                })
+
+    def test_rollback_preserves_artifacts_when_their_identity_is_unreadable(self):
+        real_lstat = Path.lstat
+        for suffix in (".zip", ".artifact-check.json"):
+            with self.subTest(suffix=suffix):
+                arguments = self.arguments(output_name=f"unreadable-{suffix}")
+                output = arguments.output.resolve()
+                target = output / ("QuickFile-0.1.0-8" + suffix)
+                feed = output / "appcast.xml"
+                previous = feed.read_bytes()
+                reconciling = False
+                faulted_paths = []
+
+                def replace_feed(source, destination):
+                    nonlocal reconciling
+                    reconciling = True
+                    raise OSError("fixture feed commit failure with unreadable artifact")
+
+                def lstat(path, *args, **kwargs):
+                    if reconciling and path == target:
+                        faulted_paths.append(path)
+                        raise PermissionError("fixture artifact identity denied")
+                    return real_lstat(path, *args, **kwargs)
+
+                with patch.object(MODULE.subprocess, "run", side_effect=run_successful_tools), \
+                        patch.object(Path, "replace", replace_feed), patch.object(Path, "lstat", lstat):
+                    with self.assertRaisesRegex(OSError, "fixture feed commit failure with unreadable artifact"):
+                        MODULE.prepare(arguments)
+                self.assertEqual(faulted_paths, [target], "artifact identity fault must actually be injected")
+                self.assertEqual(target.read_bytes(), b"final archive" if suffix == ".zip" else b'{"status": "passed"}')
+                self.assertEqual(feed.read_bytes(), previous)
+                self.assertEqual({path.name for path in output.iterdir()}, {
+                    target.name, feed.name, ".quickfile-update.lock",
+                })
+
     def test_exception_after_feed_replace_preserves_committed_release(self):
         real_replace = Path.replace
         for history in (True, False):

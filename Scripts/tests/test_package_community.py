@@ -45,6 +45,11 @@ class CommunityPackagingTests(unittest.TestCase):
             signature.write_bytes(b"adhoc signature")
         elif tool == "ditto":
             shutil.copytree(Path(command[-2]), Path(command[-1]), symlinks=True)
+        elif tool == "xcrun":
+            self.assertEqual(command[:3], ["/usr/bin/xcrun", "strip", "-x"])
+            binary = Path(command[-1])
+            self.assertTrue(binary.is_relative_to(self.workspaces))
+            binary.write_bytes(binary.read_bytes()[:-1])
         else:
             raise AssertionError(command)
 
@@ -77,6 +82,16 @@ class CommunityPackagingTests(unittest.TestCase):
         image, = self.output.glob("*.dmg")
         self.assertEqual(image.with_name(image.name + ".sha256").read_text(), MODULE.ARTIFACT.sha256(image) + "  " + image.name + "\n")
         self.assertEqual(report["dmg"]["image_sha256"], MODULE.ARTIFACT.sha256(image))
+        stripping = report["symbol_stripping"]
+        self.assertEqual(stripping["tool"], "xcrun strip")
+        self.assertEqual(stripping["flags"], ["-x"])
+        self.assertEqual(stripping["stage"], "private copy before signing")
+        for label, relative, binary_relative in MODULE.ARTIFACT.COMPONENTS:
+            binary = self.app / relative / binary_relative
+            self.assertEqual(stripping["components"][label], {
+                "binary": binary.relative_to(self.app).as_posix(),
+                "before_bytes": binary.stat().st_size, "after_bytes": binary.stat().st_size - 1,
+            })
         self.assertEqual(list(self.workspaces.iterdir()), [])
         self.assertNotIn(str(self.directory), (self.output / "artifact-check.json").read_text())
         signatures = [command for command in self.commands if Path(command[0]).name == "codesign"]
@@ -87,6 +102,115 @@ class CommunityPackagingTests(unittest.TestCase):
             self.assertEqual(command[command.index("--sign") + 1], "-")
             self.assertIn("runtime", command)
         self.assert_clean()
+
+    def test_strips_both_private_binaries_before_any_signing_and_dmg_creation(self):
+        before = MODULE.ARTIFACT.tree_manifest(self.app)
+        def tool(command):
+            if Path(command[0]).name == "codesign":
+                stripped = [item for item in self.commands if Path(item[0]).name == "xcrun"]
+                self.assertEqual(len(stripped), 2)
+                for item in stripped:
+                    self.assertEqual(item[:3], ["/usr/bin/xcrun", "strip", "-x"])
+                    self.assertEqual(len(item), 4)
+                    self.assertTrue(Path(item[-1]).is_relative_to(self.workspaces))
+            self.tool(command)
+        def dmg(app, image, workspace, installation_notes):
+            self.assertEqual(len([item for item in self.commands if Path(item[0]).name == "codesign"]), 2)
+            return self.create_dmg(app, image, workspace, installation_notes)
+        self.package(tool=tool, dmg=dmg)
+        stripped = [item for item in self.commands if Path(item[0]).name == "xcrun"]
+        self.assertEqual([Path(item[-1]).name for item in stripped], ["FinderExtension", "QuickFile"])
+        self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
+        self.assert_clean()
+
+    def test_localizations_are_binary_and_value_preserving_before_signing(self):
+        originals = {}
+        plural = {"%lld 件": {"NSStringLocalizedFormatKey": "%#@count@", "count": {
+            "NSStringFormatSpecTypeKey": "NSStringPluralRuleType", "NSStringFormatValueTypeKey": "lld",
+            "one": "%lld item", "other": "%lld items"}}}
+        for _, relative, _ in MODULE.ARTIFACT.COMPONENTS:
+            for language in ("en", "zh-Hans"):
+                values = {"Localizable.strings": {"软件更新": "Software Update", "保留 Unicode": "中文 😀 e\u0301"}}
+                if language == "en":
+                    values["Localizable.stringsdict"] = plural
+                for name, document in values.items():
+                    path = self.app / relative / "Contents/Resources" / (language + ".lproj") / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    xml = plistlib.dumps(document).decode("utf-8").replace('encoding="UTF-8"', 'encoding="UTF-16"')
+                    path.write_bytes(xml.encode("utf-16"))
+                    originals[path.relative_to(self.app)] = (document, path.stat().st_size)
+        before = MODULE.ARTIFACT.tree_manifest(self.app)
+        def tool(command):
+            if Path(command[0]).name == "codesign":
+                component = Path(command[-1])
+                app = component.parents[2] if component.suffix == ".appex" else component
+                for relative, (document, _) in originals.items():
+                    encoded = (app / relative).read_bytes()
+                    self.assertTrue(encoded.startswith(b"bplist00"))
+                    self.assertEqual(plistlib.loads(encoded), document)
+            self.tool(command)
+        report = self.package(tool=tool)
+        entries = report["resource_encoding"]["files"]
+        self.assertEqual(set(entries), {path.as_posix() for path in originals})
+        for relative, (document, byte_count) in originals.items():
+            self.assertEqual(entries[relative.as_posix()]["before_bytes"], byte_count)
+            self.assertEqual(entries[relative.as_posix()]["after_bytes"], len(plistlib.dumps(document, fmt=plistlib.FMT_BINARY)))
+            self.assertLess(entries[relative.as_posix()]["after_bytes"], byte_count)
+        self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
+        self.assert_clean()
+
+    def test_binary_localization_that_is_already_smaller_is_unchanged(self):
+        path = self.app / "Contents/Resources/en.lproj/Localizable.strings"
+        path.parent.mkdir(parents=True)
+        # Preserve a valid input with a different key ordering when sorting does not save bytes.
+        original = plistlib.dumps({"z": "last", "a": "first"}, fmt=plistlib.FMT_BINARY, sort_keys=False)
+        path.write_bytes(original)
+        before = MODULE.ARTIFACT.tree_manifest(self.app)
+        def inspect(app):
+            self.assertEqual((app / path.relative_to(self.app)).read_bytes(), original)
+            return self.inspect(app)
+        report = self.package(inspect=inspect)
+        self.assertEqual(report["resource_encoding"]["files"][path.relative_to(self.app).as_posix()],
+                         {"before_bytes": len(original), "after_bytes": len(original)})
+        self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
+        self.assert_clean()
+
+    def test_invalid_localization_never_signs_or_publishes_and_keeps_input(self):
+        path = self.app / "Contents/Resources/en.lproj/Localizable.strings"
+        path.parent.mkdir(parents=True)
+        for contents in (b"not a property list", b"<?xml version=\"1.0\"?><plist><dict>", plistlib.dumps(["invalid root"])):
+            with self.subTest(contents=contents):
+                path.write_bytes(contents)
+                before = MODULE.ARTIFACT.tree_manifest(self.app)
+                self.commands.clear()
+                with self.assertRaisesRegex(ValueError, "localization resource"):
+                    self.package()
+                self.assertFalse(any(Path(command[0]).name == "codesign" for command in self.commands))
+                self.assertFalse(self.output.exists())
+                self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
+                self.assert_clean()
+
+    def test_strip_failure_on_either_binary_never_signs_or_publishes_and_preserves_build_evidence(self):
+        dsym = self.app.parent / "QuickFile.app.dSYM/Contents/Resources/DWARF/QuickFile"
+        dsym.parent.mkdir(parents=True)
+        dsym.write_bytes(b"paired debug symbols")
+        before = MODULE.ARTIFACT.tree_manifest(self.app.parent)
+        for name in ("FinderExtension", "QuickFile"):
+            with self.subTest(binary=name):
+                self.commands.clear()
+                def fails(command):
+                    if Path(command[0]).name == "xcrun" and Path(command[-1]).name == name:
+                        self.commands.append(command)
+                        raise subprocess.CalledProcessError(1, command)
+                    self.tool(command)
+                def unexpected_dmg(*args):
+                    self.fail("DMG creation must not run after strip fails")
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.package(tool=fails, dmg=unexpected_dmg)
+                self.assertFalse(any(Path(item[0]).name == "codesign" for item in self.commands))
+                self.assertFalse(self.output.exists())
+                self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app.parent))
+                self.assert_clean()
 
     def test_release_tags_propagate_to_dmg_checksum_and_receipt(self):
         for tag in ("v0.1.0", "v0.1.0-beta.1", "v0.1.0-beta.12"):
@@ -106,6 +230,7 @@ class CommunityPackagingTests(unittest.TestCase):
                 self.assertEqual(receipt["dmg"]["image"], filename)
                 self.assertEqual(receipt["version"], "0.1.0")
                 self.assertEqual(receipt["build"], "70")
+                self.assertEqual(receipt["release_tag"], tag)
                 self.assertEqual((self.output / "INSTALL.txt").read_bytes(), self.dmg_instructions)
                 instructions = (self.output / "INSTALL.txt").read_text()
                 self.assertIn(f"shasum -a 256 -c {filename}.sha256", instructions)
@@ -115,9 +240,53 @@ class CommunityPackagingTests(unittest.TestCase):
                 shutil.rmtree(self.output)
         self.assert_clean()
 
+    def test_release_tag_is_written_to_both_private_components_before_any_signing(self):
+        for tag in ("v0.1.0", "v0.1.0-beta.12"):
+            with self.subTest(tag=tag):
+                for _, relative, _ in MODULE.ARTIFACT.COMPONENTS:
+                    path = self.app / relative / "Contents/Info.plist"
+                    FIXTURE.write_plist(path, dict(MODULE.ARTIFACT.read_plist(path), QuickFileReleaseTag="v0.0.1-beta.1"))
+                before = MODULE.ARTIFACT.tree_manifest(self.app)
+                self.arguments.release_tag = tag
+                def tool(command):
+                    if Path(command[0]).name == "codesign":
+                        component = Path(command[-1])
+                        app = component.parents[2] if component.suffix == ".appex" else component
+                        for label, relative, _ in MODULE.ARTIFACT.COMPONENTS:
+                            info = MODULE.ARTIFACT.bundle_info(app, label, relative)
+                            self.assertEqual(info["QuickFileReleaseTag"], tag)
+                            self.assertEqual(info["CFBundleShortVersionString"], "0.1.0")
+                            self.assertEqual(info["CFBundleVersion"], "70")
+                    self.tool(command)
+                self.assertEqual(self.package(tool=tool)["release_tag"], tag)
+                self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
+                shutil.rmtree(self.output)
+        self.assert_clean()
+
+    def test_untagged_package_clears_inherited_tags_before_signing_without_mutating_input(self):
+        for inherited in ("v0.0.1-beta.1", "", 12):
+            with self.subTest(inherited=inherited):
+                for _, relative, _ in MODULE.ARTIFACT.COMPONENTS:
+                    path = self.app / relative / "Contents/Info.plist"
+                    FIXTURE.write_plist(path, dict(MODULE.ARTIFACT.read_plist(path), QuickFileReleaseTag=inherited))
+                before = MODULE.ARTIFACT.tree_manifest(self.app)
+                def tool(command):
+                    if Path(command[0]).name == "codesign":
+                        component = Path(command[-1])
+                        app = component.parents[2] if component.suffix == ".appex" else component
+                        for label, relative, _ in MODULE.ARTIFACT.COMPONENTS:
+                            self.assertNotIn("QuickFileReleaseTag", MODULE.ARTIFACT.bundle_info(app, label, relative))
+                    self.tool(command)
+                report = self.package(tool=tool)
+                self.assertIsNone(report["release_tag"])
+                self.assertEqual(report["archive"], "QuickFile-community-0.1.0-70.dmg")
+                self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
+                shutil.rmtree(self.output)
+        self.assert_clean()
+
     def test_invalid_or_mismatched_release_tags_fail_before_tools(self):
         before = MODULE.ARTIFACT.tree_manifest(self.app)
-        for tag in ("", "0.1.0", "v0.1.0-beta.0", "v0.1.0-beta.01", "v0.1.0-beta.-1", "v0.1.0-beta.1.2", "v0.1.0-rc.1", "v0.1.0-BETA.1", "../v0.1.0", "v0.1.0/extra", "v0.1.0\n", "v0.1.0;touch unwanted", "v0.1.0$(touch unwanted)", "v0.2.0", "v0.2.0-beta.1"):
+        for tag in ("", "0.1.0", "v0.1.0-beta.0", "v0.1.0-beta.01", "v0.1.0-beta.-1", "v0.1.0-beta.1.2", "v0.1.0-rc.1", "v0.1.0-BETA.1", "../v0.1.0", "v0.1.0/extra", "v0.1.0\n", "v0.1.0;touch unwanted", "v0.1.0$(touch unwanted)", "v0.2.0", "v0.2.0-beta.1", "v00.1.0", "v0.01.0", "v0.1.00", "v0.1.0-beta.1000000000000000000", "v０.1.0", "v0.1.0-beta.١", 12, True):
             with self.subTest(tag=tag):
                 self.arguments.release_tag = tag
                 with self.assertRaisesRegex(ValueError, "release tag"):

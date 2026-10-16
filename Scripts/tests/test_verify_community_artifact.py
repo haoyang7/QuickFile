@@ -107,6 +107,59 @@ class CommunityArtifactTests(unittest.TestCase):
         self.assertEqual(report["scope"], "artifact only")
         self.assertEqual(report["trust"], "ad-hoc/unnotarized")
         self.assertIn("Finder integration", report["unproven"])
+        self.assertIsNone(report["release_tag"])
+
+    def test_accepts_matching_release_tags_and_preserves_numeric_versions(self):
+        for tag in ("v0.1.0", "v0.1.0-beta.1", "v0.1.0-beta.999999999999999999"):
+            with self.subTest(tag=tag):
+                for _, relative, _ in MODULE.COMPONENTS:
+                    path = self.app / relative / "Contents/Info.plist"
+                    write_plist(path, dict(MODULE.read_plist(path), QuickFileReleaseTag=tag))
+                report = self.report()
+                self.assertEqual(report["verdict"], "pass")
+                self.assertEqual(report["release_tag"], tag)
+                self.assertEqual(report["version"], "0.1.0")
+                self.assertEqual(report["build"], "70")
+
+    def test_rejects_missing_different_or_invalid_tag_on_either_component(self):
+        paths = [self.app / relative / "Contents/Info.plist" for _, relative, _ in MODULE.COMPONENTS]
+        originals = [dict(MODULE.read_plist(path), QuickFileReleaseTag="v0.1.0-beta.12") for path in paths]
+        for path, original in zip(paths, originals):
+            write_plist(path, original)
+        invalid_tags = (None, "", False, 12, ["v0.1.0-beta.12"], "v0.1.0", "v0.1.0-beta.2", "v0.2.0-beta.12", "v0.1.0-beta.0", "v0.1.0-beta.01", "v0.1.0-beta.1000000000000000000", "v0.1.0-beta.١", "v0.1.0-rc.12", "v0.1.0-beta.12\n")
+        for path, original in zip(paths, originals):
+            for tag in invalid_tags:
+                with self.subTest(component=path.relative_to(self.app), tag=tag):
+                    changed = dict(original)
+                    if tag is None:
+                        changed.pop("QuickFileReleaseTag")
+                    else:
+                        changed["QuickFileReleaseTag"] = tag
+                    write_plist(path, changed)
+                    self.assertEqual(self.report()["verdict"], "fail")
+            write_plist(path, original)
+
+    def test_release_tag_numbers_are_canonical_ascii_and_at_most_18_digits(self):
+        for number, accepted in (("0", True), ("999999999999999999", True), ("1000000000000000000", False), ("01", False), ("０", False), ("١", False)):
+            for index in range(3):
+                with self.subTest(number=number, index=index):
+                    parts = ["0", "1", "0"]
+                    parts[index] = number
+                    version = ".".join(parts)
+                    for _, relative, _ in MODULE.COMPONENTS:
+                        path = self.app / relative / "Contents/Info.plist"
+                        values = MODULE.read_plist(path)
+                        values.update(CFBundleShortVersionString=version, QuickFileReleaseTag="v" + version)
+                        write_plist(path, values)
+                    self.assertEqual(self.report()["verdict"], "pass" if accepted else "fail")
+
+    def test_rejects_matching_invalid_tags_on_both_components(self):
+        for tag in ("", False, 12, ["v0.1.0"], "v0.2.0", "v0.1.0-beta.0", "v0.1.0-beta.01", "v0.1.0-beta.1000000000000000000", "v0.1.0-beta.١", "v0.1.0-rc.1", "v0.1.0\n"):
+            with self.subTest(tag=tag):
+                for _, relative, _ in MODULE.COMPONENTS:
+                    path = self.app / relative / "Contents/Info.plist"
+                    write_plist(path, dict(MODULE.read_plist(path), QuickFileReleaseTag=tag))
+                self.assertEqual(self.report()["verdict"], "fail")
 
     def test_rejects_old_or_mixed_storage_modes(self):
         for relative in ("Contents/Info.plist", "Contents/PlugIns/FinderExtension.appex/Contents/Info.plist"):
@@ -169,6 +222,10 @@ class CommunityArtifactTests(unittest.TestCase):
         self.assertEqual(self.report()["verdict"], "fail")
 
     def test_rejects_entitlement_changes_including_boolean_integer_and_second_slice(self):
+        self.runner.entitlements["finder_extension"] = dict(
+            MODULE.expected_entitlements("finder_extension"), **{"com.apple.security.network.client": True})
+        self.assertEqual(self.report()["verdict"], "fail")
+        self.runner.entitlements.clear()
         for label in ("app", "finder_extension"):
             for changes in ({"get-task-allow": False}, {"com.apple.developer.team-identifier": "FAKE"}, {"com.apple.security.network.server": True}):
                 with self.subTest(label=label, changes=changes):

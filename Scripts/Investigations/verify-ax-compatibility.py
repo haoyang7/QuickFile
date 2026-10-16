@@ -92,7 +92,8 @@ def validate_product_scan(entry, baseline=None):
     # Classify the entire heap and reject target AX groups, unknown roots, missed
     # nodes, and any growth beyond that measured baseline. Never call this zero
     # whole-heap leakage when the baseline itself contains reported nodes.
-    if entry["unclassified_nodes"] != 0 or entry["destroyed_notification_stack_present"]:
+    if (entry["unclassified_nodes"] != 0 or entry["destroyed_notification_stack_present"]
+            or any(group.get("tree_nodes") is None for group in entry["groups"])):
         raise RuntimeError(f"AX leakage or incomplete heap classification: {entry}")
     if any(group["root_type"] != "NSXPCConnection" for group in entry["groups"]):
         raise RuntimeError(f"Unexpected non-AX leak roots: {entry}")

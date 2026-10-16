@@ -131,13 +131,17 @@ class CommunityDMGTests(unittest.TestCase):
         self.assertEqual(report["image_bytes"], self.image.stat().st_size)
         self.assertEqual(report["format"], "UDZO")
         self.assertEqual(report["filesystem"], "HFS+")
+        self.assertEqual(report["compression"], {"codec": "zlib", "level": 9})
         self.assertEqual(report["trust"], "ad-hoc/unnotarized")
         self.assertEqual(report["installation_file"], "安装说明.txt")
         self.assertEqual(report["installation_sha256"], hashlib.sha256(self.installation_notes).hexdigest())
         self.assertNotIn(str(self.directory), json.dumps(report))
         create = next(command for command in self.commands if command[1] == "create")
-        self.assertIn("UDZO", create)
-        self.assertIn("HFS+", create)
+        self.assertEqual(create, [
+            "/usr/bin/hdiutil", "create", "-srcfolder", str(self.workspace / "source"),
+            "-format", "UDZO", "-fs", "HFS+", "-imagekey", "zlib-level=9",
+            "-volname", "QuickFile Community", str(self.private_image),
+        ])
         self.assertNotIn("-ov", create)
         attach = next(command for command in self.commands if command[1] == "attach")
         for flag in ("-readonly", "-nobrowse", "-noautoopen", "-mountpoint"):

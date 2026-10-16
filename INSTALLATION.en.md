@@ -79,7 +79,9 @@ You can also save folder access from **Diagnostics → Authorize Folder…** and
 
 **It keeps asking to access data from other apps.** That is not an expected setup step for this version. Keep the message and describe what you clicked when [reporting the problem](https://github.com/haoyang7/QuickFile/issues).
 
-**Does QuickFile update itself?** No. Download new Community versions from the project’s release page and install them yourself.
+**How do I check for updates?** The public v0.1.0-beta.2 (build 98) linked above has no **Check for Updates…** action. Check [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) in your browser, download the DMG and `.sha256` file, verify the checksum, then replace the app using the steps above.
+
+Later, unreleased source and local candidates provide **Check for Updates…**. Only a click requests the fixed repository’s GitHub Release API and validates the matching `build-provenance.json`; missing or mismatched receipts, network failures and rate limits are shown clearly. Tagged candidates are ordered by marketing version, Beta number and then the stable release of that version; builds are compared only for the same tag. Older packages without a tag keep the marketing-version/build comparison. The Beta preference is off by default, so only stable releases are checked; turn on **Receive beta versions** in Settings to include Beta releases. If a newer release is found, it provides a release page link; downloading, verifying and installing remain manual. This feature is not included in the public download above. Community never downloads or installs updates automatically.
 
 ## Updating or going back
 

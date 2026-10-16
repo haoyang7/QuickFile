@@ -48,6 +48,114 @@ final class LocalizationSwitchingTests: XCTestCase {
         XCTAssertEqual(entries[0].title, "Word 文档 (.docx)")
     }
 
+    func testFirstSaveAfterLanguageSwitchWorksAcrossStoresForAddEditAndToggle() throws {
+        let directory = try templateTestDirectory()
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
+        for (languageIndex, languages) in [
+            (QuickFileLanguage.simplifiedChinese, QuickFileLanguage.english),
+            (QuickFileLanguage.english, QuickFileLanguage.simplifiedChinese)
+        ].enumerated() {
+            for operation in 0..<3 {
+                let root = directory.appendingPathComponent("\(languageIndex)-\(operation)", isDirectory: true)
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
+                                                       attributes: [.posixPermissions: 0o700])
+                let local = LocalSharedStorage(root: root.resolvingSymlinksInPath())
+                let url = local.root.appendingPathComponent("templates.v2.json")
+                let reader = TemplateStore(defaults: nil, storageURL: url, localStorage: local)
+                QuickFileLocalization.apply(languages.0)
+                let baseline = try reader.reloadTemplates()
+                QuickFileLocalization.apply(languages.1)
+                let writer = TemplateStore(defaults: nil, storageURL: url, localStorage: local)
+                XCTAssertNotEqual(try writer.reloadTemplates()[0].name, baseline[0].name)
+                var edited = baseline
+                switch operation {
+                case 0: edited.append(FileTemplate(name: "My template", fileExtension: "txt", content: "keep"))
+                case 1:
+                    edited[0].name = "我的报告"
+                    edited[0].defaultFilename = "Report"
+                default: edited[0].isEnabled = false
+                }
+                try writer.saveTemplates(edited, expectedTemplates: baseline)
+                let saved = try reader.reloadTemplates()
+                XCTAssertEqual(saved.map(TransferTemplate.init), edited.map(TransferTemplate.init))
+                XCTAssertEqual(saved[0].officeFormat, .docx)
+                let document = try XCTUnwrap(JSONSerialization.jsonObject(with: local.read(url)) as? [String: Any])
+                XCTAssertEqual(document["version"] as? Int, 4)
+            }
+        }
+    }
+
+    func testFirstUseCASRejectsModifiedOrMixedLanguageDefaultBaselines() throws {
+        let directory = try templateTestDirectory()
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
+        let local = LocalSharedStorage(root: directory)
+        let url = local.root.appendingPathComponent("templates.v2.json")
+        let store = TemplateStore(defaults: nil, storageURL: url, localStorage: local)
+        QuickFileLocalization.apply(.simplifiedChinese)
+        let baseline = try store.reloadTemplates()
+        QuickFileLocalization.apply(.english)
+        var renamed = baseline
+        renamed[0].name = "Custom"
+        var mixed = baseline
+        mixed[0].name = BuiltInTemplates.all[0].name
+        var disabled = baseline
+        disabled[0].isEnabled = false
+        var plainOffice = baseline
+        plainOffice[0].officeFormat = nil
+        var changedBody = baseline
+        changedBody[3].content = "unpersisted edit"
+        var defaultFilename = baseline
+        defaultFilename[0].defaultFilename = "Report"
+        for invalid in [renamed, mixed, disabled, plainOffice, changedBody, defaultFilename,
+                        Array(baseline.reversed()), Array(baseline.dropLast())] {
+            XCTAssertThrowsError(try store.saveTemplates([], expectedTemplates: invalid)) {
+                guard case TemplateStore.StoreError.configurationChanged = $0 else { return XCTFail("\($0)") }
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: local.root.appendingPathComponent("templates.persistence.v1.json").path))
+    }
+
+    func testLanguageCompatibleFirstUseBaselineCannotOverrideAnExternalSaveOrPersistenceMarker() throws {
+        let directory = try templateTestDirectory()
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
+        for markerOnly in [false, true] {
+            let root = directory.appendingPathComponent(markerOnly ? "marker" : "saved", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
+                                                   attributes: [.posixPermissions: 0o700])
+            let local = LocalSharedStorage(root: root.resolvingSymlinksInPath())
+            let url = local.root.appendingPathComponent("templates.v2.json")
+            let store = TemplateStore(defaults: nil, storageURL: url, localStorage: local)
+            QuickFileLocalization.apply(.simplifiedChinese)
+            let baseline = try store.reloadTemplates()
+            QuickFileLocalization.apply(.english)
+            if markerOnly {
+                try local.write(Data("{\"version\":1}".utf8),
+                                to: local.root.appendingPathComponent("templates.persistence.v1.json"))
+            } else {
+                let other = TemplateStore(defaults: nil, storageURL: url, localStorage: local)
+                let english = try other.reloadTemplates()
+                try other.saveTemplates(english, expectedTemplates: english)
+            }
+            XCTAssertThrowsError(try store.saveTemplates(baseline, expectedTemplates: baseline)) { error in
+                if markerOnly {
+                    guard case TemplateStore.StoreError.savedConfigurationMissing = error else { return XCTFail("\(error)") }
+                } else {
+                    guard case TemplateStore.StoreError.configurationChanged = error else { return XCTFail("\(error)") }
+                }
+            }
+            if !markerOnly { XCTAssertEqual(try store.reloadTemplates(), BuiltInTemplates.all) }
+        }
+    }
+
+    private func templateTestDirectory() throws -> URL {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/Temporary/LocalizationTests-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        return directory.resolvingSymlinksInPath()
+    }
+
     func testSavedMenuFeedbackAndErrorsRefreshWithoutRepeatingPersistence() async {
         QuickFileLocalization.apply(.simplifiedChinese)
         let saves = LockedTestValue(0)

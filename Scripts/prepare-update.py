@@ -182,16 +182,22 @@ def prepare(arguments: argparse.Namespace) -> None:
             try:
                 # Staging shares the output filesystem; links refuse to overwrite existing files.
                 for source, target in ((archive, target_archive), (report, target_report)):
+                    identity = source.stat()
                     os.link(source, target)
-                    promoted.append(target)
+                    promoted.append((target, identity))
                 # The atomic feed replacement commits the release after both artifacts are ready.
                 staged_feed.replace(target_feed)
             except BaseException:
                 # replace() may commit and then be interrupted before returning.
                 # A Python flag set after the call cannot close that window.
                 if feed_is_uncommitted(staged_feed, target_feed, staged_feed_identity):
-                    for target in reversed(promoted):
-                        target.unlink()
+                    for target, identity in reversed(promoted):
+                        try:
+                            # Preserve replacements and objects whose identity cannot be confirmed.
+                            if os.path.samestat(identity, target.lstat()):
+                                target.unlink()
+                        except OSError:
+                            pass
                 raise
     print(f"Prepared {filename} and {feed_name}; nothing was uploaded.")
 

@@ -121,7 +121,18 @@ public final class TemplateStore: @unchecked Sendable {
     }
     private var protectedStorageURLs: [URL] {
         guard let storageURL else { return [] }
-        return [storageURL, storageURL.appendingPathExtension("lock")] + [persistenceMarkerURL].compactMap { $0 }
+        let directory = localStorage?.root ?? storageURL.deletingLastPathComponent()
+        // These are the existing shared-storage contracts, including files that
+        // have not been created yet. Queue records and backups are protected below.
+        let names = [
+            "templates.persistence.v1.json", "language-settings.v1.json",
+            "file-creation-settings.v1.json", "finder-menu-settings.v1.json",
+            "authorizedDirectories.v2.json", "authorizedDirectories.migrated", "authorizedDirectories.lock",
+            "finderExtension.failureHistory.v1.json", "finderExtension.failureHistory.v1.json.lock",
+            "finderExtension.failureHistory.v1.json.latest-v2.json"
+        ]
+        return [storageURL, storageURL.appendingPathExtension("lock")]
+            + names.map { directory.appendingPathComponent($0) }
     }
     private let storageURL: URL?
     private let fileManager: FileManager
@@ -209,15 +220,7 @@ public final class TemplateStore: @unchecked Sendable {
             defaults: directory == nil ? nil : QuickFileSharedStorage.legacyDefaults(),
             storageURL: directory?.appendingPathComponent("templates.v2.json"),
             localStorage: local,
-            cachesReads: cachesReads, cachesMenuReads: cachesMenuReads,
-            writeTemplatesData: { data, url in
-                if let local { try local.write(data, to: url) }
-                else { try data.write(to: url, options: .atomic) }
-            },
-            readTemplatesData: { url in
-                if let local { return try local.read(url) }
-                return try Data(contentsOf: url)
-            }
+            cachesReads: cachesReads, cachesMenuReads: cachesMenuReads
         )
     }
 
@@ -229,10 +232,8 @@ public final class TemplateStore: @unchecked Sendable {
         cachesReads: Bool = true,
         cachesMenuReads: Bool = false,
         changeNotificationName: String = QuickFileConfiguration.templatesDidChangeDarwinNotification,
-        writeTemplatesData: @escaping @Sendable (Data, URL) throws -> Void = {
-            try $0.write(to: $1, options: .atomic)
-        },
-        readTemplatesData: @escaping @Sendable (URL) throws -> Data = { try Data(contentsOf: $0) },
+        writeTemplatesData: (@Sendable (Data, URL) throws -> Void)? = nil,
+        readTemplatesData: (@Sendable (URL) throws -> Data)? = nil,
         decodeTemplatesData: @escaping @Sendable (Data) throws -> [FileTemplate] = {
             try JSONDecoder().decode(StoredTemplates.self, from: $0).templates
         },
@@ -248,8 +249,16 @@ public final class TemplateStore: @unchecked Sendable {
         self.fileManager = fileManager
         self.cachesReads = cachesReads
         self.cachesMenuReads = cachesMenuReads
-        self.writeTemplatesData = writeTemplatesData
-        self.readTemplatesData = readTemplatesData
+        self.writeTemplatesData = writeTemplatesData ?? { data, url in
+            if let localStorage { try localStorage.write(data, to: url) }
+            else { try data.write(to: url, options: .atomic) }
+        }
+        self.readTemplatesData = readTemplatesData ?? { url in
+            // Historical libraries remain readable even above the separate
+            // recovery/cache budgets, including the authority read before a reduction.
+            if let localStorage { return try localStorage.read(url, maximumBytes: nil) }
+            return try Data(contentsOf: url)
+        }
         self.decodeTemplatesData = decodeTemplatesData
         self.decodeMenuEntriesData = decodeMenuEntriesData ?? {
             try JSONDecoder().decode(MenuEntries.self, from: $0).entries
@@ -276,7 +285,9 @@ public final class TemplateStore: @unchecked Sendable {
             // Community reads reject links; the official route retains its existing semantics.
             let result = localStorage == nil ? stat(storageURL.path, &status) : lstat(storageURL.path, &status)
             if result == 0 {
-                try localStorage?.validateFile(status)
+                if let localStorage, try !localStorage.containsFile(at: storageURL) {
+                    return ChangeToken(revision: try currentRevision(), fileIdentity: nil)
+                }
                 identity = RecoveryFileIdentity(status)
                 // Existing v2 files carry their own invalidation identity. The
                 // legacy preferences revision must not gate normal file reads.
@@ -536,9 +547,12 @@ public final class TemplateStore: @unchecked Sendable {
             if current == nil, try hasSavedConfiguration() {
                 throw StoreError.savedConfigurationMissing
             }
-            if let expectedTemplates,
-               !Self.templatesMatchExactly(current ?? BuiltInTemplates.all, expectedTemplates) {
-                throw StoreError.configurationChanged
+            if let expectedTemplates {
+                // Only a genuinely unpersisted library may use a default snapshot
+                // from another UI language. Persisted user data always uses byte CAS.
+                let matches = current.map { Self.templatesMatchExactly($0, expectedTemplates) }
+                    ?? BuiltInTemplates.matchesUnpersistedSnapshot(expectedTemplates)
+                guard matches else { throw StoreError.configurationChanged }
             }
             try Self.validateOrdinarySave(templates, replacing: current ?? BuiltInTemplates.all)
             return try persistTemplates(templates)
@@ -615,8 +629,8 @@ public final class TemplateStore: @unchecked Sendable {
         )) == true
     }
 
-    /// A user-selected export must not replace the store's authoritative file,
-    /// coordination lock or immutable backups with the portable transfer envelope.
+    /// A user-selected export must not replace shared configuration, coordination
+    /// files, pending requests or recovery evidence with the portable envelope.
     public func validateExportDestination(_ url: URL) throws {
         guard url.isFileURL else { throw TemplateTransferError.nonLocalFile }
         // Panels supply ordinary absolute paths. Reject explicit traversal rather
@@ -626,16 +640,20 @@ public final class TemplateStore: @unchecked Sendable {
             throw TemplateTransferError.protectedDestination
         }
         let destination = try canonicalExportURL(url)
-        let backupParent = try canonicalExportURL(
-            storageURL?.deletingLastPathComponent() ?? fileManager.temporaryDirectory
+        let storageParent = try canonicalExportURL(
+            localStorage?.root ?? storageURL?.deletingLastPathComponent() ?? fileManager.temporaryDirectory
         ).pathComponents
         let destinationParts = destination.pathComponents
-        if destinationParts.count > backupParent.count,
-           zip(backupParent, destinationParts).allSatisfy({ pair in
+        if destinationParts.count > storageParent.count,
+           zip(storageParent, destinationParts).allSatisfy({ pair in
                pair.0.caseInsensitiveCompare(pair.1) == .orderedSame
-           }),
-           destinationParts[backupParent.count].lowercased().hasPrefix("quickfile-template-backup-") {
-            throw TemplateTransferError.protectedDestination
+           }) {
+            let name = destinationParts[storageParent.count].lowercased()
+            if name.hasPrefix("quickfile-template-backup-")
+                || (storageURL != nil && (name == "finder-authorization-requests"
+                    || name.hasPrefix(".quickfile-write-"))) {
+                throw TemplateTransferError.protectedDestination
+            }
         }
         guard storageURL != nil else { return }
         for protected in protectedStorageURLs {
@@ -669,17 +687,18 @@ public final class TemplateStore: @unchecked Sendable {
     private func validateExportDestination(in parent: Int32, named name: String) throws {
         let actualParent = try TemplateTransferFile.directoryURL(for: parent)
         try validateExportDestination(actualParent.appendingPathComponent(name))
-        guard let storageURL else { return }
+        guard storageURL != nil else { return }
         var openedParent = stat()
         guard fstat(parent, &openedParent) == 0 else { throw currentPOSIXError() }
-        var protectedParent = stat()
-        if stat(storageURL.deletingLastPathComponent().path, &protectedParent) == 0 {
-            if openedParent.st_dev == protectedParent.st_dev, openedParent.st_ino == protectedParent.st_ino,
-               protectedStorageURLs.map(\.lastPathComponent)
-                .contains(where: { name.caseInsensitiveCompare($0) == .orderedSame }) {
-                throw TemplateTransferError.protectedDestination
-            }
-        } else if errno != ENOENT { throw currentPOSIXError() }
+        for protected in protectedStorageURLs {
+            var protectedParent = stat()
+            if stat(protected.deletingLastPathComponent().path, &protectedParent) == 0 {
+                if openedParent.st_dev == protectedParent.st_dev, openedParent.st_ino == protectedParent.st_ino,
+                   name.caseInsensitiveCompare(protected.lastPathComponent) == .orderedSame {
+                    throw TemplateTransferError.protectedDestination
+                }
+            } else if errno != ENOENT { throw currentPOSIXError() }
+        }
 
         // Check hardlink identity against the entry in the opened destination, not
         // a fresh lookup through the user's possibly retargeted parent pathname.
@@ -801,7 +820,7 @@ public final class TemplateStore: @unchecked Sendable {
         defer { close(descriptor) }
         var before = stat()
         guard fstat(descriptor, &before) == 0 else { throw currentPOSIXError() }
-        try localStorage?.validateFile(before)
+        try localStorage?.validateFile(descriptor: descriptor)
         guard before.st_mode & S_IFMT == S_IFREG else {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
         }

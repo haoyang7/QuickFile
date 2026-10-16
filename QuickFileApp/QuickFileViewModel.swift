@@ -882,9 +882,11 @@ final class QuickFileViewModel: ObservableObject {
                     switch result {
                     case let .success(snapshot):
                         self.templateRefreshToken = snapshot.token
+                        // Rejoin the Store's decoded storage even when values match:
+                        // saving invalidates that cache before a notification reload.
+                        self.templates = snapshot.templates
+                        self.persistedTemplates = snapshot.templates
                         if snapshot.changed || !self.hasLoadedTemplates || self.templateLoadFailure != nil {
-                            self.templates = snapshot.templates
-                            self.persistedTemplates = snapshot.templates
                             self.templateStateGeneration &+= 1
                         }
                         self.hasLoadedTemplates = true

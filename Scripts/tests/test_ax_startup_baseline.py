@@ -48,6 +48,12 @@ def registration_scan_classification(scans):
 
 
 def check_negative_control(test, receipt, records, original, modified, return_code):
+    compatibility.LIFECYCLE.receipt_fields(receipt, ('cleanup',))
+    if type(receipt['cleanup']) is dict and receipt['cleanup'].get('primary_exception') is True:
+        raise ValueError('AX receipt incomplete: runner aborted')
+    compatibility.LIFECYCLE.receipt_fields(receipt, ('startup_baseline', 'coverage', 'scans',
+        'destroyed_buttons', 'notifications', 'ordinary_compensations', 'mutable_compensations',
+        'validation_errors'))
     # Emit only anonymous observations before any acceptance assertion, including
     # on failure. The runner's strict verdict stays failed for an injected leak.
     scans = receipt.get('scans', [])
@@ -93,6 +99,23 @@ def check_negative_control(test, receipt, records, original, modified, return_co
     test.assertEqual(inputs['sources']['QuickFileApp/AXCompatibility.m'], evidence['negative_source_sha256'])
 
 
+def check_negative_control_result(test, result, records, original, modified):
+    # Keep bounded raw diagnostics in test failures, outside the anonymous
+    # negative-control summary. In particular, retain the runner traceback.
+    tail = lambda stream: stream.encode('utf-8', errors='replace')[-8192:].decode('utf-8', errors='ignore')
+    diagnostics = (f'AX negative-control runner exit code: {result.returncode}\n'
+                   f'stdout:\n{tail(result.stdout)}\nstderr:\n{tail(result.stderr)}')
+    test.assertEqual(result.returncode, 1, diagnostics)
+    try:
+        receipt = json.loads((records / 'result.json').read_text())
+        check_negative_control(test, receipt, records, original, modified, result.returncode)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, AssertionError) as error:
+        problem = ('AX receipt incomplete: result.json missing'
+                   if isinstance(error, FileNotFoundError) and error.filename == str(records / 'result.json')
+                   else f'AX receipt validation failed: {error}')
+        raise test.failureException(f'{problem}\n{diagnostics}') from error
+
+
 @unittest.skipUnless(sys.platform == 'darwin' and shutil.which('xcrun'), 'requires macOS SDK')
 class StartupBaselineNativeNegativeControlTests(unittest.TestCase):
     def test_settled_baseline_rejects_real_uncompensated_ax_copies(self):
@@ -131,8 +154,7 @@ raise SystemExit(runner.main())
             if result.returncode == 77:
                 compatibility.LIFECYCLE.record(records, 'negative-control', result.returncode)
                 self.skipTest('AX negative control unavailable: ' + result.stdout.strip())
-            receipt = json.loads((records / 'result.json').read_text())
-            check_negative_control(self, receipt, records, original, source.read_bytes(), result.returncode)
+            check_negative_control_result(self, result, records, original, source.read_bytes())
             compatibility.LIFECYCLE.record(records, 'negative-control', result.returncode)
 
 
@@ -251,6 +273,70 @@ class NegativeControlReceiptTests(unittest.TestCase):
             receipt = self.receipt(); mutate(receipt['cleanup'])
             self.exercise(receipt, fails=True)
         self.exercise(self.receipt(), fails=True, wrong_source=True)
+
+
+class NegativeControlRunnerResultTests(unittest.TestCase):
+    def exercise(self, content, problem, *, return_code=1, stdout='runner stdout', stderr='runner traceback'):
+        with tempfile.TemporaryDirectory() as directory:
+            records = Path(directory)
+            if content is not None:
+                (records / 'result.json').write_text(content)
+            result = subprocess.CompletedProcess([], return_code, stdout, stderr)
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(AssertionError) as failure:
+                check_negative_control_result(self, result, records, 'original', b'negative')
+            message = str(failure.exception)
+            self.assertIn(problem, message)
+            self.assertIn('stdout:\n', message)
+            self.assertIn(stdout[-100:], message)
+            self.assertIn('stderr:\n', message)
+            self.assertIn(stderr[-100:], message)
+            return message
+
+    def test_missing_receipt_preserves_both_runner_streams(self):
+        self.exercise(None, 'AX receipt incomplete: result.json missing')
+
+    def test_aborted_receipt_is_reported_before_missing_activity(self):
+        self.exercise(json.dumps({'coverage': 'failed', 'cleanup': {'primary_exception': True},
+                                  'validation_errors': [{'stage': 'execution'}]}),
+                      'AX receipt incomplete: runner aborted')
+
+    def test_missing_activity_and_malformed_receipts_fail_with_diagnostics(self):
+        receipt = NegativeControlReceiptTests().receipt()
+        del receipt['destroyed_buttons']
+        self.exercise(json.dumps(receipt), 'AX receipt incomplete: missing fields destroyed_buttons')
+        for content in ('{', '[]', 'null', json.dumps({'cleanup': None}),
+                        json.dumps(NegativeControlReceiptTests().receipt() | {'scans': None})):
+            with self.subTest(content=content):
+                self.exercise(content, 'AX receipt validation failed:')
+
+    def test_execution_failure_is_not_replaced_by_missing_receipt(self):
+        message = self.exercise(None, 'AX negative-control runner exit code: 2', return_code=2)
+        self.assertNotIn('result.json missing', message)
+
+    def test_runner_diagnostics_are_bounded_and_retain_traceback_tail(self):
+        message = self.exercise(None, 'AX receipt incomplete: result.json missing',
+            stdout='omitted stdout' + 'a' * 9000 + 'stdout tail',
+            stderr='omitted stderr' + 'b' * 9000 + 'traceback tail')
+        self.assertNotIn('omitted stdout', message)
+        self.assertNotIn('omitted stderr', message)
+        self.assertLess(len(message), 17 * 1024)
+        message = self.exercise(None, 'AX receipt incomplete: result.json missing', stdout='界' * 9000, stderr='错' * 9000)
+        self.assertLess(len(message.encode('utf-8')), 17 * 1024)
+
+    def test_complete_negative_control_still_emits_only_anonymous_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            records = Path(directory)
+            (records / 'result.json').write_text(json.dumps(NegativeControlReceiptTests().receipt()))
+            (records / 'inputs.json').write_text(json.dumps({'sources': {
+                'QuickFileApp/AXCompatibility.m': hashlib.sha256(b'negative').hexdigest()}}))
+            output = io.StringIO()
+            result = subprocess.CompletedProcess([], 1, 'private stdout', 'private stderr')
+            with contextlib.redirect_stdout(output):
+                check_negative_control_result(self, result, records, 'original', b'negative')
+            evidence = json.loads((records / 'negative-control.json').read_text())
+            self.assertEqual(json.loads(output.getvalue()), {'negative_control': evidence})
+            self.assertNotIn('private', output.getvalue())
+            self.assertNotIn('secret', output.getvalue())
 
 
 class StartupBaselineTests(unittest.TestCase):

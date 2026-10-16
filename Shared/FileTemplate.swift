@@ -65,6 +65,18 @@ public struct FileTemplate: Codable, Equatable, Identifiable, Sendable {
 public enum BuiltInTemplates {
     public static var all: [FileTemplate] { make(bundle: QuickFileLocalization.bundle) }
 
+    /// A first-use read can precede a language change in another store instance.
+    /// Accept only a complete, byte-exact default snapshot from one shipped language.
+    /// This is never a comparison rule for already-persisted user templates.
+    public static func matchesUnpersistedSnapshot(_ templates: [FileTemplate]) -> Bool {
+        QuickFileLanguage.supportedIdentifiers.contains { language in
+            let defaults = make(bundle: QuickFileLocalization.resourceBundle(for: language))
+            return templates.count == defaults.count && zip(templates, defaults).allSatisfy { pair in
+                pair.0.id == pair.1.id && TransferTemplate(pair.0) == TransferTemplate(pair.1)
+            }
+        }
+    }
+
     // Fixed IDs establish origin; a matching built-in name establishes that the
     // user has not renamed it. Never infer origin from a name or extension alone.
     private static let namesByID: [UUID: [String: String]] = {

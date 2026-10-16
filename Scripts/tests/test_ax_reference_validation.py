@@ -337,6 +337,145 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("private_cleanup_failed", value["reasons"])
         self.assertNotIn("private path", json.dumps(value))
 
+    def worker_result(self, fixture, value, *, confirmed=True):
+        def owned(command, logfile, environment, timeout):
+            (logfile.parent / "result.json").write_bytes(ref.encode_summary(value, fixture.frozen, fixture.bridge))
+            logfile.write_text("private worker output")
+            return {"status": "completed", "command_return_code": 0, "cleanup": {"complete": confirmed}}
+        return owned
+
+    def test_first_publication_failure_preserves_old_summary_and_private_evidence(self):
+        for failure in ("encode", "write", "rename"):
+            for previous in (False, True):
+                with self.subTest(failure=failure, previous=previous):
+                    root = self.root / (failure + str(previous)); root.mkdir()
+                    fixture = Fixture(root)
+                    value = fixture.collect()
+                    target = fixture.records / "reference-validation.json"
+                    temporary = target.with_suffix(".tmp")
+                    old = copy.deepcopy(value)
+                    ref.reason(old, "original_partial")
+                    old_payload = ref.encode_summary(old, fixture.frozen, fixture.bridge)
+                    if previous: target.write_bytes(old_payload)
+                    real_write, real_replace, real_encode = Path.write_bytes, Path.replace, ref.encode_summary
+                    def write(path, payload):
+                        if path == temporary and failure == "write":
+                            real_write(path, payload[:20])
+                            raise OSError("private write error")
+                        return real_write(path, payload)
+                    def replace(path, destination):
+                        if path == temporary and failure == "rename":
+                            raise OSError("private rename error")
+                        return real_replace(path, destination)
+                    def encode(summary, frozen, bridge):
+                        if "private_cleanup_pending" in summary["reasons"] and failure == "encode":
+                            raise ValueError("private encoding error")
+                        return real_encode(summary, frozen, bridge)
+                    with mock.patch.object(ref, "run_owned", side_effect=self.worker_result(fixture, value)), \
+                            mock.patch.object(Path, "write_bytes", write), mock.patch.object(Path, "replace", replace), \
+                            mock.patch.object(ref, "encode_summary", side_effect=encode), \
+                            mock.patch.object(ref.shutil, "rmtree") as cleanup:
+                        self.assertFalse(ref.write_sidecar(fixture.frozen, fixture.context, fixture.graphs, fixture.records))
+                        cleanup.assert_not_called()
+                    if previous:
+                        self.assertEqual(target.read_bytes(), old_payload)
+                    else:
+                        self.assertFalse(target.exists())
+                    self.assertFalse(temporary.exists())
+                    private = fixture.records / "reference-validation-private"
+                    self.assertEqual(json.loads((private / "result.json").read_bytes()), value)
+                    self.assertEqual((private / "worker.log").read_text(), "private worker output")
+
+    def test_cleanup_requires_published_pending_checkpoint_and_failure_is_recorded(self):
+        fixture = Fixture(self.root)
+        value = fixture.collect()
+        def cleanup(private):
+            checkpoint = json.loads((fixture.records / "reference-validation.json").read_bytes())
+            ref.validate_summary(checkpoint, fixture.frozen, fixture.bridge)
+            self.assertEqual(checkpoint["status"], "partial")
+            self.assertEqual(checkpoint["reasons"], ["private_cleanup_pending"])
+            self.assertEqual(checkpoint["objects"], value["objects"])
+            self.assertTrue((private / "worker.log").is_file())
+            raise OSError("private cleanup error")
+        with mock.patch.object(ref, "run_owned", side_effect=self.worker_result(fixture, value)), \
+                mock.patch.object(ref.shutil, "rmtree", side_effect=cleanup):
+            self.assertFalse(ref.write_sidecar(fixture.frozen, fixture.context, fixture.graphs, fixture.records))
+        final = json.loads((fixture.records / "reference-validation.json").read_bytes())
+        ref.validate_summary(final, fixture.frozen, fixture.bridge)
+        self.assertEqual(final["status"], "partial")
+        self.assertEqual(final["reasons"], ["private_cleanup_failed"])
+        self.assertTrue((fixture.records / "reference-validation-private/worker.log").is_file())
+        self.assertNotIn("private cleanup error", json.dumps(final))
+
+    def test_final_publication_failure_keeps_measured_pending_checkpoint(self):
+        for cleanup_failed in (False, True):
+            for failure in ("encode", "write", "rename"):
+                with self.subTest(cleanup_failed=cleanup_failed, failure=failure):
+                    root = self.root / (str(cleanup_failed) + failure); root.mkdir()
+                    fixture = Fixture(root)
+                    value = fixture.collect()
+                    target = fixture.records / "reference-validation.json"
+                    temporary = target.with_suffix(".tmp")
+                    real_write, real_replace, real_cleanup, real_encode = Path.write_bytes, Path.replace, ref.shutil.rmtree, ref.encode_summary
+                    def write(path, payload):
+                        if path == temporary and target.exists() and failure == "write":
+                            real_write(path, payload[:20])
+                            raise OSError("private final write error")
+                        return real_write(path, payload)
+                    def replace(path, destination):
+                        if path == temporary and target.exists() and failure == "rename":
+                            raise OSError("private final rename error")
+                        return real_replace(path, destination)
+                    def cleanup(private):
+                        if cleanup_failed: raise OSError("private cleanup error")
+                        return real_cleanup(private)
+                    def encode(summary, frozen, bridge):
+                        if target.exists() and "private_cleanup_pending" not in summary["reasons"] and failure == "encode":
+                            raise ValueError("private final encoding error")
+                        return real_encode(summary, frozen, bridge)
+                    with mock.patch.object(ref, "run_owned", side_effect=self.worker_result(fixture, value)), \
+                            mock.patch.object(Path, "write_bytes", write), mock.patch.object(Path, "replace", replace), \
+                            mock.patch.object(ref, "encode_summary", side_effect=encode), \
+                            mock.patch.object(ref.shutil, "rmtree", side_effect=cleanup):
+                        self.assertFalse(ref.write_sidecar(fixture.frozen, fixture.context, fixture.graphs, fixture.records))
+                    final = json.loads(target.read_bytes())
+                    ref.validate_summary(final, fixture.frozen, fixture.bridge)
+                    self.assertEqual(final["status"], "partial")
+                    self.assertEqual(final["reasons"], ["private_cleanup_pending"])
+                    self.assertEqual(final["objects"], value["objects"])
+                    self.assertEqual((fixture.records / "reference-validation-private").exists(), cleanup_failed)
+                    self.assertFalse(temporary.exists())
+
+    def test_public_summary_and_staging_symlinks_preserve_destination_and_private_evidence(self):
+        for linked in ("reference-validation.json", "reference-validation.tmp"):
+            with self.subTest(linked=linked):
+                root = self.root / linked; root.mkdir()
+                fixture = Fixture(root)
+                value = fixture.collect()
+                destination = root / "unrelated"
+                destination.write_text("untouched")
+                (fixture.records / linked).symlink_to(destination)
+                with mock.patch.object(ref, "run_owned", side_effect=self.worker_result(fixture, value)), \
+                        mock.patch.object(ref.shutil, "rmtree") as cleanup:
+                    self.assertFalse(ref.write_sidecar(fixture.frozen, fixture.context, fixture.graphs, fixture.records))
+                    cleanup.assert_not_called()
+                self.assertEqual(destination.read_text(), "untouched")
+                self.assertTrue((fixture.records / linked).is_symlink())
+                self.assertTrue((fixture.records / "reference-validation-private/worker.log").is_file())
+
+    def test_unconfirmed_worker_exit_retains_private_result_and_log(self):
+        fixture = Fixture(self.root)
+        value = fixture.collect()
+        with mock.patch.object(ref, "run_owned", side_effect=self.worker_result(fixture, value, confirmed=False)), \
+                mock.patch.object(ref.shutil, "rmtree") as cleanup:
+            self.assertFalse(ref.write_sidecar(fixture.frozen, fixture.context, fixture.graphs, fixture.records))
+            cleanup.assert_not_called()
+        final = json.loads((fixture.records / "reference-validation.json").read_bytes())
+        ref.validate_summary(final, fixture.frozen, fixture.bridge)
+        self.assertFalse(final["process_cleanup_confirmed"])
+        self.assertIn("process_exit_unconfirmed", final["reasons"])
+        self.assertTrue((fixture.records / "reference-validation-private/worker.log").is_file())
+
     def test_tool_budget_and_deadline_refuse_new_child(self):
         summary = {"tools": [{}] * ref.TOOL_LIMIT, "process_cleanup_confirmed": True}
         tools = ref.Tools(self.root / "tools", summary, time.monotonic() + ref.SECONDS)

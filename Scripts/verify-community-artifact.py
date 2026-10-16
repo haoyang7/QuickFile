@@ -84,7 +84,12 @@ def bundle_info(app: Path, label: str, relative: str) -> dict:
     return read_plist(path)
 
 
-def validate_configuration(app: Path, *, allow_sparkle_services=False) -> dict:
+def validate_release_tag(release_tag: str, version: str) -> None:
+    if CONTRACT.release_tag_version(release_tag) != version:
+        raise ValueError("release tag must match the app marketing version")
+
+
+def validate_configuration(app: Path, *, allow_sparkle_services=False, check_release_tag=True) -> dict:
     info = read_plist(app / "Contents/Info.plist")
     extension = read_plist(app / "Contents/PlugIns/FinderExtension.appex/Contents/Info.plist")
     for values, identifier, executable in ((info, APP_ID, "QuickFile"), (extension, EXTENSION_ID, "FinderExtension")):
@@ -100,6 +105,12 @@ def validate_configuration(app: Path, *, allow_sparkle_services=False) -> dict:
                 raise ValueError("invalid version or build")
             if value != info.get(key):
                 raise ValueError("app and extension versions must match")
+    if check_release_tag:
+        for values in (info, extension):
+            if "QuickFileReleaseTag" in values:
+                validate_release_tag(values["QuickFileReleaseTag"], values["CFBundleShortVersionString"])
+        if info.get("QuickFileReleaseTag") != extension.get("QuickFileReleaseTag"):
+            raise ValueError("app and extension release tags must match")
     if info.get("QuickFileUpdatesEnabled") not in (False, "NO") or type(info.get("QuickFileUpdatesEnabled")) not in (bool, str):
         raise ValueError("online updates must be explicitly disabled")
     for key in ("SUFeedURL", "SUPublicEDKey"):
@@ -268,6 +279,7 @@ def inspect_artifact(app: Path, runner=run_command) -> dict:
         "schema_version": 1, "scope": "artifact only", "trust": "ad-hoc/unnotarized",
         "verdict": "pass" if all(item["status"] == "pass" for item in checks) else "fail",
         "artifact": "QuickFile.app", "version": info.get("CFBundleShortVersionString"), "build": info.get("CFBundleVersion"),
+        "release_tag": info.get("QuickFileReleaseTag"),
         "unproven": ["cross-machine launch", "Finder integration", "upgrades", "Gatekeeper acceptance"],
         "components": components, "checks": checks,
         "manifest_sha256": hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest() if manifest is not None else None,

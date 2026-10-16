@@ -8,9 +8,17 @@ if [[ ( $# -ne 2 && $# -ne 4 ) || "$1" != "--output" || ( $# -eq 4 && "$3" != "-
     exit 2
 fi
 RELEASE_TAG=${4-}
-if [[ $# -eq 4 && ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[1-9][0-9]*)?$ ]]; then
-    echo "error: release tag must be vVERSION or vVERSION-beta.N with positive N" >&2
-    exit 2
+if [[ $# -eq 4 ]]; then
+    python3 - "$PROJECT_DIRECTORY/Scripts" "$RELEASE_TAG" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from distribution_contract import release_tag_version
+try:
+    release_tag_version(sys.argv[2])
+except ValueError as error:
+    print("error: " + str(error), file=sys.stderr)
+    sys.exit(2)
+PY
 fi
 OUTPUT_DIRECTORY=$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).absolute())' "$2")
 if [[ -e "$OUTPUT_DIRECTORY" || -L "$OUTPUT_DIRECTORY" ]]; then
@@ -130,6 +138,51 @@ PY
 python3 Scripts/verify-localizations.py \
     --derived-data "$TASK_DIRECTORY/DerivedData" \
     --app "$TASK_DIRECTORY/DerivedData/Build/Products/Release/QuickFile.app"
+# Retain matching symbols outside the App before packaging strips local symbols
+# and cleanup removes DerivedData. These archives stay in private build records.
+python3 - "$TASK_DIRECTORY" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+products = root / "DerivedData/Build/Products/Release"
+components = (
+    ("QuickFile.app.dSYM", products / "QuickFile.app/Contents/MacOS/QuickFile"),
+    ("FinderExtension.appex.dSYM", products / "QuickFile.app/Contents/PlugIns/FinderExtension.appex/Contents/MacOS/FinderExtension"),
+)
+
+def uuids(path):
+    result = subprocess.run(["/usr/bin/xcrun", "dwarfdump", "--uuid", str(path)],
+                            check=True, capture_output=True, text=True, timeout=30)
+    rows = re.findall(r"^UUID: ([0-9A-Fa-f-]{36}) \((arm64|x86_64)\) ", result.stdout, re.MULTILINE)
+    if len(rows) != 2 or {arch for _, arch in rows} != {"arm64", "x86_64"}:
+        raise ValueError("debug symbols must match both supported architectures")
+    return {arch: identifier.upper() for identifier, arch in rows}
+
+validated = []
+for name, binary in components:
+    identifiers = uuids(binary)
+    symbols = products / name
+    if uuids(symbols) != identifiers:
+        raise ValueError("debug symbols do not match the application binary")
+    validated.append((name, symbols, identifiers))
+archives = []
+for name, symbols, identifiers in validated:
+    archive = root / "records" / (name + ".zip")
+    subprocess.run(["/usr/bin/ditto", "-c", "-k", "--keepParent", str(symbols), str(archive)],
+                   check=True, capture_output=True, timeout=60)
+    digest = hashlib.sha256()
+    with archive.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    archives.append({"archive": archive.name, "uuids": identifiers, "bytes": archive.stat().st_size,
+                     "sha256": digest.hexdigest()})
+(root / "records/debug-symbols.json").write_text(json.dumps({"schema_version": 1, "components": archives}, indent=2) + "\n")
+PY
 PACKAGE_ARGUMENTS=(
     --app "$TASK_DIRECTORY/DerivedData/Build/Products/Release/QuickFile.app"
     --output "$OUTPUT_DIRECTORY"

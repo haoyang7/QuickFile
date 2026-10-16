@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import ctypes
 import importlib.util
 import json
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
 SPEC = importlib.util.spec_from_file_location("community_artifact", Path(__file__).with_name("verify-community-artifact.py"))
 ARTIFACT = importlib.util.module_from_spec(SPEC)
@@ -105,12 +107,38 @@ def archive_filename(info: dict, release_tag: str | None) -> str:
     version = info["CFBundleShortVersionString"]
     if release_tag is None:
         return f"QuickFile-community-{version}-{info['CFBundleVersion']}.dmg"
-    match = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+)(?:-beta\.[1-9][0-9]*)?", release_tag)
-    if match is None:
-        raise ValueError("release tag must be vVERSION or vVERSION-beta.N with positive N")
-    if match[1] != version:
-        raise ValueError("release tag must match the app marketing version")
+    ARTIFACT.validate_release_tag(release_tag, version)
     return f"QuickFile-{release_tag}.dmg"
+
+
+def encode_localization_resources(app: Path) -> dict:
+    files = {}
+    for _, relative, _ in ARTIFACT.COMPONENTS:
+        resources = app / relative / "Contents/Resources"
+        for path in sorted(resources.glob("*.lproj/*")):
+            if path.suffix not in (".strings", ".stringsdict") or not path.is_file() or path.is_symlink():
+                continue
+            original = path.read_bytes()
+            data = original
+            # Xcode emits UTF-16 XML; normalize its declaration for plistlib,
+            # matching the compiled-resource reader in verify-localizations.py.
+            try:
+                if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+                    data = data.decode("utf-16").replace('encoding="UTF-16"', 'encoding="UTF-8"', 1).encode("utf-8")
+                values = plistlib.loads(data)
+            except (plistlib.InvalidFileException, ExpatError, UnicodeError, ValueError):
+                raise ValueError("invalid compiled localization resource") from None
+            if not isinstance(values, dict):
+                raise ValueError("compiled localization resource must be a dictionary")
+            encoded = plistlib.dumps(values, fmt=plistlib.FMT_BINARY, sort_keys=True)
+            if plistlib.loads(encoded) != values:
+                raise ValueError("localization resource encoding changed its values")
+            if len(encoded) < len(original):
+                path.write_bytes(encoded)
+            files[path.relative_to(app).as_posix()] = {
+                "before_bytes": len(original), "after_bytes": min(len(encoded), len(original)),
+            }
+    return {"format": "binary plist when smaller", "stage": "private copy before signing", "files": files}
 
 
 def package(arguments: argparse.Namespace) -> dict:
@@ -125,8 +153,9 @@ def package(arguments: argparse.Namespace) -> dict:
     if app.is_relative_to(applications) or output.is_relative_to(applications):
         raise ValueError("community packaging must use paths outside /Applications")
     input_manifest = ARTIFACT.validate_layout(app, allow_sparkle=True)
-    info = ARTIFACT.validate_configuration(app, allow_sparkle_services=True)
-    filename = archive_filename(info, getattr(arguments, "release_tag", None))
+    info = ARTIFACT.validate_configuration(app, allow_sparkle_services=True, check_release_tag=False)
+    release_tag = getattr(arguments, "release_tag", None)
+    filename = archive_filename(info, release_tag)
     for label, relative, binary_relative in ARTIFACT.COMPONENTS:
         binary = app / relative / binary_relative
         for architecture in ARTIFACT.ARCHITECTURES:
@@ -150,10 +179,28 @@ def package(arguments: argparse.Namespace) -> dict:
         sparkle = copied / ARTIFACT.SPARKLE
         if sparkle.exists():
             shutil.rmtree(sparkle)
-        copied_info = ARTIFACT.read_plist(copied / "Contents/Info.plist")
-        copied_info.update({"SUEnableInstallerLauncherService": False, "SUEnableDownloaderService": False})
-        (copied / "Contents/Info.plist").write_bytes(plistlib.dumps(copied_info))
+        for label, relative, _ in ARTIFACT.COMPONENTS:
+            path = copied / relative / "Contents/Info.plist"
+            values = ARTIFACT.read_plist(path)
+            if label == "app":
+                values.update({"SUEnableInstallerLauncherService": False, "SUEnableDownloaderService": False})
+            values.pop("QuickFileReleaseTag", None)
+            if release_tag is not None:
+                values["QuickFileReleaseTag"] = release_tag
+            path.write_bytes(plistlib.dumps(values))
         ARTIFACT.validate_layout(copied)
+        resource_encoding = encode_localization_resources(copied)
+        stripped_binaries = {}
+        # Strip only non-global symbols from the private copy before signing.
+        # The unchanged build input remains paired with its external dSYMs.
+        for label, relative, binary_relative in ARTIFACT.COMPONENTS:
+            binary = copied / relative / binary_relative
+            before_bytes = binary.stat().st_size
+            run(["/usr/bin/xcrun", "strip", "-x", str(binary)])
+            stripped_binaries[label] = {
+                "binary": binary.relative_to(copied).as_posix(),
+                "before_bytes": before_bytes, "after_bytes": binary.stat().st_size,
+            }
         for label, relative, _ in ARTIFACT.COMPONENTS:
             configuration = staging / (label + ".entitlements")
             configuration.write_bytes(plistlib.dumps(entitlements[label]))
@@ -187,7 +234,8 @@ def package(arguments: argparse.Namespace) -> dict:
             "两条 xattr 命令都不提供签名、公证或目录访问授权。无需全局关闭 Gatekeeper 或 SIP。\n\n"
             "在系统设置中启用 QuickFile 的 Finder 扩展，再在应用内验证 Finder 集成。\n"
             "Finder 扩展开关与目录授权是独立步骤；按应用提示授权需要使用的目录。\n"
-            "QuickFile 无需“完全磁盘访问”。此版本不自动检查更新，升级需手动下载安装。\n"
+            "QuickFile 无需“完全磁盘访问”。可在“检查更新…”中手动查询 GitHub Release；\n"
+            "预发布版本需开启“接收 Beta 版本”。升级仍需从发行页手动下载、校验并安装。\n"
             "Community 与新版 Developer ID 共用本地数据目录；旧 App Group 模板可通过导出、导入转移。\n"
             "若模板或授权交接队列持续加载，停止创建验收，保留旧版和数据备份，不删除共享目录或旧 App Group 数据。\n"
             "记录升级前后版本/build、分发路线、macOS 版本和等待时长，按发布页反馈；不要上传书签或私人日志。\n"
@@ -205,7 +253,7 @@ def package(arguments: argparse.Namespace) -> dict:
         shutil.rmtree(copied.parent)
         for configuration in staging.glob("*.entitlements"):
             configuration.unlink()
-        report.update({"archive": filename, "archive_sha256": digest, "archive_bytes": image.stat().st_size, "dmg": dmg_report, "cleanup": "DMG detached; temporary signing and image copies removed before publication"})
+        report.update({"archive": filename, "archive_sha256": digest, "archive_bytes": image.stat().st_size, "dmg": dmg_report, "resource_encoding": resource_encoding, "symbol_stripping": {"tool": "xcrun strip", "flags": ["-x"], "stage": "private copy before signing", "components": stripped_binaries}, "cleanup": "DMG detached; temporary signing and image copies removed before publication"})
         (delivery / (filename + ".sha256")).write_text(digest + "  " + filename + "\n", encoding="utf-8")
         (delivery / "artifact-check.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (delivery / "INSTALL.txt").write_bytes(installation_notes)

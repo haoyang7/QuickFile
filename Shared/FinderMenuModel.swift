@@ -125,7 +125,15 @@ public struct FinderMenuAction: Equatable, Sendable {
         self.templateID = templateID
         self.context = context
         self.menuTimingID = menuTimingID
-        self.target = .selection(targetedURL: targetedURL, selectedItemURLs: selectedItemURLs)
+        let capturedSelection: [URL]
+        if context == .container || (context == .toolbar && targetedURL != nil) {
+            // Resolution ignores this selection. Preserve its original first URL for
+            // scheduler admission without retaining the unused array or its tail.
+            capturedSelection = selectedItemURLs.first.map { [$0] } ?? []
+        } else {
+            capturedSelection = selectedItemURLs
+        }
+        self.target = .selection(targetedURL: targetedURL, selectedItemURLs: capturedSelection)
         self.preparedDestination = preparedDestination
     }
 }

@@ -165,6 +165,20 @@ class ProjectionTests(TemporaryTests):
         measurement['original_scans'][0]['groups'][0]['root_type'] = 'NSXPCConnection'
         measurement['failure_counts']['notifications'] = 1
         self.assertEqual(C.hypothetical(measurement, shadow), 'failed')
+    def test_zero_totals_require_complete_group_trees(self):
+        empty = 'Process 123: 0 leaks for 0 total leaked bytes.\n'
+        invalid = empty + ("STACK OF 1 INSTANCE OF 'ROOT LEAK: NSXPCConnection':\n"
+            '0 synthetic-image 0x1234 synthetic_function + 0\n====\n'
+            '    1 (48 bytes) << TOTAL >>\n      1 (48 bytes) ROOT LEAK: NSXPCConnection\n')
+        for text, passed in ((invalid, False), (empty, True)):
+            with self.subTest(complete_tree=passed):
+                (self.records / 'baseline-original.stdout.txt').write_text(text)
+                row = C.project_scan(raw_scan('baseline', text), self.records)
+                self.assertEqual(row['unclassified_nodes'], 0)
+                self.assertEqual(C.classification_passed(row), passed)
+                self.assertEqual(C.fits(row, row), passed)
+                measurement = {'original_scans': [row] * 6, 'failure_counts': dict.fromkeys(C.FAILURES, 0)}
+                self.assertEqual(C.strict_verdict(measurement, process(0)), 'passed' if passed else 'failed')
     def test_private_names_map_to_fixed_unknown(self):
         text = report(kind='PrivateHostSecret')
         row = raw_scan('baseline', text)

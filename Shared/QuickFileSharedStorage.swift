@@ -109,6 +109,7 @@ final class LocalSharedStorage: @unchecked Sendable {
                 guard status.st_uid == geteuid(), forPermissionRepair || status.st_mode & 0o077 == 0 else {
                     throw POSIXError(.EACCES)
                 }
+                try validatePrivateACL(descriptor)
                 let path = "/" + components[1...index].joined(separator: "/")
                 let identity = Identity(status)
                 let valid = directories.withLock { entries in
@@ -129,6 +130,7 @@ final class LocalSharedStorage: @unchecked Sendable {
         guard named.st_mode & S_IFMT == S_IFDIR, Identity(opened) == Identity(named) else {
             throw POSIXError(.ESTALE)
         }
+        try validatePrivateACL(descriptor)
         // A rename of an ancestor must not make the pinned directory publish elsewhere.
         var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
         guard fcntl(descriptor, F_GETPATH, &path) == 0 else { throw posixError() }
@@ -144,18 +146,46 @@ final class LocalSharedStorage: @unchecked Sendable {
         var status = stat()
         guard fstat(descriptor, &status) == 0 else { throw posixError() }
         try validateFile(status)
+        try validatePrivateACL(descriptor)
+    }
+
+    // Inspect ACLs through the opened inode, then match it to the directory entry.
+    private func containsPrivateFile(named name: String, parent: Int32) throws -> Bool {
+        let descriptor = openat(parent, name, O_EVTONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            if errno == ENOENT { return false }
+            throw posixError()
+        }
+        defer { close(descriptor) }
+        try validateFile(descriptor: descriptor)
+        var opened = stat(), named = stat()
+        guard fstat(descriptor, &opened) == 0,
+              fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) == 0 else { throw posixError() }
+        guard Identity(opened) == Identity(named) else { throw POSIXError(.ESTALE) }
+        return true
     }
 
     func containsFile(at url: URL) throws -> Bool {
         try withDirectory(url.deletingLastPathComponent()) { parent in
-            var status = stat()
-            guard fstatat(parent, url.lastPathComponent, &status, AT_SYMLINK_NOFOLLOW) == 0 else {
-                if errno == ENOENT { return false }
-                throw posixError()
-            }
-            try validateFile(status)
-            return true
+            try containsPrivateFile(named: url.lastPathComponent, parent: parent)
         }
+    }
+
+    /// chmod cannot revoke extended allow entries, including inheritance-only grants.
+    /// Keep user ACLs intact and refuse a boundary whose privacy cannot be established.
+    private func validatePrivateACL(_ descriptor: Int32) throws {
+        if let acl = acl_get_fd(descriptor) {
+            defer { acl_free(UnsafeMutableRawPointer(acl)) }
+            var entry: acl_entry_t?
+            var entryID = Int32(ACL_FIRST_ENTRY.rawValue)
+            while acl_get_entry(acl, entryID, &entry) == 0 {
+                guard let entry else { throw POSIXError(.EACCES) }
+                var tag = ACL_UNDEFINED_TAG
+                guard acl_get_tag_type(entry, &tag) == 0 else { throw posixError() }
+                guard tag != ACL_EXTENDED_ALLOW else { throw POSIXError(.EACCES) }
+                entryID = Int32(ACL_NEXT_ENTRY.rawValue)
+            }
+        } else if errno != ENOENT && errno != ENOTSUP { throw posixError() }
     }
 
     /// Explicit user action only. Restores owner-only modes without reading or replacing data.
@@ -232,6 +262,7 @@ final class LocalSharedStorage: @unchecked Sendable {
                 guard opened.st_mode & S_IFMT == S_IFREG, opened.st_uid == geteuid(),
                       opened.st_nlink == 1, named.st_mode & S_IFMT == S_IFREG,
                       Identity(opened) == Identity(named) else { throw POSIXError(.EACCES) }
+                try validatePrivateACL(descriptor)
             }
             func openEntry(_ name: String, create: Bool = false) throws -> Int32? {
                 var descriptor = openat(parent, name, O_EVTONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
@@ -282,48 +313,47 @@ final class LocalSharedStorage: @unchecked Sendable {
             guard fstat(descriptor, &opened) == 0, Identity(opened) == Identity(named),
                   fstatfs(descriptor, &volume) == 0,
                   volume.f_flags & UInt32(MNT_UNKNOWNPERMISSIONS) == 0 else { throw POSIXError(.EACCES) }
-            // chmod does not remove an extended allow ACL. Do not report that boundary as repaired.
-            if let acl = acl_get_fd(descriptor) {
-                defer { acl_free(UnsafeMutableRawPointer(acl)) }
-                var entry: acl_entry_t?
-                var entryID = Int32(ACL_FIRST_ENTRY.rawValue)
-                while acl_get_entry(acl, entryID, &entry) == 0 {
-                    guard let entry else { throw POSIXError(.EACCES) }
-                    var tag = ACL_UNDEFINED_TAG
-                    guard acl_get_tag_type(entry, &tag) == 0, tag != ACL_EXTENDED_ALLOW else { throw POSIXError(.EACCES) }
-                    entryID = Int32(ACL_NEXT_ENTRY.rawValue)
-                }
-            } else if errno != ENOENT && errno != ENOTSUP { throw posixError() }
             try validateDirectory(parent, at: queue)
             guard fchmod(descriptor, 0o700) == 0 else { throw posixError() }
             try validateDirectory(descriptor, at: archive)
         }
     }
 
-    func read(_ url: URL, maximumBytes: Int = 64 * 1024 * 1024) throws -> Data {
-        try withDirectory(url.deletingLastPathComponent()) { parent in
+    /// nil permits normal historical payloads of any size; recovery callers keep a finite budget.
+    func read(_ url: URL, maximumBytes: Int? = 64 * 1024 * 1024) throws -> Data {
+        if let maximumBytes, maximumBytes < 0 { throw POSIXError(.EINVAL) }
+        return try withDirectory(url.deletingLastPathComponent()) { parent in
             let descriptor = openat(parent, url.lastPathComponent, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
             guard descriptor >= 0 else {
                 if errno == ENOENT { throw CocoaError(.fileReadNoSuchFile) }
                 throw posixError()
             }
             defer { close(descriptor) }
+            try validateFile(descriptor: descriptor)
             var before = stat()
             guard fstat(descriptor, &before) == 0 else { throw posixError() }
-            try validateFile(before)
-            guard before.st_size >= 0, before.st_size <= maximumBytes else { throw POSIXError(.EFBIG) }
+            guard before.st_size >= 0 else { throw POSIXError(.EFBIG) }
+            if let maximumBytes, before.st_size > maximumBytes { throw POSIXError(.EFBIG) }
             var data = Data()
-            var buffer = [UInt8](repeating: 0, count: min(64 * 1024, maximumBytes + 1))
-            while data.count <= maximumBytes {
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            while true {
+                // Read one byte beyond a finite budget to detect growth after fstat,
+                // without ever computing maximumBytes + 1 (which can overflow).
+                let capacity: Int
+                if let maximumBytes {
+                    capacity = min(buffer.count - 1, maximumBytes - data.count) + 1
+                } else {
+                    capacity = buffer.count
+                }
                 let count = buffer.withUnsafeMutableBytes {
-                    Darwin.read(descriptor, $0.baseAddress, min($0.count, maximumBytes + 1 - data.count))
+                    Darwin.read(descriptor, $0.baseAddress, capacity)
                 }
                 if count == 0 { break }
                 if count < 0, errno == EINTR { continue }
                 guard count > 0 else { throw posixError() }
+                if let maximumBytes, count > maximumBytes - data.count { throw POSIXError(.EFBIG) }
                 data.append(contentsOf: buffer.prefix(count))
             }
-            guard data.count <= maximumBytes else { throw POSIXError(.EFBIG) }
             try validateDirectory(parent, at: url.deletingLastPathComponent())
             return data
         }
@@ -332,10 +362,7 @@ final class LocalSharedStorage: @unchecked Sendable {
     func write(_ data: Data, to url: URL, durable: Bool = false) throws {
         try withDirectory(url.deletingLastPathComponent()) { parent in
             func validateTarget() throws {
-                var target = stat()
-                if fstatat(parent, url.lastPathComponent, &target, AT_SYMLINK_NOFOLLOW) == 0 {
-                    try validateFile(target)
-                } else if errno != ENOENT { throw posixError() }
+                _ = try containsPrivateFile(named: url.lastPathComponent, parent: parent)
             }
             try validateTarget()
             try removeAbandonedWrites(in: url.deletingLastPathComponent(), parent: parent)
@@ -345,6 +372,7 @@ final class LocalSharedStorage: @unchecked Sendable {
             let descriptor = openat(parent, temporary, O_WRONLY | O_CREAT | O_EXCL | O_EXLOCK | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, 0o600)
             guard descriptor >= 0 else { throw posixError() }
             defer { close(descriptor); unlinkat(parent, temporary, 0) }
+            try validateFile(descriptor: descriptor)
             try data.withUnsafeBytes { buffer in
                 var offset = 0
                 while offset < buffer.count {
@@ -354,6 +382,7 @@ final class LocalSharedStorage: @unchecked Sendable {
                     offset += count
                 }
             }
+            try validateFile(descriptor: descriptor)
             if durable, fsync(descriptor) != 0 { throw posixError() }
             try validateDirectory(parent, at: url.deletingLastPathComponent())
             try validateTarget()
@@ -392,6 +421,7 @@ final class LocalSharedStorage: @unchecked Sendable {
                   Double(opened.st_mtimespec.tv_sec) < cutoff,
                   fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) == 0,
                   Identity(opened) == Identity(named) else { continue }
+            guard (try? validatePrivateACL(candidate)) != nil else { continue }
             try validateDirectory(parent, at: directory)
             // Cleanup failure must not prevent a normal save; another write can retry.
             _ = unlinkat(parent, name, 0)
@@ -400,9 +430,9 @@ final class LocalSharedStorage: @unchecked Sendable {
 
     func remove(_ url: URL) throws {
         try withDirectory(url.deletingLastPathComponent()) { parent in
-            var status = stat()
-            guard fstatat(parent, url.lastPathComponent, &status, AT_SYMLINK_NOFOLLOW) == 0 else { throw posixError() }
-            try validateFile(status)
+            guard try containsPrivateFile(named: url.lastPathComponent, parent: parent) else {
+                throw POSIXError(.ENOENT)
+            }
             try validateDirectory(parent, at: url.deletingLastPathComponent())
             guard unlinkat(parent, url.lastPathComponent, 0) == 0 else { throw posixError() }
         }
@@ -416,7 +446,7 @@ final class LocalSharedStorage: @unchecked Sendable {
             defer { close(descriptor) }
             var opened = stat(), named = stat()
             guard fstat(descriptor, &opened) == 0 else { throw posixError() }
-            try validateFile(opened)
+            try validateFile(descriptor: descriptor)
             while flock(descriptor, LOCK_EX) != 0 {
                 guard errno == EINTR else { throw posixError() }
             }

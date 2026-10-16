@@ -36,7 +36,7 @@ REASONS = ("input_invalid", "original_partial", "original_cleanup_unconfirmed", 
            "list_unavailable", "tree_unavailable", "heap_unavailable", "history_unavailable",
            "history_budget", "allocation_unknown", "trace_unavailable", "layout_unavailable",
            "context_unavailable", "root_limit", "candidate_limit", "upstream_limit", "reference_budget", "reference_conflict", "snapshot_conflict", "summary_budget",
-           "tool_budget", "deadline", "tool_failed", "process_exit_unconfirmed", "private_cleanup_failed", "worker_failed", "no_targets")
+           "tool_budget", "deadline", "tool_failed", "process_exit_unconfirmed", "private_cleanup_pending", "private_cleanup_failed", "worker_failed", "no_targets")
 GENERATIONS = ("same_generation", "reused", "freed", "new_allocation", "absent_at_checkpoints", "unknown")
 VIEW_STATES = ("complete", "not_present", "not_reported", "unknown", "budget_exceeded")
 
@@ -741,6 +741,18 @@ def encode_summary(value, frozen, bridge):
     return encode(value)
 
 
+def save_summary(path, value, frozen, bridge):
+    payload = encode_summary(value, frozen, bridge)
+    temporary = path.with_suffix(".tmp")
+    if path.is_symlink() or temporary.is_symlink():
+        raise ValueError("Invalid reference validation summary destination")
+    try:
+        temporary.write_bytes(payload)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def write_sidecar(frozen, context, graphs, records):
     """Called only after original summaries are saved; never edits those files."""
     value, bridge = None, None
@@ -788,19 +800,24 @@ def write_sidecar(frozen, context, graphs, records):
             value["process_cleanup_confirmed"] = confirmed and (not launched or 'outcome' in locals() and outcome["cleanup"]["complete"])
             reason(value, "input_invalid")
             if not value["process_cleanup_confirmed"]: reason(value, "process_exit_unconfirmed")
-    if created and value is not None and value.get("process_cleanup_confirmed"):
-        try:
-            shutil.rmtree(private)
-        except OSError:
-            reason(value, "private_cleanup_failed")
     try:
         if value is None or bridge is None:
             return False
-        payload = encode_summary(value, frozen, bridge)
         target = records / "reference-validation.json"
-        if target.is_symlink():
-            return False
-        target.write_bytes(payload)
+        if created and value["process_cleanup_confirmed"]:
+            # Commit the measured evidence before deleting its private inputs.
+            # A failed final publication leaves this valid partial checkpoint,
+            # never a complete summary that implies cleanup succeeded.
+            status = value["status"]
+            reason(value, "private_cleanup_pending")
+            save_summary(target, value, frozen, bridge)
+            value["reasons"].remove("private_cleanup_pending")
+            value["status"] = status
+            try:
+                shutil.rmtree(private)
+            except OSError:
+                reason(value, "private_cleanup_failed")
+        save_summary(target, value, frozen, bridge)
         return value["status"] == "complete" and value["process_cleanup_confirmed"]
     except (OSError, ValueError, TypeError, KeyError, RecursionError):
         return False

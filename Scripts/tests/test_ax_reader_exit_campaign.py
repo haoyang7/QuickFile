@@ -197,6 +197,25 @@ class ProjectionTests(TemporaryTests):
         self.assertEqual(projected["scans"][0]["composition"]["counts_status"], "complete")
         self.assertNotIn("PrivateClassName", C.canonical(projected).decode())
 
+    def test_zero_totals_recompute_strict_from_complete_group_trees(self):
+        empty = "Process 123: 0 leaks for 0 total leaked bytes.\n"
+        invalid = empty + ("STACK OF 1 INSTANCE OF 'ROOT LEAK: NSXPCConnection':\n"
+            "0 synthetic-image 0x1234 synthetic_function + 0\n====\n"
+            "    1 (48 bytes) << TOTAL >>\n      1 (48 bytes) ROOT LEAK: NSXPCConnection\n")
+        for text, passed in ((invalid, False), (empty, True)):
+            with self.subTest(complete_tree=passed):
+                raw = raw_fixture(self.records)
+                for row in raw["scans"]:
+                    row.update(leak_nodes=0, leak_bytes=0, unclassified_nodes=0, groups=C.leak_groups(text),
+                        stdout_sha256=hashlib.sha256(text.encode()).hexdigest())
+                    (self.records / (row["label"] + "-original.stdout.txt")).write_text(text)
+                expected = {"status": "passed" if passed else "failed", "failed_labels": [] if passed else list(C.LABELS)}
+                raw["strict_verdict"] = expected
+                save(self.records / "trial.json", raw)
+                projected = C.project_trial(self.records, process(0 if passed else 1), manifest()["executables"], "keep", manifest()["sources"])
+                self.assertEqual(C.derived_strict(projected["scans"]), expected)
+                C.validate_measurement(projected, manifest()["executables"], "keep")
+
     def test_type_delta_reports_net_counts_with_unknown_generation(self):
         projected = self.project(failed=True)
         delta = projected["scans"][1]["baseline_delta"]
