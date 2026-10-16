@@ -79,6 +79,82 @@ final class TemplateRefreshTests: XCTestCase {
         XCTAssertTrue(model.canCreate)
     }
 
+    func testForcedRefreshAfterSaveSharesAuthoritativeBodyStorage() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "old")
+        try store.saveTemplates([original])
+        let source = store!
+        let reads = RefreshCounter()
+        let model = QuickFileViewModel(templateStore: source, authoritativeTemplateLoader: {
+            reads.increment()
+            return try source.reloadTemplates()
+        })
+        await model.loadTemplatesIfNeeded()
+        model.destinationFolder = directory
+        model.requestedFilename = "next file"
+        var edited = original
+        // Dynamic, multi-megabyte native storage avoids literal interning and small strings.
+        edited.content = String(repeating: "\(UUID().uuidString):正文📝\n", count: 65_536)
+        try await model.saveTemplate(edited, replacing: original)
+        var editor = TemplateEditorState(template: edited)
+        editor.draft.content = "unsaved draft"
+        let generation = try templateGeneration(of: model)
+        let savedStatus = model.status
+
+        model.requestTemplateRefresh(force: true)
+        try await settle(model)
+        let authoritative = try source.reloadTemplates()
+        XCTAssertEqual(model.templates, [edited])
+        XCTAssertEqual(authoritative, [edited])
+        // On the macOS Swift runtime, these long native strings expose contiguous
+        // UTF-8. Compare only during both borrows; never retain either pointer.
+        let sharesBodyStorage = try XCTUnwrap(model.templates[0].content.utf8.withContiguousStorageIfAvailable { modelBytes in
+            authoritative[0].content.utf8.withContiguousStorageIfAvailable { storeBytes in
+                modelBytes.baseAddress == storeBytes.baseAddress && modelBytes.count == storeBytes.count
+            }
+        })
+        XCTAssertTrue(try XCTUnwrap(sharesBodyStorage), "The model must adopt the Store's decoded snapshot after saving")
+        XCTAssertEqual(try templateGeneration(of: model), generation)
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(model.status, savedStatus)
+        XCTAssertEqual(model.selectedTemplateID, edited.id)
+        XCTAssertEqual(model.requestedFilename, "next file")
+        XCTAssertTrue(model.canCreate)
+        XCTAssertEqual(editor.draft.content, "unsaved draft")
+        XCTAssertTrue(editor.isDirty)
+
+        let publications = RefreshCounter()
+        let subscription = model.objectWillChange.sink { publications.increment() }
+        defer { subscription.cancel() }
+        model.requestTemplateRefresh()
+        try await settle(model)
+        XCTAssertEqual(publications.count, 0)
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(try templateGeneration(of: model), generation)
+    }
+
+    func testAuthoritativeRefreshAdvancesGenerationOnlyForChangedTemplates() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "old")
+        try store.saveTemplates([original])
+        let model = QuickFileViewModel(templateStore: store)
+        await model.loadTemplatesIfNeeded()
+        let generation = try templateGeneration(of: model)
+        model.requestTemplateRefresh(force: true)
+        try await settle(model)
+        XCTAssertEqual(try templateGeneration(of: model), generation)
+
+        var external = original
+        external.content = "external"
+        try JSONEncoder().encode([external]).write(to: directory.appendingPathComponent("templates.json"), options: .atomic)
+        model.requestTemplateRefresh(force: true)
+        try await settle(model)
+        XCTAssertEqual(model.templates, [external])
+        XCTAssertEqual(try templateGeneration(of: model), generation + 1)
+    }
+
+    private func templateGeneration(of model: QuickFileViewModel) throws -> UInt64 {
+        try XCTUnwrap(Mirror(reflecting: model).descendant("templateStateGeneration") as? UInt64)
+    }
+
     func testProbePreservesNotificationAndManualWaiter() async throws {
         let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
         try store.saveTemplates([original])

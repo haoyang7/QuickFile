@@ -337,6 +337,90 @@ final class FinderMenuModelTests: XCTestCase {
         XCTAssertNil(registry.takeAction(for: tag))
     }
 
+    func testActionsCaptureOnlyTheSelectionRequiredByEachContext() throws {
+        let first = URL(fileURLWithPath: "/Volumes/NotMounted/folder/../first")
+        let second = URL(fileURLWithPath: "/Volumes/NotMounted/folder/second")
+        let target = URL(fileURLWithPath: "/Volumes/NotMounted/target/../folder")
+        let templateID = UUID()
+        let identity = try DirectoryIdentity.capture(at: FileManager.default.temporaryDirectory)
+        let prepared = FinderMenuDestination(folder: target, identity: identity)
+
+        for context in [FinderMenuContext.container, .toolbar, .items, .sidebar] {
+            for targetedURL in [nil, target] {
+                for selection in [[], [first], [first, second]] {
+                    let action = FinderMenuAction(
+                        templateID: templateID, context: context, targetedURL: targetedURL,
+                        selectedItemURLs: selection, preparedDestination: prepared, menuTimingID: "original-menu"
+                    )
+                    let ignoresSelection = context == .container || (context == .toolbar && targetedURL != nil)
+                    let expected = ignoresSelection ? selection.first.map { [$0] } ?? [] : selection
+                    XCTAssertEqual(action.target, .selection(targetedURL: targetedURL, selectedItemURLs: expected))
+                    XCTAssertEqual(action.templateID, templateID)
+                    XCTAssertEqual(action.context, context)
+                    XCTAssertEqual(action.preparedDestination, prepared)
+                    XCTAssertEqual(action.menuTimingID, "original-menu")
+                }
+            }
+        }
+    }
+
+    func testActionSelectionPreservesMixedAndMissingTailForBackgroundValidation() throws {
+        let parent = URL(fileURLWithPath: "/QuickFileFixture/Selection")
+        let items = (0..<257).map { parent.appendingPathComponent("item-\($0)") }
+        for context in [FinderMenuContext.items, .toolbar] {
+            for mixedParents in [false, true] {
+                var selection = items
+                if mixedParents {
+                    selection[256] = URL(fileURLWithPath: "/QuickFileFixture/Other/tail")
+                }
+                let action = FinderMenuAction(templateID: UUID(), context: context,
+                                              targetedURL: nil, selectedItemURLs: selection)
+                guard case let .selection(targetedURL, captured) = action.target else {
+                    return XCTFail("Expected captured selection")
+                }
+                var inspected: [URL] = []
+                let resolver = FinderContextResolver(isDirectory: { _ in true }, entryExists: { url in
+                    inspected.append(url)
+                    return url != items.last
+                })
+                XCTAssertEqual(captured, selection)
+                XCTAssertNil(resolver.destinationFolder(for: context, targetedURL: targetedURL, selectedItemURLs: captured))
+                XCTAssertEqual(inspected, mixedParents ? [] : items)
+            }
+        }
+    }
+
+    func testRegistryKeepsThreeGenerationsOfReducedSelectionActionsAndTheirOriginalProof() throws {
+        let registry = FinderMenuActionRegistry()
+        let parent = URL(fileURLWithPath: "/Volumes/NotMounted/Selection")
+        let identity = try DirectoryIdentity.capture(at: FileManager.default.temporaryDirectory)
+        let prepared = FinderMenuDestination(folder: parent, identity: identity)
+        var tags: [[Int]] = []
+        var expectedActions: [FinderMenuAction] = []
+        for generation in 0..<3 {
+            let selection = (0..<5_000).map { parent.appendingPathComponent("generation-\(generation)-item-\($0)") }
+            let context: FinderMenuContext = generation == 1 ? .toolbar : .container
+            let action = FinderMenuAction(templateID: UUID(), context: context,
+                                          targetedURL: parent, selectedItemURLs: selection,
+                                          preparedDestination: prepared, menuTimingID: "menu-\(generation)")
+            tags.append(registry.registerMenu([action, action]))
+            expectedActions.append(action)
+            XCTAssertEqual(action.target, .selection(targetedURL: parent, selectedItemURLs: [selection[0]]))
+        }
+        for index in 0..<3 {
+            XCTAssertEqual(registry.takeAction(for: tags[index][0]), expectedActions[index])
+        }
+        // An empty fourth menu advances retention without replacing any captured proof.
+        _ = registry.registerMenu([])
+        XCTAssertNil(registry.takeAction(for: tags[0][1]))
+        for index in 1..<3 {
+            let retained = try XCTUnwrap(registry.takeAction(for: tags[index][1]))
+            XCTAssertEqual(retained, expectedActions[index])
+            XCTAssertEqual(retained.preparedDestination, prepared)
+            XCTAssertNil(registry.takeAction(for: tags[index][1]))
+        }
+    }
+
     func testRegistryPreservesMenuTraceIdentityAcrossMenuRebuild() throws {
         let registry = FinderMenuActionRegistry()
         let menuID = UUID().uuidString

@@ -104,6 +104,34 @@ final class FinderOperationSchedulerTests: XCTestCase {
         wait(for: [finished], timeout: 2)
     }
 
+    func testReducedSelectionsPreserveOriginalFirstURLAdmissionKeys() {
+        let parent = URL(fileURLWithPath: "/QuickFileFixture/Selection")
+        let first = parent.appendingPathComponent("first")
+        let other = parent.appendingPathComponent("other")
+        for context in [FinderMenuContext.container, .toolbar] {
+            let scheduler = FinderOperationScheduler()
+            let release = DispatchSemaphore(value: 0)
+            let finished = expectation(description: "Both \(context) operations finished")
+            finished.expectedFulfillmentCount = 2
+            let original = FinderMenuAction(templateID: UUID(), context: context,
+                targetedURL: parent, selectedItemURLs: [first, other])
+            let sameFirst = FinderMenuAction(templateID: UUID(), context: context,
+                targetedURL: parent, selectedItemURLs: [first, parent.appendingPathComponent("changed-tail")])
+            let differentFirst = FinderMenuAction(templateID: UUID(), context: context,
+                targetedURL: parent, selectedItemURLs: [other, first])
+            let operation: @Sendable () -> Void = {
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+                finished.fulfill()
+            }
+            XCTAssertEqual(scheduler.submitCreation(original, operation: operation), .accepted)
+            XCTAssertEqual(scheduler.submitCreation(sameFirst) { XCTFail("Repeated context executed") }, .targetBusy)
+            XCTAssertEqual(scheduler.submitCreation(differentFirst, operation: operation), .accepted)
+            release.signal()
+            release.signal()
+            wait(for: [finished], timeout: 2)
+        }
+    }
+
     private func action(_ path: String) -> FinderMenuAction {
         FinderMenuAction(templateID: UUID(), context: .container, destinationFolder: URL(fileURLWithPath: path))
     }

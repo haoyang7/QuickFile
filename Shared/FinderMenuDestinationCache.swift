@@ -44,7 +44,9 @@ public struct FinderMenuDestination: Equatable, Sendable {
 /// cancellation mechanism for the underlying synchronous filesystem reads.
 /// A cache miss fails closed.
 /// Exact selection equality deliberately includes the entire selection, never a prefix.
-/// Its memory-only comparison is O(selection size); real menu latency still needs measurement.
+/// Cached selections retain at most 4,096 items in total, or just the newest selection
+/// when it alone exceeds that budget. In-flight reads retain their full inputs separately.
+/// Exact comparison remains O(selection size); real menu latency still needs measurement.
 public final class FinderMenuDestinationCache: @unchecked Sendable {
     public enum Snapshot: Equatable, Sendable {
         /// Preparation for this exact selection is already running or was just admitted.
@@ -73,6 +75,7 @@ public final class FinderMenuDestinationCache: @unchecked Sendable {
     private let standardizeURL: @Sendable (URL) -> URL
     private let maximumEntries: Int
     private let maximumConcurrentPreparations: Int
+    private static let maximumCachedSelectionItems = 4_096
     private var entries: [Entry] = []
     private struct Preparation {
         let generation: UUID
@@ -203,7 +206,16 @@ public final class FinderMenuDestinationCache: @unchecked Sendable {
         // Keep the requested entry ahead of an optional alias in the LRU, including
         // when the configured cache has room for only one snapshot.
         entries.append(entry)
-        while entries.count > maximumEntries { entries.removeFirst() }
+        // Count array elements without traversing or hashing the URLs on the menu thread.
+        // Keep one complete oversized selection so its next menu can still use its proof.
+        // Active preparations are independent: eviction must not release their slots or
+        // allow an old generation to publish into a subsequently recreated entry.
+        var selectionItems = entries.reduce(0) { $0 + $1.selection.selectedItemURLs.count }
+        while entries.count > maximumEntries || (
+            entries.count > 1 && selectionItems > Self.maximumCachedSelectionItems
+        ) {
+            selectionItems -= entries.removeFirst().selection.selectedItemURLs.count
+        }
         lock.unlock()
 
         if let linkedTimingID { timing?.mark("menu.destination.preparation.link", relatedID: linkedTimingID) }
@@ -246,6 +258,11 @@ public final class FinderMenuDestinationCache: @unchecked Sendable {
     var cachedEntryCount: Int {
         lock.lock(); defer { lock.unlock() }
         return entries.count
+    }
+
+    var cachedSelectionItemCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return entries.reduce(0) { $0 + $1.selection.selectedItemURLs.count }
     }
 
     var activePreparationCount: Int {

@@ -398,6 +398,90 @@ final class FinderMenuDestinationCacheTests: XCTestCase {
         try waitUntil { cache.activePreparationCount == 0 }
     }
 
+    func testSelectionItemBudgetEvictsLeastRecentlyUsedProofs() throws {
+        let cache = FinderMenuDestinationCache { _ in nil }
+        let selections = (0..<6).map { largeSelection("Item-\($0)", count: 1_024) }
+        for selection in selections.prefix(4) {
+            XCTAssertEqual(cache.menuSnapshot(for: selection, waitingUntil: .now() + 2), .unavailable)
+        }
+        XCTAssertEqual(cache.cachedEntryCount, 4)
+        XCTAssertEqual(cache.cachedSelectionItemCount, 4_096)
+
+        // Refreshing the oldest proof makes the next-oldest selection the eviction victim.
+        XCTAssertEqual(cache.currentSnapshot(for: selections[0]), .unavailable)
+        try waitUntil { cache.activePreparationCount == 0 }
+        for selection in selections.suffix(2) {
+            XCTAssertEqual(cache.menuSnapshot(for: selection, waitingUntil: .now() + 2), .unavailable)
+            XCTAssertEqual(cache.cachedEntryCount, 4)
+            XCTAssertEqual(cache.cachedSelectionItemCount, 4_096)
+        }
+        XCTAssertEqual(cache.cachedSnapshot(for: selections[0]), .unavailable)
+        XCTAssertNil(cache.cachedSnapshot(for: selections[1]))
+        XCTAssertNil(cache.cachedSnapshot(for: selections[2]))
+        XCTAssertEqual(cache.cachedSnapshot(for: selections[3]), .unavailable)
+    }
+
+    func testOversizedSelectionsRetainOnlyTheLatestCompleteIdentity() throws {
+        let destination = try destination()
+        defer { try? FileManager.default.removeItem(at: destination.folder) }
+        let cache = FinderMenuDestinationCache { _ in destination }
+        var previous: FinderMenuSelection?
+        for index in 0..<32 {
+            // All earlier URLs and the target match; only the final URL changes.
+            let selection = largeSelection("Item-\(index % 16)")
+            XCTAssertNil(cache.cachedSnapshot(for: selection), "A differing last item must miss")
+            XCTAssertEqual(cache.currentSnapshot(for: selection), .loading)
+            try waitUntil { cache.activePreparationCount == 0 }
+            XCTAssertEqual(cache.cachedSnapshot(for: selection), .ready(destination))
+            XCTAssertEqual(cache.cachedEntryCount, 1)
+            XCTAssertEqual(cache.cachedSelectionItemCount, selection.selectedItemURLs.count)
+            if let previous { XCTAssertNil(cache.cachedSnapshot(for: previous)) }
+            previous = selection
+        }
+        let small = selection("Small")
+        XCTAssertEqual(cache.menuSnapshot(for: small, waitingUntil: .now() + 2), .ready(destination))
+        XCTAssertEqual(cache.cachedSelectionItemCount, 1, "An older oversized selection must not linger")
+        XCTAssertNil(cache.cachedSnapshot(for: previous!))
+    }
+
+    func testSelectionBudgetEvictionKeepsActiveReadsAndRejectsOldGenerations() throws {
+        let destination = try destination()
+        defer { try? FileManager.default.removeItem(at: destination.folder) }
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal(); release.signal() }
+        let calls = LockedPreparationCount()
+        let cache = FinderMenuDestinationCache { _ in
+            if calls.increment() <= 2 {
+                started.signal()
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+            }
+            return destination
+        }
+        let first = largeSelection("First")
+        let second = largeSelection("Second")
+        XCTAssertEqual(cache.currentSnapshot(for: first), .loading)
+        XCTAssertEqual(cache.currentSnapshot(for: second), .loading)
+        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
+        XCTAssertNil(cache.cachedSnapshot(for: first))
+        XCTAssertEqual(cache.currentSnapshot(for: largeSelection("Denied")), .busy)
+        XCTAssertEqual(cache.currentSnapshot(for: first), .loading)
+        cache.invalidate(first)
+        XCTAssertEqual(cache.currentSnapshot(for: first), .loading)
+        XCTAssertEqual(cache.cachedEntryCount, 1)
+        XCTAssertEqual(cache.cachedSelectionItemCount, first.selectedItemURLs.count)
+        XCTAssertEqual(cache.activePreparationCount, 2)
+        XCTAssertEqual(calls.value, 2, "Budget eviction must not hide active reads or queue misses")
+
+        release.signal(); release.signal()
+        try waitUntil { cache.activePreparationCount == 0 }
+        XCTAssertEqual(cache.cachedSnapshot(for: first), .loading,
+                       "An evicted or invalidated generation cannot republish into a revisited selection")
+        XCTAssertEqual(cache.menuSnapshot(for: first, waitingUntil: .now() + 2), .ready(destination))
+        XCTAssertEqual(calls.value, 3)
+    }
+
     func testBackgroundPreparationValidatesEntireLargeSelection() throws {
         let destination = try destination()
         defer { try? FileManager.default.removeItem(at: destination.folder) }
@@ -644,6 +728,13 @@ final class FinderMenuDestinationCacheTests: XCTestCase {
     private func selection(_ name: String) -> FinderMenuSelection {
         FinderMenuSelection(context: .items, targetedURL: nil,
                             selectedItemURLs: [URL(fileURLWithPath: "/Volumes/Test/\(name)")])
+    }
+
+    private func largeSelection(_ lastItem: String, count: Int = 5_000) -> FinderMenuSelection {
+        let folder = URL(fileURLWithPath: "/Volumes/Test/Shared")
+        var items = Array(repeating: folder.appendingPathComponent("same-prefix"), count: count)
+        items[count - 1] = folder.appendingPathComponent(lastItem)
+        return FinderMenuSelection(context: .items, targetedURL: folder, selectedItemURLs: items)
     }
 
     private func destination() throws -> FinderMenuDestination {

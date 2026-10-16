@@ -69,12 +69,14 @@ final class TemplateStoreTests: XCTestCase {
         suiteName = "QuickFileTests.\(UUID().uuidString)"
         defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defaults.removePersistentDomain(forName: suiteName)
-        temporaryDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("QuickFileTemplateStoreTests-\(UUID().uuidString)", isDirectory: true)
+        temporaryDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/Temporary/TemplateStoreTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(
             at: temporaryDirectory,
-            withIntermediateDirectories: true
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
         )
+        temporaryDirectory = temporaryDirectory.resolvingSymlinksInPath()
     }
 
     override func tearDownWithError() throws {
@@ -89,7 +91,7 @@ final class TemplateStoreTests: XCTestCase {
                     }
                 }
             }
-            try? FileManager.default.removeItem(at: temporaryDirectory)
+            try FileManager.default.removeItem(at: temporaryDirectory)
         }
         temporaryDirectory = nil
         defaults = nil
@@ -337,6 +339,41 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertThrowsError(try store.saveTemplates([second, repaired, third]))
         try store.saveTemplates([repaired])
         XCTAssertEqual(try store.reloadTemplates(), [repaired])
+    }
+
+    func testLocalHistoricalLibraryAboveRecoveryBudgetLoadsProjectsAndCanShrink() throws {
+        let local = try makeLocalStorage("local-history")
+        let root = local.root
+        let url = root.appendingPathComponent("templates.v2.json")
+        let body = String(repeating: "x", count: 13 * 1024 * 1024)
+        let historical = (0..<5).map {
+            FileTemplate(name: "Historical \($0)", fileExtension: "txt", content: body, isEnabled: $0 != 4)
+        }
+        do {
+            let data = try JSONEncoder().encode(historical)
+            XCTAssertGreaterThan(data.count, TemplateStore.maximumRecoveryFileBytes)
+            try local.write(data, to: url)
+        }
+        // No injected reader: this initializer and the public initializer share
+        // the production LocalSharedStorage I/O policy.
+        let store = TemplateStore(defaults: nil, storageURL: url, localStorage: local,
+                                  cachesReads: true, cachesMenuReads: true)
+        XCTAssertEqual(try store.reloadTemplates(), historical)
+        XCTAssertEqual(store.decodedFileCacheRetainedRawByteCount, 0)
+        let entries = FinderMenuModelBuilder().entries(from: historical)
+        XCTAssertEqual(try store.reloadMenuEntries(), entries)
+        let creation = try store.reloadCreationSnapshot(templateID: historical[2].id)
+        XCTAssertEqual(creation.template, historical[2])
+        XCTAssertEqual(creation.menuEntries, entries)
+        XCTAssertThrowsError(try store.prepareRecovery()) { error in
+            guard case TemplateStore.StoreError.readFailed(let underlying) = error,
+                  case TemplateTransferError.fileTooLarge = underlying else { return XCTFail("\(error)") }
+        }
+        let reduced = Array(historical.prefix(2))
+        try store.saveTemplates(reduced, expectedTemplates: historical)
+        XCTAssertEqual(try store.reloadTemplates(), reduced)
+        XCTAssertEqual(try local.read(root.appendingPathComponent("templates.persistence.v1.json")),
+                       Data("{\"version\":1}".utf8))
     }
 
     func testHistoricalUnsafeNamesRemainReadableAndAllowBoundedRepair() throws {
@@ -831,6 +868,78 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testExportProtectsAllSharedConfigurationFilesWhenMissingExistingOrAliased() throws {
+        let local = try makeLocalStorage("shared")
+        try local.prepare(local.root)
+        let store = TemplateStore(defaults: nil, storageURL: local.root.appendingPathComponent("templates.v2.json"),
+                                  localStorage: local)
+        let parentAlias = temporaryDirectory.appendingPathComponent("shared-alias")
+        try FileManager.default.createSymbolicLink(at: parentAlias, withDestinationURL: local.root)
+        let names = [
+            "templates.v2.json", "templates.v2.json.lock", "templates.persistence.v1.json",
+            "language-settings.v1.json", "file-creation-settings.v1.json", "finder-menu-settings.v1.json",
+            "authorizedDirectories.v2.json", "authorizedDirectories.migrated", "authorizedDirectories.lock",
+            "finderExtension.failureHistory.v1.json", "finderExtension.failureHistory.v1.json.lock",
+            "finderExtension.failureHistory.v1.json.latest-v2.json"
+        ]
+        for (index, name) in names.enumerated() {
+            let target = local.root.appendingPathComponent(name)
+            for spelling in [name, name.uppercased()] {
+                XCTAssertThrowsError(try store.exportTemplates(exportBundle(), to: parentAlias.appendingPathComponent(spelling))) {
+                    XCTAssertEqual($0 as? TemplateTransferError, .protectedDestination)
+                }
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+            let original = name == "language-settings.v1.json"
+                ? Data("{\"version\":1,\"language\":\"en\"}".utf8) : Data("original \(name)".utf8)
+            try local.write(original, to: target)
+            XCTAssertThrowsError(try store.exportTemplates(exportBundle(), to: target))
+            let symlink = temporaryDirectory.appendingPathComponent("symbolic-\(index).json")
+            let hardlink = temporaryDirectory.appendingPathComponent("hard-\(index).json")
+            try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: target)
+            try FileManager.default.linkItem(at: target, to: hardlink)
+            XCTAssertThrowsError(try store.exportTemplates(exportBundle(), to: symlink))
+            XCTAssertThrowsError(try store.exportTemplates(exportBundle(), to: hardlink))
+            XCTAssertEqual(try Data(contentsOf: target), original)
+            try FileManager.default.removeItem(at: hardlink)
+            if name == "language-settings.v1.json" {
+                XCTAssertEqual(try LanguageSettingsStore(storage: local).load(), .english)
+            }
+        }
+        let ordinary = local.root.appendingPathComponent("My templates.json")
+        try Data("previous export".utf8).write(to: ordinary)
+        try store.exportTemplates(exportBundle(), to: ordinary)
+        XCTAssertEqual(try TemplateTransferFile.read(from: ordinary), exportBundle())
+    }
+
+    func testExportProtectsRequestQueueRecoveryEvidenceAndAtomicWriteFiles() throws {
+        let root = try makeExportDirectory("shared")
+        let store = TemplateStore(defaults: defaults, storageURL: root.appendingPathComponent("templates.v2.json"))
+        let paths = [
+            "finder-authorization-requests/.queue.lock", "finder-authorization-requests/.legacy-v1-migrated",
+            "finder-authorization-requests/\(UUID().uuidString).json",
+            "finder-authorization-requests/.recovery-archive/\(UUID().uuidString).original.json",
+            "QuickFile-template-backup-fixture/templates.original.json",
+            "QuickFile-template-backup-fixture/persistence.original.json",
+            ".quickfile-write-\(UUID().uuidString)"
+        ]
+        let alias = temporaryDirectory.appendingPathComponent("shared-alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: root)
+        for path in paths {
+            XCTAssertThrowsError(try store.validateExportDestination(alias.appendingPathComponent(path.uppercased())))
+            let target = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let original = Data("recovery or coordination evidence".utf8)
+            try original.write(to: target)
+            XCTAssertThrowsError(try store.exportTemplates(exportBundle(), to: alias.appendingPathComponent(path)))
+            XCTAssertEqual(try Data(contentsOf: target), original)
+        }
+        let queueAlias = temporaryDirectory.appendingPathComponent("queue-alias")
+        try FileManager.default.createSymbolicLink(at: queueAlias,
+            withDestinationURL: root.appendingPathComponent("finder-authorization-requests"))
+        XCTAssertThrowsError(try store.exportTemplates(exportBundle(), to: queueAlias.appendingPathComponent("new.json")))
+    }
+
     func testMissingStoreBehindParentAliasCannotBeExportedOver() throws {
         let directory = temporaryDirectory.appendingPathComponent("store", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -894,7 +1003,11 @@ final class TemplateStoreTests: XCTestCase {
         let original = try Data(contentsOf: storageURL)
         let lockURL = storageURL.appendingPathExtension("lock")
         let originalLock = try Data(contentsOf: lockURL)
-        for (index, name) in [storageURL.lastPathComponent, lockURL.lastPathComponent].enumerated() {
+        let settingsURL = directory.appendingPathComponent("language-settings.v1.json")
+        let originalSettings = Data("{\"version\":1,\"language\":\"en\"}".utf8)
+        try originalSettings.write(to: settingsURL)
+        for (index, name) in [storageURL.lastPathComponent, lockURL.lastPathComponent,
+                              settingsURL.lastPathComponent, "authorizedDirectories.lock"].enumerated() {
             let safe = try makeExportDirectory("safe-\(index)")
             let alias = temporaryDirectory.appendingPathComponent("selected-\(index)")
             try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: safe)
@@ -907,6 +1020,8 @@ final class TemplateStoreTests: XCTestCase {
             XCTAssertThrowsError(try exporting.exportTemplates(exportBundle(), to: alias.appendingPathComponent(name)))
             XCTAssertEqual(try Data(contentsOf: storageURL), original)
             XCTAssertEqual(try Data(contentsOf: lockURL), originalLock)
+            XCTAssertEqual(try Data(contentsOf: settingsURL), originalSettings)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent("authorizedDirectories.lock").path))
             XCTAssertFalse(FileManager.default.fileExists(atPath: safe.appendingPathComponent(name).path))
         }
         XCTAssertEqual(try store.reloadTemplates(), BuiltInTemplates.all)
@@ -991,6 +1106,28 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: storageURL), original)
     }
 
+    func testExportRejectsPinnedDirectoryRelocatedIntoRequestRecoveryArchive() throws {
+        let storageURL = temporaryDirectory.appendingPathComponent("templates.v2.json")
+        let safe = try makeExportDirectory("safe")
+        let queue = try makeExportDirectory("finder-authorization-requests")
+        let archive = queue.appendingPathComponent(".recovery-archive")
+        let alias = temporaryDirectory.appendingPathComponent("selected")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: safe)
+        let previous = Data("preserve archive evidence".utf8)
+        try previous.write(to: safe.appendingPathComponent("record.json"))
+        let store = TemplateStore(defaults: defaults, storageURL: storageURL, exportCheckpoint: { stage in
+            if case .beforePublication = stage {
+                try FileManager.default.moveItem(at: safe, to: archive)
+                try FileManager.default.removeItem(at: alias)
+                try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: archive)
+            }
+        })
+        XCTAssertThrowsError(try store.exportTemplates(exportBundle(), to: alias.appendingPathComponent("record.json"))) {
+            XCTAssertEqual($0 as? TemplateTransferError, .protectedDestination)
+        }
+        XCTAssertEqual(try Data(contentsOf: archive.appendingPathComponent("record.json")), previous)
+    }
+
     func testDescriptorBoundExportOverwritesConfirmedOrdinaryFileAndKeepsStore() throws {
         let storageURL = temporaryDirectory.appendingPathComponent("templates.v2.json")
         let store = TemplateStore(defaults: defaults, storageURL: storageURL)
@@ -1041,6 +1178,27 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: destination), original)
     }
 
+    func testExportRechecksOtherConfigurationHardlinkBeforePublication() throws {
+        let local = try makeLocalStorage("shared")
+        let settings = LanguageSettingsStore(storage: local)
+        try settings.save(.english)
+        let settingsURL = local.root.appendingPathComponent("language-settings.v1.json")
+        let original = try Data(contentsOf: settingsURL)
+        let destination = temporaryDirectory.appendingPathComponent("export.json")
+        let store = TemplateStore(defaults: nil, storageURL: local.root.appendingPathComponent("templates.v2.json"),
+                                  localStorage: local, exportCheckpoint: { stage in
+            if case .beforePublication = stage {
+                try FileManager.default.linkItem(at: settingsURL, to: destination)
+            }
+        })
+        XCTAssertThrowsError(try store.exportTemplates(exportBundle(), to: destination)) {
+            XCTAssertEqual($0 as? TemplateTransferError, .protectedDestination)
+        }
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+        try FileManager.default.removeItem(at: destination)
+        XCTAssertEqual(try settings.load(), .english)
+    }
+
     func testExportRejectsFinalSymlinkAndSpecialFileWithoutChangingTargets() throws {
         let storageURL = temporaryDirectory.appendingPathComponent("templates.v2.json")
         let store = TemplateStore(defaults: defaults, storageURL: storageURL)
@@ -1055,6 +1213,13 @@ final class TemplateStoreTests: XCTestCase {
         let fifo = directory.appendingPathComponent("fifo.json")
         XCTAssertEqual(mkfifo(fifo.path, S_IRUSR | S_IWUSR), 0)
         XCTAssertThrowsError(try store.exportTemplates(exportBundle(), to: fifo))
+    }
+
+    private func makeLocalStorage(_ name: String) throws -> LocalSharedStorage {
+        let root = temporaryDirectory.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
+                                               attributes: [.posixPermissions: 0o700])
+        return LocalSharedStorage(root: root.resolvingSymlinksInPath())
     }
 
     private func makeExportDirectory(_ name: String) throws -> URL {

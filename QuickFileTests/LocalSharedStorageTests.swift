@@ -573,15 +573,18 @@ final class LocalSharedStorageTests: XCTestCase {
         XCTAssertEqual(link(hardlinked.path, hardlink.path), 0)
         let symlinkURL = storage.root.appendingPathComponent(".quickfile-write-" + UUID().uuidString)
         XCTAssertEqual(symlink(unknown.path, symlinkURL.path), 0)
+        let aclGranted = try file()
+        try setACL("allow:read", on: aclGranted)
+        defer { try? setACL(nil, on: aclGranted) }
         let orphan = try file()
         try storage.write(Data("normal".utf8), to: storage.root.appendingPathComponent("saved"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
-        for url in [fresh, unknown, nonPrivate, hardlinked, hardlink, symlinkURL] {
+        for url in [fresh, unknown, nonPrivate, hardlinked, hardlink, symlinkURL, aclGranted] {
             XCTAssertEqual(try Data(contentsOf: url), Data("keep".utf8))
         }
     }
 
-    func testMarkerFailurePreventsPayloadPublication() throws {
+    func testInvalidMarkerPreventsPayloadPublication() throws {
         try storage.prepare(markerURL)
         let writes = OSAllocatedUnfairLock(initialState: 0)
         let store = templates(write: { _, _ in writes.withLock { $0 += 1 } })
@@ -675,6 +678,109 @@ final class LocalSharedStorageTests: XCTestCase {
         XCTAssertEqual(mkfifo(fifo.path, 0o600), 0)
         XCTAssertThrowsError(try storage.read(fifo))
         XCTAssertEqual(try storage.read(file), Data("value".utf8))
+    }
+
+    private func setACL(_ entry: String?, on url: URL) throws {
+        let text = "!#acl 1\n" + (entry.map {
+            "group:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:\($0)\n"
+        } ?? "")
+        let acl = try XCTUnwrap(entry == nil ? acl_init(0) : acl_from_text(text))
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        XCTAssertEqual(acl_set_file(url.path, ACL_TYPE_EXTENDED, acl), 0)
+    }
+
+    func testRootAllowACLRejectsReadsWritesLocksAndEveryPermissionRepair() throws {
+        let original = Data("original".utf8)
+        try storage.write(original, to: libraryURL)
+        try setACL("allow,file_inherit,directory_inherit:read,execute", on: storage.root)
+        defer { try? setACL(nil, on: storage.root) }
+        XCTAssertThrowsError(try storage.read(libraryURL))
+        XCTAssertThrowsError(try storage.write(Data("replacement".utf8), to: libraryURL))
+        XCTAssertThrowsError(try storage.containsFile(at: libraryURL))
+        XCTAssertThrowsError(try storage.withLock(at: storage.root.appendingPathComponent("new.lock")) {})
+        XCTAssertThrowsError(try storage.repairTemplatePermissions())
+        XCTAssertThrowsError(try storage.repairAuthorizationPermissions())
+        XCTAssertThrowsError(try storage.repairRequestPermissions())
+        XCTAssertEqual(try Data(contentsOf: libraryURL), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storage.root.appendingPathComponent("new.lock").path))
+        // Repair must leave the ACL intact, so a fresh backend also refuses it.
+        XCTAssertThrowsError(try LocalSharedStorage(root: storage.root).prepare(storage.root))
+    }
+
+    func testLeafAllowACLRejectsAccessAndRepairWithoutReplacingDataOrACL() throws {
+        let original = Data("original".utf8)
+        for name in ["templates.v2.json", "templates.persistence.v1.json", "templates.v2.json.lock"] {
+            let file = storage.root.appendingPathComponent(name)
+            try storage.write(original, to: file)
+            try setACL("allow:read,write", on: file)
+            XCTAssertThrowsError(try storage.read(file))
+            XCTAssertThrowsError(try storage.containsFile(at: file))
+            XCTAssertThrowsError(try storage.write(Data(), to: file))
+            XCTAssertThrowsError(try storage.remove(file))
+            XCTAssertThrowsError(try storage.withLock(at: file) { XCTFail("Unsafe lock admitted operation") })
+            XCTAssertThrowsError(try storage.repairTemplatePermissions())
+            XCTAssertEqual(try Data(contentsOf: file), original)
+            XCTAssertThrowsError(try storage.read(file), "Repair must preserve the rejecting ACL")
+            try setACL(nil, on: file)
+            XCTAssertEqual(try storage.read(file), original)
+        }
+    }
+
+    func testInheritedLeafACLIsRejectedAfterParentACLIsRemoved() throws {
+        try storage.prepare(storage.root)
+        try setACL("allow,file_inherit,only_inherit:read", on: storage.root)
+        let original = Data("inherited".utf8)
+        // Create through the OS so this fixture genuinely inherits its ACL.
+        try original.write(to: libraryURL)
+        XCTAssertEqual(chmod(libraryURL.path, 0o600), 0)
+        try setACL(nil, on: storage.root)
+        XCTAssertThrowsError(try storage.read(libraryURL))
+        XCTAssertThrowsError(try storage.write(Data(), to: libraryURL))
+        XCTAssertThrowsError(try storage.repairTemplatePermissions())
+        XCTAssertEqual(try Data(contentsOf: libraryURL), original)
+        try setACL(nil, on: libraryURL)
+        XCTAssertEqual(try storage.read(libraryURL), original)
+    }
+
+    func testNewRootWithInheritedAllowACLDoesNotPublishPayloadOrLock() throws {
+        try setACL("allow,file_inherit,directory_inherit,only_inherit:read", on: directory)
+        defer {
+            try? setACL(nil, on: storage.root)
+            try? setACL(nil, on: directory)
+        }
+        XCTAssertThrowsError(try storage.write(Data("private".utf8), to: libraryURL))
+        XCTAssertThrowsError(try storage.withLock(at: storage.root.appendingPathComponent("new.lock")) {})
+        XCTAssertThrowsError(try storage.prepare(storage.root.appendingPathComponent("nested")))
+        XCTAssertThrowsError(try storage.repairTemplatePermissions())
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: storage.root.path), [])
+    }
+
+    func testDenyACLRemainsCompatibleWithPrivateStorageAndRepair() throws {
+        try storage.write(Data("private".utf8), to: libraryURL)
+        try setACL("deny:delete", on: libraryURL)
+        defer { try? setACL(nil, on: libraryURL) }
+        XCTAssertEqual(try storage.read(libraryURL), Data("private".utf8))
+        XCTAssertNoThrow(try storage.repairTemplatePermissions())
+        XCTAssertEqual(try storage.read(libraryURL), Data("private".utf8))
+    }
+
+    func testOptionalReadBudgetAndIntegerBoundaries() throws {
+        try storage.write(Data(), to: libraryURL)
+        XCTAssertEqual(try storage.read(libraryURL, maximumBytes: 0), Data())
+        XCTAssertThrowsError(try storage.read(libraryURL, maximumBytes: -1))
+        try storage.write(Data("value".utf8), to: libraryURL)
+        XCTAssertEqual(try storage.read(libraryURL, maximumBytes: nil), Data("value".utf8))
+        XCTAssertEqual(try storage.read(libraryURL, maximumBytes: Int.max), Data("value".utf8))
+        XCTAssertThrowsError(try storage.read(libraryURL, maximumBytes: 0))
+        // Sparse storage proves nil exceeds the default budget without a second large fixture buffer.
+        let descriptor = open(libraryURL.path, O_WRONLY | O_NOFOLLOW | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        guard descriptor >= 0 else { return }
+        defer { close(descriptor) }
+        let largeSize = 64 * 1024 * 1024 + 1
+        XCTAssertEqual(ftruncate(descriptor, off_t(largeSize)), 0)
+        XCTAssertThrowsError(try storage.read(libraryURL))
+        XCTAssertEqual(try storage.read(libraryURL, maximumBytes: nil).count, largeSize)
     }
 
     func testNonPrivateTemplatesAndRequestsAreNotReadOrConsumed() throws {
