@@ -177,6 +177,7 @@ def _byte_range(text, count, total):
 
 
 def _group_tree(lines, instances, marker, header_name, total_bytes, failure_context):
+    """Return own-byte bounds, roots with feasible subtree bounds, and group bounds."""
     stack, output, roots = [], [], []
     total_row = None
     separated = any(re.fullmatch(r" +----", line) for line in lines)
@@ -185,15 +186,19 @@ def _group_tree(lines, instances, marker, header_name, total_bytes, failure_cont
     def close():
         row = stack.pop()
         own = row["count"] - sum(child["count"] for child in row["children"])
-        low = max(own, row["bytes"][0] - sum(child["bytes"][1] for child in row["children"]))
-        high = row["bytes"][1] - sum(child["bytes"][0] for child in row["children"])
+        require(own == 0 if row["name"] is None else own > 0, "totals")
+        child_low = sum(child["bytes"][0] for child in row["children"])
+        child_high = sum(child["bytes"][1] for child in row["children"])
+        # Closed children carry feasible subtree intervals, not just their
+        # displayed ranges. Every allocated instance needs at least one byte;
+        # TOTAL contributes none and must also respect the children's maximum.
+        low = max(row["bytes"][0], child_low + own)
+        high = min(row["bytes"][1], child_high) if row["name"] is None else row["bytes"][1]
         require(low <= high, "byte_bounds")
-        if row["name"] is None:
-            require(own == 0, "totals")
-            require(low <= 0 <= high, "byte_bounds")
-        else:
-            require(own > 0, "totals")
-            output.append((row["name"] if row["name"] in TYPES else "unknown", own, low, high))
+        row["bytes"] = (low, high)
+        if row["name"] is not None:
+            output.append((row["name"] if row["name"] in TYPES else "unknown", own,
+                           max(own, low - child_high), high - child_low))
             row["own"] = own
 
     for line in lines:
@@ -253,8 +258,10 @@ def _group_tree(lines, instances, marker, header_name, total_bytes, failure_cont
     require(roots and (instances is None or sum(root["own"] for root in roots) == instances), "totals")
     if total_row is not None:
         require(total_row["count"] == sum(root["count"] for root in roots), "totals")
+    group_bytes = total_row["bytes"] if total_row is not None else (
+        sum(root["bytes"][0] for root in roots), sum(root["bytes"][1] for root in roots))
     failure_context.clear()
-    return output, roots
+    return output, roots, group_bytes
 
 
 def grouped_composition(report):
@@ -277,7 +284,7 @@ def grouped_composition(report):
         require("STACK OF " not in prefix and "====" not in prefix)
         headers = list(re.finditer(r"^STACK OF (\d{1,6}) INSTANCES? OF '(ROOT LEAK|ROOT CYCLE): ([^\n']+)':$", body, re.M))
         require(len(headers) == len(re.findall(r"^STACK OF ", body, re.M)))
-        rows, roots, seen = [], [], set()
+        rows, roots, byte_ranges, seen = [], [], [], set()
         if headers:
             require(not body[:headers[0].start()].strip())
             for index, header in enumerate(headers):
@@ -294,18 +301,20 @@ def grouped_composition(report):
                 require(key not in seen); seen.add(key)
                 header_name = _name(header[3])
                 stage = "tree_shape"
-                group, group_roots = _group_tree(tree.splitlines(), int(header[1]), header[2], header_name, totals[1], failure_context)
+                group, group_roots, group_bytes = _group_tree(tree.splitlines(), int(header[1]), header[2], header_name, totals[1], failure_context)
                 rows.extend(group); roots.extend(group_roots)
+                byte_ranges.append(group_bytes)
         elif body.strip():
             stage = "tree_shape"
             lines = [line for line in body.splitlines() if line.strip()]
             require(re.fullmatch(r" *\d+ \([^)]+\) << TOTAL >>", lines[0]) is not None)
-            rows, roots = _group_tree(lines, None, None, None, totals[1], failure_context)
+            rows, roots, group_bytes = _group_tree(lines, None, None, None, totals[1], failure_context)
+            byte_ranges.append(group_bytes)
         else:
             require(totals == (0, 0), "totals")
         stage = "totals"
         require(sum(root["count"] for root in roots) == totals[0])
-        require(sum(root["bytes"][0] for root in roots) <= totals[1] <= sum(root["bytes"][1] for root in roots))
+        require(sum(low for low, _ in byte_ranges) <= totals[1] <= sum(high for _, high in byte_ranges))
         require(sum(count for _, count, _, _ in rows) == totals[0])
         types, exact, unresolved = Counter(), Counter(), []
         for kind, count, low, high in rows:

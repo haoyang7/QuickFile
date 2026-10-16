@@ -212,6 +212,24 @@ class ProjectionTests(TemporaryTests):
         self.assertNotIn("PrivateTargetType", C.public_bytes(value).decode())
         self.assertNotIn("0x1234", C.public_bytes(value).decode())
 
+    def test_zero_totals_project_classification_from_complete_group_trees(self):
+        empty = "Process 123: 0 leaks for 0 total leaked bytes.\n"
+        invalid = empty + ("STACK OF 1 INSTANCE OF 'ROOT LEAK: NSXPCConnection':\n"
+            "0 synthetic-image 0x1234 synthetic_function + 0\n====\n"
+            "    1 (48 bytes) << TOTAL >>\n      1 (48 bytes) ROOT LEAK: NSXPCConnection\n")
+        for text, passed in ((invalid, False), (empty, True)):
+            with self.subTest(complete_tree=passed):
+                raw = raw_fixture(self.records)
+                scan = raw["scans"][0]
+                scan.update(leak_nodes=0, leak_bytes=0, unclassified_nodes=0, groups=C.leak_groups(text),
+                    stdout_sha256=hashlib.sha256(text.encode()).hexdigest())
+                (self.records / (scan["label"] + "-original.stdout.txt")).write_text(text)
+                projected = C.project_scan(scan, self.records, 0, "t0")
+                self.assertEqual(projected["classification"], "passed" if passed else "failed")
+                self.assertEqual(projected["composition"]["counts_status"], "complete" if passed else "unavailable")
+                self.assertEqual(C.strict_from_scans([projected]), {
+                    "status": "passed" if passed else "failed", "failed_labels": [] if passed else [scan["label"]]})
+
     def test_empty_failed_scan_keeps_checkpoints_and_baseline(self):
         value = self.project(partial=True)
         self.assertEqual(value["status"], "failed")

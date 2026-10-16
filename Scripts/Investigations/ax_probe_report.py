@@ -514,8 +514,52 @@ def collect_heap_diagnostics(graph_directory, records):
     (records / "heap-diagnostics.json").write_text(json.dumps(summary) + "\n")
 
 
+def _grouped_total_trees(report):
+    """Validate every group and report totals when a grouped aggregate is present."""
+    body = report.split("Binary Images:", 1)[0]
+    if not re.search(r"^ +\d+ \([^)]+\) <<", body, re.MULTILINE):
+        return None
+    # Composition depends on this module through frozen-node helpers. Defer the
+    # import and reuse its grammar once per tree, without a second report parse.
+    from ax_composition import _group_tree
+
+    totals = list(re.finditer(r"^Process \d+: (\d+) leaks? for (\d+) total leaked bytes\.$", body, re.MULTILINE))
+    if len(totals) != 1:
+        raise ValueError("Invalid grouped totals")
+    total = totals[0]
+    blocks = re.split(r"(?=^STACK OF )", body[total.end():], flags=re.MULTILINE)
+    if blocks[0].strip() or "STACK OF " in body[:total.start()]:
+        raise ValueError("Invalid grouped prefix")
+    groups, roots, byte_ranges = [], [], []
+    for block in blocks[1:]:
+        header, _, remainder = block.partition("\n")
+        match = re.fullmatch(r"STACK OF (\d{1,6}) INSTANCES? OF '(ROOT LEAK|ROOT CYCLE): ([^\n']+)':", header)
+        if not match or remainder.count("\n====\n") != 1:
+            raise ValueError("Invalid grouped header")
+        _, tree = remainder.split("\n====\n")
+        lines = [line for line in tree.splitlines() if line.strip()]
+        first = re.fullmatch(r" +(\d+) \(([^)]+)\) (?:<< TOTAL >>|ROOT (?:LEAK|CYCLE): .+)", lines[0]) if lines else None
+        if not first:
+            raise ValueError("Invalid grouped tree")
+        own_rows, group_roots, group_bytes = _group_tree(lines, int(match[1]), match[2], match[3], int(total[2]), [])
+        if (sum(root["count"] for root in group_roots) != int(first[1])
+                or sum(count for _, count, _, _ in own_rows) != int(first[1])):
+            raise ValueError("Incomplete grouped tree")
+        byte_ranges.append(group_bytes)
+        roots.extend(group_roots)
+        groups.append((int(first[1]), first[2]))
+    if (sum(root["count"] for root in roots) != int(total[1]) or not
+            sum(low for low, _ in byte_ranges) <= int(total[2]) <= sum(high for _, high in byte_ranges)):
+        raise ValueError("Grouped report totals disagree")
+    return groups
+
+
 def leak_groups(report):
     groups = []
+    try:
+        validated = _grouped_total_trees(report)
+    except ValueError:
+        validated = []
     for block in re.split(r"(?=STACK OF \d+ INSTANCES? OF )", report):
         header = re.match(r"STACK OF (\d+) INSTANCES? OF '([^']+)':", block)
         if not header:
@@ -525,10 +569,18 @@ def leak_groups(report):
         # leaks includes the root classification inside the quoted type label.
         # Keep it separately so callers compare the actual class, not decoration.
         root = re.fullmatch(r"ROOT (LEAK|CYCLE): (.+)", header[2])
+        nodes, size = (int(tree[1]), tree[2]) if tree else (None, None)
+        _, separator, tree_text = block.partition("\n====\n")
+        tree_lines = [line for line in tree_text.splitlines() if line.strip()]
+        if validated is not None:
+            nodes, size = validated[len(groups)] if len(groups) < len(validated) else (None, None)
+        elif separator and tree_lines and not re.fullmatch(
+                r"\s+\d+ \([^)]+\) ROOT (?:LEAK|CYCLE): .+", tree_lines[0]):
+            nodes, size = None, None
         groups.append({"root_instances": int(header[1]), "root_type": root[2] if root else header[2],
                        "root_kind": root[1] if root else None,
-                       "tree_nodes": int(tree[1]) if tree else None,
-                       "display_size": tree[2] if tree else None,
+                       "tree_nodes": nodes,
+                       "display_size": size,
                        "destroyed_return_offsets": sorted(set(map(int, re.findall(re.escape(DESTROYED) + r" \+ (\d+)", block))))})
     return groups
 
@@ -641,6 +693,7 @@ def terminal_other_images(frames, context, budget):
 
 def terminal_roots(body, nodes):
     roots, root_keys = [], set()
+    validated = _grouped_total_trees(body)
     blocks = re.split(r"(?=^STACK OF )", body, flags=re.MULTILINE)[1:]
     for block in blocks:
         header, _, remainder = block.partition("\n")
@@ -648,8 +701,18 @@ def terminal_roots(body, nodes):
         stack, separator, tree = remainder.partition("\n====\n")
         tree_lines = [line for line in tree.splitlines() if line.strip()]
         first = re.fullmatch(r"\s+(\d+) \([^)]+\) ROOT (LEAK|CYCLE): (.+)", tree_lines[0]) if tree_lines else None
-        if (not match or not separator or not first or (match[2], match[3]) != (first[2], first[3])
-                or not 1 <= int(match[1]) <= int(first[1]) <= TERMINAL_NODE_LIMIT):
+        if not match or not separator:
+            raise ValueError("Invalid terminal root group")
+        if validated is not None:
+            tree_nodes, _ = validated[len(roots)]
+            if tree_nodes > TERMINAL_NODE_LIMIT:
+                raise ValueError("Invalid terminal root group")
+        elif first:
+            if ((match[2], match[3]) != (first[2], first[3])
+                    or not 1 <= int(match[1]) <= int(first[1]) <= TERMINAL_NODE_LIMIT):
+                raise ValueError("Invalid terminal root group")
+            tree_nodes = int(first[1])
+        else:
             raise ValueError("Invalid terminal root group")
         frames, unparsed = terminal_frames(stack)
         key = (match[2], match[3], frames)
@@ -657,7 +720,7 @@ def terminal_roots(body, nodes):
             raise ValueError("Duplicate terminal root group")
         root_keys.add(key)
         roots.append({"type": match[3] if match[3] in HEAP_TYPES else "unknown", "kind": match[2],
-                      "instances": int(match[1]), "tree_nodes": int(first[1]), "private_stack": (frames, unparsed)})
+                      "instances": int(match[1]), "tree_nodes": tree_nodes, "private_stack": (frames, unparsed)})
     if sum(root["tree_nodes"] for root in roots) != nodes:
         raise ValueError("Incomplete terminal root groups")
     return roots

@@ -6,6 +6,8 @@
 
 Community 分支构建的 artifact 标签由 `project.yml` 唯一营销版本推导为 `v<版本>`，不沿用旧 Beta 标签；版本标签事件与手动 `release_tag` 输入保留原值。分支产物不代表该版本已公开发布。
 
+Community 打包在签名前将同一完整标签写入主 App 与 Finder 扩展的 `QuickFileReleaseTag`，并在产物收据中记录 `release_tag`。校验拒绝无效、营销版本不匹配或两组件不一致的标签；两者均无标签的旧包继续兼容。
+
 [Community DMG](.github/workflows/community-dmg.yml) 独立负责分发包构建：固定事件提交，在 macOS 15 arm64 / Xcode 26.3 / XcodeGen 2.46.0 上生成并检查 ad-hoc Universal DMG，拒绝源码漂移，只上传五项交付文件，保留 14 天。它由版本标签、手动入口或匹配路径的 `codex/**` 分支推送触发，不自动公开 Release。首次手动入口需先让工作流进入默认分支；分支推送可先验证流程。来源记录、下载核对及正式发布步骤见[免费自行分发](COMMUNITY_DISTRIBUTION.md#github-actions-打包)。
 
 [主 CI](.github/workflows/ci.yml) 在 main 的相关代码/配置变更、所有 PR 和手动触发时运行。main push 保留原路径过滤；PR 在作业内分类范围，仅根目录 `*.md` 和 `LICENSE` 的改动跳过 Linux 与 macOS 测试，其它路径（包括子目录文档、截图及未知路径）均执行现有验证。手动触发始终执行完整验证。
@@ -27,7 +29,9 @@ macOS 脚本测试中的授权、创建边界和创建预检三组测试，在�
 
 Python 脚本测试同时运行 [架构守卫](Scripts/verify-architecture.py)，检查 Shared 源码归属及共享库依赖方向。`verify-release-readiness.sh` 在生成工程前重复执行该守卫；GitHub Actions 中还在 XcodeGen 生成前后核对受管的已跟踪工程、共享 scheme、Info.plist 和 entitlements，存在差异即失败，避免 CI 自动修正未同步的工程后继续通过。本地开发允许已有未提交改动，不使用这项 HEAD 差异门禁；SwiftPM 锁文件继续按独立哈希检查验证。
 
-站外产物检查共用 `Scripts/distribution_contract.py` 的存储与权限契约：两种渠道均为 `local-shared`，元数据分别匹配 `community` / `developer-id`；实际签名逐架构验证。Community 不含 Team、profile 或 Sparkle，Developer ID 校验公证评估和携带的 profile，注册设备模式仍要求两个 profile 及共同设备范围。构建或单元测试通过不能替代这三种产物各自的验收。
+站外产物检查共用 `Scripts/distribution_contract.py` 的存储与权限契约：两种渠道均为 `local-shared`，元数据分别匹配 `community` / `developer-id`；实际签名逐架构验证。Community 在副本签名前剥离本地符号，并将已编译本地化资源在更小时转为等值二进制 plist；保留配对双架构 dSYM 的私有归档及摘要，DMG 使用 UDZO / zlib 9。Community 不含 Team、profile 或 Sparkle，Developer ID 校验公证评估和携带的 profile，注册设备模式仍要求两个 profile 及共同设备范围。构建或单元测试通过不能替代这三种产物各自的验收。
+
+主 App 的精确权限包含 `network.client`，用于 Community 用户手动检查 GitHub Release；Finder 扩展不允许出站或监听网络权限。Community 原生回归在无 Sparkle 模块的条件下编译生产检查器与控制器，验证版本/收据匹配、手动准入及 Beta 偏好不会触发请求；测试使用注入响应，不访问公网。Sparkle 的禁用元数据和脱链检查继续保留。
 
 构建设置查询前显式解析锁定的 SwiftPM 依赖，复用本轮包目录。仅当解析失败明确报告二进制依赖下载超时且没有其他错误时，最多尝试 3 次；每次结束都检查锁文件哈希，漂移或其他错误立即失败。下载和 checksum 验证仍由 SwiftPM 完成，构建设置查询、原生测试及 Release 构建各执行一次，失败不会触发整轮重试。
 
@@ -49,6 +53,8 @@ AX 工作流默认包含无订阅读取、无插桩的销毁通知、目标数�
 
 侧录最多 56 次工具调用、180 秒、128 KiB 公共摘要，另行绑定原 frozen/bridge 摘要和七张图的哈希；不占用或扩大原诊断预算。campaign 使用独立进程组，逐例保留严格退出码及证据完整度；已知严格失败仍采集后续对照，进程回收无法确认则停止。上传前独立校验固定字段、枚举、数量、嵌套摘要和总字节上限，仅上传匿名 `summary.json`；原始地址、路径、完整栈、启动元数据、堆图和日志保留在私有临时目录，不上传。reference campaign schema 2 分别记录投影状态与清理状态。只有角色均退出、顶层及角色清理 errors 均为空，且测量证据已保存时，才回收本轮 App、缓存和原始临时产物；投影失败保留私有材料并标为 `retained-evidence`，清理无法确认则标为 `retained-unconfirmed`。回收失败保持非零结果。campaign 在构建或逐例采集过程中遇到未捕获异常时保留私有材料和最后一份已发布的合法摘要，跳过最终清理与摘要改写，让原异常继续传播；该摘要仅是中途检查点，不代表 campaign 已完成或临时产物已回收。该工作流只用于归因，完整侧录不等于产品泄漏已排除或正式版放行。
 
+reference sidecar 在回收私有目录前，先原子发布包含完整测量的 `partial` 摘要，以 `private_cleanup_pending` 明确标记清理尚未完成；回收完成后再原子发布最终状态。首次发布失败保留旧摘要和私有材料；最终发布失败返回失败，并保留已保存测量的 pending 检查点。清理失败报告 `private_cleanup_failed`，无法发布该状态时仍保留 pending，不能把任一中途检查点作为清理完成的证据。
+
 普通原生 AX 回归通过 `--settle-startup-baseline` 建立 `zero-target-settled-v1` 基线：首次空窗口 AX 查询后，在任何测试按钮创建前观察至少 20 秒，最多 12 次探测、总计 40 秒，单次扫描使用剩余总预算作为超时上限；探测结束后至少间隔 2 秒，连续 3 次节点、字节、根分组和有界类型／尺寸构成一致才接受最后一次扫描。20 秒窗口覆盖既有空窗口时点实验中发生变化的观测点，不是系统初始化完成的 API 保证。每次须确认 Reader 存活、宿主目标分配／销毁及两类补偿为零，且完整堆分类没有目标 AX 栈或未知根。不可解析、超时、持续变化均失败；不重试失败探测，不取历史最大值，也不在目标生命周期开始后重设基线。
 
 startup 构成不完整时，错误日志保留经过白名单与 8 KiB 上限校验的匿名构成摘要，包括解析阶段、计数、省略原因及可用的有界结构片段；它不包含原始地址、路径或完整栈。失败探测的该摘要仅输出到运行日志，不包含在保留 7 天的公开工件中；私有原始 startup 报告和扫描记录在 fingerprint 前保存，但不上传。分组报告中的 `storage + 8 + 8 -->` 一类十进制偏移链只修饰引用标签，不增加节点或字节；解析后仍须满足全部树结构和计数守恒检查，不以忽略整行的方式接受报告。
@@ -63,7 +69,7 @@ required 使用 `ax-lifecycle-v1` 验收 AX 通知与补偿生命周期：普通
 
 `ax-lifecycle.json` 为独立的 16 KiB 白名单工件，记录策略版本、checkout SHA、三个分量的状态、原 runner 退出码、原严格结果、输入／结果／源码摘要哈希及有界扫描计数。CI 重新核对三份私有回执、当前夹具源码（负对照只允许两处指定 autorelease 移除）、copy 全部检查点和原匿名堆证据；缺失、不同版本、绑定不符或混合覆盖状态均失败。上传前再次验证公开字段及与原堆工件的对应关系。job 摘要同时展示生命周期结果和原严格堆结果；已分类增长写为 `unresolved`。三项均明确未覆盖且原因一致时记为 unsupported，不能计为 AX 验收通过。
 
-运行回执明确报告异常中止时，生命周期验收报 `AX receipt incomplete: runner aborted`；入口检查发现活动、清理或模式字段缺失时报回执不完整，不仅凭缺键推断中止。这些入口字段的错误结构或矛盾状态继续作为非法证据拒绝。测试 wrapper 读取必需的 `result.json` 时若文件缺失，单独报告 `AX receipt incomplete: result.json missing`，不据此推断中止原因；异常退出码仍先按执行失败拒绝。wrapper 保留 runner stdout/stderr，供定位具体执行原因；这些诊断不改变验收结果。
+运行回执明确报告异常中止时，生命周期验收报 `AX receipt incomplete: runner aborted`；入口检查发现活动、清理或模式字段缺失时报回执不完整，不仅凭缺键推断中止。这些入口字段的错误结构或矛盾状态继续作为非法证据拒绝。测试 wrapper 读取必需的 `result.json` 时若文件缺失，单独报告 `AX receipt incomplete: result.json missing`，不据此推断中止原因；异常退出码仍先按执行失败拒绝。wrapper 保留 runner stdout/stderr，供定位具体执行原因；负对照在读取计数字段前识别中止及不完整回执，失败诊断分别保留两路输出末尾最多 8 KiB 的 UTF-8 文本。这些诊断不改变验收结果。
 
 该边界只覆盖合成夹具中可观测的通知与补偿生命周期，不保证全堆零增长或检测所有泄漏签名。现有 settled 前置条件未满足仍失败；不会自动延长窗口或重跑到绿。相同未归因增长保留证据，不自动扩展 XPC 机制调查；目标生命周期失败、负对照漏检、证据不完整或实际产品问题须单独处置。手动严格调查仍按原零增长规则判定。
 
@@ -179,7 +185,7 @@ Xcode 的 macOS App 构建会添加 Launch Services 注册步骤，文件回收�
 - `ax-evidence.json`：schema 3 显式记录 baseline_protocol；新协议保留有界启动期探测和选中值，并校验其与正式 baseline 的 stdout 哈希、节点、字节和根数量相符。继续保留六点严格 AX 扫描、各点有界类型成分、带正负计数的成分差集，以及严格失败后可用的终点图和精确尺寸直方图；未执行、能力跳过、缺失和不完整状态分别保留
 - `ax-lifecycle.json`：ax-lifecycle-v1 的三个独立验收分量、同一 checkout 及源码／输入／结果绑定、原 runner 退出码和严格结果；已分类增长仍记为未归因，不声明全堆零增长
 
-类型成分子摘要使用 schema 3；无法解析时以固定 `failure_stage` 定位失败阶段，不输出原始行或类型名。树行格式失败可附不超过 4 KiB 的匿名诊断片段：最多两个父行和当前行，经已有词法白名单编码，地址匿名化、任意名称替换为 opaque，完整摘要仍限 8 KiB。片段仅用于语法调查，不是完整树、类型身份或等价重放证据；超预算时不保留片段。真实报告的子层 `ROOT CYCLE` 标记不新增根或节点，层级与计数仍由缩进及子树守恒核对。
+类型成分子摘要使用 schema 3；无法解析时以固定 `failure_stage` 定位失败阶段，不输出原始行或类型名。树行格式失败可附不超过 4 KiB 的匿名诊断片段：最多两个父行和当前行，经已有词法白名单编码，地址匿名化、任意名称替换为 opaque，完整摘要仍限 8 KiB。片段仅用于语法调查，不是完整树、类型身份或等价重放证据；超预算时不保留片段。真实报告的子层 `ROOT CYCLE` 标记不新增根或节点，层级与计数仍由缩进及子树守恒核对。舍入的字节显示保留保守区间，各层向父层传播可行子树范围；普通节点须容纳自身及子树，TOTAL 只汇总子树，跨 STACK 继续核对全局节点和字节守恒。合法区间不能证明精确对象尺寸或跨快照身份。
 
 身份与 verification 回执不声明测试数量或断言详情；AX 回执只保留有限扫描判定标签与脱敏诊断。四份回执都不是签名、实机、安装、性能或发布验收。PR 的 checkout 通常是临时合并提交，不应拿 PR head SHA 替代。最终 job 结论仍以 Actions 为准：`job_before_upload` 不能证明上传步骤本身成功。
 

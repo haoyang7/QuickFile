@@ -1,6 +1,7 @@
 """Self-authored grouped reports and pure composition invariants."""
 import copy
 import hashlib
+import itertools
 from pathlib import Path
 import re
 import sys
@@ -71,6 +72,86 @@ class CompositionTests(unittest.TestCase):
         self.assertEqual(sum(row["size"] * row["count"] for row in value["exact_size_histogram"]), 272)
         report = "Process 123: 5 leaks for 272 total leaked bytes.\n" + body + "\n"
         self.assertEqual(self.parse(report)["type_counts"], value["type_counts"])
+
+    def test_recursive_byte_bounds_reject_an_impossible_non_total_group(self):
+        # The 80-byte leaf and 30-byte sibling require another three bytes for
+        # their ancestors. A separate rounded group cannot supply those bytes.
+        body = ("    5 (112 bytes) ROOT CYCLE: NSXPCConnection\n"
+                "       3 (1K) NSArray\n          2 (1K) NSString\n"
+                "             1 (80 bytes) NSData\n       1 (30 bytes) NSMutableArray")
+        extra = grouped(1, 200, "    1 (1K) ROOT CYCLE: NSXPCConnection",
+                        kind="NSXPCConnection", marker="ROOT CYCLE", frame=1).split("\n\n", 1)[1]
+        report = grouped(6, 200, body, kind="NSXPCConnection", marker="ROOT CYCLE") + "\n" + extra
+        invalid = self.parse(report)
+        self.assertEqual((invalid["counts_status"], invalid["failure_stage"]), ("unavailable", "byte_bounds"))
+        valid = self.parse(report.replace("112 bytes", "113 bytes"))
+        self.assertEqual(valid["counts_status"], "complete")
+        self.assertIn({"type": "NSXPCConnection", "size": 1, "count": 1}, valid["exact_size_histogram"])
+
+    def test_group_total_interval_is_preserved_across_rounded_roots_and_stacks(self):
+        body = ("    3 (200 bytes) << TOTAL >>\n"
+                "      2 (1K) ROOT CYCLE: NSXPCConnection\n         1 (80 bytes) NSData\n"
+                "      1 (1K) ROOT CYCLE: NSXPCConnection")
+        extra = grouped(1, 250, "    1 (50 bytes) ROOT CYCLE: NSXPCConnection",
+                        kind="NSXPCConnection", marker="ROOT CYCLE", frame=1).split("\n\n", 1)[1]
+        for total in (249, 250, 251):
+            with self.subTest(total=total):
+                report = grouped(4, total, body, instances=2, kind="NSXPCConnection", marker="ROOT CYCLE") + "\n" + extra
+                self.assertEqual(self.parse(report)["counts_status"], "complete" if total == 250 else "unavailable")
+
+    def test_small_tree_intervals_match_independent_byte_assignment_enumeration(self):
+        # Each tuple is (combined own count, children). Zero denotes TOTAL.
+        # Enumerate actual positive integer own-byte assignments independently
+        # of the parser's interval arithmetic, then vary every displayed bound.
+        leaf = (1, ())
+        chain = (1, (leaf,))
+        shapes = (leaf, (2, ()), (1, (chain,)), (2, (leaf, leaf)),
+                  (1, (chain, leaf)), (0, (chain, leaf)), (0, (chain, chain)))
+        budget = 6
+        for shape in shapes:
+            rows = []
+            def visit(node, indent=4, root=True):
+                own, children = node
+                index = len(rows)
+                row = {"own": own, "indent": indent, "root": root}
+                rows.append(row)
+                for child in children:
+                    visit(child, indent + (2 if own == 0 else 3), own == 0)
+                row["end"] = len(rows)
+                row["count"] = sum(item["own"] for item in rows[index:])
+            visit(shape)
+            assignments = []
+            for own_bytes in itertools.product(*(range(row["own"], budget + 1) if row["own"] else (0,) for row in rows)):
+                if sum(own_bytes) <= budget:
+                    subtree_bytes = tuple(sum(own_bytes[index:row["end"]]) for index, row in enumerate(rows))
+                    assignments.append((own_bytes, subtree_bytes))
+            labels = ((None, *range(row["count"], budget + 1)) for row in rows)
+            for exact_sizes in itertools.product(*labels):
+                possible = [(own, subtree) for own, subtree in assignments
+                            if all(size is None or size == subtree[index] for index, size in enumerate(exact_sizes))]
+                lines = []
+                for row, size in zip(rows, exact_sizes):
+                    name = "<< TOTAL >>" if row["own"] == 0 else ("ROOT LEAK: " if row["root"] else "") + "NSArray"
+                    display = "1K" if size is None else f"{size} bytes"
+                    lines.append(f"{' ' * row['indent']}{row['count']} ({display}) {name}")
+                with self.subTest(shape=shape, sizes=exact_sizes):
+                    if not possible:
+                        with self.assertRaises(ValueError):
+                            composition._group_tree(lines, None, None, None, budget, [])
+                        continue
+                    own_rows, roots, bounds = composition._group_tree(lines, None, None, None, budget, [])
+                    totals = {subtree[0] for _, subtree in possible}
+                    self.assertEqual(set(range(bounds[0], bounds[1] + 1)), totals)
+                    self.assertEqual(sum(root["count"] for root in roots), rows[0]["count"])
+                    # Published own-byte intervals may be conservative because
+                    # they do not condition descendants on ancestor totals.
+                    postorder = sorted((i for i, row in enumerate(rows) if row["own"]),
+                                       key=lambda i: (rows[i]["end"], -i))
+                    self.assertEqual(len(own_rows), len(postorder))
+                    for index, (_, count, low, high) in zip(postorder, own_rows):
+                        self.assertEqual(count, rows[index]["own"])
+                        self.assertLessEqual(low, min(own[index] for own, _ in possible))
+                        self.assertGreaterEqual(high, max(own[index] for own, _ in possible))
 
     def test_observed_composed_edge_offsets_preserve_all_nodes_and_bytes(self):
         # An owned native grouped report used "storage + 8 + 8 -->".

@@ -119,7 +119,7 @@ def signature(row):
 
 def classification_passed(row):
     return (row['unclassified_nodes'] == 0 and not row['destroyed_notification_stack_present']
-            and all(group['root_type'] == 'NSXPCConnection' for group in row['groups']))
+            and all(group['tree_nodes'] is not None and group['root_type'] == 'NSXPCConnection' for group in row['groups']))
 
 
 def root_count(row):

@@ -455,7 +455,7 @@ class AXCompatibilityHeapValidationTests(unittest.TestCase):
     def test_non_ax_growth_cannot_be_hidden_as_a_startup_baseline(self):
         baseline = self.scan(288, 18_816)
         for value in (self.scan(289, 18_816), self.scan(288, 18_832),
-                      self.scan(288, 18_816) | {"groups": [{"root_type": "NSXPCConnection", "root_instances": 2}]}):
+                      self.scan(288, 18_816) | {"groups": [{"root_type": "NSXPCConnection", "root_instances": 2, "tree_nodes": 288}]}):
             with self.subTest(value=value), self.assertRaises(RuntimeError) as failure:
                 PROBE.validate_product_scan(value, baseline)
             self.assertIn(f"baseline={baseline}", str(failure.exception))
@@ -470,6 +470,261 @@ class AXCompatibilityHeapValidationTests(unittest.TestCase):
         PROBE.validate_product_scan(entry, entry)
         with self.assertRaises(RuntimeError):
             PROBE.validate_product_scan(entry | {"groups": PROBE.leak_groups(text.replace("NSXPCConnection", "UnexpectedConnection"))})
+
+
+class AXGroupedTotalTests(unittest.TestCase):
+    @staticmethod
+    def reports():
+        # Self-authored shape shared with the composition multi-root regression.
+        grouped = ("Process 123: 5 leaks for 272 total leaked bytes.\n\n"
+            "STACK OF 2 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
+            "0 synthetic-image 0x1234 synthetic_function + 0\n====\n"
+            "    5 (272 bytes) << TOTAL >>\n      ----\n"
+            "      3 (144 bytes) ROOT CYCLE: NSXPCConnection\n"
+            "         2 (96 bytes) _connection --> NSArray\n"
+            "            1 (80 bytes) list --> NSData\n"
+            "               __strong [capture] --> CYCLE BACK TO NSXPCConnection\n      ----\n"
+            "      2 (128 bytes) ROOT CYCLE: NSXPCConnection\n"
+            "         1 (80 bytes) NSData\n            CYCLE BACK TO NSXPCConnection\n")
+        listed = "Process 123: 5 leaks for 272 total leaked bytes.\n"
+        for index, (kind, size) in enumerate((("NSXPCConnection", 48), ("NSArray", 16),
+                                             ("NSData", 80), ("NSXPCConnection", 48), ("NSData", 80))):
+            listed += (f"\nLeak: {0x1000 + index * 0x100:#x}  size={size}  zone: private-zone   {kind}\n"
+                       "\tCall stack: \n0 synthetic-image 0x1234 synthetic_function + 0\n")
+        return grouped, listed
+
+    @staticmethod
+    def scan(report, nodes=5, size=272):
+        groups = REPORT.leak_groups(report)
+        return {"leak_nodes": nodes, "leak_bytes": size, "groups": groups,
+                "unclassified_nodes": nodes - sum(group["tree_nodes"] or 0 for group in groups),
+                "destroyed_notification_stack_present": False}
+
+    def test_live_and_terminal_total_conserve_nodes_roots_and_stack_identity(self):
+        grouped, listed = self.reports()
+        scan = self.scan(grouped)
+        PROBE.validate_product_scan(scan, scan)
+        self.assertEqual(scan["unclassified_nodes"], 0)
+        self.assertEqual(scan["groups"], [{"root_instances": 2, "root_type": "NSXPCConnection",
+            "root_kind": "CYCLE", "tree_nodes": 5, "display_size": "272 bytes", "destroyed_return_offsets": []}])
+        roots = REPORT.terminal_roots(grouped, 5)
+        self.assertEqual((roots[0]["instances"], roots[0]["tree_nodes"]), (2, 5))
+        self.assertEqual(roots[0]["private_stack"], (((0, "synthetic-image", 0x1234, "synthetic_function", 0),), 0))
+        resolver = mock.Mock()
+        with mock.patch.object(REPORT.ax_system_images, "report_images", return_value=[]):
+            value = REPORT.terminal_snapshot_summary(grouped, listed, resolver)
+        self.assertEqual((value["parsing_status"], value["root_instances"], value["leak_nodes"]), ("complete", 2, 5))
+        self.assertEqual(value["root_groups"][0]["stack"]["filtered_frames"], 1)
+        self.assertEqual(value["root_groups"][0]["stack"]["frames"], [])
+        resolver.verified.assert_not_called()
+
+    def test_total_rejects_bad_headers_subtrees_instances_and_unknown_syntax(self):
+        grouped, listed = self.reports()
+        mutations = (("5 leaks for 272", "5 leaks for 273"),
+                     ("5 (272 bytes) << TOTAL >>", "6 (272 bytes) << TOTAL >>"),
+                     ("5 (272 bytes) << TOTAL >>", "5 (273 bytes) << TOTAL >>"),
+                     ("2 INSTANCES", "3 INSTANCES"),
+                     ("3 (144 bytes)", "4 (144 bytes)"),
+                     ("2 (96 bytes)", "3 (96 bytes)"),
+                     ("1 (80 bytes) list", "1 (97 bytes) list"),
+                     ("      2 (128 bytes)", "       2 (128 bytes)"),
+                     ("ROOT CYCLE: NSXPCConnection\n         1", "ROOT CYCLE: UnknownConnection\n         1"),
+                     ("<< TOTAL >>", "<< UNKNOWN >>"),
+                     ("\n====\n", "\n"),
+                     ("CYCLE BACK TO NSXPCConnection", "CYCLE BACK TO unknown"))
+        for old, new in mutations:
+            report = grouped.replace(old, new)
+            with self.subTest(old=old, new=new):
+                with self.assertRaises(RuntimeError):
+                    PROBE.validate_product_scan(self.scan(report))
+                with self.assertRaises(ValueError):
+                    REPORT.terminal_roots(report, 5)
+                self.assertEqual(REPORT.terminal_snapshot_summary(report, listed, mock.Mock())["parsing_status"], "unavailable")
+        for report in (grouped[:grouped.rindex("      ----")], grouped + "      ----\n", grouped + "unknown\n"):
+            with self.subTest(report=report), self.assertRaises(RuntimeError):
+                PROBE.validate_product_scan(self.scan(report))
+
+    def test_rounded_total_uses_combined_self_byte_bounds(self):
+        from ax_composition import grouped_composition
+        grouped, listed = self.reports()
+        rounded = grouped.replace("3 (144 bytes)", "3 (1K)")
+        for size in (225, 272):
+            report = rounded.replace("272", str(size))
+            with self.subTest(valid_size=size):
+                self.assertEqual(grouped_composition(report)["counts_status"], "complete")
+                scan = self.scan(report, 5, size)
+                PROBE.validate_product_scan(scan, scan)
+                self.assertEqual(REPORT.terminal_roots(report, 5)[0]["tree_nodes"], 5)
+        with mock.patch.object(REPORT.ax_system_images, "report_images", return_value=[]):
+            self.assertEqual(REPORT.terminal_snapshot_summary(rounded, listed, mock.Mock())["parsing_status"], "complete")
+        for size in (200, 224):
+            report = rounded.replace("272", str(size))
+            with self.subTest(invalid_size=size):
+                self.assertEqual(grouped_composition(report)["counts_status"], "unavailable")
+                with self.assertRaises(RuntimeError):
+                    PROBE.validate_product_scan(self.scan(report, 5, size))
+                with self.assertRaises(ValueError):
+                    REPORT.terminal_roots(report, 5)
+        false_list = listed.replace("272", "200").replace("size=80", "size=44")
+        self.assertEqual(REPORT.terminal_snapshot_summary(rounded.replace("272", "200"), false_list,
+                                                        mock.Mock())["parsing_status"], "unavailable")
+        # A second uncertain group cannot compensate for an impossible first
+        # group's own-byte interval, even if the report-wide bounds overlap.
+        invalid_group = rounded.replace("272 bytes", "200 bytes").replace("5 leaks for 272", "6 leaks for 320")
+        invalid_group += ("\nSTACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
+                          "0 synthetic-image 0x1250 extra_function + 0\n====\n"
+                          "    1 (1K) << TOTAL >>\n      1 (1K) ROOT CYCLE: NSXPCConnection\n")
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_product_scan(self.scan(invalid_group, 6, 320))
+        with self.assertRaises(ValueError):
+            REPORT.terminal_roots(invalid_group, 6)
+        # Here each group's interval is nonempty. The combined minimum of
+        # 225 + 48 must still fit the report total across both STACK groups.
+        multi = rounded.replace("272 bytes", "1K") + (
+            "\nSTACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
+            "0 synthetic-image 0x1250 extra_function + 0\n====\n"
+            "    1 (48 bytes) ROOT CYCLE: NSXPCConnection\n")
+        for size, valid in ((250, False), (273, True)):
+            report = multi.replace("5 leaks for 272", f"6 leaks for {size}")
+            with self.subTest(multiple_group_size=size):
+                self.assertEqual(grouped_composition(report)["counts_status"], "complete" if valid else "unavailable")
+                if valid:
+                    PROBE.validate_product_scan(self.scan(report, 6, size))
+                    self.assertEqual(len(REPORT.terminal_roots(report, 6)), 2)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        PROBE.validate_product_scan(self.scan(report, 6, size))
+                    with self.assertRaises(ValueError):
+                        REPORT.terminal_roots(report, 6)
+
+    def test_invalid_total_with_zero_report_totals_is_not_an_empty_scan(self):
+        grouped, _ = self.reports()
+        report = grouped.replace("5 leaks for 272", "0 leaks for 0")
+        scan = self.scan(report, 0, 0)
+        self.assertEqual(scan["unclassified_nodes"], 0)
+        self.assertIsNone(scan["groups"][0]["tree_nodes"])
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_product_scan(scan)
+        with self.assertRaises(ValueError):
+            REPORT.terminal_roots(report, 0)
+        PROBE.validate_product_scan(self.scan("Process 123: 0 leaks for 0 total leaked bytes.\n", 0, 0))
+
+    def test_recursive_rounded_subtrees_must_fit_each_ancestor(self):
+        from ax_composition import grouped_composition
+        # The first root needs 80 + 30 descendant bytes and two own bytes.
+        # Its rounded sibling must not hide the impossible 100-byte subtree.
+        report = ("Process 123: 5 leaks for 200 total leaked bytes.\n\n"
+            "STACK OF 2 INSTANCES OF 'ROOT CYCLE: NSXPCConnection':\n"
+            "0 synthetic-image 0x1234 synthetic_function + 0\n====\n"
+            "    5 (200 bytes) << TOTAL >>\n"
+            "      4 (100 bytes) ROOT CYCLE: NSXPCConnection\n"
+            "         2 (1K) NSArray\n            1 (80 bytes) NSData\n"
+            "         1 (30 bytes) NSMutableArray\n"
+            "      1 (1K) ROOT CYCLE: NSXPCConnection\n")
+        for root_bytes in (100, 111, 112, 113):
+            for display in ("200 bytes", "1K"):
+                candidate = report.replace("4 (100 bytes)", f"4 ({root_bytes} bytes)").replace(
+                    "5 (200 bytes)", f"5 ({display})")
+                with self.subTest(root_bytes=root_bytes, display=display):
+                    if root_bytes < 112:
+                        value = grouped_composition(candidate)
+                        self.assertEqual((value["counts_status"], value["failure_stage"]), ("unavailable", "byte_bounds"))
+                        with self.assertRaises(RuntimeError):
+                            PROBE.validate_product_scan(self.scan(candidate, 5, 200))
+                        with self.assertRaises(ValueError):
+                            REPORT.terminal_roots(candidate, 5)
+                    else:
+                        value = grouped_composition(candidate)
+                        self.assertEqual(value["counts_status"], "complete")
+                        root_sizes = [row for row in value["exact_size_histogram"] + value["unresolved_sizes"]
+                                      if row["type"] == "NSXPCConnection"]
+                        self.assertIn({"type": "NSXPCConnection", "size": 1, "count": 1} if root_bytes == 112 else
+                                      {"type": "NSXPCConnection", "count": 1, "bytes_min": 1, "bytes_max": 2,
+                                       "reason": "rounded_subtree"}, root_sizes)
+                        scan = self.scan(candidate, 5, 200)
+                        PROBE.validate_product_scan(scan, scan)
+                        self.assertEqual(scan["groups"][0]["display_size"], display)
+                        root = REPORT.terminal_roots(candidate, 5)[0]
+                        self.assertEqual((root["instances"], root["tree_nodes"]), (2, 5))
+                        self.assertEqual(root["private_stack"], (((0, "synthetic-image", 0x1234, "synthetic_function", 0),), 0))
+        listed = "Process 123: 5 leaks for 200 total leaked bytes.\n"
+        for index, (kind, size) in enumerate((("NSXPCConnection", 1), ("NSArray", 1), ("NSData", 80),
+                                             ("NSMutableArray", 30), ("NSXPCConnection", 88))):
+            listed += (f"\nLeak: {0x1000 + index * 0x100:#x}  size={size}  zone: private-zone   {kind}\n"
+                       "\tCall stack: \n0 synthetic-image 0x1234 synthetic_function + 0\n")
+        with mock.patch.object(REPORT.ax_system_images, "report_images", return_value=[]):
+            for size, status in ((100, "unavailable"), (112, "complete")):
+                candidate = report.replace("4 (100 bytes)", f"4 ({size} bytes)")
+                self.assertEqual(REPORT.terminal_snapshot_summary(candidate, listed, mock.Mock())["parsing_status"], status)
+
+    def test_recursive_bounds_cover_non_total_groups_in_a_mixed_report(self):
+        report = ("Process 123: 6 leaks for 200 total leaked bytes.\n\n"
+            "STACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
+            "0 synthetic-image 0x1234 synthetic_function + 0\n====\n"
+            "    5 (112 bytes) ROOT CYCLE: NSXPCConnection\n"
+            "       3 (1K) NSArray\n          2 (1K) NSString\n"
+            "             1 (80 bytes) NSData\n       1 (30 bytes) NSMutableArray\n\n"
+            "STACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
+            "0 synthetic-image 0x1250 extra_function + 0\n====\n"
+            "    1 (1K) << TOTAL >>\n      1 (1K) ROOT CYCLE: NSXPCConnection\n")
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_product_scan(self.scan(report, 6, 200))
+        with self.assertRaises(ValueError):
+            REPORT.terminal_roots(report, 6)
+        valid = report.replace("112 bytes", "113 bytes")
+        scan = self.scan(valid, 6, 200)
+        PROBE.validate_product_scan(scan, scan)
+        self.assertEqual([group["display_size"] for group in scan["groups"]], ["113 bytes", "1K"])
+        self.assertEqual([root["tree_nodes"] for root in REPORT.terminal_roots(valid, 6)], [5, 1])
+
+    def test_multiple_total_groups_require_global_nodes_and_bytes(self):
+        grouped, listed = self.reports()
+        extra = ("\nSTACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
+                 "0 synthetic-image 0x1250 extra_function + 0\n====\n"
+                 "    1 (48 bytes) << TOTAL >>\n"
+                 "      1 (48 bytes) ROOT CYCLE: NSXPCConnection\n")
+        grouped = grouped.replace("5 leaks for 272", "6 leaks for 320") + extra
+        listed = listed.replace("5 leaks for 272", "6 leaks for 320") + (
+            "\nLeak: 0x2000  size=48  zone: private-zone   NSXPCConnection\n"
+            "\tCall stack: \n0 synthetic-image 0x1250 extra_function + 0\n")
+        scan = self.scan(grouped, 6, 320)
+        PROBE.validate_product_scan(scan, scan)
+        self.assertEqual([root["tree_nodes"] for root in REPORT.terminal_roots(grouped, 6)], [5, 1])
+        with mock.patch.object(REPORT.ax_system_images, "report_images", return_value=[]):
+            self.assertEqual(REPORT.terminal_snapshot_summary(grouped, listed, mock.Mock())["parsing_status"], "complete")
+        invalid = [grouped.replace("6 leaks for 320", "6 leaks for 321"),
+                   grouped.replace("6 leaks for 320", "7 leaks for 320"),
+                   grouped.replace("1 (48 bytes) << TOTAL >>", "2 (48 bytes) << TOTAL >>"),
+                   grouped.replace("1 INSTANCE OF", "2 INSTANCES OF"),
+                   grouped.replace("      1 (48 bytes)", "       1 (48 bytes)"),
+                   grouped + "unknown\n"]
+        for report in invalid:
+            with self.subTest(report=report):
+                scan = self.scan(report, 6, 321)
+                with self.assertRaises(RuntimeError):
+                    PROBE.validate_product_scan(scan, scan)
+                with self.assertRaises(ValueError):
+                    REPORT.terminal_roots(report, 6)
+                # The list agrees with the false 321-byte header. Grouped trees
+                # must independently reject it before declaring parsing complete.
+                false_list = listed.replace("6 leaks for 320", "6 leaks for 321").replace("0x2000  size=48", "0x2000  size=49")
+                self.assertEqual(REPORT.terminal_snapshot_summary(report, false_list, mock.Mock())["parsing_status"], "unavailable")
+        mixed = grouped.replace("    1 (48 bytes) << TOTAL >>\n      1", "    1")
+        PROBE.validate_product_scan(self.scan(mixed, 6, 320))
+        with self.assertRaises(RuntimeError):
+            PROBE.validate_product_scan(self.scan(mixed.replace("6 leaks for 320", "6 leaks for 321"), 6, 321))
+
+    def test_total_multiple_stacks_binary_images_and_destroyed_offsets(self):
+        report, _ = self.reports()
+        extra = ("\nSTACK OF 1 INSTANCE OF 'ROOT CYCLE: NSXPCConnection':\n"
+                 f"0 synthetic-image 0x1234 {REPORT.DESTROYED} + 4\n====\n"
+                 "    1 (48 bytes) ROOT CYCLE: NSXPCConnection\n")
+        report = report.replace("5 leaks for 272", "6 leaks for 320") + extra
+        baseline = self.scan(report, 6, 320)
+        self.assertEqual([group["tree_nodes"] for group in baseline["groups"]], [5, 1])
+        self.assertEqual(baseline["groups"][1]["destroyed_return_offsets"], [4])
+        self.assertEqual(sum(root["instances"] for root in REPORT.terminal_roots(report, 6)), 3)
+        self.assertEqual(REPORT.leak_groups(report + "\nBinary Images:\nprivate-data\n"), baseline["groups"])
 
 
 class AXCompatibilityNotificationTests(unittest.TestCase):
