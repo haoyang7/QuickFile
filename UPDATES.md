@@ -4,7 +4,7 @@ Community 采用 ad-hoc 签名、未经公证并手动覆盖升级，不包含�
 
 证书签名更新路线使用 Sparkle 2，默认构建不启用在线更新。正式更新源和签名公钥尚未确定；Developer ID、公证、真实 HTTPS 跨版本升级和完整运行准入仍需完成，尚未对外发布。
 
-[Community 免费构建](COMMUNITY_DISTRIBUTION.md) 通过条件编译移除 Sparkle，采用手动覆盖安装。下述手动检查能力已在后续未发布源码与本地候选中提供；公开的 v0.1.0-beta.2（build 98）没有该操作，需在浏览器中查看 GitHub Releases。Sparkle 配置和发布步骤适用于 Developer ID 证书签名路线。
+[Community 免费构建](COMMUNITY_DISTRIBUTION.md) 通过条件编译移除 Sparkle，采用手动覆盖安装。公开的 v0.1.0-beta.3（build 107）包含下述手动检查能力；较早公开的 v0.1.0-beta.2（build 98）没有该操作，需在浏览器中查看 GitHub Releases。Sparkle 配置和发布步骤适用于 Developer ID 证书签名路线。
 
 ## 应用行为
 

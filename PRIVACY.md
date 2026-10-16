@@ -2,7 +2,7 @@
 
 适用于当前源码；软件更新行为取决于构建渠道。
 
-QuickFile 的文件创建、模板和目录授权完全在本机运行，不需要账号，也不包含遥测、广告或用户行为分析。Community 构建不包含或调用 Sparkle，也不自动下载或安装更新。当前未发布源码与后续候选的主 App 提供“检查更新…”手动动作；只有用户点击后，才通过 HTTPS 访问固定公开仓库 `haoyang7/QuickFile` 的 GitHub Release API 和同一 Release 的 `build-provenance.json`，核对版本身份，并在发现新版时提供官方 Release 页面链接。公开的 v0.1.0-beta.2（build 98）没有该手动检查能力。用户在浏览器中下载、校验 DMG 并覆盖安装。支持 Sparkle 的 Developer ID 构建默认也不启用在线更新；配置正式更新渠道后，用户可主动检查更新，或在设置中开启自动检查。
+QuickFile 的文件创建、模板和目录授权完全在本机运行，不需要账号，也不包含遥测、广告或用户行为分析。Community 构建不包含或调用 Sparkle，也不自动下载或安装更新。公开的 v0.1.0-beta.3（build 107）主 App 提供“检查更新…”手动动作；只有用户点击后，才通过 HTTPS 访问固定公开仓库 `haoyang7/QuickFile` 的 GitHub Release API 和同一 Release 的 `build-provenance.json`，核对版本身份，并在发现新版时提供官方 Release 页面链接。较早公开的 v0.1.0-beta.2（build 98）没有该手动检查能力。用户在浏览器中下载、校验 DMG 并覆盖安装。支持 Sparkle 的 Developer ID 构建默认也不启用在线更新；配置正式更新渠道后，用户可主动检查更新，或在设置中开启自动检查。
 
 ## 软件更新
 

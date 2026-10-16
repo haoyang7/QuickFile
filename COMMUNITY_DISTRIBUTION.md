@@ -205,13 +205,13 @@ Community 打包只在私有副本最终签名前，对主 App 和 Finder 扩展
 
 ## 版本检查
 
-以下行为适用于当前未发布源码及包含此能力的后续候选；公开的 v0.1.0-beta.2（build 98）没有“检查更新…”操作，需在浏览器中查看 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases)。
+公开的 v0.1.0-beta.3（build 107）包含以下手动检查能力；较早公开的 v0.1.0-beta.2（build 98）没有“检查更新…”操作，需在浏览器中查看 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases)。
 
 Community 构建不包含或调用 Sparkle，也不自动下载或安装更新。主 App 提供“检查更新…”手动动作；只有用户点击后，才通过 HTTPS 访问固定公开仓库 `haoyang7/QuickFile` 的 GitHub Release API，并读取同一 Release 的 `build-provenance.json`。Beta 偏好默认关闭，只筛选 stable；设置中选择“接收 Beta 版本”后才包含 Beta。
 
-带标签打包会在签名前把完整发布标签写入两组件的 `QuickFileReleaseTag`，应用据此显示如 `0.1.0 Beta 2` 的当前版本，同时显示内部 build。更新先比较完整标签，顺序为营销版本、Beta 编号、同营销版本的正式版；仅同一标签比较 `internal_build`。因此 Beta 可升级到构建号较低的同版本正式版，正式版不会退回同版本 Beta。“接收 Beta”不改变当前版本展示。旧包缺少标签时继续按营销版本和 build 比较；无标签的本地打包会清除副本中的继承标签。
+带标签打包会在签名前把完整发布标签写入两组件的 `QuickFileReleaseTag`，应用据此显示如 `0.1.0 Beta 3` 的当前版本，同时显示内部 build。更新先比较完整标签，顺序为营销版本、Beta 编号、同营销版本的正式版；仅同一标签比较 `internal_build`。因此 Beta 可升级到构建号较低的同版本正式版，正式版不会退回同版本 Beta。“接收 Beta”不改变当前版本展示。旧包缺少标签时继续按营销版本和 build 比较；无标签的本地打包会清除副本中的继承标签。
 
-缺少或错配 `build-provenance.json`、网络失败或 GitHub 限流必须明确显示，不能冒充最新版。发现新版时提供对应官方 Release 页面链接；用户在浏览器中手动下载 DMG 和 `.sha256`，核对校验和，再按[安装指南](INSTALLATION.md)覆盖安装。旧版没有这项 Community 检查能力，必须先手动安装包含该能力的新版本。
+缺少或错配 `build-provenance.json`、网络失败或 GitHub 限流必须明确显示，不能冒充最新版。发现新版时提供对应官方 Release 页面链接；用户在浏览器中手动下载 DMG 和 `.sha256`，核对校验和，再按[安装指南](INSTALLATION.md)覆盖安装。较早公开的 beta.2 等旧版没有这项 Community 检查能力，必须先手动安装包含该能力的新版本。
 
 启动、激活和修改 Beta 偏好不会触发 Community 后台联网，Community 没有自动检查开关。主 App 配置出站网络客户端权限，Finder Extension 不配置网络权限；文件、模板和目录授权能力仍在本机完成。GitHub 或其 CDN 可看到 IP 地址、请求时间和常规请求信息；检查不使用账号 token，也不上传用户文件、模板、目录路径、目录书签、剪贴板内容或诊断记录。
 

@@ -6,10 +6,10 @@ You only need to install QuickFile once. To add its **New File** menu to Finder,
 
 ## 1. Download
 
-Open the [release page](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.2) and download these two files from **Assets**:
+Open the [release page](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.3) and download these two files from **Assets**:
 
-- `QuickFile-v0.1.0-beta.2.dmg` — the app installer.
-- `QuickFile-v0.1.0-beta.2.dmg.sha256` — a small file used to check the download.
+- `QuickFile-v0.1.0-beta.3.dmg` — the app installer.
+- `QuickFile-v0.1.0-beta.3.dmg.sha256` — a small file used to check the download.
 
 The same installer works on Apple Silicon and Intel Macs. The minimum system is macOS 13. This is a Beta; see the release page for the systems and workflows actually tested.
 
@@ -18,7 +18,7 @@ The same installer works on Apple Silicon and Intel Macs. The minimum system is 
 Keep both files in the same folder. Open **Terminal**, type `cd` followed by a space, drag that folder into Terminal, then press Return. Paste this command and press Return:
 
 ```bash
-shasum -a 256 -c QuickFile-v0.1.0-beta.2.dmg.sha256
+shasum -a 256 -c QuickFile-v0.1.0-beta.3.dmg.sha256
 ```
 
 If you see `OK`, continue. If it reports a mismatch, download both files again. This checks that the installer matches the published download; it is not an Apple security approval.
@@ -79,9 +79,7 @@ You can also save folder access from **Diagnostics → Authorize Folder…** and
 
 **It keeps asking to access data from other apps.** That is not an expected setup step for this version. Keep the message and describe what you clicked when [reporting the problem](https://github.com/haoyang7/QuickFile/issues).
 
-**How do I check for updates?** The public v0.1.0-beta.2 (build 98) linked above has no **Check for Updates…** action. Check [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) in your browser, download the DMG and `.sha256` file, verify the checksum, then replace the app using the steps above.
-
-Later, unreleased source and local candidates provide **Check for Updates…**. Only a click requests the fixed repository’s GitHub Release API and validates the matching `build-provenance.json`; missing or mismatched receipts, network failures and rate limits are shown clearly. Tagged candidates are ordered by marketing version, Beta number and then the stable release of that version; builds are compared only for the same tag. Older packages without a tag keep the marketing-version/build comparison. The Beta preference is off by default, so only stable releases are checked; turn on **Receive beta versions** in Settings to include Beta releases. If a newer release is found, it provides a release page link; downloading, verifying and installing remain manual. This feature is not included in the public download above. Community never downloads or installs updates automatically.
+**How do I check for updates?** The public v0.1.0-beta.3 (build 107) linked above includes **Check for Updates…**. Only a click requests the fixed repository’s GitHub Release API and validates the matching `build-provenance.json`; missing or mismatched receipts, network failures and rate limits are shown clearly. Tagged candidates are ordered by marketing version, Beta number and then the stable release of that version; builds are compared only for the same tag. Older packages without a tag keep the marketing-version/build comparison. The Beta preference is off by default, so only stable releases are checked; turn on **Receive beta versions** in Settings to include Beta releases. If a newer release is found, it provides a release page link; downloading, verifying and replacing the app remain manual. The earlier public v0.1.0-beta.2 (build 98) did not include this action. Community has no Sparkle and never downloads or installs updates automatically.
 
 ## Updating or going back
 

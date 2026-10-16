@@ -6,7 +6,7 @@
 
 打开 Finder 文件夹，在空白处点鼠标右键，选一种文件，QuickFile 就会把新文件放在这里。你也可以打开 QuickFile，在窗口里完成操作。
 
-[下载 Mac 版](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.2) · [安装帮助](INSTALLATION.md) · [反馈问题](https://github.com/haoyang7/QuickFile/issues)
+[下载 Mac 版](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.3) · [安装帮助](INSTALLATION.md) · [反馈问题](https://github.com/haoyang7/QuickFile/issues)
 
 ## 可以新建哪些文件？
 
@@ -48,9 +48,9 @@
 
 ## 安装前知道这几件事
 
-- **需要什么电脑？** macOS 13 或更新版本，Apple Silicon 和 Intel Mac 使用同一个安装包。目前是 Beta 测试版，并非每种 Mac 和系统都已测试，具体范围见[发布说明](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.2)。
+- **需要什么电脑？** macOS 13 或更新版本，Apple Silicon 和 Intel Mac 使用同一个安装包。目前是 Beta 测试版，并非每种 Mac 和系统都已测试，具体范围见[发布说明](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.3)。
 - **第一次打开有提示？** Community 版尚未经过 Apple 公证，系统可能需要你确认打开。[安装指南](INSTALLATION.md)里有具体步骤。
-- **怎么更新？** 已公开的 v0.1.0-beta.2（build 98）没有“检查更新…”操作，请在浏览器中查看 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases)，自行下载、校验 DMG 并安装。后续未发布候选已增加手动检查，详见[安装指南](INSTALLATION.md#常见问题)。Community 不会自动下载或安装更新。
+- **怎么更新？** 已公开的 v0.1.0-beta.3（build 107）提供“检查更新…”：默认只检查 stable，在设置中打开“接收 Beta 版本”后才会包含 Beta。发现新版本后，仍需从 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 手动下载 DMG 和对应 `.sha256`、校验并覆盖安装。之前公开的 v0.1.0-beta.2（build 98）没有这项操作。Community 不会自动下载或安装更新，详见[安装指南](INSTALLATION.md#常见问题)。
 - **数据放在哪里？** 模板和设置保存在你的 Mac 上，无需账号，没有广告或使用情况追踪。选择文件夹时才授予相应访问权限，详见[隐私说明](PRIVACY.md)。
 
 建议先在测试文件夹里创建一个文件。云盘、外接磁盘和网络磁盘还需要更多测试。
