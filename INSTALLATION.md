@@ -6,10 +6,10 @@
 
 ## 1. 下载
 
-打开[发布页面](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.2)，在 **Assets** 中下载这两个文件：
+打开[发布页面](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.3)，在 **Assets** 中下载这两个文件：
 
-- `QuickFile-v0.1.0-beta.2.dmg`：用来安装 QuickFile。
-- `QuickFile-v0.1.0-beta.2.dmg.sha256`：用来检查下载是否完整。
+- `QuickFile-v0.1.0-beta.3.dmg`：用来安装 QuickFile。
+- `QuickFile-v0.1.0-beta.3.dmg.sha256`：用来检查下载是否完整。
 
 Apple Silicon 和 Intel Mac 下载同一个包。需要 macOS 13 或更新版本；目前是 Beta，已经测试过哪些系统和操作，请看发布页面的说明。
 
@@ -18,7 +18,7 @@ Apple Silicon 和 Intel Mac 下载同一个包。需要 macOS 13 或更新版本
 把两个文件放在同一个文件夹。打开“终端”，输入 `cd` 和一个空格，把这个文件夹拖进终端，再按回车。接着粘贴下面一行，再按回车：
 
 ```bash
-shasum -a 256 -c QuickFile-v0.1.0-beta.2.dmg.sha256
+shasum -a 256 -c QuickFile-v0.1.0-beta.3.dmg.sha256
 ```
 
 看到 `OK` 就可以继续。若提示不匹配，请重新下载两个文件。这一步只检查文件是否与发布的下载一致，不代表 Apple 已经批准该应用。
@@ -79,9 +79,7 @@ macOS 15 及以后，Finder 扩展通常位于“系统设置 → 通用 → 登
 
 **反复要求“访问其他 App 的数据”。** 这不是当前版本正常使用所需的步骤。保留提示原文，说明当时点了什么，再[反馈问题](https://github.com/haoyang7/QuickFile/issues)。
 
-**怎么检查更新？** 本页下载的公开 v0.1.0-beta.2（build 98）没有“检查更新…”操作，请在浏览器中查看 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases)，下载 DMG 和 `.sha256`、核对校验和，再按上面的步骤覆盖安装。
-
-后续未发布源码与本地候选已提供“检查更新…”：只有点击后才会查询固定仓库的 GitHub Release API，并核对同一 Release 的 `build-provenance.json`；缺少或错配收据、网络失败和限流会明确显示。带标签的候选按营销版本、Beta 编号及同版本正式版排序，仅同标签比较 build；旧包缺少标签时沿用营销版本与 build 比较。Beta 偏好默认关闭，只检查 stable；在设置中打开“接收 Beta 版本”后也会包含 Beta。发现新版会提供对应发布页链接，下载、校验和安装仍需手动完成。该功能尚未包含在上述公开下载中，Community 不会自动下载或安装更新。
+**怎么检查更新？** 本页下载的公开 v0.1.0-beta.3（build 107）提供“检查更新…”操作。只有用户主动点击后，QuickFile 才会查询固定仓库的 GitHub Release API，并核对同一 Release 的 `build-provenance.json`；缺少或错配收据、网络失败和限流会明确显示。带标签的候选按营销版本、Beta 编号及同版本正式版排序，仅同标签比较 build；旧包缺少标签时沿用营销版本与 build 比较。Beta 偏好默认关闭，只检查 stable；在设置中打开“接收 Beta 版本”后也会包含 Beta。发现新版会提供对应发布页链接；下载、校验和覆盖安装仍需手动完成。较早公开的 v0.1.0-beta.2（build 98）没有这项操作。Community 不包含 Sparkle，也不会自动下载或安装更新。
 
 ## 升级与恢复
 
@@ -121,7 +119,7 @@ xattr -dr com.apple.quarantine /Applications/QuickFile.app
 
 ### 升级与恢复技术说明
 
-Community 不包含或调用 Sparkle，也不自动下载或安装更新。包含手动检查的后续候选仅在用户点击后联网，具体行为见上面的“怎么检查更新”；启动、激活和修改 Beta 偏好不会触发后台联网，Community 没有自动检查开关。先确认旧版与新版的分发路线、版本/build 和发布说明。开发签名或 Developer ID 版本切换到 Community 涉及签名身份变化，不能套用同一路线的升级结果；采用统一存储的新版本共用原数据目录，模板和设置直接延续，目录书签失效时重新授权。较早使用 App Group 的版本仍需切换前导出模板、新版预览导入；不自动读取旧容器。
+Community 不包含或调用 Sparkle，也不自动下载或安装更新。公开的 v0.1.0-beta.3（build 107）包含手动检查，只有用户点击后联网，具体行为见上面的“怎么检查更新”；启动、激活和修改 Beta 偏好不会触发后台联网，Community 没有自动检查开关。先确认旧版与新版的分发路线、版本/build 和发布说明。开发签名或 Developer ID 版本切换到 Community 涉及签名身份变化，不能套用同一路线的升级结果；采用统一存储的新版本共用原数据目录，模板和设置直接延续，目录书签失效时重新授权。较早使用 App Group 的版本仍需切换前导出模板、新版预览导入；不自动读取旧容器。
 
 升级时先备份并退出旧版，再按同一校验、拖拽、推出和首次打开流程覆盖安装；打开后在“关于”中核对版本/build，重新确认 Finder 扩展实际加载的是当前 `/Applications/QuickFile.app`，再验证模板、目录授权和 Finder 创建。若系统拒绝启动、持续加载或扩展未响应，保留提示原文并停止该项验收，不通过重签、注册修复或关闭安全功能掩盖失败。
 
