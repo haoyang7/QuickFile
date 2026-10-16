@@ -35,6 +35,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       run_checks: ${{ steps.scope.outputs.run_checks }}
+      scope: ${{ steps.scope.outputs.scope }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,35 +46,9 @@ jobs:
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import re
-          import subprocess
-          from pathlib import Path
-
-          run_checks = True
-          if os.environ["GITHUB_EVENT_NAME"] == "pull_request":
-              head = os.environ["PR_HEAD_SHA"]
-              base = os.environ["PR_BASE_SHA"]
-              if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (base, head)):
-                  raise ValueError("PR base/head must be full commit SHAs")
-              # Three-dot PR scope; no rename detection so old code paths also count.
-              changed = subprocess.check_output([
-                  "git", "diff", "--name-only", "--no-renames", "-z", f"{base}...{head}", "--",
-              ]).split(b"\0")
-              paths = [path for path in changed if path]
-              run_checks = any(
-                  not (path == b"LICENSE" or (b"/" not in path and path.endswith(b".md")))
-                  for path in paths
-              )
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-              output.write(f"run_checks={str(run_checks).lower()}\n")
-          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
-              summary.write("### Verification scope\n\n")
-              summary.write("Full Linux and macOS validation required.\n" if run_checks else
-                            "Only root Markdown/LICENSE changes; Linux and macOS tests are skipped, not tested.\n")
-          PY
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: python3 Scripts/ci-scope.py
 
   scripts:
     name: Python scripts (Linux)
@@ -219,17 +194,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Require successful verification or explicit documentation skip
+      - name: Require successful verification or explicit verified scope
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           RUN_CHECKS: ${{ needs.changes.outputs.run_checks }}
+          SCOPE: ${{ needs.changes.outputs.scope }}
           SCRIPTS_RESULT: ${{ needs.scripts.result }}
           MACOS_RESULT: ${{ needs.macos.result }}
         run: |
           if [[ "$CHANGES_RESULT" == success && "$RUN_CHECKS" == false &&
-                "$SCRIPTS_RESULT" == skipped && "$MACOS_RESULT" == skipped ]]; then
+                "$SCOPE" == documentation && "$SCRIPTS_RESULT" == skipped && "$MACOS_RESULT" == skipped ]]; then
             printf '%s\n' 'Documentation scope accepted; Linux and macOS tests were skipped, not tested.' >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "$CHANGES_RESULT" == success && "$RUN_CHECKS" == true &&
+          elif [[ "$CHANGES_RESULT" == success && "$RUN_CHECKS" == false &&
+                  "$SCOPE" == build-version && "$SCRIPTS_RESULT" == skipped && "$MACOS_RESULT" == skipped ]]; then
+            printf '%s\n' 'Internal build increment and project consistency verified by scope classification; Linux and macOS tests were skipped, not tested.' >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$CHANGES_RESULT" == success && "$RUN_CHECKS" == true && "$SCOPE" == full &&
                   "$SCRIPTS_RESULT" == success && "$MACOS_RESULT" == success ]]; then
             printf '%s\n' 'Linux script tests and all three macOS validation lanes succeeded.' >> "$GITHUB_STEP_SUMMARY"
           else

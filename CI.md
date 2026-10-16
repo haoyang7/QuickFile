@@ -10,20 +10,22 @@ Community 打包在签名前将同一完整标签写入主 App 与 Finder 扩展
 
 [Community DMG](.github/workflows/community-dmg.yml) 独立负责分发包构建：固定事件提交，在 macOS 15 arm64 / Xcode 26.3 / XcodeGen 2.46.0 上生成并检查 ad-hoc Universal DMG，拒绝源码漂移，只上传五项交付文件，保留 14 天。它由版本标签、手动入口或匹配路径的 `codex/**` 分支推送触发，不自动公开 Release。首次手动入口需先让工作流进入默认分支；分支推送可先验证流程。来源记录、下载核对及正式发布步骤见[免费自行分发](COMMUNITY_DISTRIBUTION.md#github-actions-打包)。
 
-[主 CI](.github/workflows/ci.yml) 在 main 的相关代码/配置变更、所有 PR 和手动触发时运行。main push 保留原路径过滤；PR 在作业内分类范围，仅根目录 `*.md` 和 `LICENSE` 的改动跳过 Linux 与 macOS 测试，其它路径（包括子目录文档、截图及未知路径）均执行现有验证。手动触发始终执行完整验证。
+[主 CI](.github/workflows/ci.yml) 在 main 的相关代码/配置变更、所有 PR 和手动触发时运行。main push 保留原路径过滤；PR 与已触发的 main push 在作业内分类范围：仅根目录 `*.md` 和 `LICENSE` 的改动明确跳过测试；仅递增内部 build 号并可选更新根文档时，先执行严格版本与工程一致性校验，再跳过 Linux 与 macOS 测试。其它改动（包括子目录文档、截图及未知路径）均执行现有验证。手动触发始终执行完整验证。
 
-PR 范围通过完整 Git 历史中的 base/head 三点 diff 分类，使用 NUL 分隔路径且关闭重命名检测，删除或移出代码目录不会被文档名称掩盖，也不受 GitHub 路径过滤的 300 文件上限影响。SHA 通过环境变量传入，缺失、格式错误或 diff 失败使分类作业失败；测试仍 checkout PR 临时合并提交，分类所用 head SHA 不代替实际测试 SHA。
+分类器直接读取原始 Git 对象：PR 比较唯一真实 merge-base 与 head，push 比较事件的 before 与 sha。完整 raw diff 使用 NUL 分隔且关闭重命名检测，删除或移出代码目录不会被文档名称掩盖；分类不受 GitHub 文件列表的 300 文件上限影响，main push 的工作流路径过滤仍受平台规则约束。SHA 缺失、格式错误、对象不可用或 diff 失败使分类失败，新建分支 push 转全量。测试仍 checkout PR 临时合并提交，分类 head 不代替实际测试 SHA。
+
+版本快路径只允许 `project.yml` 的一个共享 `CURRENT_PROJECT_VERSION` 与 `QuickFile.xcodeproj/project.pbxproj` 的共享 Debug/Release 两处值，从同一个规范正整数递增为同一个新值；除这些数字外，两个文件的字节和普通文件模式必须不变。缺一端修改、值不一致、回退、重复或非规范赋值、二进制、增删、重命名、符号链接和模式变化均不能进入此快路径。营销版本、架构、权限、依赖或其它配置变化仍执行全量。此校验只证明差异范围和版本一致性，不声明执行了原生测试、签名或 DMG 验证；发行工作流继续负责原有打包验收。
 
 | 作业 | 环境 | 验证 |
 | --- | --- | --- |
-| Classify verification scope | Ubuntu 24.04 | 确定完整验证或明确的根文档跳过范围 |
+| Classify verification scope | Ubuntu 24.04 | 判定完整验证、根文档跳过或已校验的内部 build 递增范围 |
 | Python scripts | Ubuntu 24.04 / Python 3.13 | 发布准备、签名检查脚本的模拟与文件事务测试 |
 | macOS 15 / arm64 | `macos-15` / Xcode 26.3 / XcodeGen 2.46.0 | 脚本测试、原生 Swift 测试、无签名 Universal 构建与 bundle/权限配置自检 |
 | macOS 15 / x86_64 | `macos-15-intel` / 同一工具版本 | 同一测试及自检在 Intel runner 上执行 |
 | macOS 26 / arm64 | `macos-26` / Xcode 26.3 / XcodeGen 2.46.0 | 同一测试及自检；显式选择 26.3，不使用镜像默认 Xcode |
 | CI required | Ubuntu 24.04 | 汇总分类、Linux 与全部 macOS 矩阵的终态 |
 
-稳定总门禁名称为 `CI required`，使用 `always()` 等待上述依赖。代码范围只有分类、Linux 和全部三项 macOS 验证成功才通过；失败、取消、意外跳过或缺失分类输出均失败。根文档范围仅在分类成功且两类测试作业均明确 skipped 时通过，摘要记录“跳过、未测试”，不能将门禁成功写成测试通过。配置 main 的 required status check 时应选此总门禁，避免把允许跳过的单项测试设为必需；工作流文件自身不设置仓库保护，也不能证明线上规则已经启用。
+稳定总门禁名称为 `CI required`，使用 `always()` 等待上述依赖。代码范围只有分类、Linux 和全部三项 macOS 验证成功才通过；失败、取消、意外跳过或缺失分类输出均失败。根文档或已校验的内部 build 范围仅在分类成功、scope 与 run_checks 输出匹配且两类测试作业均明确 skipped 时通过；缺失、未知或矛盾的 scope 均失败。摘要分别标明文档跳过或版本校验通过，并记录“跳过、未测试”，不能将门禁成功写成测试通过。配置 main 的 required status check 时应选此总门禁，避免把允许跳过的单项测试设为必需；工作流文件自身不设置仓库保护，也不能证明线上规则已经启用。
 
 macOS 脚本测试中的授权、创建边界和创建预检三组测试，在同一 Python 进程内共用一次新编译的 debug 模块。每组仍单独编译可执行文件，各场景仍用独立进程和数据目录；完整 UI 夹具编译检查保持独立。共享模块不跨进程缓存，构建失败立即清理，正常退出时回收。
 
@@ -35,7 +37,7 @@ Python 脚本测试同时运行 [架构守卫](Scripts/verify-architecture.py)�
 
 构建设置查询前显式解析锁定的 SwiftPM 依赖，复用本轮包目录。仅当解析失败明确报告二进制依赖下载超时且没有其他错误时，最多尝试 3 次；每次结束都检查锁文件哈希，漂移或其他错误立即失败。下载和 checksum 验证仍由 SwiftPM 完成，构建设置查询、原生测试及 Release 构建各执行一次，失败不会触发整轮重试。
 
-[macOS 27 兼容性](.github/workflows/macos-27-compatibility.yml) 独立使用 `xcode-27` 标准 arm64 runner、真实 macOS 27、`/Applications/Xcode_27.0.app/Contents/Developer` 和 Xcode 27.0。初期只在 main 相关变更或手动触发时运行，不跟随每个 PR。它保留与主矩阵相同的脚本测试、原生 Swift 测试、Universal 构建和安全检查；失败正常标红，没有 `continue-on-error`，不依赖主 CI，也不改变 required checks 或仓库保护规则。preview 可能排队、调整镜像或工具链；失配必须修正基线，不能把 macOS 26 上的 27 SDK 冒充真实 macOS 27 主机。
+[macOS 27 兼容性](.github/workflows/macos-27-compatibility.yml) 独立使用 `xcode-27` 标准 arm64 runner、真实 macOS 27、`/Applications/Xcode_27.0.app/Contents/Developer` 和 Xcode 27.0。初期只在 main 相关变更或手动触发时运行，不跟随每个 PR。它保留与主矩阵相同的脚本测试、原生 Swift 测试、Universal 构建和安全检查；失败正常标红，没有 `continue-on-error`，不依赖主 CI，也不改变 required checks 或仓库保护规则。已触发的 main push 复用同一分类器，纯内部 build 递增及根文档变化经严格校验后跳过重任务；手动触发仍执行全部兼容性检查。preview 可能排队、调整镜像或工具链；失配必须修正基线，不能把 macOS 26 上的 27 SDK 冒充真实 macOS 27 主机。
 
 每行矩阵都声明 runner、macOS 主版本、架构、Xcode 版本和 Developer 路径，并将 OS/架构/Xcode 写入 job 名称。`ci-evidence.py initialize` 在安装工具、测试和构建前读取 `sw_vers`、`uname -m`、`xcodebuild -version`，同时记录 OS build、Xcode build、macOS SDK、Swift/Clang build 和 Python 版本。实际身份必须与期望一致。GitHub-hosted 镜像会更新，工作流不会静默改用默认 Xcode；固定版本不可用时应明确失败并审查基线。XcodeGen 继续使用固定 2.46.0 发布包、SHA-256 校验和实际版本断言。
 
@@ -212,7 +214,7 @@ gh run view <run-id> --json headSha,status,conclusion,jobs
 gh run view <run-id> --log-failed
 ```
 
-触发后必须等待终态，核对 `headSha`、实际 checkout、各 job 及失败日志。PR 检查通常运行临时合并提交；合并前确认 base 没有失配，合并后另核对 main 结果。主 CI 与 macOS 27 兼容性结论分别记录；PR 根文档跳过记为“门禁通过，测试未执行”，main push 等被路径过滤的运行记为“CI 未触发”。
+触发后必须等待终态，核对 `headSha`、实际 checkout、各 job 及失败日志。PR 检查通常运行临时合并提交；合并前确认 base 没有失配，合并后另核对 main 结果。主 CI 与 macOS 27 兼容性结论分别记录；根文档跳过记为“门禁通过，测试未执行”；内部 build 快路径记为“版本与工程一致性校验通过，测试未执行”；main push 等被路径过滤的运行记为“CI 未触发”。
 
 签名、安装、Finder 实机、真实存储和性能验收另见 [开发流程](CONTRIBUTING.md) 与 [发布清单](RELEASE_CHECKLIST.md)。工作流不配置用户证书或 profile，不发布应用。
 
