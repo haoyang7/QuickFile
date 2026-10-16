@@ -28,8 +28,28 @@ defaults:
     shell: bash
 
 jobs:
+  changes:
+    name: Classify compatibility verification scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run_checks: ${{ steps.scope.outputs.run_checks }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: scope
+        env:
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: python3 Scripts/ci-scope.py
+
   compatibility:
     name: macOS ${{ matrix.macos_major }} preview (${{ matrix.architecture }}, Xcode ${{ matrix.xcode_version }})
+    needs: changes
+    if: needs.changes.outputs.run_checks == 'true'
     strategy:
       fail-fast: false
       matrix:

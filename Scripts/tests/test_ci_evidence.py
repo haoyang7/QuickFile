@@ -716,7 +716,14 @@ class CIWorkflowContractTests(unittest.TestCase):
         self.assertIn("  workflow_dispatch:\n", self.preview)
         self.assertNotIn("  pull_request:", self.preview)
         self.assertNotIn("pull_request_target", self.preview)
-        self.assertNotIn("needs:", self.preview)
+        self.assertIn("    needs: changes\n    if: needs.changes.outputs.run_checks == 'true'\n", self.preview)
+        self.assertNotIn("needs: [changes, scripts]", self.preview)
+        scope = self.preview.split("  changes:\n", 1)[1].split("  compatibility:\n", 1)[0]
+        self.assertIn("          fetch-depth: 0\n", scope)
+        self.assertIn("          PUSH_BEFORE_SHA: ${{ github.event.before }}\n", scope)
+        self.assertIn("          PUSH_HEAD_SHA: ${{ github.sha }}\n", scope)
+        self.assertIn("        run: python3 Scripts/ci-scope.py\n", scope)
+        self.assertIn("      run_checks: ${{ steps.scope.outputs.run_checks }}\n", scope)
         self.assertNotIn("continue-on-error", self.preview)
         self.assertNotIn("required", self.preview)
 
