@@ -50,7 +50,7 @@
 
 - **需要什么电脑？** macOS 13 或更新版本，Apple Silicon 和 Intel Mac 使用同一个安装包。目前是 Beta 测试版，并非每种 Mac 和系统都已测试，具体范围见[发布说明](https://github.com/haoyang7/QuickFile/releases/tag/v0.1.0-beta.2)。
 - **第一次打开有提示？** Community 版尚未经过 Apple 公证，系统可能需要你确认打开。[安装指南](INSTALLATION.md)里有具体步骤。
-- **怎么更新？** 下载新版本后手动安装，目前不会自动更新。
+- **怎么更新？** 已公开的 v0.1.0-beta.2（build 98）没有“检查更新…”操作，请在浏览器中查看 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases)，自行下载、校验 DMG 并安装。后续未发布候选已增加手动检查，详见[安装指南](INSTALLATION.md#常见问题)。Community 不会自动下载或安装更新。
 - **数据放在哪里？** 模板和设置保存在你的 Mac 上，无需账号，没有广告或使用情况追踪。选择文件夹时才授予相应访问权限，详见[隐私说明](PRIVACY.md)。
 
 建议先在测试文件夹里创建一个文件。云盘、外接磁盘和网络磁盘还需要更多测试。

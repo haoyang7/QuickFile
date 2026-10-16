@@ -70,6 +70,7 @@ class FakeRunner:
                 entitlements["com.apple.application-identifier"] = signing_app_id
             if path.name == "QuickFile.app":
                 entitlements["com.apple.security.files.user-selected.read-write"] = True
+                entitlements["com.apple.security.network.client"] = True
             entitlements.update(self.entitlement_overrides.get(path.name, {}))
             return MODULE.CommandResult(0, stdout=plistlib.dumps(entitlements))
         if arguments[:2] == ["/usr/bin/codesign", "-d"] and arguments[2].startswith("--extract-certificates="):

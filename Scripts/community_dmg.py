@@ -129,7 +129,7 @@ def create_dmg(app: Path, image: Path, workspace: Path, installation_notes: byte
         instructions.chmod(0o644)
         run([
             "/usr/bin/hdiutil", "create", "-srcfolder", str(source), "-format", "UDZO", "-fs", "HFS+",
-            "-volname", "QuickFile Community", str(private_image),
+            "-imagekey", "zlib-level=9", "-volname", "QuickFile Community", str(private_image),
         ])
         run(["/usr/bin/hdiutil", "verify", str(private_image)])
         mount.mkdir()
@@ -166,7 +166,8 @@ def create_dmg(app: Path, image: Path, workspace: Path, installation_notes: byte
         publish_image(private_image, image)
         return {
             "image": image.name, "image_sha256": ARTIFACT.sha256(image), "image_bytes": image.stat().st_size,
-            "format": "UDZO", "filesystem": "HFS+", "scope": "DMG contents and mounted artifact only",
+            "format": "UDZO", "filesystem": "HFS+", "compression": {"codec": "zlib", "level": 9},
+            "scope": "DMG contents and mounted artifact only",
             "trust": "ad-hoc/unnotarized", "hdiutil_verify": "pass", "readonly_mount": "pass",
             "mounted_manifest": "matches all input bytes, modes and symlinks", "mounted_artifact_verdict": "pass",
             "applications_link": "/Applications", "input_unchanged": True,

@@ -12,7 +12,7 @@ QuickFile 提供实验性的 community 构建流程，不需要 Apple 开发者�
   --release-tag v0.1.0-beta.2
 ```
 
-输出目录必须尚不存在。上面的标签仅为命名示例，须替换为本次候选标签；此命令不创建 Git 标签或发布 Release。脚本锁定已有 `Package.resolved`，构建 arm64 / x86_64 Release，使用 `QUICKFILE_COMMUNITY` 排除 Sparkle 调用，并在确认两个架构都只链接系统动态库后移除副本中的 Sparkle。主应用不再需要 Sparkle 的 Mach 服务例外权限。不能将普通构建直接重签后视为 community 包：Hardened Runtime 的动态库验证可能阻止 ad-hoc 主程序加载第三方 framework。
+输出目录必须尚不存在。上面的标签仅为命名示例，须替换为本次候选标签；此命令不创建 Git 标签或发布 Release。标签格式为 `v主版本.次版本.修订版本` 或追加 `-beta.N`；各数字最多 18 位且不带前导零，Beta 编号须为正数。构建、打包和来源收据使用同一标签校验规则。脚本锁定已有 `Package.resolved`，构建 arm64 / x86_64 Release，使用 `QUICKFILE_COMMUNITY` 排除 Sparkle 调用，并在确认两个架构都只链接系统动态库后移除副本中的 Sparkle。主应用不再需要 Sparkle 的 Mach 服务例外权限。不能将普通构建直接重签后视为 community 包：Hardened Runtime 的动态库验证可能阻止 ad-hoc 主程序加载第三方 framework。
 
 打包脚本拒绝带 profile 或已完成应用签名的输入。`CODE_SIGNING_ALLOWED=NO` 构建可能保留链接器生成的 ad-hoc 标记；仅在它没有 Team、证书、权限、Info 绑定或资源封装时接受。脚本先签扩展、后签宿主，逐架构检查签名、权限、版本与动态库依赖。它不修改输入 App，不覆盖已有输出；DMG 只读挂载复验成功、镜像卸载后才发布本地输出目录，包含：
 
@@ -195,10 +195,24 @@ Community 使用 `~/Library/Application Support/QuickFileCommunity/` 共享文�
 
 产物检查收据只声明 artifact 层结果，不声明跨机器、Finder、升级或 Gatekeeper 已通过。尚未完成这些实测时，应标明实验候选及缺口。
 
+## 打包体积
+
+Community 打包只在私有副本最终签名前，对主 App 和 Finder 扩展执行 `strip -x`，去掉本地符号，保留 Universal 两架构。`build-community.sh` 先核对对应 dSYM 的双架构 UUID，再将压缩符号及摘要留在私有构建 records；它们不嵌入 App，也不增加公开发行资产。独立调用 `package-community.py` 时，调用方应保留自己的配对 dSYM。DMG 继续使用 HFS+ / UDZO，显式设置 `zlib-level=9`，创建后验证签名、挂载内容及输入不变；失败不发布镜像。
+
+签名前还会把两组件已编译的 `.strings` 和 `.stringsdict` 转为二进制 plist，仅在文件更小时写入，并核对转换前后的全部值。转换不修改构建输入；收据的 `resource_encoding` 记录各文件字节数。安装后的文件收益与压缩后的 DMG 收益分别测量，不能直接互换。
+
+这些处理减少安装或下载字节，不能据此推断运行内存按同样比例降低。
+
 ## 版本检查
 
-当前 community 构建不含 Sparkle，不进行在线检查、下载或安装；“检查更新”菜单禁用，升级采用手动覆盖安装。
+以下行为适用于当前未发布源码及包含此能力的后续候选；公开的 v0.1.0-beta.2（build 98）没有“检查更新…”操作，需在浏览器中查看 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases)。
 
-免费分发可以使用固定 HTTPS 版本清单或 GitHub Releases API 查询版本，不依赖 Apple 会员。后续接入时需为查询组件配置沙盒出站网络权限，比较单调递增的 build，区分稳定版和预发布版，限制响应大小及下载链接来源，处理超时和限流，再由用户打开发布页下载。查询版本与自动替换应用是独立能力；此流程尚未实现版本查询客户端。
+Community 构建不包含或调用 Sparkle，也不自动下载或安装更新。主 App 提供“检查更新…”手动动作；只有用户点击后，才通过 HTTPS 访问固定公开仓库 `haoyang7/QuickFile` 的 GitHub Release API，并读取同一 Release 的 `build-provenance.json`。Beta 偏好默认关闭，只筛选 stable；设置中选择“接收 Beta 版本”后才包含 Beta。
+
+带标签打包会在签名前把完整发布标签写入两组件的 `QuickFileReleaseTag`，应用据此显示如 `0.1.0 Beta 2` 的当前版本，同时显示内部 build。更新先比较完整标签，顺序为营销版本、Beta 编号、同营销版本的正式版；仅同一标签比较 `internal_build`。因此 Beta 可升级到构建号较低的同版本正式版，正式版不会退回同版本 Beta。“接收 Beta”不改变当前版本展示。旧包缺少标签时继续按营销版本和 build 比较；无标签的本地打包会清除副本中的继承标签。
+
+缺少或错配 `build-provenance.json`、网络失败或 GitHub 限流必须明确显示，不能冒充最新版。发现新版时提供对应官方 Release 页面链接；用户在浏览器中手动下载 DMG 和 `.sha256`，核对校验和，再按[安装指南](INSTALLATION.md)覆盖安装。旧版没有这项 Community 检查能力，必须先手动安装包含该能力的新版本。
+
+启动、激活和修改 Beta 偏好不会触发 Community 后台联网，Community 没有自动检查开关。主 App 配置出站网络客户端权限，Finder Extension 不配置网络权限；文件、模板和目录授权能力仍在本机完成。GitHub 或其 CDN 可看到 IP 地址、请求时间和常规请求信息；检查不使用账号 token，也不上传用户文件、模板、目录路径、目录书签、剪贴板内容或诊断记录。
 
 Developer ID 的签名、公证及 Sparkle 发布流程继续使用 [BETA_RELEASE](BETA_RELEASE.md) 和 [UPDATES](UPDATES.md) 中对应检查，不用 community 产物检查替代。

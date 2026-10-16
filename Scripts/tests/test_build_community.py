@@ -1,5 +1,6 @@
 """Exercise the build script's actual cleanup heredoc on owned product fixtures."""
 import json
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -13,6 +14,32 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "Scripts" / "build-community.sh"
 TEMPORARY = ROOT / ".build" / "Temporary"
+
+
+def load_script(name, filename):
+    specification = importlib.util.spec_from_file_location(name, ROOT / "Scripts" / filename)
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+PROVENANCE = load_script("build_test_provenance", "community-provenance.py")
+ARTIFACT = load_script("build_test_artifact", "verify-community-artifact.py")
+
+
+def release_tag_cases():
+    for number, accepted in (("0", True), ("999999999999999999", True),
+                             ("01", False), ("1000000000000000000", False),
+                             ("０", False), ("١", False)):
+        for index in range(3):
+            parts = ["0", "1", "0"]
+            parts[index] = number
+            yield "v" + ".".join(parts), accepted
+    for number, accepted in (("1", True), ("999999999999999999", True), ("0", False),
+                             ("01", False), ("1000000000000000000", False), ("１", False), ("١", False)):
+        yield "v0.1.0-beta." + number, accepted
+    for tag in ("v0.1.0\n", "v0.1.0-beta.1\n", "v0.1.0-rc.1", "0.1.0", ""):
+        yield tag, False
 
 
 class CommunityBuildArgumentsTests(unittest.TestCase):
@@ -61,6 +88,56 @@ class CommunityBuildArgumentsTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.record.read_bytes().split(b"\0")[-3:], [b"--release-tag", tag.encode(), b""])
 
+    def test_tag_boundaries_agree_before_build_resolve_check_and_artifact_verification(self):
+        environment_file = self.directory / "github-environment"
+        project = self.directory / "project.yml"
+        for tag, accepted in release_tag_cases():
+            with self.subTest(tag=tag):
+                self.record.unlink(missing_ok=True)
+                environment_file.unlink(missing_ok=True)
+                with self.subTest(entry="build"):
+                    result = self.run_arguments("--output", str(self.output), "--release-tag", tag)
+                    self.assertEqual(result.returncode, 0 if accepted else 2, result.stderr)
+                    self.assertEqual(self.record.exists(), accepted)
+                    self.assertFalse(self.output.exists())
+                env = {"RELEASE_TAG": tag, "GITHUB_EVENT_NAME": "workflow_dispatch",
+                       "GITHUB_ENV": str(environment_file)}
+                version = tag[1:].split("-beta.")[0]
+                with self.subTest(entry="resolve"):
+                    if accepted:
+                        self.assertEqual(PROVENANCE.resolve(env, project), tag)
+                        self.assertEqual(environment_file.read_text(), "RELEASE_TAG=" + tag + "\n")
+                    else:
+                        with self.assertRaises(ValueError):
+                            PROVENANCE.resolve(env, project)
+                        self.assertFalse(environment_file.exists())
+                with self.subTest(entry="artifact"):
+                    if accepted:
+                        ARTIFACT.validate_release_tag(tag, version)
+                    else:
+                        with self.assertRaises(ValueError):
+                            ARTIFACT.validate_release_tag(tag, version)
+                with self.subTest(entry="check"), patch.object(PROVENANCE, "verify_source") as source, \
+                        patch.object(PROVENANCE, "verify_host"), patch.object(PROVENANCE, "metadata"):
+                    if accepted:
+                        PROVENANCE.check(env)
+                        source.assert_called_once_with(env)
+                    else:
+                        with self.assertRaises(ValueError):
+                            PROVENANCE.check(env)
+                        source.assert_not_called()
+                if "-" not in tag and "\n" not in tag:
+                    environment_file.unlink(missing_ok=True)
+                    project.write_text('MARKETING_VERSION: "' + version + '"\n')
+                    branch = dict(env, GITHUB_EVENT_NAME="push", GITHUB_REF="refs/heads/codex/fixture")
+                    with self.subTest(entry="branch-project"):
+                        if accepted:
+                            self.assertEqual(PROVENANCE.resolve(branch, project), tag)
+                        else:
+                            with self.assertRaises(ValueError):
+                                PROVENANCE.resolve(branch, project)
+                            self.assertFalse(environment_file.exists())
+
     def test_rejects_invalid_tags_and_option_shapes_before_packaging(self):
         invalid = [(), ("--unknown", str(self.output)), ("--output",),
                    ("--output", str(self.output), "--unknown", "v0.1.0"),
@@ -74,6 +151,63 @@ class CommunityBuildArgumentsTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(self.record.exists())
                 self.assertFalse(self.output.exists())
+
+
+class CommunityDebugSymbolsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        match = re.search(r'python3 - "\$TASK_DIRECTORY" <<\'PY\'\n(.*?)\nPY(?:\n|$)',
+                          SCRIPT.read_text(), re.DOTALL)
+        if match is None:
+            raise AssertionError("Debug symbol archive block was not found")
+        cls.archive_code = compile(match.group(1), str(SCRIPT), "exec")
+
+    def setUp(self):
+        TEMPORARY.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="community-debug-symbol-tests-", dir=TEMPORARY)
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        (self.directory / "records").mkdir()
+        self.products = self.directory / "DerivedData/Build/Products/Release"
+        self.products.mkdir(parents=True)
+        self.commands = []
+
+    def archive(self, mismatch=False):
+        def run(arguments, **kwargs):
+            self.commands.append(arguments)
+            if arguments[:3] == ["/usr/bin/xcrun", "dwarfdump", "--uuid"]:
+                identifier = "11111111-1111-1111-1111-111111111111"
+                if mismatch and arguments[-1].endswith("FinderExtension.appex.dSYM"):
+                    identifier = "33333333-3333-3333-3333-333333333333"
+                return subprocess.CompletedProcess(arguments, 0,
+                    f"UUID: {identifier} (arm64) fixture\nUUID: 22222222-2222-2222-2222-222222222222 (x86_64) fixture\n", "")
+            self.assertEqual(arguments[:5], ["/usr/bin/ditto", "-c", "-k", "--keepParent", arguments[4]])
+            Path(arguments[-1]).write_bytes(b"synthetic symbol archive")
+            return subprocess.CompletedProcess(arguments, 0, b"", b"")
+        with patch.object(subprocess, "run", side_effect=run), \
+                patch.object(sys, "argv", [str(SCRIPT), str(self.directory)]):
+            exec(self.archive_code, {"__name__": "__main__"})
+
+    def test_retains_archives_with_both_matching_architecture_uuids(self):
+        self.archive()
+        report = json.loads((self.directory / "records/debug-symbols.json").read_text())
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual([row["archive"] for row in report["components"]],
+                         ["QuickFile.app.dSYM.zip", "FinderExtension.appex.dSYM.zip"])
+        for row in report["components"]:
+            self.assertEqual(set(row["uuids"]), {"arm64", "x86_64"})
+            self.assertEqual(row["bytes"], len(b"synthetic symbol archive"))
+            self.assertEqual(len(row["sha256"]), 64)
+        self.assertEqual([Path(command[0]).name for command in self.commands],
+                         ["xcrun"] * 4 + ["ditto"] * 2)
+        self.assertNotIn(str(self.directory), json.dumps(report))
+
+    def test_rejects_mismatched_symbols_before_archiving_any_component(self):
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            self.archive(mismatch=True)
+        self.assertFalse((self.directory / "records/debug-symbols.json").exists())
+        self.assertEqual(list((self.directory / "records").glob("*.zip")), [])
+        self.assertTrue(all(Path(command[0]).name == "xcrun" for command in self.commands))
 
 
 class CommunityBuildCleanupTests(unittest.TestCase):

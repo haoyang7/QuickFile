@@ -11,9 +11,11 @@ import stat
 import subprocess
 import sys
 
+# Scripts are also loaded by file path from the test harness.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import distribution_contract as CONTRACT
+
 SHA = r"[0-9a-f]{40}"
-VERSION = r"[0-9]+\.[0-9]+\.[0-9]+"
-TAG = rf"v({VERSION})(?:-beta\.[1-9][0-9]*)?"
 
 
 def checked(value, pattern, label):
@@ -30,7 +32,8 @@ def output(command):
 
 
 def release_tag(env):
-    tag = checked(env.get("RELEASE_TAG"), TAG, "release tag")
+    tag = env.get("RELEASE_TAG")
+    CONTRACT.release_tag_version(tag)
     if env.get("GITHUB_REF", "").startswith("refs/tags/") and env["GITHUB_REF"] != "refs/tags/" + tag:
         raise ValueError("release tag does not match event tag")
     return tag
@@ -48,7 +51,7 @@ def resolve(env, project=Path("project.yml")):
         value = values[0].strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
             value = value[1:-1]
-        tag = checked("v" + checked(value, VERSION, "marketing version"), TAG, "release tag")
+        tag = "v" + checked(value, CONTRACT.MARKETING_VERSION_PATTERN, "marketing version")
     else:
         raise ValueError("cannot resolve release tag for this event")
     destination = env.get("GITHUB_ENV")
@@ -121,11 +124,15 @@ def assets(directory, tag):
     if regular_file(receipt_path).st_size > 1024 * 1024:
         raise ValueError("artifact receipt exceeds size limit")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    version = re.fullmatch(TAG, tag).group(1)
+    if not isinstance(receipt, dict):
+        raise ValueError("artifact receipt must contain an object")
+    version = CONTRACT.release_tag_version(tag)
     if receipt.get("verdict") != "pass" or receipt.get("trust") != "ad-hoc/unnotarized":
         raise ValueError("Community artifact did not pass its trust checks")
     if receipt.get("version") != version or receipt.get("archive") != image:
         raise ValueError("release tag does not match the artifact version or filename")
+    if receipt.get("release_tag") != tag:
+        raise ValueError("release tag does not match the artifact receipt release tag")
     build = checked(receipt.get("build"), r"[0-9]+", "internal build")
     records = [digest(directory / name) for name in sorted(names)]
     dmg = next(record for record in records if record["name"] == image)
@@ -146,6 +153,9 @@ def check(env):
 
 def write(directory, env):
     tag = release_tag(env)
+    destination = env.get("GITHUB_OUTPUT")
+    if not isinstance(destination, str) or not destination or "\0" in destination:
+        raise ValueError("missing or invalid GitHub output file")
     sha = verify_source(env)
     host = verify_host(env)
     run = metadata(env)
@@ -154,10 +164,10 @@ def write(directory, env):
                "trust": "ad-hoc/unnotarized", "source_commit": sha, "source_worktree_clean": True,
                "release_tag": tag, "internal_build": build, "run": run, "runner": host, "assets": records,
                "unproven": ["cross-machine launch", "Finder integration", "upgrades", "Gatekeeper acceptance"]}
-    with (directory / "build-provenance.json").open("x", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     artifact = f"quickfile-community-{sha}-{run['run_id']}-attempt-{run['run_attempt']}"
-    with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+    with open(destination, "a", encoding="utf-8") as stream:
+        with (directory / "build-provenance.json").open("x", encoding="utf-8") as receipt:
+            receipt.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         stream.write(f"artifact_name={artifact}\n")
         stream.write(f"dmg={directory / ('QuickFile-' + tag + '.dmg')}\n")
         stream.write(f"checksum={directory / ('QuickFile-' + tag + '.dmg.sha256')}\n")

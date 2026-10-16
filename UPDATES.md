@@ -1,18 +1,20 @@
 # QuickFile 更新发布说明
 
-Community 采用 ad-hoc 签名、未经公证并手动覆盖升级，不包含 Sparkle。已公开版本与下载资产以 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 为准；源码版本见 [project.yml](project.yml)，候选身份见对应 `build-provenance.json`。本页说明 Developer ID 渠道的更新配置，不表示候选已经启用更新或通过 [发布验收](RELEASE_CHECKLIST.md)。
+Community 采用 ad-hoc 签名、未经公证并手动覆盖升级，不包含或调用 Sparkle。已公开版本与下载资产以 [GitHub Releases](https://github.com/haoyang7/QuickFile/releases) 为准；源码版本见 [project.yml](project.yml)，候选身份见对应 `build-provenance.json`。本页说明 Developer ID 渠道的 Sparkle 更新配置，也说明 Community 的手动 GitHub Release 检查，不表示候选已经启用 Developer ID 更新或通过 [发布验收](RELEASE_CHECKLIST.md)。
 
 证书签名更新路线使用 Sparkle 2，默认构建不启用在线更新。正式更新源和签名公钥尚未确定；Developer ID、公证、真实 HTTPS 跨版本升级和完整运行准入仍需完成，尚未对外发布。
 
-[Community 免费构建](COMMUNITY_DISTRIBUTION.md) 通过条件编译移除 Sparkle 并采用手动覆盖升级。目前没有在线版本查询；未来可通过固定 HTTPS 清单或 GitHub Releases 查询版本，这不需要 Apple 会员，也不等于已实现自动安装。以下 Sparkle 配置和发布步骤适用于证书签名路线。
+[Community 免费构建](COMMUNITY_DISTRIBUTION.md) 通过条件编译移除 Sparkle，采用手动覆盖安装。下述手动检查能力已在后续未发布源码与本地候选中提供；公开的 v0.1.0-beta.2（build 98）没有该操作，需在浏览器中查看 GitHub Releases。Sparkle 配置和发布步骤适用于 Developer ID 证书签名路线。
 
 ## 应用行为
 
-- 应用菜单提供“检查更新…”，设置窗口显示版本及更新选项。未启用在线更新的构建显示手动安装说明，检查菜单禁用。
-- 自动检查默认关闭；用户开启后每天检查一次。下载与安装由用户确认，不提供后台静默安装。
-- 正式版本使用默认稳定渠道；选择“接收 Beta 版本”后，同时接收 `beta` 渠道。关闭自动检查时，改变渠道不会触发联网检查。
-- Debug 和 XCTest 不启动更新器。源码自编译默认不启用正式渠道，避免替换自编译应用的签名身份及授权环境。
-- 主 App 使用 Sparkle Installer/Downloader XPC 服务，保留沙盒、目录书签与精确的本地共享目录权限；Finder Extension 不嵌入更新器。
+- 应用菜单提供“检查更新…”。Community 仅在用户点击该动作时，通过 HTTPS 访问固定公开仓库 `haoyang7/QuickFile` 的 GitHub Release API 和同一 Release 的 `build-provenance.json`；发现新版时提供官方 Release 页面链接，下载、校验 DMG 与覆盖安装均由用户在浏览器和 Finder 中完成。
+- Community 按包内 `QuickFileReleaseTag` 比较营销版本、Beta 编号与同版本正式版，仅同标签比较 `internal_build`；无标签旧包沿用营销版本/build 比较。带标签包的当前版本显示保留 Beta 身份，不随接收 Beta 偏好改变。
+- Community 的 Beta 偏好默认关闭，只筛选 stable；用户在设置中选择“接收 Beta 版本”后才包含 Beta。缺少或错配 `build-provenance.json`、网络失败或限流会明确显示，不能据此冒充最新版。
+- Community 不提供自动检查开关，也不因启动、激活或修改 Beta 偏好而后台联网。它不自动下载或安装更新。
+- Developer ID 版本使用默认稳定渠道；选择“接收 Beta 版本”后同时接收 `beta` 渠道。自动检查默认关闭，用户开启后每天检查一次；关闭自动检查时，改变渠道不会触发联网检查。下载与安装由用户确认，不提供后台静默安装。
+- Developer ID 的 Debug 构建不启动 Sparkle，XCTest 禁用两条渠道的更新检查。源码自编译默认不启用正式渠道，避免替换自编译应用的签名身份及授权环境。
+- Developer ID 主 App 使用 Sparkle Installer/Downloader XPC 服务，保留沙盒、目录书签与精确的本地共享目录权限；Finder Extension 不嵌入更新器。
 - Finder 响应探针同时核对安装路径与运行版本。旧版本仍在运行时不会被标记为当前版本已响应；用户可在诊断页按指引重新启用扩展，必要时重启 Finder。
 
 ## 配置正式更新渠道
@@ -25,6 +27,8 @@ Community 采用 ad-hoc 签名、未经公证并手动覆盖升级，不包含 S
 | `QUICKFILE_UPDATES_ENABLED` | `NO` | `YES` |
 | `QUICKFILE_UPDATE_FEED_URL` | 空 | 固定 HTTPS appcast 地址 |
 | `QUICKFILE_UPDATE_PUBLIC_KEY` | 空 | Sparkle 生成的 Base64 EdDSA 公钥 |
+
+`QUICKFILE_UPDATES_ENABLED` 对应包内 `QuickFileUpdatesEnabled`，只控制 Developer ID 的 Sparkle 更新；它不控制 Community 的手动 GitHub Release 检查，设为 `NO` 不会关闭该手动操作。
 
 SPM 包版本由 `project.yml` 固定，`Package.resolved` 保存对应提交。Sparkle 工具位于 Xcode 包目录的 `SourcePackages/artifacts/sparkle/Sparkle/bin/`，以下示例使用独立构建目录；实际路径以本次构建为准。
 
@@ -84,7 +88,7 @@ ZIP 与校验报告写入时拒绝覆盖同名文件，最后原子替换 appcas
 
 本地自检：`./Scripts/verify-release-readiness.sh`。更新脚本测试：`python3 -m unittest discover -s Scripts/tests -v`。
 
-真实发布前仍需两份正式签名产物和实际 HTTPS 测试源，覆盖：
+Developer ID 正式发布前仍需两份正式签名产物和实际 HTTPS 测试源，覆盖：
 
 - 手动检查、自动检查关闭/开启、偏好重启后保留；稳定用户不收到 Beta，选择后可收到。
 - 旧版升级新版、Finder 扩展正在运行时升级、升级后当前版本探针及实际文件创建。

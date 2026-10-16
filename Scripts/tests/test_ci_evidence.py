@@ -13,6 +13,9 @@ import unittest
 from unittest.mock import patch
 
 
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
 PROJECT = Path(__file__).resolve().parents[2]
 SCRIPT = PROJECT / "Scripts" / "ci-evidence.py"
 SPEC = importlib.util.spec_from_file_location("ci_evidence", SCRIPT)

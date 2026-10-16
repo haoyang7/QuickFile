@@ -3,7 +3,7 @@ import SwiftUI
 
 @main
 struct QuickFileApp: App {
-    @StateObject private var updates = UpdateController()
+    @StateObject private var updates = UpdateController(presentCommunityResult: CommunityUpdatePresentation.present)
     @StateObject private var creationSettings = CreationSettingsViewModel()
     @StateObject private var languageSettings = LanguageSettingsViewModel()
     @StateObject private var finderMenuSettings = FinderMenuSettingsViewModel()

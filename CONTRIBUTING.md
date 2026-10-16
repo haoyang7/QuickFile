@@ -25,7 +25,7 @@ open QuickFile.xcodeproj
 ./Scripts/build-community.sh --output .build/Packages/community-candidate
 ```
 
-生成带发布标签的候选时追加 `--release-tag v0.1.0-beta.2`（示例）；参数用于对外 DMG 文件名，不创建 Git 标签或发布 Release。内部 build 以应用和收据为准。
+生成带发布标签的候选时追加 `--release-tag v0.1.0-beta.2`（示例）；参数用于对外 DMG 文件名，并在签名前写入主 App 与 Finder 扩展的 `QuickFileReleaseTag`，不创建 Git 标签或发布 Release。标准版本/build 保持数字形式；内部 build 以应用和收据为准。不传标签的本地打包会清除副本中的旧标签。
 
 维护者的 GitHub Actions 打包入口、五项 artifact 和不自动公开 Release 的约束见[免费自行分发流程](COMMUNITY_DISTRIBUTION.md#github-actions-打包)。
 

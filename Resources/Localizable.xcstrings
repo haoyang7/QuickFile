@@ -581,6 +581,78 @@
         }
       }
     },
+    "GitHub 当前没有符合所选渠道的已发布版本。": {
+      "comment": "No published release matches the user's stable or beta choice.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub has no published releases for the selected channel."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub 当前没有符合所选渠道的已发布版本。"
+          }
+        }
+      }
+    },
+    "GitHub 暂时限制了检查请求，请稍后重试。": {
+      "comment": "GitHub rejected a manual update check due to rate limiting.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub has temporarily limited update requests. Try again later."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub 暂时限制了检查请求，请稍后重试。"
+          }
+        }
+      }
+    },
+    "GitHub 版本信息超过检查上限，无法确认最新版本。": {
+      "comment": "Community update check exceeded its response or pagination budget.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub version information exceeds the check limit. The latest version could not be confirmed."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub 版本信息超过检查上限，无法确认最新版本。"
+          }
+        }
+      }
+    },
+    "GitHub 返回的版本信息无效，请稍后重试。": {
+      "comment": "Community update check received an invalid release response.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub returned invalid version information. Try again later."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub 返回的版本信息无效，请稍后重试。"
+          }
+        }
+      }
+    },
     "Office 模板只能创建对应格式的空白文档，不能修改扩展名或预填文本。": {
       "comment": "Template editor: draft validation error.",
       "extractionState": "manual",
@@ -881,6 +953,24 @@
         }
       }
     },
+    "update.community.available": {
+      "comment": "Community update result. Arguments are the published tag and internal build; installation is manual.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Version %@ (build %@) is available. Open its GitHub release page to download and install it."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "发现新版本 %@（build %@）。请前往 GitHub 发行页下载安装。"
+          }
+        }
+      }
+    },
     "{{date}}、{{time}}、{{year}}、{{folderName}}、{{clipboard}}、{{sequence}}": {
       "comment": "Template editor: fields, validation, content limits and unsaved drafts. Keep template variable tokens in double braces unchanged.",
       "extractionState": "manual",
@@ -1165,6 +1255,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "仅复制状态、标识和计数，不含路径、错误原文、书签或模板内容。"
+          }
+        }
+      }
+    },
+    "仅手动检查时连接 GitHub 及其下载服务；对方可见 IP 等连接信息。不会上传文件、路径、模板或剪贴板内容。": {
+      "comment": "Community update settings privacy disclosure for manually requested GitHub release metadata.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Manual checks connect to GitHub and its download service, which can see your IP and connection details. Files, paths, templates, and clipboard contents are not uploaded."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "仅手动检查时连接 GitHub 及其下载服务；对方可见 IP 等连接信息。不会上传文件、路径、模板或剪贴板内容。"
           }
         }
       }
@@ -4445,6 +4553,42 @@
         }
       }
     },
+    "当前构建的版本信息无效，无法比较更新。": {
+      "comment": "Community update check cannot parse the installed version or build.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This build has invalid version information, so updates cannot be compared."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "当前构建的版本信息无效，无法比较更新。"
+          }
+        }
+      }
+    },
+    "当前没有比此构建更新的已发布版本。": {
+      "comment": "Community version check found no newer eligible release.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No published version is newer than this build."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "当前没有比此构建更新的已发布版本。"
+          }
+        }
+      }
+    },
     "当前版本 %@（%@）": {
       "comment": "Settings: application version, distribution channel and update availability. Arguments (source order): 1 = marketing version; 2 = build number.",
       "extractionState": "manual",
@@ -4873,6 +5017,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "打开 QuickFile…"
+          }
+        }
+      }
+    },
+    "打开发行页": {
+      "comment": "Open the selected Community release in the default browser.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Open Release Page"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开发行页"
           }
         }
       }
@@ -7055,6 +7217,24 @@
         }
       }
     },
+    "无法连接 GitHub 检查更新，请检查网络后重试。": {
+      "comment": "Community update check failed to reach GitHub.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Could not check GitHub for updates. Check your connection and try again."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法连接 GitHub 检查更新，请检查网络后重试。"
+          }
+        }
+      }
+    },
     "无法连接系统扩展注册服务。": {
       "comment": "Finder extension installation/registration diagnostics; evidence is not proof of successful creation.",
       "extractionState": "manual",
@@ -8099,6 +8279,24 @@
         }
       }
     },
+    "查看 GitHub 发行版": {
+      "comment": "Open the official QuickFile release list in the default browser.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "View GitHub Releases"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "查看 GitHub 发行版"
+          }
+        }
+      }
+    },
     "检查 Finder 异常请求": {
       "comment": "Finder request recovery panel: inspect and archive one problematic request.",
       "extractionState": "manual",
@@ -9107,6 +9305,24 @@
         }
       }
     },
+    "正在检查 GitHub Release…": {
+      "comment": "Progress shown during a user-initiated Community version check.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking GitHub Releases…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在检查 GitHub Release…"
+          }
+        }
+      }
+    },
     "正在检查…": {
       "comment": "Diagnostics screen, including folder access management and extension health. New File screen: destination selection, template choice and Finder setup.",
       "extractionState": "manual",
@@ -9751,6 +9967,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "清除目录搜索"
+          }
+        }
+      }
+    },
+    "点击“检查更新”时连接 GitHub Release；新版需手动下载和安装。": {
+      "comment": "Community update settings: checking is manual and does not download or install updates.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Check for Updates connects to GitHub Releases. Download and install new versions manually."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "点击“检查更新”时连接 GitHub Release；新版需手动下载和安装。"
           }
         }
       }
@@ -10795,6 +11029,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "诊断"
+          }
+        }
+      }
+    },
+    "该发行版的构建收据或下载资产不完整，无法确认更新版本。": {
+      "comment": "Community release metadata cannot be matched to its build provenance and download assets.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This release has incomplete build provenance or download assets. The update could not be verified."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "该发行版的构建收据或下载资产不完整，无法确认更新版本。"
           }
         }
       }

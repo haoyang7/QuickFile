@@ -100,5 +100,5 @@ jobs:
             printf '[Download the delivery ZIP](%s) (`%s`; retained for 14 days).\n\n' "$ARTIFACT_URL" "$ARTIFACT_NAME"
             printf 'Extract all five files. Verify the DMG with `shasum --algorithm 256 --check QuickFile-%s.dmg.sha256`, then read `INSTALL.txt`.\n\n' "$RELEASE_TAG"
             printf 'Source commit: `%s`; release tag: `%s`. `build-provenance.json` binds the four delivery files to this commit, run, and tool versions.\n\n' "$GITHUB_SHA" "$RELEASE_TAG"
-            printf '%s\n' 'Universal arm64/x86_64; ad-hoc signed and unnotarized; online updates disabled. Artifact checks do not establish cross-machine launch, Finder integration, upgrades, or Gatekeeper acceptance. This workflow does not publish a GitHub Release.'
+            printf '%s\n' 'Universal arm64/x86_64; ad-hoc signed and unnotarized; manual GitHub Release version checks; manual download/install; no Sparkle/automatic installation. Artifact checks do not establish cross-machine launch, Finder integration, upgrades, or Gatekeeper acceptance. This workflow does not publish a GitHub Release.'
           } >> "$GITHUB_STEP_SUMMARY"
