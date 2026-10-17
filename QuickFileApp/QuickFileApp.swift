@@ -3,6 +3,7 @@ import SwiftUI
 
 @main
 struct QuickFileApp: App {
+    @NSApplicationDelegateAdaptor(QuickFileApplicationDelegate.self) private var applicationDelegate
     @StateObject private var updates = UpdateController(presentCommunityResult: CommunityUpdatePresentation.present)
     @StateObject private var creationSettings = CreationSettingsViewModel()
     @StateObject private var languageSettings = LanguageSettingsViewModel()
@@ -26,7 +27,8 @@ struct QuickFileApp: App {
                 // Keep the receiving view mounted while loading preferences so
                 // cold-launch Finder URLs and an existing editor keep their owner.
                 ContentView(viewModel: viewModel, finderMenuSettings: finderMenuSettings,
-                            finderIntegrationViewModel: finderIntegration)
+                            finderIntegrationViewModel: finderIntegration,
+                            folderService: applicationDelegate.folderService)
                     .environment(\.locale, languageSettings.locale)
                     .task {
                         if !languageSettings.hasLoaded { await languageSettings.reload() }

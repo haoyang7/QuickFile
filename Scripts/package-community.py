@@ -120,13 +120,21 @@ def encode_localization_resources(app: Path) -> dict:
                 continue
             original = path.read_bytes()
             data = original
-            # Xcode emits UTF-16 XML; normalize its declaration for plistlib,
-            # matching the compiled-resource reader in verify-localizations.py.
+            # Catalog resources are XML/binary; copied .strings tables can be OpenStep.
             try:
                 if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
                     data = data.decode("utf-16").replace('encoding="UTF-16"', 'encoding="UTF-8"', 1).encode("utf-8")
-                values = plistlib.loads(data)
-            except (plistlib.InvalidFileException, ExpatError, UnicodeError, ValueError):
+                try:
+                    values = plistlib.loads(data)
+                except plistlib.InvalidFileException:
+                    # Parse the original bytes without rewriting the resource or build input.
+                    converted = subprocess.run(
+                        ["/usr/bin/plutil", "-convert", "xml1", "-o", "-", "--", "-"],
+                        input=original, check=True, capture_output=True, timeout=30,
+                    )
+                    values = plistlib.loads(converted.stdout)
+            except (plistlib.InvalidFileException, ExpatError, UnicodeError, ValueError,
+                    OSError, subprocess.SubprocessError):
                 raise ValueError("invalid compiled localization resource") from None
             if not isinstance(values, dict):
                 raise ValueError("compiled localization resource must be a dictionary")

@@ -36,6 +36,8 @@ Set this up once:
 
 If QuickFile asks to use that folder, select the same folder and confirm. You can cancel without creating a file. Once set up, the Finder menu works even when the QuickFile window is closed.
 
+The development build 108 also provides a separate system service: select one folder in Finder, choose **Finder → Services → New File with QuickFile…**, then click **Choose This Folder…** in QuickFile and confirm the location. Choose a template and filename, then click **Create File**. You can assign a shortcut under macOS **Keyboard → Keyboard Shortcuts → Services**. This entry is not included in the public Beta 3; verify system registration, shortcuts and cloud-folder support for each final candidate and target environment using the [Beta test guide](BETA_TEST_GUIDE.md).
+
 ## Keep your favourite templates handy
 
 In **Templates**, add your own starting text, edit a template, or drag the rows to change their order. Uncheck a template to hide it from the creation menu. **More** contains import and export options.
