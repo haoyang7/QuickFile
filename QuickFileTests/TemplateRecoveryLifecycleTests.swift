@@ -274,35 +274,132 @@ final class TemplateRecoveryLifecycleTests: XCTestCase {
     }
 
     private func startRecovery() async throws {
-        // SwiftUI lazily materializes the menu when AppKit starts tracking it.
-        // Select its real menu item, then end the native tracking loop.
-        let selected = LockedTestValue(false)
-        let titles = LockedTestValue<[String]>([])
-        let observer = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification,
-                                                              object: nil, queue: .main) { notification in
+        let actionTitle = "从默认模板恢复…"
+        let menuRoles = [NSAccessibility.Role.menuButton, .popUpButton].map(\.rawValue)
+        var seen = Set<ObjectIdentifier>()
+        let candidates = nodes(host.view).filter { node in
+            seen.insert(ObjectIdentifier(node)).inserted && isPressable(node)
+                && accessibilityString("accessibilityRole", of: node).map(menuRoles.contains) == true
+        }
+        var matches: [NSObject] = []
+        var evidence: [String] = []
+        for candidate in candidates {
+            let probe = try await inspectMenu(candidate, actionTitle: actionTitle, performAction: false)
+            evidence.append("\(type(of: candidate)): \(probe.summary)")
+            if probe.isDisabled { continue }
+            guard probe.didEndTracking, !probe.timedOut else {
+                XCTFail("Menu discovery did not finish: \(evidence)")
+                throw CocoaError(.featureUnsupported)
+            }
+            let count = probe.titles.filter { $0 == actionTitle }.count
+            guard count <= 1 else {
+                XCTFail("Ambiguous recovery items: \(evidence)")
+                throw CocoaError(.featureUnsupported)
+            }
+            if count == 1 { matches.append(candidate) }
+        }
+        guard matches.count == 1, let recoveryControl = matches.first else {
+            XCTFail("Expected one recovery menu, found \(matches.count): \(evidence)")
+            throw CocoaError(.featureUnsupported)
+        }
+        // Discovery only opens and cancels menus. After proving uniqueness,
+        // reopen the identified control and execute its freshly materialized item.
+        let commit = try await inspectMenu(recoveryControl, actionTitle: actionTitle, performAction: true)
+        guard commit.didPerformAction, commit.didEndTracking, !commit.timedOut else {
+            XCTFail("Recovery menu action did not finish: \(commit.summary)")
+            throw CocoaError(.featureUnsupported)
+        }
+        await settle()
+    }
+
+    @MainActor
+    private final class MenuProbe {
+        var menu: NSMenu?
+        var titles: [String] = []
+        var isDisabled = false
+        var didEndTracking = false
+        var didPerformAction = false
+        var timedOut = false
+        var timers: [Timer] = []
+
+        var summary: String {
+            "disabled=\(isDisabled), tracking=\(menu != nil), ended=\(didEndTracking), "
+                + "action=\(didPerformAction), timeout=\(timedOut), "
+                + "items=\(titles.prefix(40).map { String($0.prefix(100)) })"
+        }
+    }
+
+    private func inspectMenu(_ control: NSObject, actionTitle: String, performAction: Bool) async throws -> MenuProbe {
+        let probe = MenuProbe()
+        guard let enabled = isEnabled(control) else {
+            let role = accessibilityString("accessibilityRole", of: control) ?? "unknown"
+            XCTFail("Cannot determine menu enabled state: \(type(of: control)), role=\(role.prefix(100))")
+            throw CocoaError(.featureUnsupported)
+        }
+        if !enabled {
+            probe.isDisabled = true
+            return probe
+        }
+        let begin = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification,
+                                                           object: nil, queue: .main) { notification in
             MainActor.assumeIsolated {
-                guard let menu = notification.object as? NSMenu else { return }
-                let timer = Timer(timeInterval: 0.05, repeats: false) { _ in
+                guard probe.menu == nil, let menu = notification.object as? NSMenu else { return }
+                probe.menu = menu
+                let inspect = Timer(timeInterval: 0.05, repeats: false) { _ in
                     MainActor.assumeIsolated {
-                        titles.value = menu.items.map(\.title)
-                        let index = menu.items.firstIndex(where: { $0.title == "从默认模板恢复…" })
-                        menu.cancelTracking()
-                        if let index {
-                            selected.value = true
+                        guard !probe.timedOut else { return }
+                        probe.titles = menu.items.map(\.title)
+                        let items = menu.items.indices.filter { menu.items[$0].title == actionTitle }
+                        menu.cancelTrackingWithoutAnimation()
+                        if performAction, items.count == 1, let index = items.first,
+                           menu.items[index].isEnabled {
                             menu.performActionForItem(at: index)
+                            probe.didPerformAction = true
                         }
                     }
                 }
-                RunLoop.main.add(timer, forMode: .eventTracking)
-                RunLoop.main.add(timer, forMode: .common)
-
+                probe.timers.append(inspect)
+                RunLoop.main.add(inspect, forMode: .eventTracking)
+                RunLoop.main.add(inspect, forMode: .common)
             }
         }
-        defer { NotificationCenter.default.removeObserver(observer) }
-        try press("修复损坏的配置…", in: host.view)
-        await settle()
-        XCTAssertTrue(selected.value, "The production recovery menu action must run; items: \(titles.value)")
-        if !selected.value { throw CocoaError(.featureUnsupported) }
+        let end = NotificationCenter.default.addObserver(forName: NSMenu.didEndTrackingNotification,
+                                                         object: nil, queue: .main) { notification in
+            MainActor.assumeIsolated {
+                if let menu = notification.object as? NSMenu, menu === probe.menu {
+                    probe.didEndTracking = true
+                }
+            }
+        }
+        let deadline = Timer(timeInterval: 2, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                probe.timedOut = true
+                probe.menu?.cancelTrackingWithoutAnimation()
+            }
+        }
+        probe.timers.append(deadline)
+        RunLoop.main.add(deadline, forMode: .eventTracking)
+        RunLoop.main.add(deadline, forMode: .common)
+        defer {
+            NotificationCenter.default.removeObserver(begin)
+            NotificationCenter.default.removeObserver(end)
+            probe.timers.forEach { $0.invalidate() }
+            probe.timers.removeAll()
+            if !probe.didEndTracking { probe.menu?.cancelTrackingWithoutAnimation() }
+        }
+        try pressControl(control)
+        while !probe.didEndTracking && !probe.timedOut {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return probe
+    }
+
+    private func isEnabled(_ node: NSObject) -> Bool? {
+        if let control = node as? NSControl { return control.isEnabled }
+        let selector = NSSelectorFromString("isAccessibilityEnabled")
+        guard node.responds(to: selector) else { return nil }
+        typealias Enabled = @convention(c) (AnyObject, Selector) -> Bool
+        return unsafeBitCast(node.method(for: selector), to: Enabled.self)(node, selector)
     }
 
     private func nodes(_ element: Any) -> [NSObject] {
@@ -364,6 +461,10 @@ final class TemplateRecoveryLifecycleTests: XCTestCase {
         let matches = nodes(view).filter { isPressable($0) && controlNames($0).contains(label) }
         let node = try XCTUnwrap(matches.first { $0 is NSButton } ?? matches.first,
             "Missing button: \(label); controls: \(controlDiagnostics(in: view))")
+        try pressControl(node)
+    }
+
+    private func pressControl(_ node: NSObject) throws {
         if let button = node as? NSButton {
             button.performClick(nil)
             return
