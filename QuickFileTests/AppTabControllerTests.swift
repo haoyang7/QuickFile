@@ -431,6 +431,103 @@ final class AppTabControllerTests: XCTestCase {
         XCTAssertNil(controller.tabViewItems[1].view?.superview)
     }
 
+    func testExternalRouteWaitsForNativePickerHandoffAndActualImportSheet() async throws {
+        let presentation = TemplateModalPresentation()
+        let gate = AppModalPresentationGate()
+        let receiving = AppTabController(viewModel: model, finderIntegrationViewModel: integration,
+            diagnosticsViewModel: diagnostics, templatePresentation: presentation, scenePhase: .active)
+        let other = controller()
+        other.selectedTab = .templates
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 650),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentViewController = receiving
+        window.orderFront(nil)
+        defer { window.close() }
+        receiving.selectedTab = .templates
+        await settleLayout(receiving.view)
+        let pages = receiving.tabViewItems.map { $0.viewController! }
+        var pending = QuickFilePendingAppRoute()
+        func applyRoute() {
+            if let route = pending.takeIfReady(startupAuthorizationChecked: true, isBusy: false,
+                isPresentingModal: gate.isPresenting || presentation.isActive) {
+                receiving.selectedTab = AppTab(route: route)
+            }
+        }
+        let preparation = presentation.beginPreparation()
+        gate.present {
+            pending.receive(QuickFileAppRoute.create.url)
+            applyRoute()
+            XCTAssertEqual(receiving.selectedTab, .templates)
+        }
+        // The native gate has released, but the read/preview handoff still owns
+        // this interaction, including a full run-loop turn with no sheet yet.
+        await settleLayout(receiving.view)
+        applyRoute()
+        XCTAssertEqual(receiving.selectedTab, .templates)
+        let url = directory.appendingPathComponent("import.json")
+        try TemplateTransferFile.write(TemplateTransferBundle(templates: [
+            FileTemplate(name: "Imported", fileExtension: "txt", content: "未保存 🌏 e\u{301}")
+        ]), to: url)
+        let original = model.templates
+        presentation.importPreview = try await model.prepareTemplateImport(from: url)
+        presentation.finishPreparation(preparation)
+        applyRoute()
+        await settleLayout(receiving.view)
+        XCTAssertEqual(receiving.selectedTab, .templates)
+        XCTAssertNotNil(window.attachedSheet, "The real TemplateManager sheet must survive the pending route")
+        XCTAssertEqual(model.templates, original)
+        // Only the receiving window applies the newest valid external intent.
+        pending.receive(QuickFileAppRoute.diagnostics.url)
+        presentation.importPreview = nil
+        await settleLayout(receiving.view)
+        applyRoute()
+        await settleLayout(receiving.view)
+        XCTAssertEqual(receiving.selectedTab, .diagnostics)
+        XCTAssertNil(window.attachedSheet)
+        XCTAssertNil(pending.route)
+        XCTAssertEqual(other.selectedTab, .templates)
+        XCTAssertEqual(model.templates, original)
+        for index in pages.indices {
+            XCTAssertTrue(receiving.tabViewItems[index].viewController === pages[index])
+        }
+    }
+
+    func testExternalRouteDoesNotHideEditorAndExplicitTabStillInvalidatesPreview() async throws {
+        let presentation = TemplateModalPresentation()
+        let receiving = AppTabController(viewModel: model, finderIntegrationViewModel: integration,
+            diagnosticsViewModel: diagnostics, templatePresentation: presentation, scenePhase: .active)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 650),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentViewController = receiving
+        window.orderFront(nil)
+        defer { window.close() }
+        receiving.selectedTab = .templates
+        await settleLayout(receiving.view)
+        presentation.editorPresentation = TemplateEditorPresentation(template: model.templates.first)
+        await settleLayout(receiving.view)
+        let sheet = try XCTUnwrap(window.attachedSheet)
+        var pending = QuickFilePendingAppRoute()
+        pending.receive(QuickFileAppRoute.create.url)
+        XCTAssertNil(pending.takeIfReady(startupAuthorizationChecked: true, isBusy: false,
+                                         isPresentingModal: presentation.isActive))
+        await settleLayout(receiving.view)
+        XCTAssertTrue(window.attachedSheet === sheet)
+        XCTAssertEqual(receiving.selectedTab, .templates)
+        presentation.editorPresentation = nil
+        await settleLayout(receiving.view)
+        let url = directory.appendingPathComponent("import.json")
+        try TemplateTransferFile.write(TemplateTransferBundle(templates: [
+            FileTemplate(name: "Imported", fileExtension: "txt", content: "preview")
+        ]), to: url)
+        presentation.importPreview = try await model.prepareTemplateImport(from: url)
+        await settleLayout(receiving.view)
+        receiving.selectedTab = .create // Explicit user navigation retains the old invalidation rule.
+        await settleLayout(receiving.view)
+        XCTAssertNil(presentation.importPreview)
+    }
+
     func testPendingNavigationWaitsThroughAuthorizationAndRetainsExistingPages() throws {
         let receiving = controller()
         let other = controller()

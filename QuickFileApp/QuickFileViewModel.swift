@@ -1160,7 +1160,7 @@ final class QuickFileViewModel: ObservableObject {
         resumingPauseID: UUID? = nil,
         isPresentationAvailable: @MainActor () -> Bool = { true },
         willPresent: @MainActor () -> Void = {},
-        confirmAuthorization: @MainActor (FinderAuthorizationRequest) -> URL?
+        confirmAuthorization: @MainActor (FinderAuthorizationRequest) async -> URL?
     ) async {
         // A queued task from an old window must not clear the app-wide pause. Only
         // an explicit continuation admitted by a live, idle window may resume it.
@@ -1199,7 +1199,7 @@ final class QuickFileViewModel: ObservableObject {
             willPresent: willPresent,
             confirmAuthorization: { request in
                 self.finderAuthorizationRequestPhase = .awaitingAuthorization
-                return confirmAuthorization(request)
+                return await confirmAuthorization(request)
             },
             complete: { request, directory in
                 self.finderAuthorizationRequestPhase = .creatingFile

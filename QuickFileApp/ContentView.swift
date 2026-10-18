@@ -10,11 +10,14 @@ struct ContentView: View {
     @StateObject private var finderIntegrationViewModel: FinderIntegrationViewModel
     @StateObject private var finderMenuSettings: FinderMenuSettingsViewModel
     @StateObject private var finderRequestRecovery: FinderRequestRecoveryViewModel
+    @StateObject private var templatePresentation = TemplateModalPresentation()
+    @ObservedObject private var modalPresentationGate = AppModalPresentationGate.shared
     @State private var selectedTab = AppTab.create
     @State private var hasCheckedStartupAuthorizationRequests = false
     @State private var pendingAppRoute = QuickFilePendingAppRoute()
     @State private var windowPresentation = QuickFileWindowPresentationState()
     @State private var windowID = UUID()
+    @State private var nativeWindow = AppNativeWindowReference()
     private let authorizationRequestStore: FinderAuthorizationRequestStore
     private let folderService: QuickFileFolderService?
 
@@ -53,11 +56,12 @@ struct ContentView: View {
                     service: folderService, viewModel: viewModel,
                     finderIntegration: finderIntegrationViewModel,
                     presentationGeneration: windowPresentation.generation,
+                    presentationWindow: { nativeWindow.window },
                     isPresentationAvailable: { generation in
                         windowPresentation.canPresent(generation)
                     },
                     isInteractionAvailable: {
-                        !windowPresentation.isAwaitingAuthorizationCheck && !finderRequestRecovery.isPresented
+                        !windowPresentation.isAwaitingAuthorizationCheck && !isPresentingModal
                     },
                     willPresent: {
                         pendingAppRoute.discard()
@@ -69,6 +73,7 @@ struct ContentView: View {
                 viewModel: viewModel,
                 finderIntegrationViewModel: finderIntegrationViewModel,
                 finderMenuSettings: finderMenuSettings,
+                templatePresentation: templatePresentation,
                 selectedTab: Binding(get: { selectedTab }, set: { tab in
                     selectedTab = tab
                     // A newer native tab choice supersedes pending external navigation.
@@ -78,6 +83,7 @@ struct ContentView: View {
             )
         }
         .frame(minWidth: 720, idealWidth: 780, minHeight: 520, idealHeight: 600)
+        .background(AppNativeWindowReader(reference: nativeWindow))
         .handlesExternalEvents(preferring: QuickFileAppRoute.externalEventIdentifiers,
                                allowing: QuickFileAppRoute.externalEventIdentifiers)
         .sheet(isPresented: Binding(
@@ -131,6 +137,13 @@ struct ContentView: View {
             // An initial idle value only resumes an existing intent; it never polls.
             if !isBusy { resumeAuthorizationCheckOrApplyRoute() }
         }
+        .onReceive(templatePresentation.objectWillChange.receive(on: RunLoop.main)) { _ in
+            applyPendingAppRoute()
+        }
+        .onReceive(modalPresentationGate.$isPresenting.receive(on: RunLoop.main)) { _ in
+            applyPendingAppRoute()
+        }
+        .onChange(of: finderRequestRecovery.isPresented) { _ in applyPendingAppRoute() }
         .onChange(of: viewModel.destinationFolder) { folder in
             finderIntegrationViewModel.destinationDidChange(to: folder)
         }
@@ -195,9 +208,11 @@ struct ContentView: View {
                 isPresentationAvailable: { windowPresentation.canPresent(generation) },
                 willPresent: { selectedTab = .create },
                 confirmAuthorization: { request in
-                    AppKitFileActions.confirmFinderAuthorization(
+                    guard let owner = nativeWindow.window else { return nil }
+                    return await AppKitFileActions.confirmFinderAuthorization(
                         for: request,
-                        templateName: viewModel.template(withID: request.templateID)?.displayName
+                        templateName: viewModel.template(withID: request.templateID)?.displayName,
+                        owner: owner
                     )
                 }
             )
@@ -219,6 +234,10 @@ struct ContentView: View {
         }
     }
 
+    private var isPresentingModal: Bool {
+        templatePresentation.isActive || modalPresentationGate.isPresenting || finderRequestRecovery.isPresented
+    }
+
     @MainActor
     private func applyPendingAppRoute() {
         guard windowPresentation.generation != nil,
@@ -226,7 +245,8 @@ struct ContentView: View {
               pendingAppRoute.route != nil else { return }
         guard let route = pendingAppRoute.takeIfReady(
             startupAuthorizationChecked: hasCheckedStartupAuthorizationRequests,
-            isBusy: viewModel.isAuthorizationCheckBusy
+            isBusy: viewModel.isAuthorizationCheckBusy,
+            isPresentingModal: isPresentingModal
         ) else { return }
         // Only select the existing controller; do not replace its content or .id.
         selectedTab = AppTab(route: route)
@@ -238,6 +258,7 @@ private struct QuickFileFolderServiceBanner: View {
     @ObservedObject var viewModel: QuickFileViewModel
     let finderIntegration: FinderIntegrationViewModel
     let presentationGeneration: UUID?
+    let presentationWindow: @MainActor () -> NSWindow?
     let isPresentationAvailable: @MainActor (UUID) -> Bool
     let isInteractionAvailable: @MainActor () -> Bool
     let willPresent: @MainActor () -> Void
@@ -260,7 +281,7 @@ private struct QuickFileFolderServiceBanner: View {
                 .font(.callout)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 Button("选择这个文件夹…") {
-                    guard let generation = presentationGeneration else { return }
+                    guard let generation = presentationGeneration, let owner = presentationWindow() else { return }
                     Task { @MainActor in
                         guard isInteractionAvailable() else { return }
                         await service.selectFolder(
@@ -268,7 +289,7 @@ private struct QuickFileFolderServiceBanner: View {
                             finderIntegration: finderIntegration,
                             isPresentationAvailable: { isPresentationAvailable(generation) },
                             willPresent: willPresent,
-                            choose: { AppKitFileActions.chooseDestinationFolder(startingAt: $0) }
+                            choose: { await AppKitFileActions.chooseDestinationFolder(startingAt: $0, for: owner) }
                         )
                     }
                 }
@@ -279,6 +300,34 @@ private struct QuickFileFolderServiceBanner: View {
             }
             .padding()
             .background(Color.secondary.opacity(0.08))
+        }
+    }
+}
+
+/// A window-specific reference, read at presentation time rather than guessing
+/// whichever window is key after an asynchronous authorization queue wait.
+@MainActor
+private final class AppNativeWindowReference {
+    weak var window: NSWindow?
+}
+
+private struct AppNativeWindowReader: NSViewRepresentable {
+    let reference: AppNativeWindowReference
+
+    func makeNSView(context: Context) -> WindowView { WindowView(reference: reference) }
+    func updateNSView(_ view: WindowView, context: Context) {}
+
+    final class WindowView: NSView {
+        let reference: AppNativeWindowReference
+        init(reference: AppNativeWindowReference) {
+            self.reference = reference
+            super.init(frame: .zero)
+        }
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("Use init(reference:)") }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            reference.window = window
         }
     }
 }
