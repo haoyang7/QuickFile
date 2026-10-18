@@ -1,3 +1,4 @@
+import AppKit
 import QuickFileCore
 import QuickFileInfrastructure
 import SwiftUI
@@ -7,6 +8,7 @@ struct CreateFileView: View {
     @ObservedObject var viewModel: QuickFileViewModel
     @ObservedObject var finderIntegrationViewModel: FinderIntegrationViewModel
     var showTemplateManager: () -> Void = {}
+    var presentationWindow: @MainActor () -> NSWindow? = { NSApp.keyWindow?.sheetParent ?? NSApp.mainWindow }
     @State private var showsSavedAuthorizations = false
 
     var body: some View {
@@ -333,9 +335,10 @@ struct CreateFileView: View {
     }
 
     private func chooseDestinationFolder() {
+        guard let owner = presentationWindow() else { return }
         Task {
             await viewModel.selectDestinationFolder(choosing: {
-                let folder = AppKitFileActions.chooseDestinationFolder(startingAt: viewModel.destinationFolder)
+                let folder = await AppKitFileActions.chooseDestinationFolder(startingAt: viewModel.destinationFolder, for: owner)
                 if folder != nil { finderIntegrationViewModel.cancelVerification() }
                 return folder
             })
@@ -351,9 +354,10 @@ struct CreateFileView: View {
         case .chooseFolder:
             chooseDestinationFolder()
         case .saveAuthorization:
+            guard let owner = presentationWindow() else { return }
             Task {
                 let attemptedSave = await viewModel.saveFinderAuthorization(choosing: {
-                    let folder = AppKitFileActions.chooseFinderAuthorizationFolder(startingAt: viewModel.destinationFolder)
+                    let folder = await AppKitFileActions.chooseFinderAuthorizationFolder(startingAt: viewModel.destinationFolder, for: owner)
                     if folder != nil { finderIntegrationViewModel.cancelVerification() }
                     return folder
                 })

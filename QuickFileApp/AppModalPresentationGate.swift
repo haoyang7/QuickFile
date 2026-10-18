@@ -1,11 +1,12 @@
+import Combine
 import Foundation
 
-/// Native panels share one application-modal slot. The single Finder request
+/// Native panels share app-wide admission. The single Finder request
 /// pump may reserve the next presentation; other callers never enqueue panels.
 @MainActor
-final class AppModalPresentationGate {
+final class AppModalPresentationGate: ObservableObject {
     static let shared = AppModalPresentationGate()
-    private(set) var isPresenting = false
+    @Published private(set) var isPresenting = false
     private(set) var isFinderReserved = false
     private var finderWaiter: CheckedContinuation<Void, Never>?
 
@@ -29,10 +30,16 @@ final class AppModalPresentationGate {
         return operation()
     }
 
+    func presentAsync<Value>(_ operation: () async -> Value) async -> Value? {
+        guard tryBegin() else { return nil }
+        defer { finish() }
+        return await operation()
+    }
+
     /// Only the application-scoped pump calls this. Reserve before waiting so
     /// another window cannot steal the slot before its continuation resumes.
     /// The caller rechecks its window after waiting, before navigation or UI.
-    func withFinderPresentation<Value>(_ operation: () -> Value) async -> Value {
+    func withFinderPresentation<Value>(_ operation: () async -> Value) async -> Value {
         precondition(!isFinderReserved, "The application owns only one Finder request pump")
         isFinderReserved = true
         defer { isFinderReserved = false }
@@ -41,6 +48,6 @@ final class AppModalPresentationGate {
         }
         isPresenting = true
         defer { finish() }
-        return operation()
+        return await operation()
     }
 }

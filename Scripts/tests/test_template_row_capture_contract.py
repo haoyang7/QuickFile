@@ -60,14 +60,14 @@ def capture_contract_violations(source):
     edit_action = (
         r"\{\s*guard let current = viewModel\.template\(withID: id\) else \{ return \}\s*"
         r"selectedTemplateID = id\s*"
-        r"editorPresentation = TemplateEditorPresentation\(template: current\)\s*\}"
+        r"presentation\.editorPresentation = TemplateEditorPresentation\(template: current\)\s*\}"
     )
     for marker in (r"\.simultaneousGesture\(TapGesture\(count: 2\)\.onEnded", r'Button\("编辑"\)'):
         if not re.search(marker + r"\s*" + edit_action, row):
             violations.append("each edit action must look up the current template by ID")
 
     if not re.search(
-        r'Button\("删除"\)\s*\{\s*confirmation = \.delete\(id, name\)\s*\}', deferred
+        r'Button\("删除"\)\s*\{\s*presentation\.confirmation = \.delete\(id, name\)\s*\}', deferred
     ):
         violations.append("delete must preserve the captured ID and displayed name")
     if not re.search(r"case delete\(FileTemplate\.ID, String\)", source):
@@ -105,7 +105,8 @@ class TemplateRowCaptureContractTests(unittest.TestCase):
 
     def test_guard_rejects_original_whole_template_delete_capture(self):
         self.assert_rejected_mutation(
-            "confirmation = .delete(id, name)", "confirmation = .delete(id, template.name)",
+            "presentation.confirmation = .delete(id, name)",
+            "presentation.confirmation = .delete(id, template.name)",
             "deferred row actions must not reference the FileTemplate value",
         )
 
@@ -152,14 +153,35 @@ class TemplateRowCaptureContractTests(unittest.TestCase):
 
     def test_guard_rejects_wrong_confirmation_identity_or_name(self):
         for replacement in (
-            "confirmation = .delete(UUID(), name)",
-            'confirmation = .delete(id, "Different name")',
+            "presentation.confirmation = .delete(UUID(), name)",
+            'presentation.confirmation = .delete(id, "Different name")',
         ):
             with self.subTest(replacement=replacement):
                 self.assert_rejected_mutation(
-                    "confirmation = .delete(id, name)", replacement,
+                    "presentation.confirmation = .delete(id, name)", replacement,
                     "delete must preserve the captured ID and displayed name",
                 )
+
+    def test_guard_rejects_wrong_editor_presentation_receiver_for_each_entry_point(self):
+        self.assertEqual(capture_contract_violations(self.source), [])
+        before = "presentation.editorPresentation = TemplateEditorPresentation(template: current)"
+        self.assertEqual(self.source.count(before), 2)
+        offsets = [match.start() for match in re.finditer(re.escape(before), self.source)]
+        for offset in offsets:
+            with self.subTest(offset=offset):
+                after = "otherPresentation.editorPresentation = TemplateEditorPresentation(template: current)"
+                mutated = self.source[:offset] + after + self.source[offset + len(before):]
+                self.assertIn(
+                    "each edit action must look up the current template by ID",
+                    capture_contract_violations(mutated),
+                )
+
+    def test_guard_rejects_wrong_confirmation_receiver(self):
+        self.assert_rejected_mutation(
+            "presentation.confirmation = .delete(id, name)",
+            "otherPresentation.confirmation = .delete(id, name)",
+            "delete must preserve the captured ID and displayed name",
+        )
 
     def test_guard_rejects_whole_template_confirmation_payload(self):
         self.assert_rejected_mutation(

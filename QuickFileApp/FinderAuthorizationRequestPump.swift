@@ -26,7 +26,7 @@ final class FinderAuthorizationRequestPump {
         willReadQueue: @MainActor () -> Void = {},
         prepareForPresentation: @MainActor () async -> Void = {},
         willPresent: @MainActor () -> Void,
-        confirmAuthorization: @MainActor (FinderAuthorizationRequest) -> URL?,
+        confirmAuthorization: @MainActor (FinderAuthorizationRequest) async -> URL?,
         complete: @MainActor (FinderAuthorizationRequest, URL) async -> Bool,
         didCancel: @MainActor () -> Void,
         didFail: @MainActor (Error) -> Void,
@@ -78,9 +78,9 @@ final class FinderAuthorizationRequestPump {
                 guard isPresentationAvailable() else { return nil as URL? }
                 willPresent()
                 guard isPresentationAvailable() else { return nil }
-                return confirmAuthorization(request)
+                return await confirmAuthorization(request)
             }
-            // NSOpenPanel.runModal may process window-close events before returning.
+            // The owning window may close while its native sheet is awaiting completion.
             // A stale panel result must not begin an unstarted creation operation.
             guard isPresentationAvailable() else {
                 didCancelForUnavailableWindow(request)

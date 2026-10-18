@@ -31,8 +31,8 @@ struct QuickFilePendingAppRoute: Equatable, Sendable {
 
     mutating func discard() { route = nil }
 
-    mutating func takeIfReady(startupAuthorizationChecked: Bool, isBusy: Bool) -> QuickFileAppRoute? {
-        guard startupAuthorizationChecked, !isBusy else { return nil }
+    mutating func takeIfReady(startupAuthorizationChecked: Bool, isBusy: Bool, isPresentingModal: Bool = false) -> QuickFileAppRoute? {
+        guard startupAuthorizationChecked, !isBusy, !isPresentingModal else { return nil }
         defer { route = nil }
         return route
     }
@@ -121,6 +121,7 @@ struct AppTabsView: NSViewControllerRepresentable {
     let finderIntegrationViewModel: FinderIntegrationViewModel
     var finderMenuSettings: FinderMenuSettingsViewModel? = nil
     var diagnosticsViewModel: DiagnosticsViewModel? = nil
+    var templatePresentation: TemplateModalPresentation? = nil
     @Binding var selectedTab: AppTab
 
     func makeNSViewController(context: Context) -> AppTabController {
@@ -129,6 +130,7 @@ struct AppTabsView: NSViewControllerRepresentable {
             finderIntegrationViewModel: finderIntegrationViewModel,
             finderMenuSettings: finderMenuSettings,
             diagnosticsViewModel: diagnosticsViewModel,
+            templatePresentation: templatePresentation,
             scenePhase: context.environment.scenePhase,
             locale: context.environment.locale
         )
@@ -158,6 +160,7 @@ final class AppTabController: NSTabViewController {
         finderIntegrationViewModel: FinderIntegrationViewModel,
         finderMenuSettings: FinderMenuSettingsViewModel? = nil,
         diagnosticsViewModel: DiagnosticsViewModel? = nil,
+        templatePresentation: TemplateModalPresentation? = nil,
         scenePhase: ScenePhase,
         locale: Locale = Locale(identifier: QuickFileLocalization.identifier)
     ) {
@@ -168,9 +171,12 @@ final class AppTabController: NSTabViewController {
         transitionOptions = []
         let bundle = QuickFileLocalization.resourceBundle(for: locale.identifier)
         addPage(CreateFileView(viewModel: viewModel, finderIntegrationViewModel: finderIntegrationViewModel,
-                               showTemplateManager: { [weak self] in self?.selectedTab = .templates }),
+                               showTemplateManager: { [weak self] in self?.selectedTab = .templates },
+                               presentationWindow: { [weak self] in self?.view.window }),
                 tab: .create, title: String(localized: "创建文件", bundle: bundle), symbol: "doc.badge.plus")
-        addPage(TemplateManagerView(viewModel: viewModel, finderMenuSettings: finderMenuSettings),
+        addPage(TemplateManagerView(viewModel: viewModel, finderMenuSettings: finderMenuSettings,
+                                    presentation: templatePresentation,
+                                    presentationWindow: { [weak self] in self?.view.window }),
                 tab: .templates, title: String(localized: "模板管理", bundle: bundle), symbol: "list.bullet.rectangle")
         addPage(DiagnosticsView(viewModel: diagnosticsViewModel),
                 tab: .diagnostics, title: String(localized: "诊断", bundle: bundle), symbol: "stethoscope")

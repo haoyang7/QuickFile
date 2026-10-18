@@ -10,7 +10,7 @@ enum AppKitFileActions {
         NSApplication.didBecomeActiveNotification
     }
 
-    static func chooseDestinationFolder(startingAt directoryURL: URL?) -> URL? {
+    static func chooseDestinationFolder(startingAt directoryURL: URL?, for owner: NSWindow) async -> URL? {
         let panel = NSOpenPanel()
         panel.title = QuickFileLocalization.text(.init("选择新文件的保存位置"))
         panel.prompt = QuickFileLocalization.text(.init("选择文件夹"))
@@ -21,11 +21,10 @@ enum AppKitFileActions {
         panel.directoryURL = directoryURL
         panel.message = QuickFileLocalization.text(.init("选择后即可在此创建文件。本次选择不会自动保存 Finder 授权；需要 Finder 右键菜单时，可在下方单独设置。"))
 
-        guard AppModalPresentationGate.shared.present({ panel.runModal() }) == .OK else { return nil }
-        return panel.url
+        return await chooseURL(using: panel, for: owner)
     }
 
-    static func chooseFinderAuthorizationFolder(startingAt directoryURL: URL?) -> URL? {
+    static func chooseFinderAuthorizationFolder(startingAt directoryURL: URL?, for owner: NSWindow) async -> URL? {
         let panel = NSOpenPanel()
         panel.title = QuickFileLocalization.text(.init("保存 Finder 文件夹授权"))
         panel.message = QuickFileLocalization.text(.init("仅保存所选文件夹及其子文件夹的 Finder 创建权限，不会创建文件。可在“诊断”中撤销。无需完全磁盘访问。"))
@@ -36,14 +35,14 @@ enum AppKitFileActions {
         panel.canCreateDirectories = false
         panel.directoryURL = directoryURL
 
-        guard AppModalPresentationGate.shared.present({ panel.runModal() }) == .OK else { return nil }
-        return panel.url
+        return await chooseURL(using: panel, for: owner)
     }
 
     static func confirmFinderAuthorization(
         for request: FinderAuthorizationRequest,
-        templateName: String?
-    ) -> URL? {
+        templateName: String?,
+        owner: NSWindow
+    ) async -> URL? {
         let panel = NSOpenPanel()
         panel.title = QuickFileLocalization.text(.init("授权并继续本次 Finder 创建"))
         panel.message = QuickFileLocalization.text(.init("请核对下方请求及授权说明；较长内容可滚动查看。"))
@@ -57,8 +56,7 @@ enum AppKitFileActions {
         panel.directoryURL = request.destinationFolder
 
         // The request pump owns the modal slot before navigation and this call.
-        guard panel.runModal() == .OK else { return nil }
-        return panel.url
+        return await beginPanel(panel, for: owner)
     }
 
     // Display only explicit request context, never template body, clipboard, bookmarks
@@ -113,7 +111,7 @@ enum AppKitFileActions {
         return scrollView
     }
 
-    static func chooseTemplateImportFile() -> URL? {
+    static func chooseTemplateImportFile(for owner: NSWindow) async -> URL? {
         let panel = NSOpenPanel()
         panel.title = QuickFileLocalization.text(.init("导入 QuickFile 模板"))
         panel.prompt = QuickFileLocalization.text(.init("预览导入"))
@@ -122,11 +120,10 @@ enum AppKitFileActions {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        guard AppModalPresentationGate.shared.present({ panel.runModal() }) == .OK else { return nil }
-        return panel.url
+        return await chooseURL(using: panel, for: owner)
     }
 
-    static func chooseTemplateExportFile() -> URL? {
+    static func chooseTemplateExportFile(for owner: NSWindow) async -> URL? {
         let panel = NSSavePanel()
         panel.title = QuickFileLocalization.text(.init("导出 QuickFile 模板"))
         panel.prompt = QuickFileLocalization.text(.init("导出"))
@@ -134,7 +131,34 @@ enum AppKitFileActions {
         panel.allowedContentTypes = [.json]
         panel.nameFieldStringValue = "QuickFile-templates.json"
         panel.canCreateDirectories = true
-        guard AppModalPresentationGate.shared.present({ panel.runModal() }) == .OK else { return nil }
+        return await chooseURL(using: panel, for: owner)
+    }
+
+    /// The app-wide slot rejects other native panels while this window's sheet
+    /// is open. Awaiting AppKit completion leaves the main run loop and actor free
+    /// to receive Services; runModal's nested loop did not reliably do so.
+    static func chooseURL(
+        using panel: NSSavePanel, for owner: NSWindow,
+        presentationGate: AppModalPresentationGate? = nil
+    ) async -> URL? {
+        await (presentationGate ?? .shared).presentAsync {
+            await beginPanel(panel, for: owner)
+        } ?? nil
+    }
+
+    private static func beginPanel(_ panel: NSSavePanel, for owner: NSWindow) async -> URL? {
+        guard owner.isVisible, !Task.isCancelled else { return nil }
+        let lifetime = NativePanelLifetime(panel: panel, owner: owner)
+        guard await lifetime.waitForExistingSheet(on: owner) else { return nil }
+        let response = await withCheckedContinuation { continuation in
+            panel.beginSheetModal(for: owner) { response in
+                // AppKit may call completion while the panel is still on screen.
+                // Remove it before releasing admission or presenting a preview.
+                panel.orderOut(nil)
+                continuation.resume(returning: response)
+            }
+        }
+        guard response == .OK, !lifetime.ownerDidClose, owner.isVisible, !Task.isCancelled else { return nil }
         return panel.url
     }
 
@@ -178,4 +202,50 @@ enum AppKitFileActions {
     static func clipboardString() -> String? {
         NSPasteboard.general.string(forType: .string)
     }
+}
+
+/// Tracks the original owner through an asynchronous native panel. A close can
+/// occur before completion or while its continuation is waiting on MainActor.
+@MainActor
+private final class NativePanelLifetime: NSObject {
+    private let panel: NSSavePanel
+    private(set) var ownerDidClose = false
+    private var existingSheetWaiter: CheckedContinuation<Void, Never>?
+
+    init(panel: NSSavePanel, owner: NSWindow) {
+        self.panel = panel
+        super.init()
+        NotificationCenter.default.addObserver(self, selector: #selector(ownerWillClose),
+            name: NSWindow.willCloseNotification, object: owner)
+        NotificationCenter.default.addObserver(self, selector: #selector(ownerDidEndSheet),
+            name: NSWindow.didEndSheetNotification, object: owner)
+    }
+
+    func waitForExistingSheet(on owner: NSWindow) async -> Bool {
+        // A preceding SwiftUI confirmation can still be dismissing. AppKit's
+        // remote file panel cannot reliably cancel before its queued sheet shows,
+        // so wait here before registering it with AppKit.
+        while owner.isVisible, !ownerDidClose, !Task.isCancelled, owner.attachedSheet != nil {
+            await withCheckedContinuation { existingSheetWaiter = $0 }
+        }
+        return owner.isVisible && !ownerDidClose && !Task.isCancelled
+    }
+
+    @objc private func ownerDidEndSheet(_ notification: Notification) {
+        finishExistingSheetWait()
+    }
+
+    private func finishExistingSheetWait() {
+        let waiter = existingSheetWaiter
+        existingSheetWaiter = nil
+        waiter?.resume()
+    }
+
+    @objc private func ownerWillClose(_ notification: Notification) {
+        ownerDidClose = true
+        finishExistingSheetWait()
+        panel.cancel(nil)
+    }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
 }

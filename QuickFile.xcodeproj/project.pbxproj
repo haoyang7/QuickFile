@@ -74,6 +74,7 @@
 		501D37A90BB0099F6F234BAC /* CommunityUpdatePresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = B48BDB59053C26906805EB6F /* CommunityUpdatePresentation.swift */; };
 		5024DE67CFACE7DF17157BCC /* QuickFileConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDB9F0243ACE84AE151E0FD0 /* QuickFileConfigurationTests.swift */; };
 		51E12C0FCA4E9B0B3570D062 /* FileTemplate.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEB6947A962E98B04B33DAD7 /* FileTemplate.swift */; };
+		52C1906B1A9EC26491690E63 /* TemplateRecoveryLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA40000392DADD612994DC8A /* TemplateRecoveryLifecycleTests.swift */; };
 		52F9632D6F42B14D437FD7EA /* FinderExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 779E2F0443BBC3A94000995B /* FinderExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		5302485BBADBA56F5711A9AE /* FinderLanguageSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = F044DB4C579D3BF9002D7923 /* FinderLanguageSettings.swift */; };
 		530E508CA93FABD0C5AC6BDC /* AdaptiveActionRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DBED03B9514C481A5EFE838 /* AdaptiveActionRow.swift */; };
@@ -390,6 +391,7 @@
 		A4F735220B5B554AAAFCE639 /* FinderFirstUseVerificationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderFirstUseVerificationTests.swift; sourceTree = "<group>"; };
 		A6B42E5ED80F9F6963D268C6 /* QuickFileSharedStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickFileSharedStorage.swift; sourceTree = "<group>"; };
 		A91204A8295F6E74C568C70D /* DiagnosticsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsViewModel.swift; sourceTree = "<group>"; };
+		AA40000392DADD612994DC8A /* TemplateRecoveryLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateRecoveryLifecycleTests.swift; sourceTree = "<group>"; };
 		AAA6B5FC731912B23B86D33D /* FinderSyncTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderSyncTests.swift; sourceTree = "<group>"; };
 		AC3648F8CF0B9441552091DF /* FinderMenuModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderMenuModelTests.swift; sourceTree = "<group>"; };
 		AD2E95C3D552962F9200D752 /* AuthorizedDirectoryStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthorizedDirectoryStoreTests.swift; sourceTree = "<group>"; };
@@ -608,6 +610,7 @@
 				97CBDF14660EE6E661DA23A0 /* TemplatePresentationLifetimeTests.swift */,
 				FD0279EE65F3ABB35FFBDF42 /* TemplatePreviewControllerTests.swift */,
 				7A115436D48CDF4F8EB71AD0 /* TemplatePreviewTests.swift */,
+				AA40000392DADD612994DC8A /* TemplateRecoveryLifecycleTests.swift */,
 				1607C8C851A9225BA5687E37 /* TemplateRefreshTests.swift */,
 				B5FDAA0D4D2FB8BB2346AF37 /* TemplateRendererTests.swift */,
 				A3317EF63C18D53876BA073B /* TemplateStoreTests.swift */,
@@ -1196,6 +1199,7 @@
 				DC22BD200F53EF3F5C801B17 /* TemplatePresentationLifetimeTests.swift in Sources */,
 				17976D1AD32989EBA27B2BC7 /* TemplatePreviewControllerTests.swift in Sources */,
 				0FADB3FF28A4EA9DB2F9AD5D /* TemplatePreviewTests.swift in Sources */,
+				52C1906B1A9EC26491690E63 /* TemplateRecoveryLifecycleTests.swift in Sources */,
 				D060545AD05E30FB5650E068 /* TemplateRefreshTests.swift in Sources */,
 				E320FA91337CC73DB0820C18 /* TemplateRendererTests.swift in Sources */,
 				5C976D22A21F2A821B4B313E /* TemplateStoreTests.swift in Sources */,
@@ -1352,7 +1356,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 108;
+				CURRENT_PROJECT_VERSION = 111;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -1584,7 +1588,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 108;
+				CURRENT_PROJECT_VERSION = 111;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
