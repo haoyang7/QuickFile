@@ -725,6 +725,24 @@
         }
       }
     },
+    "QuickFile 中已有文件夹请求。请先处理或取消该请求。": {
+      "comment": "System folder service: a second request is rejected while the first is pending or being confirmed.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "QuickFile already has a folder request. Complete or cancel it first."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "QuickFile 中已有文件夹请求。请先处理或取消该请求。"
+          }
+        }
+      }
+    },
     "QuickFile 无法创建文件": {
       "comment": "Finder extension: alert or creation/setup feedback.",
       "extractionState": "manual",
@@ -6767,6 +6785,24 @@
         }
       }
     },
+    "无法打开创建窗口。请在 QuickFile 中继续处理此请求。": {
+      "comment": "Folder service request banner: the app could not open its creation window; the pending location hint is retained.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Could not open the creation window. Continue with this request in QuickFile."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法打开创建窗口。请在 QuickFile 中继续处理此请求。"
+          }
+        }
+      }
+    },
     "无法生成示例，请修改后重试。": {
       "comment": "Template editor: fields, validation, content limits and unsaved drafts.",
       "extractionState": "manual",
@@ -11123,6 +11159,24 @@
         }
       }
     },
+    "请仅选择一个文件夹，再使用 QuickFile 服务。": {
+      "comment": "System folder service: selection was empty, ambiguous, or not a supported local file URL.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Select exactly one folder, then use the QuickFile service."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "请仅选择一个文件夹，再使用 QuickFile 服务。"
+          }
+        }
+      }
+    },
     "请从“应用程序”文件夹启动完整 QuickFile 应用，然后再检查。": {
       "comment": "Finder setup: extension activation, permissions and first-creation verification.",
       "extractionState": "manual",
@@ -11821,6 +11875,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "选择要诊断的文件夹"
+          }
+        }
+      }
+    },
+    "选择这个文件夹…": {
+      "comment": "Folder service request banner: opens the native folder picker at the supplied hint; it does not create a file or save Finder access.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choose This Folder…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择这个文件夹…"
           }
         }
       }

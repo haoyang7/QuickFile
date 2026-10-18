@@ -222,7 +222,9 @@ gh run view <run-id> --log-failed
 
 `Scripts/verify-localizations.py` 以 `project.yml` 的 `knownRegions` 为语言集合，检查 String Catalog 翻译完整性、上下文、模板变量 token、参数身份与类型，以及单一计数的复数形式。参数契约取自源语言译文，允许语义键和位置参数重排。新增语言与翻译维护见 [LOCALIZATION.md](LOCALIZATION.md)。
 
-原生 Release 自检和 Community 打包传入本轮 DerivedData 与 App：校对编译器抽取的产品键，并核对主 App 与嵌入扩展实际打包的 `.strings` / `.stringsdict` 内容。漏译或漏打包即失败；`Resources/**` 变更触发对应构建工作流。
+原生 Release 自检和 Community 打包传入本轮 DerivedData 与 App：校对编译器抽取的产品键，并核对主 App 与嵌入扩展实际打包的 Catalog 生成资源 `Localizable.strings` / `Localizable.stringsdict`。漏译或漏打包即失败；`Resources/**` 变更触发对应构建工作流。
+
+独立的 `ServicesMenu.strings` 由 `QuickFileConfigurationTests` 核对已打包的中英文译文和服务声明。macOS 打包回归另以真实菜单文案构造 UTF-16 OpenStep 资源，验证签名前转为等值二进制 plist、原始输入不变及损坏资源拒绝。系统是否注册并显示该服务仍按最终安装包验收。
 
 原生测试 scheme 固定简体中文与中国地区，既有错误和容量说明断言保留其语言前提。本地化测试另行覆盖最终 bundle 的英文资源、带参数错误、复数规则与用户参数按字面保留。语言设置测试覆盖独立实例持久化、损坏和链接拒绝、保存失败保留选择、扩展通知刷新与慢读不阻塞菜单。切换回归检查原生工具栏、已显示反馈、编辑状态保留，以及内置名称的只读翻译；嵌套 SwiftUI 视图通过保留的真实宿主核验已显示文字，不能只断言字符串 getter。
 

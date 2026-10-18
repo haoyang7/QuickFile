@@ -3,6 +3,7 @@ import json
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -159,6 +160,43 @@ class CommunityPackagingTests(unittest.TestCase):
         self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
         self.assert_clean()
 
+    @unittest.skipUnless(sys.platform == "darwin", "OpenStep localization parsing requires macOS plutil")
+    def test_utf16_openstep_services_localizations_are_binary_before_signing(self):
+        source = Path(__file__).parents[2] / "QuickFileApp"
+        key = "New File with QuickFile…"
+        expected = {"en": {key: key}, "zh-Hans": {key: "使用 QuickFile 新建文件…"}}
+        originals = {}
+        for language, document in expected.items():
+            relative = Path("Contents/Resources") / (language + ".lproj") / "ServicesMenu.strings"
+            path = self.app / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((source / (language + ".lproj") / path.name).read_text(encoding="utf-8").encode("utf-16"))
+            originals[relative] = (document, path.stat().st_size)
+        before = MODULE.ARTIFACT.tree_manifest(self.app)
+        def tool(command):
+            if Path(command[0]).name == "codesign":
+                component = Path(command[-1])
+                app = component.parents[2] if component.suffix == ".appex" else component
+                for relative, (document, _) in originals.items():
+                    encoded = (app / relative).read_bytes()
+                    self.assertTrue(encoded.startswith(b"bplist00"))
+                    self.assertEqual(plistlib.loads(encoded), document)
+            self.tool(command)
+        report = self.package(tool=tool)
+        self.assertEqual(report["verdict"], "pass")
+        self.assertEqual(len([command for command in self.commands if Path(command[0]).name == "codesign"]), 2)
+        entries = report["resource_encoding"]["files"]
+        self.assertEqual(set(entries), {relative.as_posix() for relative in originals})
+        for relative, (document, byte_count) in originals.items():
+            self.assertEqual(entries[relative.as_posix()], {
+                "before_bytes": byte_count,
+                "after_bytes": len(plistlib.dumps(document, fmt=plistlib.FMT_BINARY)),
+            })
+            self.assertLess(entries[relative.as_posix()]["after_bytes"], byte_count)
+        self.assertEqual(before, MODULE.ARTIFACT.tree_manifest(self.app))
+        self.assertEqual(list(self.workspaces.iterdir()), [])
+        self.assert_clean()
+
     def test_binary_localization_that_is_already_smaller_is_unchanged(self):
         path = self.app / "Contents/Resources/en.lproj/Localizable.strings"
         path.parent.mkdir(parents=True)
@@ -178,7 +216,8 @@ class CommunityPackagingTests(unittest.TestCase):
     def test_invalid_localization_never_signs_or_publishes_and_keeps_input(self):
         path = self.app / "Contents/Resources/en.lproj/Localizable.strings"
         path.parent.mkdir(parents=True)
-        for contents in (b"not a property list", b"<?xml version=\"1.0\"?><plist><dict>", plistlib.dumps(["invalid root"])):
+        for contents in (b"not a property list", b"<?xml version=\"1.0\"?><plist><dict>",
+                         '"broken" = "unterminated;'.encode("utf-16"), plistlib.dumps(["invalid root"])):
             with self.subTest(contents=contents):
                 path.write_bytes(contents)
                 before = MODULE.ARTIFACT.tree_manifest(self.app)

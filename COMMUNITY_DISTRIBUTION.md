@@ -199,7 +199,7 @@ Community 使用 `~/Library/Application Support/QuickFileCommunity/` 共享文�
 
 Community 打包只在私有副本最终签名前，对主 App 和 Finder 扩展执行 `strip -x`，去掉本地符号，保留 Universal 两架构。`build-community.sh` 先核对对应 dSYM 的双架构 UUID，再将压缩符号及摘要留在私有构建 records；它们不嵌入 App，也不增加公开发行资产。独立调用 `package-community.py` 时，调用方应保留自己的配对 dSYM。DMG 继续使用 HFS+ / UDZO，显式设置 `zlib-level=9`，创建后验证签名、挂载内容及输入不变；失败不发布镜像。
 
-签名前还会把两组件已编译的 `.strings` 和 `.stringsdict` 转为二进制 plist，仅在文件更小时写入，并核对转换前后的全部值。转换不修改构建输入；收据的 `resource_encoding` 记录各文件字节数。安装后的文件收益与压缩后的 DMG 收益分别测量，不能直接互换。
+签名前还会把两组件已编译的 `.strings` 和 `.stringsdict` 转为二进制 plist，支持 String Catalog 生成的 XML/binary plist，以及复制产生的 OpenStep `.strings`（包括 UTF-16 `ServicesMenu.strings`）。仅在文件更小时写入私有副本，并核对转换前后的全部值。转换不修改构建输入；收据的 `resource_encoding` 记录各文件字节数。安装后的文件收益与压缩后的 DMG 收益分别测量，不能直接互换。
 
 这些处理减少安装或下载字节，不能据此推断运行内存按同样比例降低。
 

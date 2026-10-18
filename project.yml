@@ -16,7 +16,7 @@ settings:
     ARCHS: "arm64 x86_64"
     ONLY_ACTIVE_ARCH: "NO"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "107"
+    CURRENT_PROJECT_VERSION: "108"
     QUICKFILE_STORAGE_MODE: "local-shared"
     QUICKFILE_DISTRIBUTION_CHANNEL: "development"
 
@@ -151,6 +151,14 @@ targets:
           - CFBundleURLName: com.haoyoung.QuickFile.navigation
             CFBundleTypeRole: Editor
             CFBundleURLSchemes: [quickfile]
+        NSServices:
+          - NSMenuItem:
+              default: New File with QuickFile…
+            NSMessage: newFileWithQuickFile
+            NSPortName: QuickFile
+            NSSendFileTypes: [public.folder]
+            NSRequiredContext: {}
+            NSRestricted: false
         QuickFileUpdatesEnabled: "$(QUICKFILE_UPDATES_ENABLED)"
         SUFeedURL: "$(QUICKFILE_UPDATE_FEED_URL)"
         SUPublicEDKey: "$(QUICKFILE_UPDATE_PUBLIC_KEY)"

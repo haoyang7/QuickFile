@@ -16,15 +16,18 @@ struct ContentView: View {
     @State private var windowPresentation = QuickFileWindowPresentationState()
     @State private var windowID = UUID()
     private let authorizationRequestStore: FinderAuthorizationRequestStore
+    private let folderService: QuickFileFolderService?
 
     init(
         viewModel: QuickFileViewModel,
         finderMenuSettings: FinderMenuSettingsViewModel? = nil,
         finderIntegrationViewModel: FinderIntegrationViewModel? = nil,
-        authorizationRequestStore: FinderAuthorizationRequestStore = FinderAuthorizationRequestStore()
+        authorizationRequestStore: FinderAuthorizationRequestStore = FinderAuthorizationRequestStore(),
+        folderService: QuickFileFolderService? = nil
     ) {
         self.viewModel = viewModel
         self.authorizationRequestStore = authorizationRequestStore
+        self.folderService = folderService
         _finderRequestRecovery = StateObject(wrappedValue: FinderRequestRecoveryViewModel(
             backend: .init(store: authorizationRequestStore),
             canOperate: {
@@ -45,6 +48,23 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             finderAuthorizationQueueFeedback
+            if let folderService {
+                QuickFileFolderServiceBanner(
+                    service: folderService, viewModel: viewModel,
+                    finderIntegration: finderIntegrationViewModel,
+                    presentationGeneration: windowPresentation.generation,
+                    isPresentationAvailable: { generation in
+                        windowPresentation.canPresent(generation)
+                    },
+                    isInteractionAvailable: {
+                        !windowPresentation.isAwaitingAuthorizationCheck && !finderRequestRecovery.isPresented
+                    },
+                    willPresent: {
+                        pendingAppRoute.discard()
+                        selectedTab = .create
+                    }
+                )
+            }
             AppTabsView(
                 viewModel: viewModel,
                 finderIntegrationViewModel: finderIntegrationViewModel,
@@ -210,5 +230,55 @@ struct ContentView: View {
         ) else { return }
         // Only select the existing controller; do not replace its content or .id.
         selectedTab = AppTab(route: route)
+    }
+}
+
+private struct QuickFileFolderServiceBanner: View {
+    @ObservedObject var service: QuickFileFolderService
+    @ObservedObject var viewModel: QuickFileViewModel
+    let finderIntegration: FinderIntegrationViewModel
+    let presentationGeneration: UUID?
+    let isPresentationAvailable: @MainActor (UUID) -> Bool
+    let isInteractionAvailable: @MainActor () -> Bool
+    let willPresent: @MainActor () -> Void
+
+    var body: some View {
+        if let request = service.pendingRequest {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: "folder")
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(verbatim: request.folderHint.path)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                        .help(request.folderHint.path)
+                    if service.couldNotOpenWindow {
+                        Text("无法打开创建窗口。请在 QuickFile 中继续处理此请求。")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Button("选择这个文件夹…") {
+                    guard let generation = presentationGeneration else { return }
+                    Task { @MainActor in
+                        guard isInteractionAvailable() else { return }
+                        await service.selectFolder(
+                            requestID: request.id, viewModel: viewModel,
+                            finderIntegration: finderIntegration,
+                            isPresentationAvailable: { isPresentationAvailable(generation) },
+                            willPresent: willPresent,
+                            choose: { AppKitFileActions.chooseDestinationFolder(startingAt: $0) }
+                        )
+                    }
+                }
+                .disabled(viewModel.isAuthorizationCheckBusy || service.isSelectingFolder
+                          || !isInteractionAvailable()
+                          || presentationGeneration.map { !isPresentationAvailable($0) } != false)
+                Button("取消") { service.cancel(requestID: request.id) }
+            }
+            .padding()
+            .background(Color.secondary.opacity(0.08))
+        }
     }
 }

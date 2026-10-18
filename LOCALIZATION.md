@@ -2,6 +2,8 @@
 
 QuickFile uses Apple's String Catalog (`Resources/Localizable.xcstrings`). The source language is Simplified Chinese (`zh-Hans`); English (`en`) is also shipped. The app and Finder extension bundle the same catalog. Translators do not need to edit Swift code or install a translation service.
 
+The macOS Services menu uses a separate `QuickFileApp/<language>.lproj/ServicesMenu.strings` table. Keep its key equal to `NSServices`' `NSMenuItem.default` in `project.yml` and translate only the value. macOS chooses this menu's language; QuickFile's language setting applies to the in-app request and feedback through the catalog.
+
 ## Contribute a translation
 
 For an existing language, edit its column in Xcode's String Catalog editor and submit the catalog diff. Read each entry's English context comment: it identifies the feature and explains interpolated arguments. Ask about ambiguous wording before marking it translated. Include the affected screen and a screenshot when text does not fit; use synthetic names and paths in screenshots.
@@ -28,7 +30,7 @@ A new-language contribution should identify a person willing to review future wo
 ## Add a language
 
 1. Add a BCP-47 identifier, such as `fr`, to `options.knownRegions` in `project.yml` and add the language in Xcode's String Catalog editor.
-2. Translate every entry and mark it translated. Preserve argument identities and types, identifiers, template-variable tokens, and literal commands. Do not translate user template contents, paths, or filenames.
+2. Translate every catalog entry and mark it translated, and add the language's `ServicesMenu.strings` table. Extend the Services resource checks in `QuickFileConfigurationTests` to include the language. Preserve argument identities and types, identifiers, template-variable tokens, and literal commands. Do not translate user template contents, paths, or filenames.
 3. Run `xcodegen generate` and include the generated project with the catalog and `project.yml`. After an Xcode import, reconcile language changes in `project.yml` before regenerating. The picker discovers shipped languages and uses their native names; no Swift language branch needs adding.
 4. Run `python3 Scripts/verify-localizations.py`, `python3 -m unittest Scripts.tests.test_localizations`, and `Scripts/verify-release-readiness.sh`. The release guard checks compiler-extracted keys and translations shipped in both bundles.
 5. Review the installed language using `BETA_TEST_GUIDE.md`. Resource completeness does not prove correct layout or runtime switching. An RTL language needs explicit direction/layout acceptance before shipping.
