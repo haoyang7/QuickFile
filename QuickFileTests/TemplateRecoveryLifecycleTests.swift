@@ -313,21 +313,57 @@ final class TemplateRecoveryLifecycleTests: XCTestCase {
         return [node] + children.flatMap(nodes)
     }
 
+    private func accessibilityString(_ name: String, of node: NSObject) -> String? {
+        let selector = NSSelectorFromString(name)
+        guard node.responds(to: selector) else { return nil }
+        return node.perform(selector)?.takeUnretainedValue() as? String
+    }
+
+    private func controlNames(_ node: NSObject) -> [String] {
+        // AXTitle is the visible text; AXDescription (accessibilityLabel) is a
+        // separate description. Native menu controls may expose either one.
+        [accessibilityString("accessibilityLabel", of: node),
+         accessibilityString("accessibilityTitle", of: node),
+         (node as? NSButton)?.title].compactMap { $0 }
+    }
+
+    private func isPressable(_ node: NSObject) -> Bool {
+        if node is NSButton { return true }
+        let roles = [NSAccessibility.Role.button, .popUpButton, .menuButton].map(\.rawValue)
+        return node.responds(to: NSSelectorFromString("accessibilityPerformPress"))
+            && accessibilityString("accessibilityRole", of: node).map(roles.contains) == true
+    }
+
     private func texts(_ element: Any) -> [String] {
         nodes(element).flatMap { node in
-            ["accessibilityLabel", "accessibilityValue"].compactMap { name in
-                let selector = NSSelectorFromString(name)
-                return node.responds(to: selector) ? node.perform(selector)?.takeUnretainedValue() as? String : nil
-            }
+            controlNames(node) + [accessibilityString("accessibilityValue", of: node)].compactMap { $0 }
         }
     }
 
+    private func controlDiagnostics(in view: NSView) -> [String] {
+        // Inspect only this fixture. The bounded native subtree helps distinguish
+        // missing AX nodes from changed names without printing template text.
+        var candidates = nodes(view)
+        var views = [view]
+        var remaining = 256
+        while let current = views.popLast(), remaining > 0 {
+            remaining -= 1
+            candidates.append(current)
+            views.append(contentsOf: current.subviews)
+        }
+        var seen = Set<ObjectIdentifier>()
+        return candidates.filter { seen.insert(ObjectIdentifier($0)).inserted && isPressable($0) }
+            .prefix(40).map { node in
+                let role = accessibilityString("accessibilityRole", of: node) ?? "unknown"
+                let names = controlNames(node).map { String($0.prefix(100)) }
+                return "\(type(of: node)): role=\(role.prefix(100)); names=\(names)"
+            }
+    }
+
     private func press(_ label: String, in view: NSView) throws {
-        let node = try XCTUnwrap(nodes(view).first { node in
-            let selector = NSSelectorFromString("accessibilityLabel")
-            return node.responds(to: selector)
-                && node.perform(selector)?.takeUnretainedValue() as? String == label
-        }, "Missing button: \(label); \(texts(view))")
+        let matches = nodes(view).filter { isPressable($0) && controlNames($0).contains(label) }
+        let node = try XCTUnwrap(matches.first { $0 is NSButton } ?? matches.first,
+            "Missing button: \(label); controls: \(controlDiagnostics(in: view))")
         if let button = node as? NSButton {
             button.performClick(nil)
             return
