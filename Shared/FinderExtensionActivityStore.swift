@@ -57,8 +57,8 @@ public struct FinderExtensionActivityStore: @unchecked Sendable {
         let activity: FinderExtensionActivity?
     }
 
-    public func latestActivity() -> FinderExtensionActivity? {
-        try? withLockedFailureHistory { try loadLatestActivity(alongside: $0).activity }
+    public func latestActivity() throws -> FinderExtensionActivity? {
+        try withLockedFailureHistory { try loadLatestActivity(alongside: $0).activity }
     }
 
     private func latestActivityURL(alongside fileURL: URL) -> URL {

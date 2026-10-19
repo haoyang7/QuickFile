@@ -1842,6 +1842,131 @@ final class DiagnosticsViewModelTests: XCTestCase {
         )
     }
 
+    func testLatestActivityReadFailurePreservesRecordsAndDoesNotHideHealthyHistory() async throws {
+        let historyURL = temporaryDirectory.appendingPathComponent("failures.json")
+        let store = FinderExtensionActivityStore(defaults: defaults, failureHistoryFileURL: historyURL)
+        let failure = FinderExtensionActivityFailure(reason: .writeFailed, errorDomain: nil, errorCode: nil)
+        try store.record(.fileCreationFailed, failure: failure)
+        let model = makeActivityModel(store: store)
+        await model.refreshRuntimeStatus()
+        let previousActivity = try XCTUnwrap(model.extensionActivity)
+        let newerFailure = FinderExtensionActivity(
+            kind: .fileCreationFailed, timestamp: previousActivity.timestamp.addingTimeInterval(1),
+            failure: failure
+        )
+        try JSONEncoder().encode([previousActivity, newerFailure]).write(to: historyURL)
+        let latestURL = historyURL.appendingPathExtension("latest-v2.json")
+        let privatePayload = "private-latest-payload"
+        try Data(privatePayload.utf8).write(to: latestURL)
+        XCTAssertEqual(try store.recentFailures(), [newerFailure, previousActivity])
+
+        await model.refreshRuntimeStatus()
+
+        XCTAssertTrue(model.activityStoreHasError)
+        XCTAssertFalse(model.isSharedStoreAvailable)
+        XCTAssertEqual(model.extensionActivity, previousActivity)
+        XCTAssertEqual(model.recentExtensionFailures, [newerFailure, previousActivity])
+        XCTAssertNotNil(model.activityStoreMessage)
+        XCTAssertFalse(model.isRefreshingRuntimeStatus)
+        XCTAssertFalse(model.diagnosticSummary.contains(privatePayload))
+        XCTAssertFalse(model.diagnosticSummary.contains(temporaryDirectory.path))
+
+        await model.clearFailureHistory()
+        XCTAssertTrue(model.recentExtensionFailures.isEmpty)
+        XCTAssertTrue(model.activityStoreHasError)
+        XCTAssertEqual(model.extensionActivity, previousActivity)
+        model.openConsole(using: { true })
+        XCTAssertTrue(model.activityStoreHasError)
+        XCTAssertTrue(model.activityStoreMessage?.contains(
+            QuickFileLocalization.text(.init("无法读取最近活动，请稍后刷新。"))
+        ) == true)
+
+        try store.record(.fileCreated, at: newerFailure.timestamp.addingTimeInterval(1))
+        await model.refreshRuntimeStatus()
+        XCTAssertFalse(model.activityStoreHasError)
+        XCTAssertTrue(model.isSharedStoreAvailable)
+        XCTAssertNil(model.activityStoreMessage)
+        XCTAssertEqual(model.extensionActivity?.kind, .fileCreated)
+        XCTAssertTrue(model.recentExtensionFailures.isEmpty)
+    }
+
+    func testInitialLatestActivityReadFailuresAreNotReportedAsEmptyHistory() async throws {
+        for useDirectory in [false, true] {
+            let historyURL = temporaryDirectory.appendingPathComponent("failures-\(useDirectory).json")
+            let latestURL = historyURL.appendingPathExtension("latest-v2.json")
+            try JSONEncoder().encode([FinderExtensionActivity]()).write(to: historyURL)
+            if useDirectory {
+                try FileManager.default.createDirectory(at: latestURL, withIntermediateDirectories: false)
+            } else {
+                try Data("private-corrupt-activity".utf8).write(to: latestURL)
+            }
+            let store = FinderExtensionActivityStore(defaults: defaults, failureHistoryFileURL: historyURL)
+            let model = makeActivityModel(store: store)
+            XCTAssertTrue(try store.recentFailures().isEmpty)
+
+            await model.refreshRuntimeStatus()
+
+            XCTAssertTrue(model.hasLoadedActivityStoreStatus)
+            XCTAssertTrue(model.activityStoreHasError)
+            XCTAssertFalse(model.isSharedStoreAvailable)
+            XCTAssertNil(model.extensionActivity)
+            XCTAssertTrue(model.recentExtensionFailures.isEmpty)
+            XCTAssertNotNil(model.activityStoreMessage)
+            XCTAssertFalse(model.diagnosticSummary.contains(latestURL.path))
+
+            try FileManager.default.removeItem(at: latestURL)
+            await model.refreshRuntimeStatus()
+            XCTAssertFalse(model.activityStoreHasError)
+            XCTAssertTrue(model.isSharedStoreAvailable)
+            XCTAssertNil(model.activityStoreMessage)
+            XCTAssertNil(model.extensionActivity)
+        }
+    }
+
+    func testLatestActivityPermissionFailureDoesNotHideHealthyHistory() async throws {
+        guard geteuid() != 0 else { throw XCTSkip("File permissions require a non-root test host.") }
+        let historyURL = temporaryDirectory.appendingPathComponent("failures.json")
+        let store = FinderExtensionActivityStore(defaults: defaults, failureHistoryFileURL: historyURL)
+        try store.record(.menuPrepared)
+        let latestURL = historyURL.appendingPathExtension("latest-v2.json")
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: latestURL.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: latestURL.path) }
+        XCTAssertThrowsError(try Data(contentsOf: latestURL))
+        XCTAssertTrue(try store.recentFailures().isEmpty)
+        let model = makeActivityModel(store: store)
+
+        await model.refreshRuntimeStatus()
+
+        XCTAssertTrue(model.activityStoreHasError)
+        XCTAssertFalse(model.isSharedStoreAvailable)
+        XCTAssertNil(model.extensionActivity)
+        XCTAssertTrue(model.recentExtensionFailures.isEmpty)
+        XCTAssertNotNil(model.activityStoreMessage)
+        XCTAssertFalse(model.diagnosticSummary.contains(latestURL.path))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: latestURL.path)
+        await model.refreshRuntimeStatus()
+        XCTAssertFalse(model.activityStoreHasError)
+        XCTAssertTrue(model.isSharedStoreAvailable)
+        XCTAssertEqual(model.extensionActivity?.kind, .menuPrepared)
+    }
+
+    private func makeActivityModel(store: FinderExtensionActivityStore) -> DiagnosticsViewModel {
+        DiagnosticsViewModel(
+            extensionEnabledProvider: { true },
+            runtimeProvider: { enabled in
+                FinderExtensionDiagnosticSnapshot(
+                    embeddedIdentifiers: ["test.extension"], embeddingKnown: true,
+                    registration: .registered, registrationEvidence: "test fixture",
+                    enabled: enabled, responded: true
+                )
+            },
+            extensionActivityStore: store,
+            authorizedDirectoryStore: makeAuthorizationStore(),
+            inventoryReadGate: inventoryReadGate
+        )
+    }
+
     func testHistoryReadFailurePreservesVisibleRecordsAndCanRecover() async throws {
         let historyURL = temporaryDirectory.appendingPathComponent("failures.json")
         let store = FinderExtensionActivityStore(defaults: defaults, failureHistoryFileURL: historyURL)

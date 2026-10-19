@@ -41,7 +41,7 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
         let store = makeStore()
 
         XCTAssertTrue(store.isAvailable)
-        XCTAssertNil(store.latestActivity())
+        XCTAssertNil(try store.latestActivity())
     }
 
     func testRecordsAndLoadsLatestActivity() throws {
@@ -51,7 +51,7 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
         try store.record(.menuPrepared, at: timestamp)
 
         XCTAssertEqual(
-            store.latestActivity(),
+            try store.latestActivity(),
             FinderExtensionActivity(kind: .menuPrepared, timestamp: timestamp)
         )
     }
@@ -72,7 +72,9 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
         try FileManager.default.removeItem(at: lockURL)
         try FileManager.default.createSymbolicLink(at: lockURL, withDestinationURL: target)
 
-        XCTAssertNil(makeStore().latestActivity())
+        XCTAssertThrowsError(try makeStore().latestActivity()) { error in
+            XCTAssertEqual((error as NSError).code, Int(ELOOP))
+        }
         XCTAssertThrowsError(try makeStore().record(.fileCreated, at: timestamp.addingTimeInterval(1))) { error in
             XCTAssertEqual((error as NSError).code, Int(ELOOP))
         }
@@ -93,7 +95,7 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
         try store.record(.fileCreated, at: Date(timeIntervalSince1970: 2))
 
         XCTAssertEqual(
-            store.latestActivity(),
+            try store.latestActivity(),
             FinderExtensionActivity(kind: .fileCreated, timestamp: Date(timeIntervalSince1970: 2))
         )
     }
@@ -101,7 +103,7 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
     func testDelayedOlderActivityCannotReplaceLatestActivity() throws {
         try makeStore().record(.fileCreated, at: Date(timeIntervalSince1970: 200))
         try makeStore().record(.launched, at: Date(timeIntervalSince1970: 100))
-        XCTAssertEqual(makeStore().latestActivity()?.timestamp, Date(timeIntervalSince1970: 200))
+        XCTAssertEqual(try makeStore().latestActivity()?.timestamp, Date(timeIntervalSince1970: 200))
     }
 
     func testConcurrentStoresKeepNewestActivity() throws {
@@ -113,17 +115,17 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
             } catch { errors.append(error) }
         }
         XCTAssertTrue(errors.values.isEmpty, "\(errors.values)")
-        XCTAssertEqual(makeStore().latestActivity()?.timestamp, Date(timeIntervalSince1970: 63))
+        XCTAssertEqual(try makeStore().latestActivity()?.timestamp, Date(timeIntervalSince1970: 63))
     }
 
     func testLatestActivityMigratesOnceAndIgnoresStaleDefaults() throws {
         let legacy = FinderExtensionActivity(kind: .fileCreated, timestamp: Date(timeIntervalSince1970: 200))
         defaults.set(try JSONEncoder().encode(legacy), forKey: "finderExtension.latestActivity.v1")
-        XCTAssertEqual(makeStore().latestActivity(), legacy)
+        XCTAssertEqual(try makeStore().latestActivity(), legacy)
         let stale = FinderExtensionActivity(kind: .launched, timestamp: Date(timeIntervalSince1970: 300))
         defaults.set(try JSONEncoder().encode(stale), forKey: "finderExtension.latestActivity.v1")
         try makeStore().record(.menuPrepared, at: Date(timeIntervalSince1970: 100))
-        XCTAssertEqual(makeStore().latestActivity(), legacy)
+        XCTAssertEqual(try makeStore().latestActivity(), legacy)
     }
 
     func testCorruptLegacyLatestRecoversOnSuccessAndFailureEvents() throws {
@@ -132,13 +134,15 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
             let historyURL = temporaryDirectory.appendingPathComponent("legacy-recovery-\(index).json")
             let store = FinderExtensionActivityStore(defaults: defaults, failureHistoryFileURL: historyURL)
             defaults.set(Data("invalid".utf8), forKey: "finderExtension.latestActivity.v1")
-            XCTAssertNil(store.latestActivity())
+            XCTAssertThrowsError(try store.latestActivity()) { error in
+                XCTAssertTrue(error is DecodingError)
+            }
             let timestamp = Date(timeIntervalSince1970: 200)
             let kind: FinderExtensionActivityKind = eventFailure == nil ? .fileCreated : .fileCreationFailed
 
             try store.record(kind, failure: eventFailure, at: timestamp)
 
-            XCTAssertEqual(store.latestActivity(), FinderExtensionActivity(kind: kind, timestamp: timestamp, failure: eventFailure))
+            XCTAssertEqual(try store.latestActivity(), FinderExtensionActivity(kind: kind, timestamp: timestamp, failure: eventFailure))
             XCTAssertEqual(try store.recentFailures(referenceDate: timestamp).count, eventFailure == nil ? 0 : 1)
             XCTAssertNil(defaults.data(forKey: "finderExtension.latestActivity.v1"))
         }
@@ -151,13 +155,15 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
             // Exercise a malformed document and a syntactically valid, wrong-shaped state.
             let corruptData = index == 0 ? "invalid" : "{\"activity\":42}"
             try Data(corruptData.utf8).write(to: failureHistoryFileURL.appendingPathExtension("latest-v2.json"))
-            XCTAssertNil(store.latestActivity())
+            XCTAssertThrowsError(try store.latestActivity()) { error in
+                XCTAssertTrue(error is DecodingError)
+            }
             let timestamp = Date(timeIntervalSince1970: Double(200 + index))
             let kind: FinderExtensionActivityKind = eventFailure == nil ? .fileCreated : .fileCreationFailed
 
             try store.record(kind, failure: eventFailure, at: timestamp)
 
-            XCTAssertEqual(store.latestActivity(), FinderExtensionActivity(kind: kind, timestamp: timestamp, failure: eventFailure))
+            XCTAssertEqual(try store.latestActivity(), FinderExtensionActivity(kind: kind, timestamp: timestamp, failure: eventFailure))
             XCTAssertEqual(try store.recentFailures(referenceDate: timestamp).count, eventFailure == nil ? 0 : 1)
         }
     }
@@ -165,6 +171,9 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
     func testLatestFileReadErrorIsNotTreatedAsCorruption() throws {
         let latestURL = failureHistoryFileURL.appendingPathExtension("latest-v2.json")
         try FileManager.default.createDirectory(at: latestURL, withIntermediateDirectories: false)
+        XCTAssertThrowsError(try makeStore().latestActivity()) { error in
+            XCTAssertFalse(error is DecodingError)
+        }
         let failure = FinderExtensionActivityFailure(reason: .writeFailed, errorDomain: nil, errorCode: nil)
         for eventFailure in [nil, failure] {
             XCTAssertThrowsError(try makeStore().record(.fileCreationFailed, failure: eventFailure)) { error in
@@ -182,10 +191,10 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
         try Data("invalid".utf8).write(to: failureHistoryFileURL)
         let failure = FinderExtensionActivityFailure(reason: .writeFailed, errorDomain: nil, errorCode: nil)
         XCTAssertThrowsError(try makeStore().record(.fileCreationFailed, failure: failure, at: timestamp))
-        XCTAssertEqual(makeStore().latestActivity()?.timestamp, timestamp)
+        XCTAssertEqual(try makeStore().latestActivity()?.timestamp, timestamp)
         XCTAssertThrowsError(try makeStore().recentFailures())
         try makeStore().clearFailureHistory()
-        XCTAssertEqual(makeStore().latestActivity()?.timestamp, timestamp)
+        XCTAssertEqual(try makeStore().latestActivity()?.timestamp, timestamp)
         XCTAssertTrue(try makeStore().recentFailures(referenceDate: timestamp).isEmpty)
     }
 
@@ -204,7 +213,7 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            store.latestActivity(),
+            try store.latestActivity(),
             FinderExtensionActivity(
                 kind: .fileCreationFailed,
                 timestamp: Date(timeIntervalSince1970: 3),
@@ -315,7 +324,7 @@ final class FinderExtensionActivityStoreTests: XCTestCase {
         try store.clearFailureHistory()
 
         XCTAssertTrue(try store.recentFailures(referenceDate: timestamp).isEmpty)
-        XCTAssertEqual(store.latestActivity(), activity)
+        XCTAssertEqual(try store.latestActivity(), activity)
         let persistedFailures = try JSONDecoder().decode(
             [FinderExtensionActivity].self,
             from: Data(contentsOf: failureHistoryFileURL)

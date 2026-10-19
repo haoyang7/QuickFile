@@ -1014,7 +1014,7 @@ final class LocalSharedStorageTests: XCTestCase {
             failureHistoryFileURL: storage.root.appendingPathComponent("activity.json"), localStorage: storage)
         XCTAssertTrue(activity.isAvailable)
         try activity.record(.launched)
-        XCTAssertEqual(activity.latestActivity()?.kind, .launched)
+        XCTAssertEqual(try activity.latestActivity()?.kind, .launched)
         XCTAssertEqual(try activity.recentFailures().count, 0)
         let menu = FinderMenuSettingsStore(localStorage: storage)
         XCTAssertEqual(try menu.load(), .all)
