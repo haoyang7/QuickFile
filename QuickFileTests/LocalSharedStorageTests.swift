@@ -249,6 +249,76 @@ final class LocalSharedStorageTests: XCTestCase {
     }
 
     @MainActor
+    func testFailedReloadsCannotReleasePublishedCopyRetryProtection() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "keep")
+        let draft = FileTemplate(name: "Copy", fileExtension: "txt", content: "copy draft")
+        try templates().saveTemplates([original], expectedTemplates: BuiltInTemplates.all)
+        let closes = failNextPublishedClose()
+        let backend = storage!
+        let readFailure = OSAllocatedUnfairLock<Int32?>(initialState: nil)
+        let reads = OSAllocatedUnfairLock(initialState: 0)
+        let writer = TemplateStore(defaults: nil, storageURL: libraryURL, localStorage: backend,
+            writeTemplatesData: { try backend.write($0, to: $1) },
+            readTemplatesData: { url in
+                reads.withLock { $0 += 1 }
+                let code = readFailure.withLock { value in
+                    defer { value = nil }
+                    return value
+                }
+                if let code { throw NSError(domain: NSPOSIXErrorDomain, code: Int(code)) }
+                return try backend.read(url)
+            })
+        let model = model(store: writer, baseline: [original])
+        do {
+            _ = try await model.saveTemplateAsNew(draft)
+            XCTFail("A published copy must remain unconfirmed")
+        } catch {
+            let failure = try XCTUnwrap(error as? TemplateStore.StoreError)
+            XCTAssertTrue(failure.requiresReloadAfterSave)
+        }
+        let published = try templates().reloadTemplates()
+        XCTAssertEqual(published.count, 2)
+        let publishedBytes = try backend.read(libraryURL)
+
+        for code in [EIO, EACCES] {
+            readFailure.withLock { $0 = code }
+            if code == EIO {
+                await model.reloadTemplates()
+            } else {
+                // Activation refreshes use the same authority slot without an explicit reload.
+                model.requestTemplateRefresh(force: true)
+                for _ in 0..<1000 {
+                    if !model.isLoadingTemplates { break }
+                    try await Task.sleep(nanoseconds: 2_000_000)
+                }
+                guard !model.isLoadingTemplates else { return XCTFail("Activation refresh did not finish") }
+            }
+            XCTAssertEqual(model.templateLoadFailure, code == EIO ? .unreadable : .permissionDenied)
+            XCTAssertEqual(model.templates, [original])
+            let readCount = reads.withLock { $0 }
+            do {
+                _ = try await model.saveTemplateAsNew(draft)
+                XCTFail("A failed reload must not permit another append")
+            } catch {
+                guard case QuickFileViewModel.TemplateSaveError.notLoaded = error else {
+                    return XCTFail("Expected a required successful reload, got \(error)")
+                }
+            }
+            XCTAssertEqual(reads.withLock { $0 }, readCount)
+            XCTAssertEqual(closes.withLock { $0 }, 1)
+            XCTAssertEqual(try backend.read(libraryURL), publishedBytes)
+        }
+
+        await model.reloadTemplates()
+        XCTAssertNil(model.templateLoadFailure)
+        XCTAssertEqual(model.templates, published)
+        let newID = try await model.saveTemplateAsNew(draft)
+        XCTAssertNotEqual(newID, published.last?.id)
+        XCTAssertEqual(try writer.reloadTemplates().count, 3)
+        XCTAssertEqual(closes.withLock { $0 }, 2)
+    }
+
+    @MainActor
     func testPublishedTemplateImportFailureRequiresReloadAndPreservesAppliedPlan() async throws {
         let original = FileTemplate(name: "Original", fileExtension: "txt", content: "keep")
         let addition = FileTemplate(name: "Imported", fileExtension: "md", content: "new")

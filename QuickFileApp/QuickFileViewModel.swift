@@ -305,7 +305,18 @@ final class QuickFileViewModel: ObservableObject {
         let indices: [Int]
     }
     private(set) var cachedTemplateFilter: TemplateFilterCache?
-    @Published private(set) var templateLoadFailure: TemplateLoadFailure?
+    @Published private(set) var templateLoadFailure: TemplateLoadFailure? {
+        didSet {
+            if templateLoadFailure == .writeUnconfirmed {
+                hasUnconfirmedTemplateWrite = true
+            } else if templateLoadFailure == nil {
+                // Clearing the failure accompanies a verified snapshot publication.
+                hasUnconfirmedTemplateWrite = false
+            }
+        }
+    }
+    // A later read error must not erase the fact that a write needs verification.
+    private var hasUnconfirmedTemplateWrite = false
     // Compatibility projection; there is no second mutable error state.
     var templateLoadError: String? { templateLoadFailure?.message }
     var templateStorageDirectoryURL: URL? { templateStore.storageDirectoryURL }
@@ -548,7 +559,7 @@ final class QuickFileViewModel: ObservableObject {
     /// Conflict recovery is a fresh read plus one compare-and-swap append, never a force-save.
     @discardableResult
     func saveTemplateAsNew(_ draft: FileTemplate) async throws -> FileTemplate.ID {
-        guard templateLoadFailure != .writeUnconfirmed else { throw TemplateSaveError.notLoaded }
+        guard !hasUnconfirmedTemplateWrite else { throw TemplateSaveError.notLoaded }
         guard !isLoadingTemplates, !isSavingTemplates else { throw TemplateSaveError.busy }
         isSavingTemplates = true
         templateStateGeneration &+= 1
