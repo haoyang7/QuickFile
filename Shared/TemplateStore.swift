@@ -28,6 +28,11 @@ public final class TemplateStore: @unchecked Sendable {
         case savedConfigurationMissing
         case persistenceFailed(Error)
 
+        public var requiresReloadAfterSave: Bool {
+            guard case let .persistenceFailed(error) = self else { return false }
+            return error is LocalSharedStorage.PublishedWriteError
+        }
+
         public var errorDescription: String? {
             switch self {
             case .configurationChanged:
@@ -406,11 +411,17 @@ public final class TemplateStore: @unchecked Sendable {
     private struct TemplateContainer {
         var values: UnkeyedDecodingContainer
         let supportsOfficeDocuments: Bool
+        var seenIDs = Set<FileTemplate.ID>()
 
         var isAtEnd: Bool { values.isAtEnd }
 
         mutating func decodeTemplate() throws -> FileTemplate {
             let template = try values.decode(FileTemplate.self)
+            guard seenIDs.insert(template.id).inserted else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: values.codingPath, debugDescription: "Duplicate template identifier."
+                ))
+            }
             guard supportsOfficeDocuments || template.officeFormat == nil else {
                 throw DecodingError.dataCorrupted(.init(
                     codingPath: values.codingPath, debugDescription: "Office templates require library version 4."
@@ -571,6 +582,7 @@ public final class TemplateStore: @unchecked Sendable {
     private static func validateOrdinarySave(
         _ templates: [FileTemplate], replacing originals: [FileTemplate]
     ) throws {
+        try validateUniqueTemplateIDs(templates)
         do {
             try TemplateTransfer.validateEncodedSize(TemplateTransferBundle(templates: templates))
         } catch {
@@ -609,6 +621,17 @@ public final class TemplateStore: @unchecked Sendable {
                 guard candidates.contains(where: { doesNotGrow(template, comparedTo: $0) }) else {
                     throw originalError
                 }
+            }
+        }
+    }
+
+    private static func validateUniqueTemplateIDs(_ templates: [FileTemplate]) throws {
+        var seen = Set<FileTemplate.ID>()
+        for template in templates {
+            guard seen.insert(template.id).inserted else {
+                throw EncodingError.invalidValue(template, .init(
+                    codingPath: [], debugDescription: "Duplicate template identifier."
+                ))
             }
         }
     }
@@ -764,6 +787,7 @@ public final class TemplateStore: @unchecked Sendable {
     ) throws -> RecoveryResult {
         guard isAvailable else { throw StoreError.sharedDefaultsUnavailable }
         // Validation also bounds total encoded transfer bytes before backup/write.
+        try Self.validateUniqueTemplateIDs(templates)
         try TemplateTransfer.validateEncodedSize(TemplateTransferBundle(templates: templates))
         guard snapshot.storeIdentity == recoveryIdentity else { throw RecoveryError.configurationChanged }
         var revision: String?

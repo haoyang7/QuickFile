@@ -1,7 +1,10 @@
 import Foundation
+import Darwin
+import os
 import XCTest
 @testable import QuickFile
 @testable import QuickFileCore
+@testable import QuickFileInfrastructure
 
 @MainActor
 final class FinderMenuSettingsViewModelTests: XCTestCase {
@@ -139,6 +142,93 @@ final class FinderMenuSettingsViewModelTests: XCTestCase {
         await model.reload()
         XCTAssertNil(model.loadError)
         XCTAssertTrue(model.canEdit)
+    }
+
+    func testPublishedSaveFailureBlocksOldValueAndNewDraftUntilReloadThenReallySaves() async throws {
+        let (reader, writer) = try makePublishedFailureStores()
+        let gate = MenuSettingsOperationGate()
+        defer { gate.release.signal() }
+        let loads = OSAllocatedUnfairLock(initialState: 0)
+        let model = FinderMenuSettingsViewModel(load: {
+            let count = loads.withLock { count in
+                count += 1
+                return count
+            }
+            if count == 2 { gate.blockOnce() }
+            return try reader.load()
+        }, save: { try writer.save($0) })
+        await model.loadIfNeeded()
+        model.maximumCountText = "8"
+
+        let failedSave = await model.save()
+
+        XCTAssertFalse(failedSave)
+        XCTAssertTrue(model.requiresReload)
+        XCTAssertEqual(model.savedLimit.maximumCount, 4)
+        XCTAssertEqual(model.maximumCountText, "8")
+        XCTAssertEqual(try reader.load().maximumCount, 8)
+        XCTAssertEqual(model.status, .failure("Finder 菜单设置已更新，但无法确认完整写入。请重新加载并检查当前设置。"))
+        XCTAssertFalse(model.canSave)
+        model.maximumCountText = "4"
+        XCTAssertTrue(model.requiresReload)
+        XCTAssertFalse(model.canSave)
+        let oldValueSave = await model.save()
+        XCTAssertFalse(oldValueSave, "A stale unchanged value must not report no-op success")
+        model.maximumCountText = "12"
+        XCTAssertTrue(model.requiresReload)
+        XCTAssertFalse(model.canSave)
+        let newDraftSave = await model.save()
+        XCTAssertFalse(newDraftSave)
+        XCTAssertEqual(try reader.load().maximumCount, 8)
+
+        let reload = Task { await model.reload() }
+        let started = await BackgroundWork.run { gate.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(started)
+        model.maximumCountText = "16"
+        gate.release.signal()
+        await reload.value
+
+        XCTAssertFalse(model.requiresReload)
+        XCTAssertNil(model.loadError)
+        XCTAssertEqual(model.savedLimit.maximumCount, 8)
+        XCTAssertEqual(model.maximumCountText, "16", "Reload must preserve edits made while reading")
+        XCTAssertTrue(model.canSave)
+        model.maximumCountText = "4"
+        let saved = await model.save()
+        XCTAssertTrue(saved)
+        XCTAssertEqual(model.savedLimit.maximumCount, 4)
+        XCTAssertEqual(try reader.load().maximumCount, 4, "Saving the old value must write after reconciling the baseline")
+    }
+
+    func testFailedReloadAfterPublishedSaveAllowsExplicitRepairOfOldValue() async throws {
+        let (reader, writer) = try makePublishedFailureStores()
+        let failsLoading = OSAllocatedUnfairLock(initialState: false)
+        let model = FinderMenuSettingsViewModel(load: {
+            if failsLoading.withLock({ $0 }) { throw MenuSettingsTestError.unavailable }
+            return try reader.load()
+        }, save: { try writer.save($0) })
+        await model.loadIfNeeded()
+        model.maximumCountText = "8"
+        let failedSave = await model.save()
+        XCTAssertFalse(failedSave)
+        XCTAssertTrue(model.requiresReload)
+        XCTAssertEqual(try reader.load().maximumCount, 8)
+        model.maximumCountText = "4"
+        failsLoading.withLock { $0 = true }
+
+        await model.reload()
+
+        XCTAssertFalse(model.requiresReload)
+        XCTAssertEqual(model.loadError, MenuSettingsTestError.unavailable.localizedDescription)
+        XCTAssertEqual(model.savedLimit.maximumCount, 4)
+        XCTAssertEqual(model.maximumCountText, "4")
+        XCTAssertTrue(model.canSave, "A failed read must allow explicit repair even for the old value")
+        let repaired = await model.save()
+        XCTAssertTrue(repaired)
+        XCTAssertNil(model.loadError)
+        XCTAssertFalse(model.requiresReload)
+        XCTAssertFalse(model.canSave)
+        XCTAssertEqual(try reader.load().maximumCount, 4)
     }
 
     func testFailedInitialLoadDoesNotRepeatedlyReadUntilExplicitRetry() async {
@@ -313,6 +403,29 @@ final class FinderMenuSettingsViewModelTests: XCTestCase {
 
     private func makeModel(_ fixture: MenuSettingsFixture) -> FinderMenuSettingsViewModel {
         FinderMenuSettingsViewModel(load: { try fixture.load() }, save: { try fixture.save($0) })
+    }
+
+    private func makePublishedFailureStores() throws -> (FinderMenuSettingsStore, FinderMenuSettingsStore) {
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let root = repository.appendingPathComponent(".build/Temporary/pr34-p2/menu-view-model-\(UUID())")
+        addTeardownBlock { try FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        let reader = FinderMenuSettingsStore(localStorage: LocalSharedStorage(root: root))
+        try reader.save(FinderMenuDisplayLimit(maximumCount: 4))
+        let didFail = OSAllocatedUnfairLock(initialState: false)
+        let writer = FinderMenuSettingsStore(localStorage: LocalSharedStorage(root: root, closeWrittenFile: { descriptor in
+            let result = Darwin.close(descriptor)
+            let shouldFail = didFail.withLock { failed in
+                let shouldFail = !failed
+                failed = true
+                return shouldFail
+            }
+            guard result == 0, shouldFail else { return result }
+            errno = EIO
+            return -1
+        }))
+        return (reader, writer)
     }
 }
 

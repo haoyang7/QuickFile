@@ -89,7 +89,11 @@ final class AppModalPresentationGateTests: XCTestCase {
                 if owner.attachedSheet === panel { owner.endSheet(panel, returnCode: .cancel) }
                 panel.orderOut(nil)
             }
-            guard await waitForSheet(panel, on: owner) else { return }
+            if closeOwner {
+                guard await waitForSheet(panel, on: owner) else { return }
+            } else {
+                guard try await waitForSaveSelection(panel, on: owner, in: directory, named: "export.json") else { return }
+            }
             // NSSavePanel.ok(_:) raises "not implemented" on current AppKit.
             // Drive the real sheet's completion, without pretending to exercise
             // remote Save-button validation (covered by installed-app checks).
@@ -321,6 +325,25 @@ final class AppModalPresentationGateTests: XCTestCase {
         XCTAssertEqual(reads.value, 1)
         XCTAssertFalse(gate.isPresenting)
         XCTAssertFalse(gate.isFinderReserved)
+    }
+
+    private func waitForSaveSelection(
+        _ panel: NSSavePanel, on owner: NSWindow, in directory: URL, named filename: String
+    ) async throws -> Bool {
+        let expectedDirectory = try DirectoryIdentity.capture(at: directory)
+        // The remote sheet can be visible while its URL still points at the previous
+        // directory. Controlled completion must wait for the actual selection.
+        for _ in 0..<100 {
+            if owner.attachedSheet === panel, panel.isVisible,
+               let selected = panel.url, selected.lastPathComponent == filename,
+               (try? DirectoryIdentity.capture(at: selected.deletingLastPathComponent())) == expectedDirectory {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTFail("The real save panel did not select the fixture destination; URL: \(String(describing: panel.url))")
+        panel.cancel(nil)
+        return false
     }
 
     private func makeWindow() -> NSWindow {

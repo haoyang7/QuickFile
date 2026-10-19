@@ -265,6 +265,131 @@ final class TemplateTransferTests: XCTestCase {
         XCTAssertNoThrow(try TemplateTransfer.encode(TemplateTransferBundle(templates: plan.templates)))
     }
 
+    func testRepeatedLongNameGeneratesOnlyOneCandidatePerRenameAndPreservesBudget() throws {
+        let name = String(repeating: "A", count: 1_024)
+        let sources = (0..<256).map { record(name, body: "body \($0)") }
+        let bundle = TemplateTransferBundle(templates: sources)
+        var candidateCount = 0
+        let plan = try TemplateTransfer.makeImportPlan(
+            bundle: bundle, existing: [], didGenerateNameCandidate: { candidateCount += 1 }
+        )
+        XCTAssertEqual(candidateCount, 255)
+        XCTAssertEqual(plan.addedCount, 256)
+        XCTAssertEqual(plan.skippedCount, 0)
+        XCTAssertEqual(plan.renamedCount, 255)
+        XCTAssertEqual(plan.additions.map(\.sourceIndex), Array(0..<256))
+        XCTAssertEqual(plan.additions.map(\.originalName), Array(repeating: name, count: 256))
+        XCTAssertEqual(plan.templates.map(\.content), sources.map(\.content))
+        for index in 1..<256 {
+            let suffix = index == 1 ? "（导入）" : "（导入 \(index)）"
+            XCTAssertEqual(plan.templates[index].name,
+                           String(repeating: "A", count: 1_024 - suffix.utf8.count) + suffix)
+        }
+        let bytes = try TemplateTransfer.encode(.init(templates: plan.templates)).count
+        XCTAssertNoThrow(try TemplateTransfer.makeImportPlan(
+            bundle: bundle, existing: [], limits: .init(maximumFileBytes: bytes)
+        ))
+        XCTAssertThrowsError(try TemplateTransfer.makeImportPlan(
+            bundle: bundle, existing: [], limits: .init(maximumFileBytes: bytes - 1)
+        )) {
+            XCTAssertEqual($0 as? TemplateTransferError, .fileTooLarge(maximumBytes: bytes - 1))
+        }
+    }
+
+    func testRenameCursorRestartsWhenLanguageChangesBetweenSourceNames() throws {
+        let originalLanguage = try XCTUnwrap(QuickFileLanguage(rawValue: QuickFileLocalization.identifier))
+        defer { QuickFileLocalization.apply(originalLanguage) }
+        let singleGrapheme = "a" + String(repeating: "\u{20D0}", count: 337)
+        XCTAssertEqual(singleGrapheme.count, 1)
+        XCTAssertEqual(singleGrapheme.utf8.count, 1_012)
+        for name in ["A", singleGrapheme] {
+            QuickFileLocalization.apply(.simplifiedChinese)
+            let sources = [record(name, body: "first"), record(name, body: "second")]
+            var candidateCount = 0
+            let plan = try TemplateTransfer.makeImportPlan(
+                bundle: .init(templates: sources), existing: [record(name).makeTemplate()],
+                didGenerateNameCandidate: {
+                    candidateCount += 1
+                    if candidateCount == 1 { QuickFileLocalization.apply(.english) }
+                }
+            )
+            XCTAssertEqual(candidateCount, 2)
+            XCTAssertEqual(plan.additions.map(\.template.name), [name + "（导入）", name + " (Imported)"])
+            XCTAssertEqual(plan.additions.map(\.template.content), ["first", "second"])
+            XCTAssertEqual(plan.additions.map(\.originalName), [name, name])
+            XCTAssertEqual(plan.skippedCount, 0)
+        }
+    }
+
+    func testRenameCollisionSearchKeepsItsLanguageSnapshot() throws {
+        let originalLanguage = try XCTUnwrap(QuickFileLanguage(rawValue: QuickFileLocalization.identifier))
+        defer { QuickFileLocalization.apply(originalLanguage) }
+        QuickFileLocalization.apply(.simplifiedChinese)
+        var candidateCount = 0
+        let plan = try TemplateTransfer.makeImportPlan(
+            bundle: .init(templates: [record("A", body: "new")]),
+            existing: [record("A").makeTemplate(), record("A（导入）").makeTemplate()],
+            didGenerateNameCandidate: {
+                candidateCount += 1
+                if candidateCount == 1 { QuickFileLocalization.apply(.english) }
+            }
+        )
+        XCTAssertEqual(candidateCount, 2)
+        XCTAssertEqual(plan.additions.map(\.template.name), ["A（导入 2）"])
+    }
+
+    func testRenameCursorFillsNumberingHolesAndChecksLaterOccupiedNames() throws {
+        let existing = ["A", "A（导入 2）", "A（导入 4）"].map { record($0).makeTemplate() }
+        let sources = (0..<3).map { record("A", body: "new \($0)") }
+        var candidateCount = 0
+        let plan = try TemplateTransfer.makeImportPlan(
+            bundle: .init(templates: sources), existing: existing,
+            didGenerateNameCandidate: { candidateCount += 1 }
+        )
+        XCTAssertEqual(plan.additions.map(\.template.name), ["A（导入）", "A（导入 3）", "A（导入 5）"])
+        XCTAssertEqual(candidateCount, 5)
+    }
+
+    func testRenameCursorsUseOriginalUTF8BytesForEquivalentNamesThatTruncateDifferently() throws {
+        let composed = String(repeating: "é", count: 8)
+        let decomposed = String(repeating: "e\u{301}", count: 8)
+        XCTAssertEqual(composed, decomposed)
+        XCTAssertNotEqual(Data(composed.utf8), Data(decomposed.utf8))
+        let sources = [record(composed, body: "first"), record(decomposed, body: "second"),
+                       record(composed, body: "third")]
+        var candidateCount = 0
+        let plan = try TemplateTransfer.makeImportPlan(
+            bundle: .init(templates: sources), existing: [record(composed).makeTemplate()],
+            limits: .init(maximumNameBytes: 24), didGenerateNameCandidate: { candidateCount += 1 }
+        )
+        let expected = [String(repeating: "é", count: 6) + "（导入）",
+                        String(repeating: "e\u{301}", count: 4) + "（导入）",
+                        String(repeating: "é", count: 5) + "（导入 2）"]
+        XCTAssertEqual(plan.additions.map { Data($0.template.name.utf8) }, expected.map { Data($0.utf8) })
+        XCTAssertEqual(plan.additions.map { Data($0.originalName.utf8) }, sources.map { Data($0.name.utf8) })
+        XCTAssertEqual(candidateCount, 3)
+        XCTAssertEqual(plan.skippedCount, 0)
+    }
+
+    func testRenameCursorRechecksNamesOccupiedByAnotherTruncatedOriginal() throws {
+        let prefix = String(repeating: "A", count: 1_023)
+        let left = prefix + "X"
+        let right = prefix + "Y"
+        let sources = [record(left, body: "first"), record(right, body: "second"), record(left, body: "third")]
+        var candidateCount = 0
+        let plan = try TemplateTransfer.makeImportPlan(
+            bundle: .init(templates: sources), existing: [record(left).makeTemplate(), record(right).makeTemplate()],
+            didGenerateNameCandidate: { candidateCount += 1 }
+        )
+        let expected = ["（导入）", "（导入 2）", "（导入 3）"].map {
+            String(repeating: "A", count: 1_024 - $0.utf8.count) + $0
+        }
+        XCTAssertEqual(plan.additions.map(\.template.name), expected)
+        XCTAssertEqual(plan.additions.map(\.originalName), [left, right, left])
+        XCTAssertEqual(candidateCount, 5)
+        XCTAssertEqual(plan.skippedCount, 0)
+    }
+
     func testDifferentLongOriginalNamesCannotBeSkippedAfterTruncationCollision() throws {
         let prefix = String(repeating: "A", count: 1_023)
         let left = record(prefix + "X", body: "old").makeTemplate()

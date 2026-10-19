@@ -24,7 +24,7 @@ enum TemplateManagerConfirmation: Identifiable {
 }
 
 /// Window-local selection repair. All inputs describe the state after persistence
-/// completes; never retain a template inventory across the asynchronous deletion.
+/// completes; never retain a template inventory across an asynchronous mutation.
 enum TemplateManagerSelection {
     static func afterDeletion(
         of deletedID: FileTemplate.ID,
@@ -36,6 +36,17 @@ enum TemplateManagerSelection {
         // Filters and inventory may have changed while saving. Deliberately pick
         // the first currently visible survivor, or nil when the list is empty.
         return firstVisibleID
+    }
+
+    static func afterRestore(
+        succeeded: Bool,
+        originalSelectionID: FileTemplate.ID?,
+        currentSelectionID: FileTemplate.ID?,
+        visibleIDs: [FileTemplate.ID]
+    ) -> FileTemplate.ID? {
+        guard succeeded, currentSelectionID == originalSelectionID else { return currentSelectionID }
+        if let currentSelectionID, visibleIDs.contains(currentSelectionID) { return currentSelectionID }
+        return visibleIDs.first
     }
 }
 
@@ -51,25 +62,50 @@ struct TemplatePresentationLifetime {
 /// Owned by one window and shared with its route receiver. Preparation spans the
 /// native picker and asynchronous read so there is no idle gap before a preview.
 @MainActor
-final class TemplateModalPresentation: ObservableObject {
+final class TemplateModalPresentation: NSObject, ObservableObject {
     @Published var editorPresentation: TemplateEditorPresentation?
     @Published var importPreview: QuickFileViewModel.TemplateImportPreview?
     @Published var recoveryPreview: QuickFileViewModel.TemplateRecoveryPreview?
     @Published var confirmation: TemplateManagerConfirmation?
     @Published private var preparations: Set<UUID> = []
+    private weak var owner: NSWindow?
 
     var isActive: Bool {
         editorPresentation != nil || importPreview != nil || recoveryPreview != nil
             || confirmation != nil || !preparations.isEmpty
     }
 
-    func beginPreparation() -> UUID {
+    func beginPreparation(for owner: NSWindow? = nil) -> UUID {
+        if let owner, self.owner !== owner {
+            NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: self.owner)
+            invalidateTransferPresentations()
+            self.owner = owner
+            NotificationCenter.default.addObserver(self, selector: #selector(ownerWillClose),
+                name: NSWindow.willCloseNotification, object: owner)
+        }
         let token = UUID()
         preparations.insert(token)
         return token
     }
 
+    func acceptsPreparation(_ token: UUID) -> Bool { preparations.contains(token) }
+
     func finishPreparation(_ token: UUID) { preparations.remove(token) }
+
+    @objc private func ownerWillClose(_ notification: Notification) {
+        // A retained hosting controller may not disappear before this same
+        // window reopens. Revoke old operation identities synchronously, before
+        // a worker can resume or SwiftUI can enqueue its completed preview.
+        invalidateTransferPresentations()
+    }
+
+    private func invalidateTransferPresentations() {
+        preparations.removeAll()
+        importPreview = nil
+        recoveryPreview = nil
+    }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
 }
 
 @MainActor
@@ -233,9 +269,13 @@ struct TemplateManagerView: View {
                     primaryButton: .destructive(Text("恢复")) {
                         let selection = selectedTemplateID
                         Task {
-                            if await viewModel.restoreBuiltInTemplates(), selectedTemplateID == selection {
-                                selectedTemplateID = viewModel.templates.first?.id
-                            }
+                            let succeeded = await viewModel.restoreBuiltInTemplates()
+                            selectedTemplateID = TemplateManagerSelection.afterRestore(
+                                succeeded: succeeded,
+                                originalSelectionID: selection,
+                                currentSelectionID: selectedTemplateID,
+                                visibleIDs: visibleTemplates.map(\.id)
+                            )
                         }
                     }, secondaryButton: .cancel())
             case .exportAll:
@@ -293,7 +333,7 @@ struct TemplateManagerView: View {
 
     private var templateActionsMenu: some View {
         Menu(QuickFileLocalization.text(.init("更多"))) {
-            Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
+            Button("重新加载模板") { viewModel.requestTemplateReload() }
             Divider()
             Button("导入模板…", action: chooseImport)
             Button("导出全部模板…") { presentation.confirmation = .exportAll }
@@ -322,7 +362,7 @@ struct TemplateManagerView: View {
                 .foregroundColor(.red)
                 .fixedSize(horizontal: false, vertical: true)
             AdaptiveActionRow {
-                Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
+                Button("重新加载模板") { viewModel.requestTemplateReload() }
                 if let recoveryTitle = failure.recoveryActionTitle {
                     Menu(recoveryTitle) {
                         Button("从默认模板恢复…") { prepareRecovery() }
@@ -450,51 +490,51 @@ struct TemplateManagerView: View {
 
     private func chooseExport() {
         guard let token = presentationLifetime.token, let owner = presentationWindow() else { return }
-        let preparation = presentation.beginPreparation()
+        let preparation = presentation.beginPreparation(for: owner)
         Task {
             defer { presentation.finishPreparation(preparation) }
-            guard presentationLifetime.accepts(token),
+            guard presentationLifetime.accepts(token), presentation.acceptsPreparation(preparation),
                   let url = await AppKitFileActions.chooseTemplateExportFile(for: owner),
-                  presentationLifetime.accepts(token) else { return }
+                  presentationLifetime.accepts(token), presentation.acceptsPreparation(preparation) else { return }
             try? await viewModel.exportTemplates(to: url)
         }
     }
 
     private func chooseImport() {
         guard let token = presentationLifetime.token, let owner = presentationWindow() else { return }
-        let preparation = presentation.beginPreparation()
+        let preparation = presentation.beginPreparation(for: owner)
         Task {
             defer { presentation.finishPreparation(preparation) }
-            guard presentationLifetime.accepts(token),
+            guard presentationLifetime.accepts(token), presentation.acceptsPreparation(preparation),
                   let url = await AppKitFileActions.chooseTemplateImportFile(for: owner),
-                  presentationLifetime.accepts(token) else { return }
+                  presentationLifetime.accepts(token), presentation.acceptsPreparation(preparation) else { return }
             let preview = try? await viewModel.prepareTemplateImport(from: url)
-            guard presentationLifetime.accepts(token) else { return }
+            guard presentationLifetime.accepts(token), presentation.acceptsPreparation(preparation) else { return }
             presentation.importPreview = preview
         }
     }
 
     private func chooseRecoveryBackup() {
         guard let token = presentationLifetime.token, let owner = presentationWindow() else { return }
-        let preparation = presentation.beginPreparation()
+        let preparation = presentation.beginPreparation(for: owner)
         Task {
             defer { presentation.finishPreparation(preparation) }
-            guard presentationLifetime.accepts(token),
+            guard presentationLifetime.accepts(token), presentation.acceptsPreparation(preparation),
                   let url = await AppKitFileActions.chooseTemplateImportFile(for: owner),
-                  presentationLifetime.accepts(token) else { return }
+                  presentationLifetime.accepts(token), presentation.acceptsPreparation(preparation) else { return }
             prepareRecovery(from: url, appearance: token)
         }
     }
 
     private func prepareRecovery(from url: URL? = nil, appearance: UUID? = nil) {
         guard let token = appearance ?? presentationLifetime.token,
-              presentationLifetime.accepts(token) else { return }
-        let preparation = presentation.beginPreparation()
+              presentationLifetime.accepts(token), let owner = presentationWindow() else { return }
+        let preparation = presentation.beginPreparation(for: owner)
         Task {
             defer { presentation.finishPreparation(preparation) }
-            guard presentationLifetime.accepts(token) else { return }
+            guard presentationLifetime.accepts(token), presentation.acceptsPreparation(preparation) else { return }
             let preview = try? await viewModel.prepareTemplateRecovery(from: url)
-            guard presentationLifetime.accepts(token) else { return }
+            guard presentationLifetime.accepts(token), presentation.acceptsPreparation(preparation) else { return }
             presentation.recoveryPreview = preview
         }
     }

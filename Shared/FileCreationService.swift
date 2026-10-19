@@ -168,19 +168,20 @@ public struct FileCreationService: @unchecked Sendable {
             do {
                 // Validate the complete render before staging, then borrow its bytes only
                 // for this synchronous commit instead of copying the output into Data.
-                let committedURL: URL?
+                let committedFile: (url: URL, identity: stat)?
                 if let data {
-                    committedURL = try data.withUnsafeBytes { bytes in
+                    committedFile = try data.withUnsafeBytes { bytes in
                         try commit(bytes, named: filename, in: directoryFD, folderURL: destinationFolder, timing: timing)
                     }
                 } else {
-                    committedURL = try rendered.withUTF8 { bytes in
+                    committedFile = try rendered.withUTF8 { bytes in
                         try commit(UnsafeRawBufferPointer(bytes), named: filename, in: directoryFD, folderURL: destinationFolder, timing: timing)
                     }
                 }
-                if let committedURL {
+                if let committedFile {
                     timing?.mark("writer.result.ready")
-                    return FileCreationResult(fileURL: committedURL, didRenameForConflict: sequence > 1)
+                    return FileCreationResult(fileURL: committedFile.url, didRenameForConflict: sequence > 1,
+                                              publishedAttributes: committedFile.identity)
                 }
             } catch let error as FileCreationError {
                 throw error
@@ -214,7 +215,7 @@ public struct FileCreationService: @unchecked Sendable {
 
     // An exclusive rename publishes only a fully written file after closing its write handle. Unsupported
     // filesystems fail safely; never fall back to an overwriting rename or a final-path write.
-    private func commit(_ bytes: UnsafeRawBufferPointer, named filename: String, in directoryFD: Int32, folderURL: URL, timing: CreationTiming?) throws -> URL? {
+    private func commit(_ bytes: UnsafeRawBufferPointer, named filename: String, in directoryFD: Int32, folderURL: URL, timing: CreationTiming?) throws -> (url: URL, identity: stat)? {
         timing?.mark("staging.begin")
         let staging = try PrivateFileStagingDirectory.replacementDirectory(
             for: folderURL, directoryDescriptor: directoryFD, fileManager: fileManager
@@ -261,7 +262,7 @@ public struct FileCreationService: @unchecked Sendable {
             do {
                 let url = try committedURL(named: filename, in: directoryFD, identity: identity)
                 timing?.mark("file.location.verified")
-                return url
+                return (url, identity)
             } catch {
                 // Publication succeeded. Never remove a committed file or report
                 // this as a failed write that callers could safely retry.

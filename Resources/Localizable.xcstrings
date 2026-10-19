@@ -545,6 +545,24 @@
         }
       }
     },
+    "Finder 菜单设置已更新，但无法确认完整写入。请重新加载并检查当前设置。": {
+      "comment": "Shown after Finder menu settings were published but the write could not be fully confirmed. Reload before saving again.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Finder menu settings were updated, but the write could not be fully confirmed. Reload and check the current settings."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Finder 菜单设置已更新，但无法确认完整写入。请重新加载并检查当前设置。"
+          }
+        }
+      }
+    },
     "Finder 菜单设置无效，已保留上次有效设置。请重新保存。": {
       "comment": "Finder menu preferences: read/write error and repair guidance.",
       "extractionState": "manual",
@@ -7919,24 +7937,6 @@
         }
       }
     },
-    "未应用本次计划。请取消后重新选择文件并检查最新预览。": {
-      "comment": "Template import/recovery preview before changes are applied.",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "This plan was not applied. Cancel, choose the file again, and review the latest preview."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "未应用本次计划。请取消后重新选择文件并检查最新预览。"
-          }
-        }
-      }
-    },
     "未找到扩展注册记录": {
       "comment": "Finder extension installation/registration diagnostics; evidence is not proof of successful creation.",
       "extractionState": "manual",
@@ -8995,6 +8995,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "模板配置保存失败"
+          }
+        }
+      }
+    },
+    "模板配置可能已更新，但无法确认完整写入。请保留草稿，重新加载模板并检查当前配置。": {
+      "comment": "Shown after a template write was published but could not be fully confirmed. Preserve the draft and reload; do not expose the underlying system error.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The template configuration may have been updated, but the write could not be fully confirmed. Keep your draft, reload templates, and check the current configuration."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "模板配置可能已更新，但无法确认完整写入。请保留草稿，重新加载模板并检查当前配置。"
           }
         }
       }
@@ -11015,6 +11033,24 @@
         }
       }
     },
+    "设置待核对": {
+      "comment": "Finder menu settings status after an unconfirmed published write; reload to check the current settings.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Settings need verification"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "设置待核对"
+          }
+        }
+      }
+    },
     "设置未保存": {
       "comment": "Templates screen: optional Finder menu display settings.",
       "extractionState": "manual",
@@ -11263,6 +11299,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "请先选择目标文件夹和模板。"
+          }
+        }
+      }
+    },
+    "请取消后重新加载模板，并检查当前配置后再操作。": {
+      "comment": "Safe guidance after a template import or recovery commit failed; the plan may already have been published.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cancel, reload templates, and check the current configuration before continuing."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "请取消后重新加载模板，并检查当前配置后再操作。"
           }
         }
       }
@@ -11947,6 +12001,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "配置已在恢复预览后发生变化。未替换任何配置，请重新加载。"
+          }
+        }
+      }
+    },
+    "配置文件已更新，但无法确认完整写入。请重新加载并检查当前配置：%@": {
+      "comment": "Shared storage write warning after atomic publication. Argument 1 is the underlying system error. The new file is already visible; reload before deciding whether to save again.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The configuration file was updated, but the write could not be fully confirmed. Reload and check the current configuration: %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "配置文件已更新，但无法确认完整写入。请重新加载并检查当前配置：%@"
           }
         }
       }

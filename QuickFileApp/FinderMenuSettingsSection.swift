@@ -27,6 +27,10 @@ struct FinderMenuSettingsSection: View {
                 Spacer()
                 if isBusy {
                     progress
+                } else if viewModel.requiresReload {
+                    Label("设置待核对", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundColor(.red)
                 } else if viewModel.loadError != nil {
                     Label("设置读取失败", systemImage: "exclamationmark.triangle")
                         .font(.caption)
@@ -65,6 +69,8 @@ struct FinderMenuSettingsSection: View {
                 Text("无法读取 Finder 菜单设置：\(error) 可重新加载，或保存设置以修复。")
                     .font(.caption)
                     .foregroundColor(.red)
+            }
+            if viewModel.loadError != nil || viewModel.requiresReload {
                 Button("重新加载菜单设置") { Task { await viewModel.reload() } }
                     .disabled(isBusy)
             }

@@ -27,6 +27,24 @@ def array_report():
         "       2 (96 bytes) NSMutableArray (Storage)\n          1 (80 bytes) CFData")
 
 
+def header_failure_reports():
+    """Synthetic rejected inputs, not a reconstruction of the lost CI report."""
+    valid = array_report()
+    frame = "0 synthetic-image 0x1234 synthetic_function + 0"
+    return {
+        "report_header": "Binary Images:\n" + valid,
+        "report_prefix": "STACK OF private-prefix\n" + valid,
+        "stack_header": valid.replace("1 INSTANCES", "private-count INSTANCES"),
+        "stack_prefix": valid.replace("STACK OF", "private-prefix\nSTACK OF", 1),
+        "stack_separator": valid.replace("====", "private-boundary"),
+        "stack_frame": valid.replace(frame, "0 /private/image 0x1234 private_symbol"),
+        "stack_order": valid.replace(frame, frame + "\n" + frame),
+        "stack_duplicate": valid + valid.split("\n\n", 1)[1],
+        "stack_name": valid.replace("ROOT LEAK: NSMutableArray':", "ROOT LEAK: private:name':"),
+        "root_header": valid.replace("bytes) ROOT LEAK: NSMutableArray", "bytes) ROOT LEAK: NSArray"),
+    }
+
+
 class CompositionTests(unittest.TestCase):
     def parse(self, report):
         value = composition.grouped_composition(report)
@@ -300,7 +318,7 @@ class CompositionTests(unittest.TestCase):
     def test_failure_stage_is_fixed_and_identifies_rejected_structure(self):
         valid = array_report()
         reports = {
-            "header": valid.replace("====", "missing boundary"),
+            "stack_separator": valid.replace("====", "missing boundary"),
             "tree_shape": valid.replace("          1 (80", "           1 (80"),
             "child_marker": valid.replace("2 (96 bytes) NSMutableArray", "2 (96 bytes) ROOT LEAK: NSMutableArray"),
             "backref": valid + "             CYCLE BACK TO unknown_target\n",
@@ -324,6 +342,23 @@ class CompositionTests(unittest.TestCase):
             self.assertIsNone(value["failure_stage"])
             value["failure_stage"] = "header"
             with self.assertRaises(ValueError): composition.validate_grouped_composition(value)
+
+    def test_header_failures_identify_fixed_substages_without_publishing_input(self):
+        for stage, report in header_failure_reports().items():
+            with self.subTest(stage=stage):
+                value = self.parse(report)
+                self.assertEqual(value["failure_stage"], stage)
+                self.assertEqual(value, composition.empty_grouped("invalid_report", (3, 144), stage))
+                self.assertLessEqual(len(composition.encoded(value)), composition.PUBLIC_LIMIT)
+                for secret in ("private", "0x1234", "synthetic", "NSMutableArray", "NSArray"):
+                    self.assertNotIn(secret, composition.encoded(value).decode())
+                for invalid in ("stack_private", "/private/image", "0x1234", None, 1):
+                    with self.assertRaises(ValueError):
+                        composition.validate_grouped_composition(value | {"failure_stage": invalid})
+                with self.assertRaises(ValueError):
+                    composition.validate_grouped_composition(value | {"raw": report})
+        # Existing schema-3 receipts with the old coarse stage remain readable.
+        composition.validate_grouped_composition(composition.empty_grouped("invalid_report", (3, 144), "header"))
 
     def test_tree_shape_fragment_uses_reviewed_codec_without_private_text(self):
         report = array_report().replace("NSMutableArray", "CustomerTemplate")

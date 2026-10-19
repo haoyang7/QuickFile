@@ -43,7 +43,7 @@ final class FinderSyncTests: XCTestCase {
     private func adapter(store: AuthorizedDirectoryStore,
                          load: (@Sendable () throws -> FileTemplate?)? = nil,
                          reveal: @escaping @MainActor (URL) -> Void = { _ in XCTFail("Unexpected reveal") },
-                         open: @escaping @MainActor (URL, UUID) async -> Error? = { _, _ in XCTFail("Unexpected open"); return nil },
+                         open: @escaping @MainActor (FileCreationResult, UUID) async -> Error? = { _, _ in XCTFail("Unexpected open"); return nil },
                          alert: @escaping @MainActor (NSAlert) -> NSApplication.ModalResponse = { _ in XCTFail("Unexpected alert"); return .alertFirstButtonReturn },
                          launch: @escaping @MainActor (QuickFileAppRoute, @escaping @MainActor @Sendable (Error?) -> Void) -> Void = { _, _ in XCTFail("Unexpected launch") }) -> FinderSync {
         let template = self.template
@@ -101,8 +101,8 @@ final class FinderSyncTests: XCTestCase {
         let adapter = adapter(store: store, reveal: { _ in
             XCTAssertEqual(balance.withLock { $0 }, 0, "Creation scope ends before main completion")
             resolved.withLock { $0 = [] }
-        }, open: { url, id in
-            let error = await opener.openCreatedFile(url, authorizationID: id, requiresAuthorization: true)
+        }, open: { creation, id in
+            let error = await opener.openCreatedFile(creation, authorizationID: id, requiresAuthorization: true)
             completed.fulfill()
             return error
         })

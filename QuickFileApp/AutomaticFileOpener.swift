@@ -50,7 +50,7 @@ final class AutomaticFileOpener {
         self.open = open
     }
 
-    func openCreatedFile(_ url: URL, authorizationID: UUID? = nil, requiresAuthorization: Bool) async -> Error? {
+    func openCreatedFile(_ creation: FileCreationResult, authorizationID: UUID? = nil, requiresAuthorization: Bool) async -> Error? {
         guard current == nil else { return Failure.busy }
         return await withCheckedContinuation { continuation in
             let request = Request(continuation)
@@ -65,8 +65,23 @@ final class AutomaticFileOpener {
             // Blocking settings/bookmark I/O must not occupy the main actor or the
             // Finder creation scheduler. Admission remains held if it stalls.
             Task.detached { [self] in
-                let result = Result { try prepare(url, authorizationID, requiresAuthorization) }
-                await didPrepare(result, url: url, request: request)
+                let result = Result {
+                    let prepared = try prepare(creation.fileURL, authorizationID, requiresAuthorization)
+                    if let prepared {
+                        do {
+                            // Settings and bookmark resolution may stall. Recheck the
+                            // actual published file after those waits, before handoff.
+                            try creation.validateFileIdentity()
+                        } catch {
+                            prepared.release()
+                            throw error
+                        }
+                    }
+                    return prepared
+                }
+                // NSWorkspace accepts a URL, so replacement after this last check
+                // and before the system consumes the path remains possible.
+                await didPrepare(result, url: creation.fileURL, request: request)
             }
         }
     }

@@ -379,10 +379,12 @@ final class QuickFileViewModelTests: XCTestCase {
         let model = QuickFileViewModel(
             templateStore: store, templates: [template],
             authorizedDirectoryStore: makeAuthorizationStore(defaults: defaults),
-            automaticallyOpenCreatedFile: { url, _ in
+            automaticallyOpenCreatedFile: { creation, _ in
                 XCTAssertTrue(Thread.isMainThread)
-                XCTAssertEqual(try? String(contentsOf: url), "new")
-                opened.append(url)
+                do { try creation.validateFileIdentity() }
+                catch { XCTFail("Expected published file identity: \(error)") }
+                XCTAssertEqual(try? String(contentsOf: creation.fileURL), "new")
+                opened.append(creation.fileURL)
                 return LocalizedPresentation("opening failed; file retained")
             }
         )
@@ -415,9 +417,11 @@ final class QuickFileViewModelTests: XCTestCase {
         var completion: CheckedContinuation<LocalizedPresentation<String>?, Never>?
         var opened: [URL] = []
         let model = QuickFileViewModel(templateStore: store, templates: [template],
-            authorizedDirectoryStore: grants, automaticallyOpenCreatedFile: { url, id in
+            authorizedDirectoryStore: grants, automaticallyOpenCreatedFile: { creation, id in
                 XCTAssertEqual(id, selected.id)
-                opened.append(url)
+                do { try creation.validateFileIdentity() }
+                catch { XCTFail("Expected published file identity: \(error)") }
+                opened.append(creation.fileURL)
                 started.fulfill()
                 return await withCheckedContinuation { completion = $0 }
             })
@@ -2586,7 +2590,12 @@ final class QuickFileViewModelTests: XCTestCase {
                 return "copied"
             },
             revealCreatedFile: { revealed.append($0) },
-            automaticallyOpenCreatedFile: { url, _ in opened.append(url); return nil }
+            automaticallyOpenCreatedFile: { creation, _ in
+                do { try creation.validateFileIdentity() }
+                catch { XCTFail("Expected published file identity: \(error)") }
+                opened.append(creation.fileURL)
+                return nil
+            }
         )
         await model.loadTemplatesIfNeeded()
         template.content = "{{clipboard}}"

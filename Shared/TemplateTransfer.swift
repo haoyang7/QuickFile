@@ -231,6 +231,13 @@ public enum TemplateTransfer {
         bundle: TemplateTransferBundle, existing: [FileTemplate],
         limits: TemplateTransferLimits = .default
     ) throws -> TemplateImportPlan {
+        try makeImportPlan(bundle: bundle, existing: existing, limits: limits, didGenerateNameCandidate: {})
+    }
+
+    static func makeImportPlan(
+        bundle: TemplateTransferBundle, existing: [FileTemplate],
+        limits: TemplateTransferLimits = .default, didGenerateNameCandidate: () -> Void
+    ) throws -> TemplateImportPlan {
         // Complete validation precedes any plan. A malformed final item cannot be
         // partially imported. The immutable plan has no persistence side effects.
         try validate(bundle, limits: limits)
@@ -241,18 +248,34 @@ public enum TemplateTransfer {
         let candidates = existing.compactMap { incomingNames.contains($0.name) ? TransferTemplate($0) : nil }
         var seen = Set(candidates)
         var names = Set(existing.map(\.name))
+        // Names only accumulate within this plan. For the same original bytes,
+        // every earlier candidate stays occupied; equivalent Unicode spellings
+        // can truncate differently and must keep independent cursors.
+        var nextSuffixByName: [Data: Int] = [:]
+        var suffixLocale: Locale?
         var additions: [TemplateImportPlan.Item] = []
         var skipped = 0
         for (index, source) in bundle.templates.enumerated() {
             guard seen.insert(source).inserted else { skipped += 1; continue }
             var name = source.name
             if names.contains(name) {
-                var suffixNumber = 1
+                let locale = QuickFileLocalization.locale
+                if suffixLocale != locale {
+                    nextSuffixByName.removeAll(keepingCapacity: true)
+                    suffixLocale = locale
+                }
+                let nameBytes = Data(source.name.utf8)
+                var suffixNumber = nextSuffixByName[nameBytes, default: 1]
                 repeat {
-                    let suffix = suffixNumber == 1 ? QuickFileLocalization.text(.init("（导入）")) : QuickFileLocalization.text(.init("（导入 \(suffixNumber)）"))
+                    // Keep this collision search in the cursor's language even
+                    // if settings change while a candidate is being checked.
+                    var resource: LocalizedStringResource = suffixNumber == 1 ? .init("（导入）") : .init("（导入 \(suffixNumber)）")
+                    resource.locale = locale
+                    let suffix = String(localized: resource)
                     // A long valid name must remain within the exported-name limit
                     // after suffixing. Shorten only the previewed imported name.
                     name = fittingName(source.name, suffix: suffix, maximumBytes: limits.maximumNameBytes)
+                    didGenerateNameCandidate()
                     guard !name.isEmpty else {
                         throw TemplateTransferError.fieldTooLarge(
                             index: index, field: QuickFileLocalization.text(.init("改名后的名称")), maximumBytes: limits.maximumNameBytes
@@ -260,6 +283,7 @@ public enum TemplateTransfer {
                     }
                     suffixNumber += 1
                 } while names.contains(name)
+                nextSuffixByName[nameBytes] = suffixNumber
             }
             names.insert(name)
             let template = FileTemplate(name: name, fileExtension: source.fileExtension,

@@ -4,6 +4,31 @@ import Darwin
 
 final class FileCreationServiceTests: XCTestCase {
 
+    func testCreationResultRetainsPublishedIdentityAcrossInPlaceEditsAndConflicts() throws {
+        let request = FileCreationRequest(
+            template: FileTemplate(name: "Identity", fileExtension: "txt", content: "created"),
+            destinationFolder: temporaryDirectory, requestedFilename: "identity"
+        )
+        let service = FileCreationService()
+        let first = try service.createFile(for: request)
+        let second = try service.createFile(for: request)
+        XCTAssertTrue(second.didRenameForConflict)
+        XCTAssertNoThrow(try first.validateFileIdentity())
+        XCTAssertNoThrow(try second.validateFileIdentity())
+        let handle = try FileHandle(forWritingTo: first.fileURL)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: Data("edited in place".utf8))
+        try handle.close()
+        XCTAssertNoThrow(try first.validateFileIdentity())
+        XCTAssertEqual(try String(contentsOf: first.fileURL), "edited in place")
+
+        let preserved = first.fileURL.appendingPathExtension("original")
+        try FileManager.default.moveItem(at: first.fileURL, to: preserved)
+        try FileManager.default.moveItem(at: second.fileURL, to: first.fileURL)
+        XCTAssertThrowsError(try first.validateFileIdentity())
+        XCTAssertEqual(try String(contentsOf: preserved), "edited in place")
+    }
+
     func testCreationSanitizesHistoricalDefaultsAndExplicitInputOnDisk() throws {
         let name = "می\u{200C}خواهم-👩‍💻-✈\u{FE0F}-e\u{301}"
         let template = FileTemplate(name: "historical\u{202E}\u{0}\n", fileExtension: "t\u{2066}xt", content: "new",

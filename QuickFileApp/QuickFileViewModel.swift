@@ -24,6 +24,7 @@ final class QuickFileViewModel: ObservableObject {
         case storageUnavailable
         case malformedConfiguration
         case unreadable
+        case writeUnconfirmed
 
         init(_ error: Error) {
             var underlying = error
@@ -37,6 +38,10 @@ final class QuickFileViewModel: ObservableObject {
                     case .sharedDefaultsUnavailable: self = .storageUnavailable; return
                     case let .readFailed(cause): underlying = cause; continue
                     case let .persistenceFailed(cause):
+                        if storeError.requiresReloadAfterSave {
+                            self = .writeUnconfirmed
+                            return
+                        }
                         // A write/migration failure is not evidence of malformed input.
                         mayClassifyMalformed = false
                         underlying = cause
@@ -47,8 +52,15 @@ final class QuickFileViewModel: ObservableObject {
                     switch recoveryError {
                     case .configurationChanged, .notRecoverable:
                         self = .configurationChanged
-                    case .backupFailed, .replacementFailed:
+                    case .backupFailed:
                         self = .unreadable
+                    case let .replacementFailed(_, cause):
+                        if let storeError = cause as? TemplateStore.StoreError,
+                           storeError.requiresReloadAfterSave {
+                            self = .writeUnconfirmed
+                        } else {
+                            self = .unreadable
+                        }
                     }
                     return
                 }
@@ -107,6 +119,8 @@ final class QuickFileViewModel: ObservableObject {
                 return QuickFileLocalization.text(.init("模板配置格式无效，无法读取。可重新加载，或先备份原配置再恢复。"))
             case .unreadable:
                 return QuickFileLocalization.text(.init("暂时无法读取模板配置。请稍后重试；读取失败不代表配置损坏。"))
+            case .writeUnconfirmed:
+                return QuickFileLocalization.text(.init("模板配置可能已更新，但无法确认完整写入。请保留草稿，重新加载模板并检查当前配置。"))
             }
         }
     }
@@ -121,11 +135,14 @@ final class QuickFileViewModel: ObservableObject {
             case .backupFailed:
                 return QuickFileLocalization.text(.init("无法备份恢复前状态，恢复已停止，未写入替代配置。请检查存储空间和访问权限后重试。"))
             case .replacementFailed:
+                if TemplateLoadFailure(recoveryError) == .writeUnconfirmed {
+                    return TemplateLoadFailure.writeUnconfirmed.message
+                }
                 return QuickFileLocalization.text(.init("恢复前状态已备份，但恢复写入失败。请保留备份，并在检查存储空间和访问权限后重新加载。"))
             }
         }
         guard let storeError = error as? TemplateStore.StoreError else { return error.localizedDescription }
-        if case .persistenceFailed = storeError {
+        if case .persistenceFailed = storeError, !storeError.requiresReloadAfterSave {
             return QuickFileLocalization.text(.init("未能保存模板，当前修改未保存。请检查存储空间和访问权限后重试，或复制草稿。"))
         }
         return TemplateLoadFailure(storeError).message
@@ -288,7 +305,18 @@ final class QuickFileViewModel: ObservableObject {
         let indices: [Int]
     }
     private(set) var cachedTemplateFilter: TemplateFilterCache?
-    @Published private(set) var templateLoadFailure: TemplateLoadFailure?
+    @Published private(set) var templateLoadFailure: TemplateLoadFailure? {
+        didSet {
+            if templateLoadFailure == .writeUnconfirmed {
+                hasUnconfirmedTemplateWrite = true
+            } else if templateLoadFailure == nil {
+                // Clearing the failure accompanies a verified snapshot publication.
+                hasUnconfirmedTemplateWrite = false
+            }
+        }
+    }
+    // A later read error must not erase the fact that a write needs verification.
+    private var hasUnconfirmedTemplateWrite = false
     // Compatibility projection; there is no second mutable error state.
     var templateLoadError: String? { templateLoadFailure?.message }
     var templateStorageDirectoryURL: URL? { templateStore.storageDirectoryURL }
@@ -336,7 +364,7 @@ final class QuickFileViewModel: ObservableObject {
     private let finderAuthorizationCoordinator: FinderAuthorizationCoordinator
     private let clipboardProvider: (@MainActor () -> String?)?
     private let revealCreatedFile: @MainActor (URL) -> Void
-    private let automaticallyOpenCreatedFile: @MainActor (URL, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>?
+    private let automaticallyOpenCreatedFile: @MainActor (FileCreationResult, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>?
     private(set) var automaticOpenTask: Task<Void, Never>?
     private var templateRefreshObserver: TemplateRefreshObserver?
     private var templateRefreshTask: Task<Void, Never>?
@@ -348,7 +376,7 @@ final class QuickFileViewModel: ObservableObject {
     private var templateRefreshForced = false
     private var templateRefreshNeedsAuthority = false
     private var templateRefreshStatusGeneration: UInt64?
-    private var templateRefreshWaiters: [CheckedContinuation<Void, Never>] = []
+    private var templateRefreshWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var templateRefreshToken: TemplateStore.ChangeToken?
     private var templateRefreshTokenGeneration: UInt64?
     private var didRefreshAuthorizationBookmarks = false
@@ -364,7 +392,7 @@ final class QuickFileViewModel: ObservableObject {
         templateChangeTokenReader: (@Sendable () throws -> TemplateStore.ChangeToken)? = nil,
         finderAuthorizationCoordinator: FinderAuthorizationCoordinator? = nil,
         revealCreatedFile: @escaping @MainActor (URL) -> Void = { _ in },
-        automaticallyOpenCreatedFile: @escaping @MainActor (URL, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>? = { _, _ in nil }
+        automaticallyOpenCreatedFile: @escaping @MainActor (FileCreationResult, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>? = { _, _ in nil }
     ) {
         let loadedTemplates = templates ?? []
         self.hasLoadedTemplates = templates != nil
@@ -531,6 +559,7 @@ final class QuickFileViewModel: ObservableObject {
     /// Conflict recovery is a fresh read plus one compare-and-swap append, never a force-save.
     @discardableResult
     func saveTemplateAsNew(_ draft: FileTemplate) async throws -> FileTemplate.ID {
+        guard !hasUnconfirmedTemplateWrite else { throw TemplateSaveError.notLoaded }
         guard !isLoadingTemplates, !isSavingTemplates else { throw TemplateSaveError.busy }
         isSavingTemplates = true
         templateStateGeneration &+= 1
@@ -790,6 +819,10 @@ final class QuickFileViewModel: ObservableObject {
         guard !hasLoadedTemplates, !didAttemptInitialTemplateLoad else { return }
         didAttemptInitialTemplateLoad = true
         await reloadTemplates()
+        if !hasLoadedTemplates, templateLoadFailure == nil, !hasPendingTemplateRefresh {
+            // Cancellation before registration must not consume another window's initial load.
+            didAttemptInitialTemplateLoad = false
+        }
     }
 
     /// Called once by the app-owned model; windows share this observer and read slot.
@@ -809,17 +842,31 @@ final class QuickFileViewModel: ObservableObject {
         drainTemplateRefresh()
     }
 
-    func reloadTemplates() async {
+    /// UI commands coalesce intent synchronously, without creating waiting tasks.
+    func requestTemplateReload() {
         templateRefreshStatusGeneration = statusGeneration
         templateRefreshForced = true
+        requestTemplateRefresh()
+    }
+
+    func reloadTemplates() async {
+        guard !Task.isCancelled else { return }
         if isSavingTemplates || isBusy || (isLoadingTemplates && templateRefreshPhase != .loading) {
-            requestTemplateRefresh()
+            requestTemplateReload()
             return
         }
-        await withCheckedContinuation { continuation in
-            templateRefreshWaiters.append(continuation)
-            templateRefreshForced = true
-            requestTemplateRefresh()
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(); return }
+                templateRefreshWaiters[waiterID] = continuation
+                requestTemplateReload()
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                // Cancelling a caller ends only its wait, never the shared I/O.
+                self?.templateRefreshWaiters.removeValue(forKey: waiterID)?.resume()
+            }
         }
     }
 
@@ -854,8 +901,8 @@ final class QuickFileViewModel: ObservableObject {
         }
         templateRefreshNeedsAuthority = false
         templateRefreshForced = false
-        let waiters = templateRefreshWaiters
-        templateRefreshWaiters.removeAll()
+        // Keep continuations addressable while I/O runs so callers can cancel.
+        let waiterIDs = Array(templateRefreshWaiters.keys)
         let statusVersion = templateRefreshStatusGeneration
         templateRefreshStatusGeneration = nil
         let baseline = persistedTemplates
@@ -908,17 +955,19 @@ final class QuickFileViewModel: ObservableObject {
                 } else {
                     self.templateRefreshPending = true
                 }
+                for id in waiterIDs {
+                    self.templateRefreshWaiters.removeValue(forKey: id)?.resume()
+                }
                 self.templateRefreshTask = nil
                 self.templateRefreshPhase = nil
                 self.isLoadingTemplates = false
             }
-            waiters.forEach { $0.resume() }
         }
     }
 
     deinit {
         templateRefreshTask?.cancel()
-        templateRefreshWaiters.forEach { $0.resume() }
+        templateRefreshWaiters.values.forEach { $0.resume() }
     }
 
     func deleteTemplate(withID id: FileTemplate.ID) async -> Bool {
@@ -1128,7 +1177,7 @@ final class QuickFileViewModel: ObservableObject {
             statusPresentation = LocalizedPresentation(.success(
                 QuickFileLocalization.text(.init("已授权并创建 \(createdName)\(conflictNote())"))
             ))
-            startAutomaticOpen(completion.creationResult.fileURL, authorizationID: completion.authorizationID)
+            startAutomaticOpen(completion.creationResult, authorizationID: completion.authorizationID)
             return true
         case let .failure(error):
             createdFileURL = nil
@@ -1340,14 +1389,14 @@ final class QuickFileViewModel: ObservableObject {
             createdFileURL = result.fileURL
             func conflictNote() -> String { return result.didRenameForConflict ? QuickFileLocalization.text(.init("（为避免覆盖已自动改名）")) : "" }
             statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("已创建 \(result.fileURL.lastPathComponent)\(conflictNote())"))))
-            startAutomaticOpen(result.fileURL, authorizationID: savedAuthorizationID)
+            startAutomaticOpen(result, authorizationID: savedAuthorizationID)
         case let .failure(error):
             createdFileURL = nil
             statusPresentation = LocalizedPresentation(.failure(error.localizedDescription))
         }
     }
 
-    private func startAutomaticOpen(_ url: URL, authorizationID: AuthorizedDirectory.ID?) {
+    private func startAutomaticOpen(_ creation: FileCreationResult, authorizationID: AuthorizedDirectory.ID?) {
         // Opening is optional post-publication work. Keep one in-flight handoff,
         // without blocking creation/Finder requests or accumulating stalled tasks.
         guard automaticOpenTask == nil else {
@@ -1357,7 +1406,7 @@ final class QuickFileViewModel: ObservableObject {
         let generation = statusGeneration
         let open = automaticallyOpenCreatedFile
         automaticOpenTask = Task { [weak self] in
-            let message = await open(url, authorizationID)
+            let message = await open(creation, authorizationID)
             guard let self else { return }
             self.automaticOpenTask = nil
             if let message, self.statusGeneration == generation {
@@ -1406,14 +1455,7 @@ final class QuickFileViewModel: ObservableObject {
                 try store.saveTemplates(updatedTemplates, expectedTemplates: expectedTemplates)
             }.get()
         } catch let error as TemplateStore.StoreError {
-            switch error {
-            case .configurationChanged, .readFailed, .savedConfigurationMissing, .sharedDefaultsUnavailable:
-                // A failed preflight read invalidates the editing snapshot until an explicit reload.
-                templateLoadFailure = TemplateLoadFailure(error)
-                templateStateGeneration &+= 1
-            case .persistenceFailed:
-                break
-            }
+            invalidateTemplatesAfterFailure(error)
             throw error
         }
         publishTemplates(updatedTemplates, successMessage: successMessage)
@@ -1440,15 +1482,20 @@ final class QuickFileViewModel: ObservableObject {
                 // Require a fresh load rather than keeping a stale repair action.
                 templateLoadFailure = .configurationChanged
                 templateStateGeneration &+= 1
-            case .backupFailed, .replacementFailed:
+            case .backupFailed:
                 break
+            case .replacementFailed:
+                if TemplateLoadFailure(recoveryError) == .writeUnconfirmed {
+                    invalidateTemplatesAfterFailure(error)
+                }
             }
         }
     }
 
     private func invalidateTemplatesAfterFailure(_ error: Error) {
         if let storeError = error as? TemplateStore.StoreError,
-           case .persistenceFailed = storeError { return }
+           case .persistenceFailed = storeError,
+           !storeError.requiresReloadAfterSave { return }
         templateLoadFailure = TemplateLoadFailure(error)
         templateStateGeneration &+= 1
     }
