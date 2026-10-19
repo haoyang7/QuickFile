@@ -89,7 +89,11 @@ class AuthorizationStartupWiringTests(unittest.TestCase):
         self.assertIn("isBusy || isProcessingFinderAuthorizationRequests", model)
         self.assertIn("prepareForPresentation: { await self.prepareFinderPresentation() }", model)
         self.assertIn("finderPresentationWaiter = nil", model)
-        self.assertNotIn("withTaskCancellationHandler", model)
+        queue = model.split("func completeFinderAuthorizationRequest(", 1)[1].split("\n    func createFile()", 1)[0]
+        presentation = model.split("private func prepareFinderPresentation()", 1)[1].split("\n    func template(withID", 1)[0]
+        pump = (ROOT / "QuickFileApp/FinderAuthorizationRequestPump.swift").read_text()
+        for ownership in (queue, presentation, pump):
+            self.assertNotIn("withTaskCancellationHandler", ownership)
         self.assertNotIn("Task.sleep", model)
 
     def test_direct_folder_choosers_enter_model_admission_before_opening_panels(self):
