@@ -14,7 +14,11 @@ RAW_LIMIT = 16 * 1024 * 1024
 TYPES = frozen.REFERENCE_TYPES
 REASONS = ("not_available", "invalid_report", "node_budget", "bucket_budget", "summary_budget",
            "unknown_type", "size_unresolved")
-FAILURE_STAGES = ("header", "tree_shape", "child_marker", "backref", "byte_bounds", "totals", "budget")
+# Keep legacy schema-3 "header" receipts readable. New failures identify the
+# rejected structural check using fixed literals, never private report text.
+FAILURE_STAGES = ("header", "report_header", "report_prefix", "stack_header", "stack_prefix",
+                  "stack_separator", "stack_frame", "stack_order", "stack_duplicate", "stack_name",
+                  "root_header", "tree_shape", "child_marker", "backref", "byte_bounds", "totals", "budget")
 
 
 class _GroupedError(ValueError):
@@ -238,7 +242,7 @@ def _group_tree(lines, instances, marker, header_name, total_bytes, failure_cont
         if aggregate:
             require(total_row is None and not stack and not roots and row_marker is None)
         elif not stack or stack[-1]["name"] is None:
-            require(row_marker is not None and (marker is None or (row_marker, name) == (marker, header_name)), "header")
+            require(row_marker is not None and (marker is None or (row_marker, name) == (marker, header_name)), "root_header")
             if total_row is not None:
                 require(indent == total_row["indent"] + 2 and (not separated or separator_pending))
             separator_pending = False
@@ -267,7 +271,7 @@ def _group_tree(lines, instances, marker, header_name, total_bytes, failure_cont
 def grouped_composition(report):
     """Decode full grouped trees; subtract direct child subtrees before counting."""
     totals = None
-    stage = "header"
+    stage = "report_header"
     failure_context = []
     try:
         require(type(report) is str)
@@ -276,29 +280,36 @@ def grouped_composition(report):
         stage = "totals"
         totals = frozen.totals(report)
         if totals[0] > NODE_LIMIT: return empty_grouped("node_budget", totals)
-        stage = "header"
+        stage = "report_header"
         body = report.split("Binary Images:", 1)[0]
         total = re.search(r"^Process \d+: \d+ leaks? for \d+ total leaked bytes\.$", body, re.M)
         require(total is not None)
         prefix, body = body[:total.start()], body[total.end():]
+        stage = "report_prefix"
         require("STACK OF " not in prefix and "====" not in prefix)
+        stage = "stack_header"
         headers = list(re.finditer(r"^STACK OF (\d{1,6}) INSTANCES? OF '(ROOT LEAK|ROOT CYCLE): ([^\n']+)':$", body, re.M))
         require(len(headers) == len(re.findall(r"^STACK OF ", body, re.M)))
         rows, roots, byte_ranges, seen = [], [], [], set()
         if headers:
+            stage = "stack_prefix"
             require(not body[:headers[0].start()].strip())
             for index, header in enumerate(headers):
-                stage = "header"
+                stage = "stack_separator"
                 block = body[header.end():headers[index + 1].start() if index + 1 < len(headers) else len(body)]
                 require(block.count("\n====\n") == 1)
                 frames, tree = block.split("\n====\n")
                 # Stacks are checked structurally and discarded, never published.
+                stage = "stack_frame"
                 frame_rows = [line.strip() for line in frames.splitlines() if line.strip()]
                 require(all(line.replace("\t", " ").isprintable() and re.fullmatch(r"\d{1,3}\s+\S+\s+0x[0-9a-fA-F]{1,16}\s+[^\r\n]+ \+ \d{1,10}", line) for line in frame_rows))
                 indices = [int(line.split()[0]) for line in frame_rows]
+                stage = "stack_order"
                 require(len(set(indices)) == len(indices) and indices in (sorted(indices), sorted(indices, reverse=True)))
+                stage = "stack_duplicate"
                 key = (header[0], tuple(frame_rows), tuple(line for line in tree.splitlines() if line.strip()))
                 require(key not in seen); seen.add(key)
+                stage = "stack_name"
                 header_name = _name(header[3])
                 stage = "tree_shape"
                 group, group_roots, group_bytes = _group_tree(tree.splitlines(), int(header[1]), header[2], header_name, totals[1], failure_context)

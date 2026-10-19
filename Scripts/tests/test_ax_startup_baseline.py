@@ -457,6 +457,32 @@ class StartupBaselineTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 startup.fingerprint({}, composition | {'private_path': '/private/secret-account'})
 
+    def test_header_failure_aborts_first_probe_with_exact_anonymous_diagnostic(self):
+        from ax_composition import encoded, grouped_composition, PUBLIC_LIMIT, validate_grouped_composition
+        from test_ax_composition import header_failure_reports
+        for stage, report in header_failure_reports().items():
+            receipt = startup.empty()
+            saved = []
+            def measure(index, deadline):
+                return startup.fingerprint({}, grouped_composition(report))
+            probe = mock.Mock(side_effect=measure)
+            with self.subTest(stage=stage), mock.patch.object(startup.time, "sleep") as sleep:
+                with self.assertRaises(RuntimeError) as caught:
+                    startup.settle(probe, lambda value: saved.append(copy.deepcopy(value)), receipt)
+                probe.assert_called_once()
+                sleep.assert_not_called()
+                self.assertEqual(receipt, startup.empty())
+                self.assertEqual(saved, [receipt])
+                startup.validate(receipt)
+                published = str(caught.exception).split(": ", 1)[1]
+                value = json.loads(published)
+                validate_grouped_composition(value)
+                self.assertEqual(value["failure_stage"], stage)
+                self.assertEqual(value["counts_status"], "unavailable")
+                self.assertLessEqual(len(encoded(value)), PUBLIC_LIMIT)
+                for secret in ("private", "0x1234", "synthetic", "NSMutableArray", "NSArray"):
+                    self.assertNotIn(secret, published)
+
     def test_new_protocol_refuses_other_investigation_modes_before_launch(self):
         import contextlib
         import io

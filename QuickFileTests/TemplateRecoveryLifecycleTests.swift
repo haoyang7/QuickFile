@@ -243,6 +243,117 @@ final class TemplateRecoveryLifecycleTests: XCTestCase {
         try assertNoBackups()
     }
 
+    func testWindowCloseInvalidatesPreparationBeforeImmediateReopenAndLockRelease() async throws {
+        try await showManager()
+        let descriptor = open(source.appendingPathExtension("lock").path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        guard descriptor >= 0 else { return }
+        defer { flock(descriptor, LOCK_UN); Darwin.close(descriptor) }
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0)
+        try await startRecovery()
+        try await waitUntil { self.model.isLoadingTemplates }
+        XCTAssertTrue(presentation.isActive)
+
+        // A different owner closing must not invalidate this page's operation.
+        let other = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: false)
+        other.isReleasedWhenClosed = false
+        other.close()
+        XCTAssertTrue(presentation.isActive)
+
+        let controller = window.contentViewController
+        window.close()
+        // Check the synchronous close boundary before SwiftUI can deliver any
+        // disappearance or the real store lock can release the worker.
+        XCTAssertFalse(presentation.isActive, "Owner close must invalidate its preparation synchronously")
+        XCTAssertNil(presentation.recoveryPreview)
+        window.orderFront(nil)
+        XCTAssertTrue(window.contentViewController === controller)
+        XCTAssertTrue(model.isLoadingTemplates)
+        XCTAssertEqual(flock(descriptor, LOCK_UN), 0)
+        try await waitUntil { !self.model.isLoadingTemplates }
+        await settle()
+        XCTAssertNil(presentation.recoveryPreview, "An immediately reopened owner must reject the old result")
+        XCTAssertNil(window.attachedSheet)
+
+        // The retained page must still admit a fresh operation after the old
+        // worker finishes, without a tab change to repair its presentation state.
+        try await startRecovery()
+        try await waitUntil { self.window.attachedSheet != nil }
+        try press("取消", in: XCTUnwrap(window.attachedSheet).contentView!)
+        try await waitUntil { self.window.attachedSheet == nil && !self.presentation.isActive }
+        XCTAssertEqual(try Data(contentsOf: source), original)
+        try assertNoBackups()
+    }
+
+    func testClosedPreparationCompletionPreservesFreshAndOtherOwnerOperations() {
+        let other = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: false)
+        other.isReleasedWhenClosed = false
+        defer { other.close() }
+        let otherPresentation = TemplateModalPresentation()
+        let otherPreparation = otherPresentation.beginPreparation(for: other)
+        let oldPreparation = presentation.beginPreparation(for: window)
+        let editor = TemplateEditorPresentation(template: nil)
+        presentation.editorPresentation = editor
+        window.close()
+        XCTAssertFalse(presentation.acceptsPreparation(oldPreparation))
+        XCTAssertTrue(otherPresentation.acceptsPreparation(otherPreparation))
+        XCTAssertEqual(presentation.editorPresentation?.id, editor.id)
+
+        let freshPreparation = presentation.beginPreparation(for: window)
+        presentation.finishPreparation(oldPreparation)
+        XCTAssertTrue(presentation.acceptsPreparation(freshPreparation))
+        XCTAssertTrue(presentation.isActive)
+        other.close()
+        XCTAssertFalse(otherPresentation.acceptsPreparation(otherPreparation))
+        XCTAssertTrue(presentation.acceptsPreparation(freshPreparation))
+        presentation.finishPreparation(freshPreparation)
+        presentation.editorPresentation = nil
+        XCTAssertFalse(presentation.isActive)
+    }
+
+    func testWindowCloseClearsPresentedRecoveryBeforeReopen() async throws {
+        try await showManager()
+        try await startRecovery()
+        try await waitUntil { self.window.attachedSheet != nil }
+        XCTAssertNotNil(presentation.recoveryPreview)
+        window.close()
+        XCTAssertNil(presentation.recoveryPreview)
+        XCTAssertNil(presentation.importPreview)
+        window.orderFront(nil)
+        await settle()
+        XCTAssertNil(window.attachedSheet)
+        XCTAssertFalse(presentation.isActive)
+        XCTAssertEqual(try Data(contentsOf: source), original)
+        try assertNoBackups()
+    }
+
+    func testContentViewImmediateReopenRejectsPreparationAfterRealStoreLockRelease() async throws {
+        try await showContentView()
+        let controller = window.contentViewController
+        let descriptor = open(source.appendingPathExtension("lock").path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        guard descriptor >= 0 else { return }
+        defer { flock(descriptor, LOCK_UN); Darwin.close(descriptor) }
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0)
+        try await startRecovery()
+        try await waitUntil { self.model.isLoadingTemplates }
+        window.close()
+        window.orderFront(nil)
+        XCTAssertTrue(window.contentViewController === controller)
+        XCTAssertTrue(model.isLoadingTemplates)
+        XCTAssertEqual(flock(descriptor, LOCK_UN), 0)
+        try await waitUntil { !self.model.isLoadingTemplates }
+        await settle()
+        XCTAssertNil(window.attachedSheet)
+        XCTAssertEqual(window.toolbar?.selectedItemIdentifier?.rawValue, AppTab.templates.rawValue)
+        try await startRecovery()
+        try await waitUntil { self.window.attachedSheet != nil }
+        try press("取消", in: XCTUnwrap(window.attachedSheet).contentView!)
+        try await waitUntil { self.window.attachedSheet == nil }
+        XCTAssertEqual(try Data(contentsOf: source), original)
+        try assertNoBackups()
+    }
+
     private func showContentView() async throws {
         let integration = FinderIntegrationViewModel(statusProvider: { false }, runtimeProvider: { _ in
             FinderExtensionDiagnosticSnapshot(embeddedIdentifiers: [], embeddingKnown: true, registration: .unknown,
