@@ -185,9 +185,9 @@ enum AppKitFileActions {
     }
 
     /// Only called after successful publication. Failure here must never retry creation.
-    static func automaticallyOpenCreatedFile(_ fileURL: URL, authorizationID: AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>? {
+    static func automaticallyOpenCreatedFile(_ creation: FileCreationResult, authorizationID: AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>? {
         let error = await AutomaticFileOpener.shared.openCreatedFile(
-            fileURL, authorizationID: authorizationID, requiresAuthorization: false
+            creation, authorizationID: authorizationID, requiresAuthorization: false
         )
         return error.map { error in
             LocalizedPresentation(QuickFileLocalization.text(.init("文件已创建，但无法自动打开：\(error.localizedDescription)")))

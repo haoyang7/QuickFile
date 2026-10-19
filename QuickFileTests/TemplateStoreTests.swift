@@ -126,6 +126,117 @@ final class TemplateStoreTests: XCTestCase {
         XCTAssertEqual(defaults.data(forKey: "templates.v1"), data)
     }
 
+    func testDuplicateLegacyIDsAreRejectedBeforeReadingMigrationOrSave() throws {
+        let first = FileTemplate(name: "Duplicate", fileExtension: "txt", content: "body")
+        var second = first
+        second.isEnabled = false
+        for version in [nil, 3, 4] as [Int?] {
+            let data = try libraryData([first, second], version: version)
+            for migratesToFile in [false, true] {
+                let url = temporaryDirectory.appendingPathComponent("templates.v2.json")
+                defaults.set(data, forKey: "templates.v1")
+                defaults.set("original", forKey: "templates.revision.v2")
+                let store = TemplateStore(defaults: defaults, storageURL: migratesToFile ? url : nil)
+                let operations: [() throws -> Void] = [
+                    { _ = try store.loadTemplates() },
+                    { _ = try store.reloadTemplates() },
+                    { _ = try store.reloadMenuEntries() },
+                    { _ = try store.reloadCreationSnapshot(templateID: first.id) },
+                    { try store.saveTemplates([first], expectedTemplates: [first, second]) }
+                ]
+                for operation in operations {
+                    XCTAssertThrowsError(try operation()) { error in
+                        guard case TemplateStore.StoreError.readFailed(let underlying) = error,
+                              case DecodingError.dataCorrupted = underlying else { return XCTFail("\(error)") }
+                    }
+                }
+                XCTAssertEqual(try store.prepareRecovery().reason, .corruptLegacyData)
+                XCTAssertEqual(defaults.data(forKey: "templates.v1"), data)
+                XCTAssertEqual(defaults.string(forKey: "templates.revision.v2"), "original")
+                XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            }
+        }
+    }
+
+    func testDuplicateFileIDsRequireExplicitRecoveryAndPreserveOriginalBackup() throws {
+        let first = FileTemplate(name: "Duplicate", fileExtension: "txt", content: "first")
+        var second = first
+        second.content = "different"
+        let url = temporaryDirectory.appendingPathComponent("templates.v2.json")
+        for version in [nil, 3, 4] as [Int?] {
+            let data = try libraryData([first, second], version: version)
+            try data.write(to: url, options: .atomic)
+            defaults.set("original", forKey: "templates.revision.v2")
+            let store = TemplateStore(defaults: defaults, storageURL: url)
+            XCTAssertThrowsError(try store.saveTemplates([first], expectedTemplates: [first, second])) { error in
+                guard case TemplateStore.StoreError.readFailed = error else { return XCTFail("\(error)") }
+            }
+            XCTAssertEqual(try Data(contentsOf: url), data)
+            XCTAssertEqual(defaults.string(forKey: "templates.revision.v2"), "original")
+            let snapshot = try store.prepareRecovery()
+            XCTAssertEqual(snapshot.reason, .corruptFile)
+            let recovered = try store.recoverTemplates([first], expectedRecoveryState: snapshot)
+            XCTAssertEqual(try Data(contentsOf: recovered.backupURL.appendingPathComponent("templates.original.json")), data)
+            XCTAssertEqual(try store.reloadTemplates(), [first])
+        }
+    }
+
+    func testOrdinarySaveRejectsDuplicateIDsWithoutChangingAuthority() throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        let url = temporaryDirectory.appendingPathComponent("templates.v2.json")
+        for usesFile in [false, true] {
+            let store = TemplateStore(defaults: defaults, storageURL: usesFile ? url : nil)
+            try store.saveTemplates([original])
+            let data = usesFile ? try Data(contentsOf: url) : try XCTUnwrap(defaults.data(forKey: "templates.v1"))
+            let revision = defaults.string(forKey: "templates.revision.v2")
+            for firstEnabled in [true, false] {
+                for secondEnabled in [true, false] {
+                    for sameContent in [true, false] {
+                        var first = original
+                        first.isEnabled = firstEnabled
+                        var second = original
+                        second.isEnabled = secondEnabled
+                        if !sameContent { second.content = "different" }
+                        XCTAssertThrowsError(try store.saveTemplates([first, second], expectedTemplates: [original])) { error in
+                            guard case EncodingError.invalidValue = error else { return XCTFail("\(error)") }
+                        }
+                        XCTAssertEqual(try store.reloadTemplates(), [original])
+                        XCTAssertEqual(defaults.string(forKey: "templates.revision.v2"), revision)
+                        if usesFile { XCTAssertEqual(try Data(contentsOf: url), data) }
+                        else { XCTAssertEqual(defaults.data(forKey: "templates.v1"), data) }
+                    }
+                }
+            }
+        }
+    }
+
+    func testRecoveryRejectsDuplicateReplacementBeforeBackup() throws {
+        let url = temporaryDirectory.appendingPathComponent("templates.v2.json")
+        let data = Data("broken".utf8)
+        try data.write(to: url)
+        let store = TemplateStore(defaults: defaults, storageURL: url)
+        let snapshot = try store.prepareRecovery()
+        let first = FileTemplate(name: "Duplicate", fileExtension: "txt", content: "body")
+        var second = first
+        second.isEnabled = false
+        XCTAssertThrowsError(try store.recoverTemplates([first, second], expectedRecoveryState: snapshot)) { error in
+            guard case EncodingError.invalidValue = error else { return XCTFail("\(error)") }
+        }
+        XCTAssertEqual(try Data(contentsOf: url), data)
+        XCTAssertTrue(try recoveryBackupURLs().isEmpty)
+    }
+
+    private func libraryData(_ templates: [FileTemplate], version: Int?) throws -> Data {
+        let records = try JSONSerialization.jsonObject(with: JSONEncoder().encode(templates))
+        let object: Any
+        if let version {
+            object = ["format": "quickfile.template-library", "version": version, "templates": records]
+        } else {
+            object = records
+        }
+        return try JSONSerialization.data(withJSONObject: object)
+    }
+
     func testSavedEmptyTemplateListDoesNotFallBackToBuiltIns() throws {
         let store = TemplateStore(defaults: defaults)
 

@@ -68,10 +68,48 @@ public struct FileCreationRequest: Sendable {
 public struct FileCreationResult: Equatable, Sendable {
     public let fileURL: URL
     public let didRenameForConflict: Bool
+    private let identity: FileIdentity?
 
+    private struct FileIdentity: Equatable, Sendable {
+        let device: Int32
+        let inode: UInt64
+        let generation: UInt32
+        let birthSeconds: Int64
+        let birthNanoseconds: Int64
+
+        init(_ attributes: stat) {
+            device = attributes.st_dev
+            inode = UInt64(attributes.st_ino)
+            generation = attributes.st_gen
+            birthSeconds = Int64(attributes.st_birthtimespec.tv_sec)
+            birthNanoseconds = Int64(attributes.st_birthtimespec.tv_nsec)
+        }
+    }
+
+    /// A result without publication identity cannot be automatically opened.
     public init(fileURL: URL, didRenameForConflict: Bool) {
         self.fileURL = fileURL
         self.didRenameForConflict = didRenameForConflict
+        identity = nil
+    }
+
+    init(fileURL: URL, didRenameForConflict: Bool, publishedAttributes: stat) {
+        self.fileURL = fileURL
+        self.didRenameForConflict = didRenameForConflict
+        identity = FileIdentity(publishedAttributes)
+    }
+
+    /// Checks the writer's identity without following a replacement symbolic link.
+    /// Content and modification times are excluded so in-place editing remains valid.
+    public func validateFileIdentity() throws {
+        guard let identity else { throw POSIXError(.ESTALE) }
+        var attributes = stat()
+        guard lstat(fileURL.path, &attributes) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard attributes.st_mode & S_IFMT == S_IFREG, FileIdentity(attributes) == identity else {
+            throw POSIXError(.ESTALE)
+        }
     }
 }
 

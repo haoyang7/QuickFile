@@ -38,6 +38,65 @@ final class LocalSharedStorageTests: XCTestCase {
                              readTemplatesData: { try backend.read($0) })
     }
 
+    func testPublishedWriteCloseErrorsPreserveNewFileAndAreNeverRetried() throws {
+        for durable in [false, true] {
+            for code in [EIO, EINTR] {
+                let root = directory.appendingPathComponent(UUID().uuidString)
+                let original = LocalSharedStorage(root: root)
+                let url = root.appendingPathComponent("settings.json")
+                try original.write(Data("old".utf8), to: url)
+                let closes = OSAllocatedUnfairLock(initialState: 0)
+                let failing = LocalSharedStorage(root: root, closeWrittenFile: { descriptor in
+                    let result = Darwin.close(descriptor)
+                    closes.withLock { $0 += 1 }
+                    guard result == 0 else { return result }
+                    errno = code
+                    return -1
+                })
+
+                XCTAssertThrowsError(try failing.write(Data("new".utf8), to: url, durable: durable)) { error in
+                    guard let error = error as? LocalSharedStorage.PublishedWriteError else {
+                        return XCTFail("Expected an already-published write error, got \(error)")
+                    }
+                    XCTAssertEqual(error.underlyingError.domain, NSPOSIXErrorDomain)
+                    XCTAssertEqual(error.underlyingError.code, Int(code))
+                }
+                XCTAssertEqual(closes.withLock { $0 }, 1)
+                XCTAssertEqual(try original.read(url), Data("new".utf8))
+                XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), ["settings.json"])
+            }
+        }
+    }
+
+    func testPublishedTemplateCloseErrorRemainsVisibleAndReloadsAuthoritativeLibrary() throws {
+        let baseline = [FileTemplate(name: "Before", fileExtension: "txt", content: "old")]
+        try templates().saveTemplates(baseline, expectedTemplates: BuiltInTemplates.all)
+        let root = storage.root
+        storage = LocalSharedStorage(root: root, closeWrittenFile: { descriptor in
+            let result = Darwin.close(descriptor)
+            guard result == 0 else { return result }
+            errno = EIO
+            return -1
+        })
+        let writer = templates()
+        XCTAssertEqual(try writer.loadTemplates(), baseline)
+        let updated = [FileTemplate(name: "After", fileExtension: "txt", content: "new")]
+
+        XCTAssertThrowsError(try writer.saveTemplates(updated, expectedTemplates: baseline)) { error in
+            guard case TemplateStore.StoreError.persistenceFailed(let underlying) = error,
+                  underlying is LocalSharedStorage.PublishedWriteError else {
+                return XCTFail("Expected publication state to survive the store error: \(error)")
+            }
+        }
+        XCTAssertEqual(try writer.reloadTemplates(), updated)
+        XCTAssertThrowsError(try writer.saveTemplates(baseline, expectedTemplates: baseline)) { error in
+            guard case TemplateStore.StoreError.configurationChanged = error else {
+                return XCTFail("Expected stale baseline rejection, got \(error)")
+            }
+        }
+        XCTAssertEqual(try writer.reloadTemplates(), updated)
+    }
+
     func testStorageModeMustMatchTheCompiledProduct() {
         XCTAssertTrue(QuickFileSharedStorage.configurationMatches(["QuickFileStorageMode": QuickFileStorageMode.current.rawValue]))
         XCTAssertFalse(QuickFileSharedStorage.configurationMatches([:]))

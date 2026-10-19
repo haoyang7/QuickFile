@@ -336,7 +336,7 @@ final class QuickFileViewModel: ObservableObject {
     private let finderAuthorizationCoordinator: FinderAuthorizationCoordinator
     private let clipboardProvider: (@MainActor () -> String?)?
     private let revealCreatedFile: @MainActor (URL) -> Void
-    private let automaticallyOpenCreatedFile: @MainActor (URL, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>?
+    private let automaticallyOpenCreatedFile: @MainActor (FileCreationResult, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>?
     private(set) var automaticOpenTask: Task<Void, Never>?
     private var templateRefreshObserver: TemplateRefreshObserver?
     private var templateRefreshTask: Task<Void, Never>?
@@ -364,7 +364,7 @@ final class QuickFileViewModel: ObservableObject {
         templateChangeTokenReader: (@Sendable () throws -> TemplateStore.ChangeToken)? = nil,
         finderAuthorizationCoordinator: FinderAuthorizationCoordinator? = nil,
         revealCreatedFile: @escaping @MainActor (URL) -> Void = { _ in },
-        automaticallyOpenCreatedFile: @escaping @MainActor (URL, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>? = { _, _ in nil }
+        automaticallyOpenCreatedFile: @escaping @MainActor (FileCreationResult, AuthorizedDirectory.ID?) async -> LocalizedPresentation<String>? = { _, _ in nil }
     ) {
         let loadedTemplates = templates ?? []
         self.hasLoadedTemplates = templates != nil
@@ -1128,7 +1128,7 @@ final class QuickFileViewModel: ObservableObject {
             statusPresentation = LocalizedPresentation(.success(
                 QuickFileLocalization.text(.init("已授权并创建 \(createdName)\(conflictNote())"))
             ))
-            startAutomaticOpen(completion.creationResult.fileURL, authorizationID: completion.authorizationID)
+            startAutomaticOpen(completion.creationResult, authorizationID: completion.authorizationID)
             return true
         case let .failure(error):
             createdFileURL = nil
@@ -1340,14 +1340,14 @@ final class QuickFileViewModel: ObservableObject {
             createdFileURL = result.fileURL
             func conflictNote() -> String { return result.didRenameForConflict ? QuickFileLocalization.text(.init("（为避免覆盖已自动改名）")) : "" }
             statusPresentation = LocalizedPresentation(.success(QuickFileLocalization.text(.init("已创建 \(result.fileURL.lastPathComponent)\(conflictNote())"))))
-            startAutomaticOpen(result.fileURL, authorizationID: savedAuthorizationID)
+            startAutomaticOpen(result, authorizationID: savedAuthorizationID)
         case let .failure(error):
             createdFileURL = nil
             statusPresentation = LocalizedPresentation(.failure(error.localizedDescription))
         }
     }
 
-    private func startAutomaticOpen(_ url: URL, authorizationID: AuthorizedDirectory.ID?) {
+    private func startAutomaticOpen(_ creation: FileCreationResult, authorizationID: AuthorizedDirectory.ID?) {
         // Opening is optional post-publication work. Keep one in-flight handoff,
         // without blocking creation/Finder requests or accumulating stalled tasks.
         guard automaticOpenTask == nil else {
@@ -1357,7 +1357,7 @@ final class QuickFileViewModel: ObservableObject {
         let generation = statusGeneration
         let open = automaticallyOpenCreatedFile
         automaticOpenTask = Task { [weak self] in
-            let message = await open(url, authorizationID)
+            let message = await open(creation, authorizationID)
             guard let self else { return }
             self.automaticOpenTask = nil
             if let message, self.statusGeneration == generation {

@@ -33,7 +33,7 @@ final class FinderSync: FIFinderSync {
     private let fileCreationService: FileCreationService
     private let selection: () -> (target: URL?, items: [URL])
     private let reveal: @MainActor (URL) -> Void
-    private let openCreatedFile: @MainActor (URL, UUID) async -> Error?
+    private let openCreatedFile: @MainActor (FileCreationResult, UUID) async -> Error?
     private let presentAlert: @MainActor (NSAlert) -> NSApplication.ModalResponse
     private let launchApplication: @MainActor (QuickFileAppRoute, @escaping @MainActor @Sendable (Error?) -> Void) -> Void
 
@@ -68,8 +68,8 @@ final class FinderSync: FIFinderSync {
                 return (controller.targetedURL(), controller.selectedItemURLs() ?? [])
             },
             reveal: { NSWorkspace.shared.activateFileViewerSelecting([$0]) },
-            openCreatedFile: { url, id in
-                await AutomaticFileOpener.shared.openCreatedFile(url, authorizationID: id, requiresAuthorization: true)
+            openCreatedFile: { creation, id in
+                await AutomaticFileOpener.shared.openCreatedFile(creation, authorizationID: id, requiresAuthorization: true)
             },
             presentAlert: { alert in
                 alert.window.level = .modalPanel
@@ -91,7 +91,7 @@ final class FinderSync: FIFinderSync {
          fileCreationService: FileCreationService,
          selection: @escaping () -> (target: URL?, items: [URL]),
          reveal: @escaping @MainActor (URL) -> Void,
-         openCreatedFile: @escaping @MainActor (URL, UUID) async -> Error?,
+         openCreatedFile: @escaping @MainActor (FileCreationResult, UUID) async -> Error?,
          presentAlert: @escaping @MainActor (NSAlert) -> NSApplication.ModalResponse,
          launchApplication: @escaping @MainActor (QuickFileAppRoute, @escaping @MainActor @Sendable (Error?) -> Void) -> Void,
          registerWithFinder: Bool) {
@@ -262,7 +262,7 @@ final class FinderSync: FIFinderSync {
                                 verificationAttempt: verificationAttempt, timing: timing)
             if case let .success(created) = result {
                 Task { [weak self] in
-                    if let error = await self?.openCreatedFile(created.creationResult.fileURL, created.authorizationID) {
+                    if let error = await self?.openCreatedFile(created.creationResult, created.authorizationID) {
                         self?.presentAutomaticOpenError(error)
                     }
                 }

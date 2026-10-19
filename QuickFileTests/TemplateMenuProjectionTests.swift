@@ -58,7 +58,7 @@ final class TemplateMenuProjectionTests: XCTestCase {
         let templates = [
             FileTemplate(id: id, name: "模板 📝", fileExtension: " .md ", content: "正文\n\"\\"),
             FileTemplate(name: "Disabled", fileExtension: "txt", content: "hidden", isEnabled: false),
-            FileTemplate(id: id, name: " \n", fileExtension: " . ", content: "historical duplicate"),
+            FileTemplate(name: " \n", fileExtension: " . ", content: "historical label"),
             FileTemplate(name: "Large", fileExtension: "txt", content: String(repeating: "正文", count: 8192))
         ]
         try write(templates)
@@ -71,10 +71,10 @@ final class TemplateMenuProjectionTests: XCTestCase {
         let id = UUID()
         let selected = FileTemplate(id: id, name: "Selected", fileExtension: "md", content: "正文 📝\n\"\\\u{0000}")
         let templates = [
-            FileTemplate(id: id, name: "Disabled duplicate", fileExtension: "txt", content: "disabled", isEnabled: false),
+            FileTemplate(name: "Disabled", fileExtension: "txt", content: "disabled", isEnabled: false),
             FileTemplate(name: "Other", fileExtension: "txt", content: String(repeating: "x", count: 16_384)),
             selected,
-            FileTemplate(id: id, name: "Later duplicate", fileExtension: "txt", content: "must not win")
+            FileTemplate(name: "Later", fileExtension: "txt", content: "other body")
         ]
         try write(templates)
         let reader = store()
@@ -84,6 +84,56 @@ final class TemplateMenuProjectionTests: XCTestCase {
         let missing = try reader.reloadCreationSnapshot(templateID: UUID())
         XCTAssertNil(missing.template)
         XCTAssertEqual(missing.menuEntries, snapshot.menuEntries)
+    }
+
+    func testAllReadProjectionsRejectDuplicateIDsAcrossFormatsAndEnabledStates() throws {
+        let selected = FileTemplate(name: "Selected", fileExtension: "txt", content: "selected body")
+        let duplicateID = UUID()
+        let reader = TemplateStore(defaults: defaults, storageURL: url, cachesReads: true,
+                                   cachesMenuReads: true, changeNotificationName: suite)
+        for version in [nil, 3, 4] as [Int?] {
+            for firstEnabled in [true, false] {
+                for secondEnabled in [true, false] {
+                    for sameContent in [true, false] {
+                        let first = FileTemplate(id: duplicateID, name: "Duplicate", fileExtension: "md",
+                                                 content: "first body", isEnabled: firstEnabled)
+                        var second = first
+                        second.isEnabled = secondEnabled
+                        if !sameContent { second.content = "different body" }
+                        try write([selected, first])
+                        XCTAssertEqual(try reader.reloadTemplates(), [selected, first])
+                        XCTAssertFalse(try reader.reloadMenuEntries().isEmpty)
+                        let templates = [selected, first, second]
+                        let records = try JSONSerialization.jsonObject(with: JSONEncoder().encode(templates))
+                        let object: Any
+                        if let version {
+                            object = ["format": "quickfile.template-library", "version": version, "templates": records]
+                        } else {
+                            object = records
+                        }
+                        let data = try JSONSerialization.data(withJSONObject: object)
+                        try data.write(to: url, options: .atomic)
+                        let reads: [() throws -> Void] = [
+                            { _ = try reader.loadTemplates() },
+                            { _ = try reader.reloadTemplates() },
+                            { _ = try reader.reloadMenuEntries() },
+                            { _ = try reader.reloadCreationSnapshot(templateID: selected.id) },
+                            { _ = try reader.reloadCreationSnapshot(templateID: duplicateID) },
+                            { _ = try reader.reloadCreationSnapshot(templateID: UUID()) }
+                        ]
+                        for read in reads {
+                            XCTAssertThrowsError(try read()) { error in
+                                guard case TemplateStore.StoreError.readFailed(let underlying) = error,
+                                      case DecodingError.dataCorrupted = underlying else {
+                                    return XCTFail("Expected duplicate library rejection: \(error)")
+                                }
+                            }
+                        }
+                        XCTAssertEqual(try Data(contentsOf: url), data)
+                    }
+                }
+            }
+        }
     }
 
     func testCreationReadsOnceAndDoesNotUseTheWholeLibraryDecoderOrCachedBodies() throws {

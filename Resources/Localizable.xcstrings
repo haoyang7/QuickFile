@@ -11951,6 +11951,24 @@
         }
       }
     },
+    "配置文件已更新，但无法确认完整写入。请重新加载并检查当前配置：%@": {
+      "comment": "Shared storage write warning after atomic publication. Argument 1 is the underlying system error. The new file is already visible; reload before deciding whether to save again.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The configuration file was updated, but the write could not be fully confirmed. Reload and check the current configuration: %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "配置文件已更新，但无法确认完整写入。请重新加载并检查当前配置：%@"
+          }
+        }
+      }
+    },
     "重名数量超过限制": {
       "comment": "Finder activity/failure classification shown in Diagnostics.",
       "extractionState": "manual",

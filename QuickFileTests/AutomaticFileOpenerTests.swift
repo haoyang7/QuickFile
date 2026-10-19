@@ -1,12 +1,23 @@
 import XCTest
 import os
+import QuickFileCore
 @testable import QuickFile
 
 @MainActor
 final class AutomaticFileOpenerTests: XCTestCase {
-    private let url = URL(fileURLWithPath: "/example/created.txt")
+    private func makeCreation() throws -> FileCreationResult {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/Temporary/review-findings/automatic-open-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
+        return try FileCreationService().createFile(for: .init(
+            template: FileTemplate(name: "Open", fileExtension: "txt", content: "created"),
+            destinationFolder: directory, requestedFilename: "created"
+        ))
+    }
 
     func testCallbackOwnsScopeAndReleasesBeforeReturningFailure() async throws {
+        let creation = try makeCreation()
         let releases = OSAllocatedUnfairLock(initialState: 0)
         let started = expectation(description: "system handoff")
         var callback: (@Sendable (Error?) -> Void)?
@@ -16,11 +27,11 @@ final class AutomaticFileOpenerTests: XCTestCase {
             XCTAssertTrue(required)
             return .init { releases.withLock { $0 += 1 } }
         }, open: { _, done in callback = done; started.fulfill() })
-        let task = Task { await opener.openCreatedFile(url, authorizationID: id, requiresAuthorization: true) }
+        let task = Task { await opener.openCreatedFile(creation, authorizationID: id, requiresAuthorization: true) }
         await fulfillment(of: [started], timeout: 2)
         XCTAssertEqual(releases.withLock { $0 }, 0)
         XCTAssertTrue(opener.isOccupied)
-        let busy = await opener.openCreatedFile(url, requiresAuthorization: true)
+        let busy = await opener.openCreatedFile(creation, requiresAuthorization: true)
         XCTAssertTrue(busy is AutomaticFileOpener.Failure)
         callback?(CocoaError(.fileReadNoPermission))
         let error = await task.value as NSError?
@@ -29,7 +40,8 @@ final class AutomaticFileOpenerTests: XCTestCase {
         XCTAssertFalse(opener.isOccupied)
     }
 
-    func testTimeoutDoesNotReleaseScopeOrAdmitMoreHandoffsAndLateCallbackRecovers() async {
+    func testTimeoutDoesNotReleaseScopeOrAdmitMoreHandoffsAndLateCallbackRecovers() async throws {
+        let creation = try makeCreation()
         let releases = OSAllocatedUnfairLock(initialState: 0)
         let started = expectation(description: "system handoff")
         var callback: (@Sendable (Error?) -> Void)?
@@ -37,13 +49,13 @@ final class AutomaticFileOpenerTests: XCTestCase {
         let opener = AutomaticFileOpener(timeoutNanoseconds: 100_000_000, prepare: { _, _, _ in
             .init { releases.withLock { $0 += 1 } }
         }, open: { _, done in opens += 1; callback = done; started.fulfill() })
-        let task = Task { await opener.openCreatedFile(url, requiresAuthorization: true) }
+        let task = Task { await opener.openCreatedFile(creation, requiresAuthorization: true) }
         await fulfillment(of: [started], timeout: 2)
         guard case AutomaticFileOpener.Failure.timedOut? = await task.value else { return XCTFail("Expected timeout") }
         XCTAssertTrue(opener.isOccupied)
         XCTAssertEqual(releases.withLock { $0 }, 0)
         for _ in 0..<3 {
-            guard case AutomaticFileOpener.Failure.busy? = await opener.openCreatedFile(url, requiresAuthorization: true) else {
+            guard case AutomaticFileOpener.Failure.busy? = await opener.openCreatedFile(creation, requiresAuthorization: true) else {
                 return XCTFail("Timeout must not re-admit while the OS still owns the handoff")
             }
         }
@@ -54,7 +66,8 @@ final class AutomaticFileOpenerTests: XCTestCase {
         XCTAssertEqual(releases.withLock { $0 }, 1)
     }
 
-    func testDeadlineDuringBookmarkResolutionNeverStartsLateSystemOpen() async {
+    func testDeadlineDuringBookmarkResolutionNeverStartsLateSystemOpen() async throws {
+        let creation = try makeCreation()
         let entered = expectation(description: "prepare")
         let gate = DispatchSemaphore(value: 0)
         let releases = OSAllocatedUnfairLock(initialState: 0)
@@ -63,7 +76,7 @@ final class AutomaticFileOpenerTests: XCTestCase {
             gate.wait()
             return .init { releases.withLock { $0 += 1 } }
         }, open: { _, _ in XCTFail("No late opening after a preparation timeout") })
-        let task = Task { await opener.openCreatedFile(url, requiresAuthorization: true) }
+        let task = Task { await opener.openCreatedFile(creation, requiresAuthorization: true) }
         await fulfillment(of: [entered], timeout: 2)
         guard case AutomaticFileOpener.Failure.timedOut? = await task.value else {
             gate.signal(); return XCTFail("Expected timeout")
@@ -75,15 +88,79 @@ final class AutomaticFileOpenerTests: XCTestCase {
         XCTAssertEqual(releases.withLock { $0 }, 1)
     }
 
-    func testDisabledAndRejectedAuthorizationDoNotOpenOrStrandAdmission() async {
+    func testDisabledAndRejectedAuthorizationDoNotOpenOrStrandAdmission() async throws {
+        let creation = try makeCreation()
         for enabled in [false, true] {
             let opener = AutomaticFileOpener(prepare: { _, _, _ in
                 if enabled { throw CocoaError(.fileReadNoPermission) }
                 return nil
             }, open: { _, _ in XCTFail("No admitted opening") })
-            let error = await opener.openCreatedFile(url, requiresAuthorization: true)
+            let error = await opener.openCreatedFile(creation, requiresAuthorization: true)
             XCTAssertEqual(error != nil, enabled)
             XCTAssertFalse(opener.isOccupied)
         }
+    }
+
+    func testUnchangedCreatedFileOpensAndReleasesScope() async throws {
+        let creation = try makeCreation()
+        let releases = OSAllocatedUnfairLock(initialState: 0)
+        var opened: [URL] = []
+        let opener = AutomaticFileOpener(prepare: { _, _, _ in
+            .init { releases.withLock { $0 += 1 } }
+        }, open: { url, done in opened.append(url); done(nil) })
+        let error = await opener.openCreatedFile(creation, requiresAuthorization: false)
+        XCTAssertNil(error)
+        XCTAssertEqual(opened, [creation.fileURL])
+        XCTAssertEqual(releases.withLock { $0 }, 1)
+        XCTAssertFalse(opener.isOccupied)
+    }
+
+    func testReplacementDuringPreparationRejectsHandoffAndReleasesScope() async throws {
+        for replacement in ["file", "directory", "symlink", "missing"] {
+            let creation = try makeCreation()
+            let entered = expectation(description: "prepare \(replacement)")
+            let gate = DispatchSemaphore(value: 0)
+            let releases = OSAllocatedUnfairLock(initialState: 0)
+            let opener = AutomaticFileOpener(prepare: { _, _, _ in
+                entered.fulfill()
+                gate.wait()
+                return .init { releases.withLock { $0 += 1 } }
+            }, open: { _, _ in XCTFail("Must not open a replaced or missing created file") })
+            let task = Task { await opener.openCreatedFile(creation, requiresAuthorization: false) }
+            await fulfillment(of: [entered], timeout: 2)
+            do {
+                let original = creation.fileURL.appendingPathExtension("original")
+                try FileManager.default.moveItem(at: creation.fileURL, to: original)
+                switch replacement {
+                case "file": try Data("replacement".utf8).write(to: creation.fileURL)
+                case "directory": try FileManager.default.createDirectory(at: creation.fileURL, withIntermediateDirectories: false)
+                case "symlink": try FileManager.default.createSymbolicLink(at: creation.fileURL, withDestinationURL: original)
+                default: break
+                }
+                gate.signal()
+                let error = await task.value
+                XCTAssertNotNil(error, replacement)
+                XCTAssertEqual(releases.withLock { $0 }, 1, replacement)
+                XCTAssertFalse(opener.isOccupied, replacement)
+                XCTAssertEqual(try String(contentsOf: original), "created")
+            } catch {
+                gate.signal()
+                _ = await task.value
+                throw error
+            }
+        }
+    }
+
+    func testMissingPublicationIdentityCannotBeRecapturedFromCurrentPath() async throws {
+        let creation = try makeCreation()
+        let unidentified = FileCreationResult(fileURL: creation.fileURL, didRenameForConflict: false)
+        let releases = OSAllocatedUnfairLock(initialState: 0)
+        let opener = AutomaticFileOpener(prepare: { _, _, _ in
+            .init { releases.withLock { $0 += 1 } }
+        }, open: { _, _ in XCTFail("A URL alone cannot establish publication identity") })
+        let error = await opener.openCreatedFile(unidentified, requiresAuthorization: false)
+        XCTAssertNotNil(error)
+        XCTAssertEqual(releases.withLock { $0 }, 1)
+        XCTAssertFalse(opener.isOccupied)
     }
 }

@@ -69,6 +69,15 @@ enum QuickFileSharedStorage {
 /// payload operations use opened parent descriptors and never follow a leaf symlink.
 /// This does not provide App Group's application-identity isolation from the same user.
 final class LocalSharedStorage: @unchecked Sendable {
+    struct PublishedWriteError: LocalizedError {
+        let underlyingError: NSError
+
+        var errorDescription: String? {
+            QuickFileLocalization.text(.init("配置文件已更新，但无法确认完整写入。请重新加载并检查当前配置：\(underlyingError.localizedDescription)",
+                comment: "Shared storage write warning after atomic publication. Argument 1 is the underlying system error. The new file is already visible; reload before deciding whether to save again."))
+        }
+    }
+
     let root: URL
     private struct Identity: Equatable {
         let device: dev_t
@@ -76,8 +85,12 @@ final class LocalSharedStorage: @unchecked Sendable {
         init(_ value: stat) { device = value.st_dev; inode = value.st_ino }
     }
     private let directories = OSAllocatedUnfairLock(initialState: [String: Identity]())
+    private let closeWrittenFile: @Sendable (Int32) -> Int32
 
-    init(root: URL) { self.root = root.standardizedFileURL }
+    init(root: URL, closeWrittenFile: @escaping @Sendable (Int32) -> Int32 = { Darwin.close($0) }) {
+        self.root = root.standardizedFileURL
+        self.closeWrittenFile = closeWrittenFile
+    }
 
     func prepare(_ directory: URL) throws {
         try withDirectory(directory) { _ in }
@@ -371,7 +384,11 @@ final class LocalSharedStorage: @unchecked Sendable {
             // before the first write. Cleanup cannot acquire a live writer's lock.
             let descriptor = openat(parent, temporary, O_WRONLY | O_CREAT | O_EXCL | O_EXLOCK | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, 0o600)
             guard descriptor >= 0 else { throw posixError() }
-            defer { close(descriptor); unlinkat(parent, temporary, 0) }
+            var needsClose = true
+            defer {
+                if needsClose { _ = closeWrittenFile(descriptor) }
+                unlinkat(parent, temporary, 0)
+            }
             try validateFile(descriptor: descriptor)
             try data.withUnsafeBytes { buffer in
                 var offset = 0
@@ -387,7 +404,13 @@ final class LocalSharedStorage: @unchecked Sendable {
             try validateDirectory(parent, at: url.deletingLastPathComponent())
             try validateTarget()
             guard renameat(parent, temporary, parent, url.lastPathComponent) == 0 else { throw posixError() }
-            if durable, fsync(parent) != 0 { throw posixError() }
+            var publicationError: NSError?
+            if durable, fsync(parent) != 0 { publicationError = posixError() }
+            // Keep O_EXLOCK through publication. Never retry close, including EINTR:
+            // the descriptor may already have been released and reused by another thread.
+            needsClose = false
+            if closeWrittenFile(descriptor) != 0, publicationError == nil { publicationError = posixError() }
+            if let publicationError { throw PublishedWriteError(underlyingError: publicationError) }
         }
     }
 
