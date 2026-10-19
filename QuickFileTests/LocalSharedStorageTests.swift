@@ -38,6 +38,29 @@ final class LocalSharedStorageTests: XCTestCase {
                              readTemplatesData: { try backend.read($0) })
     }
 
+    @MainActor
+    private func model(store: TemplateStore, baseline: [FileTemplate]) -> QuickFileViewModel {
+        let grants = AuthorizedDirectoryStore(defaults: nil,
+            localStorage: LocalSharedStorage(root: directory.appendingPathComponent("grants")),
+            persistentBookmarkCreator: { Data($0.path.utf8) }, transferBookmarkCreator: { Data($0.path.utf8) },
+            persistentBookmarkResolver: { .init(url: URL(fileURLWithPath: String(decoding: $0, as: UTF8.self)), isStale: false) },
+            transferBookmarkResolver: { .init(url: URL(fileURLWithPath: String(decoding: $0, as: UTF8.self)), isStale: false) },
+            startAccessing: { _ in true }, stopAccessing: { _ in })
+        return QuickFileViewModel(templateStore: store, templates: baseline, authorizedDirectoryStore: grants)
+    }
+
+    private func failNextPublishedClose() -> OSAllocatedUnfairLock<Int> {
+        let closes = OSAllocatedUnfairLock(initialState: 0)
+        storage = LocalSharedStorage(root: storage.root, closeWrittenFile: { descriptor in
+            let result = Darwin.close(descriptor)
+            guard result == 0 else { return result }
+            let fail = closes.withLock { value in value += 1; return value == 1 }
+            if fail { errno = EIO; return -1 }
+            return result
+        })
+        return closes
+    }
+
     func testPublishedWriteCloseErrorsPreserveNewFileAndAreNeverRetried() throws {
         for durable in [false, true] {
             for code in [EIO, EINTR] {
@@ -175,6 +198,137 @@ final class LocalSharedStorageTests: XCTestCase {
         XCTAssertFalse(message.contains(secret))
         XCTAssertNotEqual(message, QuickFileViewModel.templateOperationErrorMessage(ordinary))
         XCTAssertFalse(QuickFileViewModel.templateOperationErrorMessage(ordinary).contains(secret))
+        let recovery = TemplateStore.RecoveryError.replacementFailed(
+            backupURL: directory.appendingPathComponent("backup"), underlying: published)
+        XCTAssertEqual(QuickFileViewModel.TemplateLoadFailure(recovery), .writeUnconfirmed)
+        XCTAssertEqual(QuickFileViewModel.templateOperationErrorMessage(recovery), message)
+    }
+
+    @MainActor
+    func testPublishedTemplateCopyFailureCannotAppendAgainBeforeReload() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "keep")
+        try templates().saveTemplates([original], expectedTemplates: BuiltInTemplates.all)
+        let closes = failNextPublishedClose()
+        let writer = templates()
+        let model = model(store: writer, baseline: [original])
+        var editor = TemplateEditorState(template: original, isCopy: true)
+        editor.draft.content = "copy draft"
+        let draft = editor.draft
+        XCTAssertTrue(editor.beginSave())
+        do {
+            _ = try await model.saveTemplateAsNew(editor.makeTemplate())
+            XCTFail("A published copy must not report confirmed success")
+        } catch {
+            editor.finishSave(error: error)
+        }
+        let published = try writer.reloadTemplates()
+        XCTAssertEqual(published.count, 2)
+        XCTAssertEqual(published.first, original)
+        XCTAssertEqual(published.last?.content, "copy draft")
+        XCTAssertEqual(model.templates, [original])
+        XCTAssertEqual(model.templateLoadFailure, .writeUnconfirmed)
+        XCTAssertEqual(editor.draft, draft)
+        XCTAssertEqual(editor.errorMessage, QuickFileViewModel.TemplateLoadFailure.writeUnconfirmed.message)
+        let publishedBytes = try storage.read(libraryURL)
+        XCTAssertTrue(editor.beginSave())
+        do {
+            _ = try await model.saveTemplateAsNew(editor.makeTemplate())
+            XCTFail("Retry must not append another UUID after a published copy")
+        } catch {
+            editor.finishSave(error: error)
+            guard case QuickFileViewModel.TemplateSaveError.notLoaded = error else {
+                return XCTFail("Expected a required reload, got \(error)")
+            }
+        }
+        XCTAssertEqual(closes.withLock { $0 }, 1)
+        XCTAssertEqual(try storage.read(libraryURL), publishedBytes)
+        XCTAssertEqual(editor.draft, draft)
+        await model.reloadTemplates()
+        XCTAssertNil(model.templateLoadFailure)
+        XCTAssertEqual(model.templates, published)
+    }
+
+    @MainActor
+    func testPublishedTemplateImportFailureRequiresReloadAndPreservesAppliedPlan() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "keep")
+        let addition = FileTemplate(name: "Imported", fileExtension: "md", content: "new")
+        try templates().saveTemplates([original], expectedTemplates: BuiltInTemplates.all)
+        let closes = failNextPublishedClose()
+        let writer = templates()
+        let model = model(store: writer, baseline: [original])
+        let url = directory.appendingPathComponent("import.json")
+        try TemplateTransferFile.write(TemplateTransferBundle(templates: [addition]), to: url)
+        let preview = try await model.prepareTemplateImport(from: url)
+        do {
+            try await model.importTemplates(preview)
+            XCTFail("A published import must remain unconfirmed")
+        } catch {
+            let failure = try XCTUnwrap(error as? TemplateStore.StoreError)
+            XCTAssertTrue(failure.requiresReloadAfterSave)
+        }
+        XCTAssertEqual(try writer.reloadTemplates(), preview.plan.templates)
+        XCTAssertEqual(model.templates, [original])
+        XCTAssertEqual(model.templateLoadFailure, .writeUnconfirmed)
+        let publishedBytes = try storage.read(libraryURL)
+        do {
+            try await model.importTemplates(preview)
+            XCTFail("An unconfirmed import cannot reuse its old preview")
+        } catch {
+            guard case QuickFileViewModel.TemplateSaveError.notLoaded = error else {
+                return XCTFail("Expected a required reload, got \(error)")
+            }
+        }
+        XCTAssertEqual(closes.withLock { $0 }, 1)
+        XCTAssertEqual(try storage.read(libraryURL), publishedBytes)
+        await model.reloadTemplates()
+        XCTAssertNil(model.templateLoadFailure)
+        XCTAssertEqual(model.templates, preview.plan.templates)
+        let refreshed = try await model.prepareTemplateImport(from: url)
+        XCTAssertEqual(refreshed.plan.addedCount, 0)
+        try await model.importTemplates(refreshed)
+        XCTAssertEqual(closes.withLock { $0 }, 1)
+    }
+
+    @MainActor
+    func testPublishedTemplateRecoveryFailurePreservesBackupAndRequiresReload() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "keep")
+        try templates().saveTemplates([original], expectedTemplates: BuiltInTemplates.all)
+        let malformed = Data("{broken configuration".utf8)
+        try storage.write(malformed, to: libraryURL)
+        let closes = failNextPublishedClose()
+        let writer = templates()
+        let model = model(store: writer, baseline: [original])
+        await model.reloadTemplates()
+        XCTAssertEqual(model.templateLoadFailure, .malformedConfiguration)
+        let preview = try await model.prepareTemplateRecovery()
+        do {
+            try await model.recoverTemplates(preview)
+            XCTFail("A published recovery must remain unconfirmed")
+        } catch {
+            XCTAssertEqual(QuickFileViewModel.TemplateLoadFailure(error), .writeUnconfirmed)
+            XCTAssertEqual(QuickFileViewModel.templateOperationErrorMessage(error),
+                           QuickFileViewModel.TemplateLoadFailure.writeUnconfirmed.message)
+        }
+        XCTAssertEqual(try writer.reloadTemplates(), preview.templates)
+        XCTAssertEqual(model.templates, [original])
+        XCTAssertEqual(model.templateLoadFailure, .writeUnconfirmed)
+        XCTAssertFalse(try XCTUnwrap(model.templateLoadFailure).offersConfigurationRecovery)
+        let backup = try XCTUnwrap(model.recoveryBackupURL)
+        XCTAssertEqual(try Data(contentsOf: backup.appendingPathComponent("templates.original.json")), malformed)
+        let publishedBytes = try storage.read(libraryURL)
+        do {
+            try await model.recoverTemplates(preview)
+            XCTFail("The stale recovery must not be retried")
+        } catch {
+            guard case TemplateStore.RecoveryError.notRecoverable = error else {
+                return XCTFail("Expected an explicit reload before any further recovery, got \(error)")
+            }
+        }
+        XCTAssertEqual(closes.withLock { $0 }, 1)
+        XCTAssertEqual(try storage.read(libraryURL), publishedBytes)
+        await model.reloadTemplates()
+        XCTAssertNil(model.templateLoadFailure)
+        XCTAssertEqual(model.templates, preview.templates)
     }
 
     func testStorageModeMustMatchTheCompiledProduct() {

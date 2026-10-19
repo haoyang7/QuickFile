@@ -52,8 +52,15 @@ final class QuickFileViewModel: ObservableObject {
                     switch recoveryError {
                     case .configurationChanged, .notRecoverable:
                         self = .configurationChanged
-                    case .backupFailed, .replacementFailed:
+                    case .backupFailed:
                         self = .unreadable
+                    case let .replacementFailed(_, cause):
+                        if let storeError = cause as? TemplateStore.StoreError,
+                           storeError.requiresReloadAfterSave {
+                            self = .writeUnconfirmed
+                        } else {
+                            self = .unreadable
+                        }
                     }
                     return
                 }
@@ -128,6 +135,9 @@ final class QuickFileViewModel: ObservableObject {
             case .backupFailed:
                 return QuickFileLocalization.text(.init("无法备份恢复前状态，恢复已停止，未写入替代配置。请检查存储空间和访问权限后重试。"))
             case .replacementFailed:
+                if TemplateLoadFailure(recoveryError) == .writeUnconfirmed {
+                    return TemplateLoadFailure.writeUnconfirmed.message
+                }
                 return QuickFileLocalization.text(.init("恢复前状态已备份，但恢复写入失败。请保留备份，并在检查存储空间和访问权限后重新加载。"))
             }
         }
@@ -538,6 +548,7 @@ final class QuickFileViewModel: ObservableObject {
     /// Conflict recovery is a fresh read plus one compare-and-swap append, never a force-save.
     @discardableResult
     func saveTemplateAsNew(_ draft: FileTemplate) async throws -> FileTemplate.ID {
+        guard templateLoadFailure != .writeUnconfirmed else { throw TemplateSaveError.notLoaded }
         guard !isLoadingTemplates, !isSavingTemplates else { throw TemplateSaveError.busy }
         isSavingTemplates = true
         templateStateGeneration &+= 1
@@ -1413,17 +1424,7 @@ final class QuickFileViewModel: ObservableObject {
                 try store.saveTemplates(updatedTemplates, expectedTemplates: expectedTemplates)
             }.get()
         } catch let error as TemplateStore.StoreError {
-            switch error {
-            case .configurationChanged, .readFailed, .savedConfigurationMissing, .sharedDefaultsUnavailable:
-                // A failed preflight read invalidates the editing snapshot until an explicit reload.
-                templateLoadFailure = TemplateLoadFailure(error)
-                templateStateGeneration &+= 1
-            case .persistenceFailed:
-                if error.requiresReloadAfterSave {
-                    templateLoadFailure = .writeUnconfirmed
-                    templateStateGeneration &+= 1
-                }
-            }
+            invalidateTemplatesAfterFailure(error)
             throw error
         }
         publishTemplates(updatedTemplates, successMessage: successMessage)
@@ -1450,15 +1451,20 @@ final class QuickFileViewModel: ObservableObject {
                 // Require a fresh load rather than keeping a stale repair action.
                 templateLoadFailure = .configurationChanged
                 templateStateGeneration &+= 1
-            case .backupFailed, .replacementFailed:
+            case .backupFailed:
                 break
+            case .replacementFailed:
+                if TemplateLoadFailure(recoveryError) == .writeUnconfirmed {
+                    invalidateTemplatesAfterFailure(error)
+                }
             }
         }
     }
 
     private func invalidateTemplatesAfterFailure(_ error: Error) {
         if let storeError = error as? TemplateStore.StoreError,
-           case .persistenceFailed = storeError { return }
+           case .persistenceFailed = storeError,
+           !storeError.requiresReloadAfterSave { return }
         templateLoadFailure = TemplateLoadFailure(error)
         templateStateGeneration &+= 1
     }

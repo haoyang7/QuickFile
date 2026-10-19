@@ -50,7 +50,7 @@ struct TemplateTransferPreviewView: View {
             }
             if let errorMessage {
                 Text(errorMessage).foregroundColor(.red).fixedSize(horizontal: false, vertical: true)
-                Text("未应用本次计划。请取消后重新选择文件并检查最新预览。")
+                Text("请取消后重新加载模板，并检查当前配置后再操作。")
                     .font(.caption).foregroundColor(.secondary)
             }
             HStack {

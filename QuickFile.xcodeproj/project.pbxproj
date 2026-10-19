@@ -43,6 +43,7 @@
 		1F8A605E74BFE477ED913244 /* FinderDirectoryMonitorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB08CFD5F41349A6263CAAF3 /* FinderDirectoryMonitorTests.swift */; };
 		236D42DF775C78C02C33DF2D /* AutomaticFileOpenerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECB5E16CD26386BA5407C462 /* AutomaticFileOpenerTests.swift */; };
 		244F7EFEC94360172C60F89E /* FinderExtensionProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70B14256AB2881C0C52939CF /* FinderExtensionProbeTests.swift */; };
+		246DCA1879C791C4CC687F95 /* TemplateTransferPreviewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85A0C5D61BE4BE60096EA1A6 /* TemplateTransferPreviewTests.swift */; };
 		26AF47FF3238175D2E2A9A75 /* FinderAuthorizationRequestPump.swift in Sources */ = {isa = PBXBuildFile; fileRef = D26E135E50634FFDBF4128EC /* FinderAuthorizationRequestPump.swift */; };
 		298A6055FD6EF5F945354F13 /* FinderRequestRecoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48448018DB0436AD4C4D9626 /* FinderRequestRecoveryTests.swift */; };
 		2E12CAA1D813598ACFA17DB5 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 64C4F1DBD9B50D4CAC4EF89F /* Localizable.xcstrings */; };
@@ -365,6 +366,7 @@
 		83027CE6F9EA258812F671DF /* FinderTemplateCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderTemplateCacheTests.swift; sourceTree = "<group>"; };
 		832178F2716872E94255C60E /* CreateFileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CreateFileView.swift; sourceTree = "<group>"; };
 		84BFE4E50A70D306F08788A8 /* FinderMenuSettingsCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderMenuSettingsCache.swift; sourceTree = "<group>"; };
+		85A0C5D61BE4BE60096EA1A6 /* TemplateTransferPreviewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateTransferPreviewTests.swift; sourceTree = "<group>"; };
 		86D9C41A4808BC580B673DFD /* FileCreationSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileCreationSettingsStore.swift; sourceTree = "<group>"; };
 		88A7D64418F0FDA9A5820992 /* TemplateStoreFailureClassifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateStoreFailureClassifier.swift; sourceTree = "<group>"; };
 		8B1F48F3EB5D4B34950FB0E1 /* FinderMenuSettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderMenuSettingsStoreTests.swift; sourceTree = "<group>"; };
@@ -614,6 +616,7 @@
 				1607C8C851A9225BA5687E37 /* TemplateRefreshTests.swift */,
 				B5FDAA0D4D2FB8BB2346AF37 /* TemplateRendererTests.swift */,
 				A3317EF63C18D53876BA073B /* TemplateStoreTests.swift */,
+				85A0C5D61BE4BE60096EA1A6 /* TemplateTransferPreviewTests.swift */,
 				D477985883430AB3E9EFCBD1 /* TemplateTransferTests.swift */,
 				4683F3DF77895DDBE0932A69 /* UpdateControllerTests.swift */,
 			);
@@ -1203,6 +1206,7 @@
 				D060545AD05E30FB5650E068 /* TemplateRefreshTests.swift in Sources */,
 				E320FA91337CC73DB0820C18 /* TemplateRendererTests.swift in Sources */,
 				5C976D22A21F2A821B4B313E /* TemplateStoreTests.swift in Sources */,
+				246DCA1879C791C4CC687F95 /* TemplateTransferPreviewTests.swift in Sources */,
 				D98CF7C54016330023A9889C /* TemplateTransferTests.swift in Sources */,
 				ACF061662DAB6CBFD92264F7 /* UpdateControllerTests.swift in Sources */,
 			);
@@ -1356,7 +1360,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 113;
+				CURRENT_PROJECT_VERSION = 114;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -1588,7 +1592,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 113;
+				CURRENT_PROJECT_VERSION = 114;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;

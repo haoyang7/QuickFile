@@ -7937,24 +7937,6 @@
         }
       }
     },
-    "未应用本次计划。请取消后重新选择文件并检查最新预览。": {
-      "comment": "Template import/recovery preview before changes are applied.",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "This plan was not applied. Cancel, choose the file again, and review the latest preview."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "未应用本次计划。请取消后重新选择文件并检查最新预览。"
-          }
-        }
-      }
-    },
     "未找到扩展注册记录": {
       "comment": "Finder extension installation/registration diagnostics; evidence is not proof of successful creation.",
       "extractionState": "manual",
@@ -11317,6 +11299,24 @@
           "stringUnit": {
             "state": "translated",
             "value": "请先选择目标文件夹和模板。"
+          }
+        }
+      }
+    },
+    "请取消后重新加载模板，并检查当前配置后再操作。": {
+      "comment": "Safe guidance after a template import or recovery commit failed; the plan may already have been published.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cancel, reload templates, and check the current configuration before continuing."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "请取消后重新加载模板，并检查当前配置后再操作。"
           }
         }
       }
