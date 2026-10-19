@@ -24,7 +24,7 @@ enum TemplateManagerConfirmation: Identifiable {
 }
 
 /// Window-local selection repair. All inputs describe the state after persistence
-/// completes; never retain a template inventory across the asynchronous deletion.
+/// completes; never retain a template inventory across an asynchronous mutation.
 enum TemplateManagerSelection {
     static func afterDeletion(
         of deletedID: FileTemplate.ID,
@@ -36,6 +36,17 @@ enum TemplateManagerSelection {
         // Filters and inventory may have changed while saving. Deliberately pick
         // the first currently visible survivor, or nil when the list is empty.
         return firstVisibleID
+    }
+
+    static func afterRestore(
+        succeeded: Bool,
+        originalSelectionID: FileTemplate.ID?,
+        currentSelectionID: FileTemplate.ID?,
+        visibleIDs: [FileTemplate.ID]
+    ) -> FileTemplate.ID? {
+        guard succeeded, currentSelectionID == originalSelectionID else { return currentSelectionID }
+        if let currentSelectionID, visibleIDs.contains(currentSelectionID) { return currentSelectionID }
+        return visibleIDs.first
     }
 }
 
@@ -258,9 +269,13 @@ struct TemplateManagerView: View {
                     primaryButton: .destructive(Text("恢复")) {
                         let selection = selectedTemplateID
                         Task {
-                            if await viewModel.restoreBuiltInTemplates(), selectedTemplateID == selection {
-                                selectedTemplateID = viewModel.templates.first?.id
-                            }
+                            let succeeded = await viewModel.restoreBuiltInTemplates()
+                            selectedTemplateID = TemplateManagerSelection.afterRestore(
+                                succeeded: succeeded,
+                                originalSelectionID: selection,
+                                currentSelectionID: selectedTemplateID,
+                                visibleIDs: visibleTemplates.map(\.id)
+                            )
                         }
                     }, secondaryButton: .cancel())
             case .exportAll:

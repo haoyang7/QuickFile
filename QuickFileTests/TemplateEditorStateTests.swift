@@ -119,6 +119,91 @@ final class TemplateManagerSelectionTests: XCTestCase {
         ))
     }
 
+    func testRestoringDefaultsPreservesVisibleMarkdownSelection() throws {
+        let current = model(BuiltInTemplates.all)
+        let markdown = try XCTUnwrap(current.templates.first { $0.fileExtension == "md" })
+        XCTAssertNotEqual(current.templates.first?.id, markdown.id)
+        for search in ["", " Markdown "] {
+            XCTAssertEqual(TemplateManagerSelection.afterRestore(
+                succeeded: true, originalSelectionID: markdown.id, currentSelectionID: markdown.id,
+                visibleIDs: current.filteredTemplates(search: search).map(\.id)
+            ), markdown.id)
+        }
+    }
+
+    func testRestoringDefaultsReplacesRemovedOrAbsentSelectionWithFirstVisibleTemplate() throws {
+        let current = model(BuiltInTemplates.all)
+        let markdown = try XCTUnwrap(current.templates.first { $0.fileExtension == "md" })
+        for selection in [UUID(), nil] as [UUID?] {
+            XCTAssertEqual(TemplateManagerSelection.afterRestore(
+                succeeded: true, originalSelectionID: selection, currentSelectionID: selection,
+                visibleIDs: current.filteredTemplates(search: "md").map(\.id)
+            ), markdown.id)
+        }
+    }
+
+    func testRestoringDefaultsReplacesSelectionExcludedBySearch() throws {
+        let current = model(BuiltInTemplates.all)
+        let word = try XCTUnwrap(current.templates.first { $0.fileExtension == "docx" })
+        let markdown = try XCTUnwrap(current.templates.first { $0.fileExtension == "md" })
+        XCTAssertEqual(TemplateManagerSelection.afterRestore(
+            succeeded: true, originalSelectionID: word.id, currentSelectionID: word.id,
+            visibleIDs: current.filteredTemplates(search: "Markdown").map(\.id)
+        ), markdown.id)
+    }
+
+    func testRestoringDefaultsClearsSelectionWhenNoTemplatesAreVisible() {
+        let selected = template("Disabled", enabled: false)
+        let current = model([selected])
+        for visible in [current.filteredTemplates(search: "missing"),
+                        current.filteredTemplates(search: "", enabledOnly: true)] {
+            XCTAssertNil(TemplateManagerSelection.afterRestore(
+                succeeded: true, originalSelectionID: selected.id, currentSelectionID: selected.id,
+                visibleIDs: visible.map(\.id)
+            ))
+        }
+    }
+
+    func testRestoreCompletionPreservesNewerOrExplicitlyClearedSelection() {
+        let original = UUID()
+        for selection in [UUID(), nil] as [UUID?] {
+            XCTAssertEqual(TemplateManagerSelection.afterRestore(
+                succeeded: true, originalSelectionID: original, currentSelectionID: selection,
+                visibleIDs: BuiltInTemplates.all.map(\.id)
+            ), selection)
+        }
+    }
+
+    func testFailedRestoreKeepsExistingOrNewerSelectionIncludingNil() {
+        let original = UUID()
+        for selection in [original, UUID(), nil] as [UUID?] {
+            XCTAssertEqual(TemplateManagerSelection.afterRestore(
+                succeeded: false, originalSelectionID: original, currentSelectionID: selection,
+                visibleIDs: BuiltInTemplates.all.map(\.id)
+            ), selection)
+        }
+    }
+
+    func testRestoreCompletionUsesLatestSearchEnabledFilterAndInventory() {
+        var selected = template("Old selection")
+        var current = model([selected, template("Old survivor")])
+        var search = "old"
+        var enabledOnly = false
+        XCTAssertEqual(current.filteredTemplates(search: search, enabledOnly: enabledOnly).first?.id, selected.id)
+
+        // These inputs are read when restoration completes, after both filters
+        // and the inventory may have changed during the save's suspension.
+        selected.isEnabled = false
+        let latestSurvivor = template("New survivor")
+        current = model([selected, template("New disabled", enabled: false), template("Other"), latestSurvivor])
+        search = "new"
+        enabledOnly = true
+        XCTAssertEqual(TemplateManagerSelection.afterRestore(
+            succeeded: true, originalSelectionID: selected.id, currentSelectionID: selected.id,
+            visibleIDs: current.filteredTemplates(search: search, enabledOnly: enabledOnly).map(\.id)
+        ), latestSurvivor.id)
+    }
+
     private func template(_ name: String, fileExtension: String = "txt", enabled: Bool = true) -> FileTemplate {
         FileTemplate(name: name, fileExtension: fileExtension, content: "", isEnabled: enabled)
     }
