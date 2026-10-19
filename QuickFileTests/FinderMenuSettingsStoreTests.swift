@@ -1,4 +1,6 @@
 import XCTest
+import Darwin
+import os
 @testable import QuickFileCore
 @testable import QuickFileInfrastructure
 
@@ -166,6 +168,58 @@ final class FinderMenuSettingsStoreTests: XCTestCase {
             try FileManager.default.contentsOfDirectory(atPath: directoryURL.path).sorted(),
             (["finder-menu-settings.v1.json"] + templates).sorted()
         )
+    }
+
+    func testPublishedCloseFailureRequiresReloadAndReportsAlreadyUpdatedSettings() throws {
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let root = repository.appendingPathComponent(".build/Temporary/pr34-p2/menu-store-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        let reader = FinderMenuSettingsStore(localStorage: LocalSharedStorage(root: root))
+        let original = try FinderMenuDisplayLimit(maximumCount: 4)
+        let updated = try FinderMenuDisplayLimit(maximumCount: 8)
+        try reader.save(original)
+        let closes = OSAllocatedUnfairLock(initialState: 0)
+        let writer = FinderMenuSettingsStore(localStorage: LocalSharedStorage(root: root, closeWrittenFile: { descriptor in
+            let result = Darwin.close(descriptor)
+            let isFirst = closes.withLock { count in
+                count += 1
+                return count == 1
+            }
+            guard result == 0, isFirst else { return result }
+            errno = EIO
+            return -1
+        }))
+
+        XCTAssertThrowsError(try writer.save(updated)) { error in
+            guard let error = error as? FinderMenuSettingsStore.StoreError,
+                  case let .saveFailed(cause) = error,
+                  let published = cause as? LocalSharedStorage.PublishedWriteError else {
+                return XCTFail("Expected an already-published save error, got \(error)")
+            }
+            XCTAssertTrue(error.requiresReloadAfterSave)
+            XCTAssertEqual(published.underlyingError.code, Int(EIO))
+            XCTAssertEqual(error.localizedDescription, "Finder 菜单设置已更新，但无法确认完整写入。请重新加载并检查当前设置。")
+            XCTAssertFalse(error.localizedDescription.contains("原设置未更改"))
+            XCTAssertFalse(error.localizedDescription.contains(published.underlyingError.localizedDescription))
+        }
+        XCTAssertEqual(closes.withLock { $0 }, 1)
+        XCTAssertEqual(try reader.load(), updated)
+        try writer.save(original)
+        XCTAssertEqual(try reader.load(), original)
+    }
+
+    func testOnlyPublishedSaveErrorsRequireReload() {
+        let ordinary = NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+        let published = LocalSharedStorage.PublishedWriteError(underlyingError: ordinary)
+        let otherErrors: [FinderMenuSettingsStore.StoreError] = [
+            .unavailable, .malformed, .readFailed(ordinary), .readFailed(published), .saveFailed(ordinary)
+        ]
+        for error in otherErrors {
+            XCTAssertFalse(error.requiresReloadAfterSave, "\(error)")
+        }
+        XCTAssertTrue(FinderMenuSettingsStore.StoreError.saveFailed(ordinary).localizedDescription.contains("原设置未更改"))
     }
 
     func testSaveNotifiesIndependentReadersOnlyAfterNewValueIsReadable() throws {

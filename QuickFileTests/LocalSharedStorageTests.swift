@@ -97,6 +97,86 @@ final class LocalSharedStorageTests: XCTestCase {
         XCTAssertEqual(try writer.reloadTemplates(), updated)
     }
 
+    @MainActor
+    func testPublishedTemplateCloseFailurePreservesDraftAndBlocksStaleSavesUntilReload() async throws {
+        let original = FileTemplate(name: "Before", fileExtension: "txt", content: "old")
+        try templates().saveTemplates([original], expectedTemplates: BuiltInTemplates.all)
+        let closes = OSAllocatedUnfairLock(initialState: 0)
+        storage = LocalSharedStorage(root: storage.root, closeWrittenFile: { descriptor in
+            let result = Darwin.close(descriptor)
+            guard result == 0 else { return result }
+            let fail = closes.withLock { value in value += 1; return value == 1 }
+            if fail { errno = EIO; return -1 }
+            return result
+        })
+        let writer = templates()
+        let grants = AuthorizedDirectoryStore(defaults: nil,
+            localStorage: LocalSharedStorage(root: directory.appendingPathComponent("grants")),
+            persistentBookmarkCreator: { Data($0.path.utf8) }, transferBookmarkCreator: { Data($0.path.utf8) },
+            persistentBookmarkResolver: { .init(url: URL(fileURLWithPath: String(decoding: $0, as: UTF8.self)), isStale: false) },
+            transferBookmarkResolver: { .init(url: URL(fileURLWithPath: String(decoding: $0, as: UTF8.self)), isStale: false) },
+            startAccessing: { _ in true }, stopAccessing: { _ in })
+        let model = QuickFileViewModel(templateStore: writer, templates: [original],
+                                      authorizedDirectoryStore: grants)
+        var editor = TemplateEditorState(template: original)
+        editor.draft.content = "published draft"
+        let draft = editor.draft
+        let updated = try draft.makeTemplate()
+        XCTAssertTrue(editor.beginSave())
+        do {
+            try await model.saveTemplate(updated, replacing: original)
+            XCTFail("A final close failure must remain visible")
+        } catch {
+            let failure = try XCTUnwrap(error as? TemplateStore.StoreError)
+            XCTAssertTrue(failure.requiresReloadAfterSave)
+            editor.finishSave(error: error)
+        }
+        XCTAssertEqual(try writer.reloadTemplates(), [updated])
+        XCTAssertEqual(model.templates, [original])
+        XCTAssertEqual(model.templateLoadFailure, .writeUnconfirmed)
+        XCTAssertEqual(editor.draft, draft)
+        XCTAssertEqual(editor.errorMessage, QuickFileViewModel.TemplateLoadFailure.writeUnconfirmed.message)
+        XCTAssertEqual(editor.requestDismissal(), .confirmDiscard)
+        do {
+            try await model.saveTemplate(updated, replacing: original)
+            XCTFail("The old baseline must not be retried")
+        } catch {
+            guard case QuickFileViewModel.TemplateSaveError.notLoaded = error else {
+                return XCTFail("Expected a required reload, got \(error)")
+            }
+        }
+        XCTAssertEqual(closes.withLock { $0 }, 1)
+        await model.reloadTemplates()
+        XCTAssertNil(model.templateLoadFailure)
+        XCTAssertEqual(model.templates, [updated])
+        var next = updated
+        next.content = "after reload"
+        try await model.saveTemplate(next, replacing: updated)
+        XCTAssertEqual(model.templates, [next])
+        XCTAssertEqual(try writer.reloadTemplates(), [next])
+        XCTAssertEqual(closes.withLock { $0 }, 2)
+    }
+
+    @MainActor
+    func testPublishedTemplateErrorPresentationIsSanitizedWithoutChangingOrdinaryFailures() {
+        let secret = "/private/fixture/template-body"
+        let underlying = NSError(domain: NSPOSIXErrorDomain, code: Int(EIO),
+                                 userInfo: [NSLocalizedDescriptionKey: secret])
+        let published = TemplateStore.StoreError.persistenceFailed(
+            LocalSharedStorage.PublishedWriteError(underlyingError: underlying))
+        let ordinary = TemplateStore.StoreError.persistenceFailed(underlying)
+        let message = QuickFileViewModel.templateOperationErrorMessage(published)
+        XCTAssertTrue(published.requiresReloadAfterSave)
+        XCTAssertFalse(ordinary.requiresReloadAfterSave)
+        XCTAssertFalse(TemplateStore.StoreError.configurationChanged.requiresReloadAfterSave)
+        XCTAssertEqual(QuickFileViewModel.TemplateLoadFailure(published), .writeUnconfirmed)
+        XCTAssertFalse(QuickFileViewModel.TemplateLoadFailure(published).offersConfigurationRecovery)
+        XCTAssertEqual(message, QuickFileViewModel.TemplateLoadFailure.writeUnconfirmed.message)
+        XCTAssertFalse(message.contains(secret))
+        XCTAssertNotEqual(message, QuickFileViewModel.templateOperationErrorMessage(ordinary))
+        XCTAssertFalse(QuickFileViewModel.templateOperationErrorMessage(ordinary).contains(secret))
+    }
+
     func testStorageModeMustMatchTheCompiledProduct() {
         XCTAssertTrue(QuickFileSharedStorage.configurationMatches(["QuickFileStorageMode": QuickFileStorageMode.current.rawValue]))
         XCTAssertFalse(QuickFileSharedStorage.configurationMatches([:]))

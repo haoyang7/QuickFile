@@ -24,6 +24,7 @@ final class QuickFileViewModel: ObservableObject {
         case storageUnavailable
         case malformedConfiguration
         case unreadable
+        case writeUnconfirmed
 
         init(_ error: Error) {
             var underlying = error
@@ -37,6 +38,10 @@ final class QuickFileViewModel: ObservableObject {
                     case .sharedDefaultsUnavailable: self = .storageUnavailable; return
                     case let .readFailed(cause): underlying = cause; continue
                     case let .persistenceFailed(cause):
+                        if storeError.requiresReloadAfterSave {
+                            self = .writeUnconfirmed
+                            return
+                        }
                         // A write/migration failure is not evidence of malformed input.
                         mayClassifyMalformed = false
                         underlying = cause
@@ -107,6 +112,8 @@ final class QuickFileViewModel: ObservableObject {
                 return QuickFileLocalization.text(.init("模板配置格式无效，无法读取。可重新加载，或先备份原配置再恢复。"))
             case .unreadable:
                 return QuickFileLocalization.text(.init("暂时无法读取模板配置。请稍后重试；读取失败不代表配置损坏。"))
+            case .writeUnconfirmed:
+                return QuickFileLocalization.text(.init("模板配置可能已更新，但无法确认完整写入。请保留草稿，重新加载模板并检查当前配置。"))
             }
         }
     }
@@ -125,7 +132,7 @@ final class QuickFileViewModel: ObservableObject {
             }
         }
         guard let storeError = error as? TemplateStore.StoreError else { return error.localizedDescription }
-        if case .persistenceFailed = storeError {
+        if case .persistenceFailed = storeError, !storeError.requiresReloadAfterSave {
             return QuickFileLocalization.text(.init("未能保存模板，当前修改未保存。请检查存储空间和访问权限后重试，或复制草稿。"))
         }
         return TemplateLoadFailure(storeError).message
@@ -1412,7 +1419,10 @@ final class QuickFileViewModel: ObservableObject {
                 templateLoadFailure = TemplateLoadFailure(error)
                 templateStateGeneration &+= 1
             case .persistenceFailed:
-                break
+                if error.requiresReloadAfterSave {
+                    templateLoadFailure = .writeUnconfirmed
+                    templateStateGeneration &+= 1
+                }
             }
             throw error
         }

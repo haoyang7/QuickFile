@@ -28,6 +28,11 @@ public final class TemplateStore: @unchecked Sendable {
         case savedConfigurationMissing
         case persistenceFailed(Error)
 
+        public var requiresReloadAfterSave: Bool {
+            guard case let .persistenceFailed(error) = self else { return false }
+            return error is LocalSharedStorage.PublishedWriteError
+        }
+
         public var errorDescription: String? {
             switch self {
             case .configurationChanged:

@@ -20,6 +20,7 @@ final class FinderMenuSettingsViewModel: ObservableObject {
     @Published private(set) var hasLoaded = false
     @Published private(set) var isLoading = false
     @Published private(set) var isSaving = false
+    @Published private(set) var requiresReload = false
     var loadError: String? { loadFailure?.localizedDescription }
     @Published private var loadFailure: Error?
     private enum Feedback {
@@ -62,7 +63,7 @@ final class FinderMenuSettingsViewModel: ObservableObject {
     }
 
     var canSave: Bool {
-        guard canEdit else { return false }
+        guard canEdit, !requiresReload else { return false }
         // Keep Save available for invalid drafts so validation explains the problem.
         guard let draft = try? draftLimit() else { return true }
         return loadError != nil || draft != savedLimit
@@ -91,6 +92,7 @@ final class FinderMenuSettingsViewModel: ObservableObject {
         let generation = draftGeneration
         let load = loadSetting
         let result = await BackgroundWork.result { try load() }
+        requiresReload = false
         switch result {
         case let .success(value):
             savedLimit = value
@@ -106,7 +108,7 @@ final class FinderMenuSettingsViewModel: ObservableObject {
 
     @discardableResult
     func save() async -> Bool {
-        guard canEdit else { return false }
+        guard canEdit, !requiresReload else { return false }
         let value: FinderMenuDisplayLimit
         do {
             value = try draftLimit()
@@ -133,7 +135,8 @@ final class FinderMenuSettingsViewModel: ObservableObject {
             }
             return true
         case let .failure(error):
-            // Keep the failed draft for retry, without changing the committed value.
+            // A published write invalidates the saved baseline until a fresh read.
+            requiresReload = (error as? FinderMenuSettingsStore.StoreError)?.requiresReloadAfterSave == true
             feedback = .failure(error)
             return false
         }
