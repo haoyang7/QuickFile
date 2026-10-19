@@ -376,7 +376,7 @@ final class QuickFileViewModel: ObservableObject {
     private var templateRefreshForced = false
     private var templateRefreshNeedsAuthority = false
     private var templateRefreshStatusGeneration: UInt64?
-    private var templateRefreshWaiters: [CheckedContinuation<Void, Never>] = []
+    private var templateRefreshWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var templateRefreshToken: TemplateStore.ChangeToken?
     private var templateRefreshTokenGeneration: UInt64?
     private var didRefreshAuthorizationBookmarks = false
@@ -819,6 +819,10 @@ final class QuickFileViewModel: ObservableObject {
         guard !hasLoadedTemplates, !didAttemptInitialTemplateLoad else { return }
         didAttemptInitialTemplateLoad = true
         await reloadTemplates()
+        if !hasLoadedTemplates, templateLoadFailure == nil, !hasPendingTemplateRefresh {
+            // Cancellation before registration must not consume another window's initial load.
+            didAttemptInitialTemplateLoad = false
+        }
     }
 
     /// Called once by the app-owned model; windows share this observer and read slot.
@@ -838,17 +842,31 @@ final class QuickFileViewModel: ObservableObject {
         drainTemplateRefresh()
     }
 
-    func reloadTemplates() async {
+    /// UI commands coalesce intent synchronously, without creating waiting tasks.
+    func requestTemplateReload() {
         templateRefreshStatusGeneration = statusGeneration
         templateRefreshForced = true
+        requestTemplateRefresh()
+    }
+
+    func reloadTemplates() async {
+        guard !Task.isCancelled else { return }
         if isSavingTemplates || isBusy || (isLoadingTemplates && templateRefreshPhase != .loading) {
-            requestTemplateRefresh()
+            requestTemplateReload()
             return
         }
-        await withCheckedContinuation { continuation in
-            templateRefreshWaiters.append(continuation)
-            templateRefreshForced = true
-            requestTemplateRefresh()
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(); return }
+                templateRefreshWaiters[waiterID] = continuation
+                requestTemplateReload()
+            }
+        } onCancel: { [weak self] in
+            Task { @MainActor [weak self] in
+                // Cancelling a caller ends only its wait, never the shared I/O.
+                self?.templateRefreshWaiters.removeValue(forKey: waiterID)?.resume()
+            }
         }
     }
 
@@ -883,8 +901,8 @@ final class QuickFileViewModel: ObservableObject {
         }
         templateRefreshNeedsAuthority = false
         templateRefreshForced = false
-        let waiters = templateRefreshWaiters
-        templateRefreshWaiters.removeAll()
+        // Keep continuations addressable while I/O runs so callers can cancel.
+        let waiterIDs = Array(templateRefreshWaiters.keys)
         let statusVersion = templateRefreshStatusGeneration
         templateRefreshStatusGeneration = nil
         let baseline = persistedTemplates
@@ -937,17 +955,19 @@ final class QuickFileViewModel: ObservableObject {
                 } else {
                     self.templateRefreshPending = true
                 }
+                for id in waiterIDs {
+                    self.templateRefreshWaiters.removeValue(forKey: id)?.resume()
+                }
                 self.templateRefreshTask = nil
                 self.templateRefreshPhase = nil
                 self.isLoadingTemplates = false
             }
-            waiters.forEach { $0.resume() }
         }
     }
 
     deinit {
         templateRefreshTask?.cancel()
-        templateRefreshWaiters.forEach { $0.resume() }
+        templateRefreshWaiters.values.forEach { $0.resume() }
     }
 
     func deleteTemplate(withID id: FileTemplate.ID) async -> Bool {

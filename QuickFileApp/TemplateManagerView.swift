@@ -333,7 +333,7 @@ struct TemplateManagerView: View {
 
     private var templateActionsMenu: some View {
         Menu(QuickFileLocalization.text(.init("更多"))) {
-            Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
+            Button("重新加载模板") { viewModel.requestTemplateReload() }
             Divider()
             Button("导入模板…", action: chooseImport)
             Button("导出全部模板…") { presentation.confirmation = .exportAll }
@@ -362,7 +362,7 @@ struct TemplateManagerView: View {
                 .foregroundColor(.red)
                 .fixedSize(horizontal: false, vertical: true)
             AdaptiveActionRow {
-                Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
+                Button("重新加载模板") { viewModel.requestTemplateReload() }
                 if let recoveryTitle = failure.recoveryActionTitle {
                     Menu(recoveryTitle) {
                         Button("从默认模板恢复…") { prepareRecovery() }

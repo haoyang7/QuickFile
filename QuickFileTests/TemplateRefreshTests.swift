@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import notify
+import SwiftUI
 import XCTest
 @testable import QuickFile
 @testable import QuickFileCore
@@ -153,6 +154,295 @@ final class TemplateRefreshTests: XCTestCase {
 
     private func templateGeneration(of model: QuickFileViewModel) throws -> UInt64 {
         try XCTUnwrap(Mirror(reflecting: model).descendant("templateStateGeneration") as? UInt64)
+    }
+
+    private func reloadWaiterCount(_ model: QuickFileViewModel) throws -> Int {
+        try XCTUnwrap(Mirror(reflecting: model).descendant("templateRefreshWaiters")
+            as? [UUID: CheckedContinuation<Void, Never>]).count
+    }
+
+    @discardableResult
+    private func waitForReloadCondition(
+        _ message: String, file: StaticString = #filePath, line: UInt = #line,
+        _ condition: () throws -> Bool
+    ) async throws -> Bool {
+        for _ in 0..<300 {
+            if try condition() { return true }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail(message, file: file, line: line)
+        return false
+    }
+
+    func testRepeatedManualCommandsDuringProbeCoalesceWithoutWaitersAndPreserveNewInput() async throws {
+        let first = FileTemplate(name: "First", fileExtension: "txt", content: "one")
+        let second = FileTemplate(name: "Second", fileExtension: "md", content: "two")
+        try store.saveTemplates([first, second])
+        let source = store!
+        let probe = RefreshGate()
+        defer { probe.release.signal() }
+        let tokens = RefreshCounter()
+        let reads = LockedTestValue((count: 0, active: 0, maximum: 0))
+        let model = QuickFileViewModel(templateStore: source, authoritativeTemplateLoader: {
+            reads.update { $0.count += 1; $0.active += 1; $0.maximum = max($0.maximum, $0.active) }
+            defer { reads.update { $0.active -= 1 } }
+            return try source.reloadTemplates()
+        }, templateChangeTokenReader: {
+            tokens.increment()
+            let token = try source.changeToken()
+            if tokens.count == 3 { probe.blockOnce() }
+            return token
+        })
+        await model.loadTemplatesIfNeeded()
+        model.requestTemplateRefresh()
+        let started = await BackgroundWork.run { probe.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(started)
+        XCTAssertTrue(model.isProbingTemplateRefresh)
+        XCTAssertFalse(model.isLoadingTemplates)
+        for _ in 0..<1_000 {
+            model.requestTemplateReload()
+            XCTAssertEqual(try reloadWaiterCount(model), 0)
+        }
+        model.selectedTemplateID = second.id
+        model.requestedFilename = "newer filename"
+        XCTAssertEqual(reads.value.count, 1)
+        probe.release.signal()
+        try await settle(model)
+        XCTAssertEqual(reads.value.count, 2, "The entire command burst needs one authoritative reload")
+        XCTAssertEqual(reads.value.maximum, 1)
+        XCTAssertEqual(try reloadWaiterCount(model), 0)
+        XCTAssertEqual(model.templates, [first, second])
+        XCTAssertEqual(model.selectedTemplateID, second.id)
+        XCTAssertEqual(model.requestedFilename, "newer filename")
+    }
+
+    func testTwoWindowsShareReloadAndCancellingOneProbeWaiterPreservesTheOther() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        try store.saveTemplates([original])
+        let source = store!
+        let probe = RefreshGate()
+        let authority = RefreshGate()
+        defer { probe.release.signal(); authority.release.signal() }
+        let tokens = RefreshCounter()
+        let reads = RefreshCounter()
+        let model = QuickFileViewModel(templateStore: source, authoritativeTemplateLoader: {
+            reads.increment()
+            let loaded = try source.reloadTemplates()
+            if reads.count == 2 { authority.blockOnce() }
+            return loaded
+        }, templateChangeTokenReader: {
+            tokens.increment()
+            let token = try source.changeToken()
+            if tokens.count == 3 { probe.blockOnce() }
+            return token
+        })
+        await model.loadTemplatesIfNeeded()
+        let firstHost = NSHostingView(rootView: TemplateManagerView(viewModel: model))
+        let secondHost = NSHostingView(rootView: TemplateManagerView(viewModel: model))
+        let windows = [firstHost, secondHost].map { host in
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 650),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = host
+            window.orderFront(nil)
+            host.layoutSubtreeIfNeeded()
+            return window
+        }
+        defer { windows.forEach { $0.contentView = nil; $0.close() } }
+        XCTAssertFalse(windows[0] === windows[1])
+        XCTAssertTrue(firstHost.rootView.viewModel === secondHost.rootView.viewModel)
+        firstHost.rootView.viewModel.requestTemplateRefresh()
+        let probing = await BackgroundWork.run { probe.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(probing)
+        for _ in 0..<20 {
+            firstHost.rootView.viewModel.requestTemplateReload()
+            secondHost.rootView.viewModel.requestTemplateReload()
+        }
+        XCTAssertEqual(try reloadWaiterCount(model), 0)
+        var firstCompletions = 0
+        var secondCompletions = 0
+        let firstWaiter = Task {
+            await firstHost.rootView.viewModel.reloadTemplates()
+            firstCompletions += 1
+        }
+        let secondWaiter = Task {
+            await secondHost.rootView.viewModel.reloadTemplates()
+            secondCompletions += 1
+        }
+        defer { firstWaiter.cancel(); secondWaiter.cancel() }
+        guard try await waitForReloadCondition("Both windows must register their waits", {
+            try self.reloadWaiterCount(model) == 2
+        }) else { return }
+        firstWaiter.cancel()
+        guard try await waitForReloadCondition("Cancelling the first window must end its wait", {
+            let count = try self.reloadWaiterCount(model)
+            return firstCompletions == 1 && count == 1
+        }) else { return }
+        XCTAssertEqual(secondCompletions, 0)
+        XCTAssertTrue(model.isProbingTemplateRefresh)
+        XCTAssertEqual(reads.count, 1)
+        windows[0].close()
+        probe.release.signal()
+        let loading = await BackgroundWork.run { authority.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(loading)
+        XCTAssertTrue(model.isLoadingTemplates)
+        XCTAssertEqual(secondCompletions, 0)
+        XCTAssertEqual(try reloadWaiterCount(model), 1)
+        XCTAssertEqual(reads.count, 2)
+        authority.release.signal()
+        guard try await waitForReloadCondition("The surviving window must finish after authority returns", {
+            secondCompletions == 1
+        }) else { return }
+        await firstWaiter.value
+        await secondWaiter.value
+        try await settle(model)
+        XCTAssertEqual(firstCompletions, 1)
+        XCTAssertEqual(secondCompletions, 1)
+        XCTAssertEqual(try reloadWaiterCount(model), 0)
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(secondHost.rootView.viewModel.templates, [original])
+    }
+
+    func testCancellingAllAuthorityWaitersDoesNotReleaseTheSharedReadSlot() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        try store.saveTemplates([original])
+        let source = store!
+        let authority = RefreshGate()
+        defer { authority.release.signal() }
+        let reads = LockedTestValue((count: 0, active: 0, maximum: 0))
+        let model = QuickFileViewModel(templateStore: source, authoritativeTemplateLoader: {
+            let number = reads.update {
+                $0.count += 1; $0.active += 1; $0.maximum = max($0.maximum, $0.active)
+                return $0.count
+            }
+            defer { reads.update { $0.active -= 1 } }
+            let loaded = try source.reloadTemplates()
+            if number == 2 { authority.blockOnce() }
+            return loaded
+        })
+        await model.loadTemplatesIfNeeded()
+        var completions = 0
+        let first = Task { await model.reloadTemplates(); completions += 1 }
+        defer { first.cancel() }
+        let loading = await BackgroundWork.run { authority.started.wait(timeout: .now() + 5) == .success }
+        XCTAssertTrue(loading)
+        let second = Task { await model.reloadTemplates(); completions += 1 }
+        defer { second.cancel() }
+        guard try await waitForReloadCondition("Both authority waiters must register", {
+            try self.reloadWaiterCount(model) == 2
+        }) else { return }
+        first.cancel()
+        second.cancel()
+        guard try await waitForReloadCondition("All cancelled callers must finish while I/O is blocked", {
+            let count = try self.reloadWaiterCount(model)
+            return completions == 2 && count == 0
+        }) else { return }
+        XCTAssertTrue(model.isLoadingTemplates)
+        XCTAssertTrue(model.hasPendingTemplateRefresh)
+        for _ in 0..<100 { model.requestTemplateReload() }
+        XCTAssertEqual(try reloadWaiterCount(model), 0)
+        XCTAssertEqual(reads.value.count, 2)
+        XCTAssertEqual(reads.value.active, 1)
+        authority.release.signal()
+        try await settle(model)
+        await first.value
+        await second.value
+        XCTAssertEqual(completions, 2)
+        XCTAssertEqual(reads.value.count, 3, "Requests made during authority coalesce into one subsequent read")
+        XCTAssertEqual(reads.value.maximum, 1)
+        XCTAssertEqual(try reloadWaiterCount(model), 0)
+        XCTAssertEqual(model.templates, [original])
+    }
+
+    func testPrecancelledInitialLoadAllowsTheNextWindowToLoadOnce() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        try store.saveTemplates([original])
+        let source = store!
+        let reads = RefreshCounter()
+        let model = QuickFileViewModel(templateStore: source, authoritativeTemplateLoader: {
+            reads.increment()
+            return try source.reloadTemplates()
+        })
+        var firstFinished = false
+        let firstWindowLoad = Task {
+            await model.loadTemplatesIfNeeded()
+            firstFinished = true
+        }
+        firstWindowLoad.cancel()
+        guard try await waitForReloadCondition("The precancelled initial load must finish", {
+            firstFinished
+        }) else { return }
+        await firstWindowLoad.value
+        XCTAssertEqual(reads.count, 0)
+        XCTAssertEqual(try reloadWaiterCount(model), 0)
+        XCTAssertFalse(model.hasPendingTemplateRefresh)
+        XCTAssertNil(model.templateLoadFailure)
+
+        var secondFinished = false
+        let secondWindowLoad = Task {
+            await model.loadTemplatesIfNeeded()
+            secondFinished = true
+        }
+        defer { secondWindowLoad.cancel() }
+        guard try await waitForReloadCondition("The next window must complete initial loading", {
+            secondFinished
+        }) else { return }
+        await secondWindowLoad.value
+        XCTAssertEqual(model.templates, [original])
+        XCTAssertEqual(reads.count, 1)
+        XCTAssertEqual(try reloadWaiterCount(model), 0)
+        XCTAssertFalse(model.hasPendingTemplateRefresh)
+        XCTAssertFalse(model.isLoadingTemplates)
+        XCTAssertNil(model.templateLoadFailure)
+        await model.loadTemplatesIfNeeded()
+        XCTAssertEqual(reads.count, 1)
+    }
+
+    func testPrecancelledReloadAndCompletionCancellationRaceLeaveNoWaiters() async throws {
+        let original = FileTemplate(name: "Original", fileExtension: "txt", content: "body")
+        try store.saveTemplates([original])
+        let source = store!
+        for _ in 0..<20 {
+            let authority = RefreshGate()
+            defer { authority.release.signal() }
+            let reads = RefreshCounter()
+            let model = QuickFileViewModel(templateStore: source, templates: [original],
+                authoritativeTemplateLoader: {
+                    reads.increment()
+                    let loaded = try source.reloadTemplates()
+                    authority.blockOnce()
+                    return loaded
+                })
+            var precancelledCompletions = 0
+            let precancelled = Task { await model.reloadTemplates(); precancelledCompletions += 1 }
+            precancelled.cancel()
+            guard try await waitForReloadCondition("A precancelled call must return without reading", {
+                precancelledCompletions == 1
+            }) else { return }
+            await precancelled.value
+            XCTAssertEqual(try reloadWaiterCount(model), 0)
+            XCTAssertFalse(model.hasPendingTemplateRefresh)
+            XCTAssertEqual(reads.count, 0)
+
+            var completions = 0
+            let waiter = Task { await model.reloadTemplates(); completions += 1 }
+            defer { waiter.cancel() }
+            let loading = await BackgroundWork.run { authority.started.wait(timeout: .now() + 5) == .success }
+            XCTAssertTrue(loading)
+            XCTAssertEqual(try reloadWaiterCount(model), 1)
+            // Release synchronous I/O and cancel from another executor so completion
+            // and cancellation can both contend for the same registered waiter.
+            let cancellation = Task.detached { authority.release.signal(); waiter.cancel() }
+            await cancellation.value
+            guard try await waitForReloadCondition("A completion/cancellation race must resume once", {
+                completions == 1
+            }) else { return }
+            await waiter.value
+            try await settle(model)
+            XCTAssertEqual(completions, 1)
+            XCTAssertEqual(try reloadWaiterCount(model), 0)
+            XCTAssertEqual(reads.count, 1)
+        }
     }
 
     func testProbePreservesNotificationAndManualWaiter() async throws {

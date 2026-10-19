@@ -18,7 +18,7 @@ struct CreateFileView: View {
                 if let error = viewModel.templateLoadError {
                     Text(error).foregroundColor(.red)
                     AdaptiveActionRow {
-                        Button("重新加载模板") { Task { await viewModel.reloadTemplates() } }
+                        Button("重新加载模板") { viewModel.requestTemplateReload() }
                             .disabled(viewModel.isLoadingTemplates || viewModel.isSavingTemplates)
                         Button("打开模板管理", action: showTemplateManager)
                     }
