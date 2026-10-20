@@ -7253,6 +7253,24 @@
         }
       }
     },
+    "无法读取最近活动，请稍后刷新。": {
+      "comment": "Diagnostics: latest activity could not be read; do not treat this as an empty record or include storage paths and raw error details.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Could not read the latest activity. Refresh again later."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法读取最近活动，请稍后刷新。"
+          }
+        }
+      }
+    },
     "无法读取目标路径信息": {
       "comment": "Folder diagnostics: identity, access and temporary write-test results.",
       "extractionState": "manual",

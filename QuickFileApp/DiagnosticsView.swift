@@ -199,7 +199,12 @@ struct DiagnosticsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                if let extensionActivity = viewModel.extensionActivity {
+                if viewModel.latestActivityReadFailed {
+                    DiagnosticValueRow(
+                        title: QuickFileLocalization.text(.init("最近活动（历史）")),
+                        value: QuickFileLocalization.text(.init("无法读取最近活动，请稍后刷新。"))
+                    )
+                } else if let extensionActivity = viewModel.extensionActivity {
                     DiagnosticValueRow(
                         title: QuickFileLocalization.text(.init("最近活动（历史）")),
                         value: QuickFileLocalization.text(.init("\(extensionActivity.kind.displayName) · \(formattedTimestamp(extensionActivity.timestamp))"))
