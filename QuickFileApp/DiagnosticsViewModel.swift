@@ -14,11 +14,14 @@ final class DiagnosticsViewModel: ObservableObject {
     @Published private(set) var recentExtensionFailures: [FinderExtensionActivity] = []
     @Published private(set) var isSharedStoreAvailable = false
     var activityStoreMessage: String? {
-        guard latestActivityReadFailed else { return activityStoreMessagePresentation?.value }
-        let readFailure = QuickFileLocalization.text(.init("无法读取最近活动，请稍后刷新。"))
-        guard let message = activityStoreMessagePresentation?.value else { return readFailure }
-        return "\(readFailure)\n\(message)"
+        let messages = [
+            latestActivityReadFailed ? QuickFileLocalization.text(.init("无法读取最近活动，请稍后刷新。")) : nil,
+            failureHistoryReadErrorPresentation?.value,
+            activityStoreMessagePresentation?.value
+        ].compactMap { $0 }
+        return messages.isEmpty ? nil : messages.joined(separator: "\n")
     }
+    @Published private var failureHistoryReadErrorPresentation: LocalizedPresentation<String?>?
     @Published private var activityStoreMessagePresentation: LocalizedPresentation<String?>?
     @Published private(set) var activityStoreHasError = false
     @Published private(set) var authorizedDirectories: [AuthorizedDirectory] = []
@@ -240,14 +243,15 @@ final class DiagnosticsViewModel: ObservableObject {
         case .failure:
             latestActivityReadFailed = true
         }
+        activityStoreMessagePresentation = nil
         switch historyResult {
         case let .success(failures):
             isSharedStoreAvailable = store.isAvailable && !latestActivityReadFailed
             recentExtensionFailures = failures
-            activityStoreMessagePresentation = nil
+            failureHistoryReadErrorPresentation = nil
             activityStoreHasError = latestActivityReadFailed
         case let .failure(error):
-            activityStoreMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("无法读取失败历史：\(error.localizedDescription)")))
+            failureHistoryReadErrorPresentation = LocalizedPresentation(QuickFileLocalization.text(.init("无法读取失败历史：\(error.localizedDescription)")))
             activityStoreHasError = true
         }
         let enabledAtEnd = extensionEnabledProvider()
@@ -307,6 +311,7 @@ final class DiagnosticsViewModel: ObservableObject {
         switch result {
         case .success:
             recentExtensionFailures = []
+            failureHistoryReadErrorPresentation = nil
             activityStoreMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("失败历史已清空；最近扩展活动状态仍保留。")))
             activityStoreHasError = latestActivityReadFailed
         case let .failure(error):
@@ -323,7 +328,7 @@ final class DiagnosticsViewModel: ObservableObject {
         }
 
         activityStoreMessagePresentation = LocalizedPresentation(QuickFileLocalization.text(.init("Console 已打开，请筛选子系统 com.haoyoung.QuickFile。")))
-        activityStoreHasError = latestActivityReadFailed
+        activityStoreHasError = latestActivityReadFailed || failureHistoryReadErrorPresentation != nil
     }
 
     func directoryDiagnosticsDidAppear() {

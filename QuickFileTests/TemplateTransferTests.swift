@@ -296,6 +296,213 @@ final class TemplateTransferTests: XCTestCase {
         }
     }
 
+    func testDistinctLongNamesShareRenameSearchWithoutChangingNamesOrBudget() throws {
+        let originalLanguage = try XCTUnwrap(QuickFileLanguage(rawValue: QuickFileLocalization.identifier))
+        defer { QuickFileLocalization.apply(originalLanguage) }
+        for language in [QuickFileLanguage.simplifiedChinese, .english] {
+            QuickFileLocalization.apply(language)
+            let names = (0..<256).map { String(repeating: "Q", count: 1_020) + String(format: "%04d", $0) }
+            let existing = names.map { record($0, body: "old").makeTemplate() }
+            let sources = names.enumerated().map { record($0.element, body: "new \($0.offset)") }
+            let bundle = TemplateTransferBundle(templates: sources)
+            var candidateCount = 0
+            let plan = try TemplateTransfer.makeImportPlan(
+                bundle: bundle, existing: existing, didGenerateNameCandidate: { candidateCount += 1 }
+            )
+            XCTAssertEqual(candidateCount, 256)
+            XCTAssertEqual(plan.addedCount, 256)
+            XCTAssertEqual(plan.skippedCount, 0)
+            XCTAssertEqual(plan.renamedCount, 256)
+            XCTAssertEqual(plan.additions.map(\.sourceIndex), Array(0..<256))
+            XCTAssertEqual(plan.additions.map(\.originalName), names)
+            XCTAssertEqual(plan.additions.map(\.template.content), sources.map(\.content))
+            for (index, addition) in plan.additions.enumerated() {
+                let suffix: String
+                if language == .simplifiedChinese {
+                    suffix = index == 0 ? "（导入）" : "（导入 \(index + 1)）"
+                } else {
+                    suffix = index == 0 ? " (Imported)" : " (Imported \(index + 1))"
+                }
+                let expected = String(repeating: "Q", count: 1_024 - suffix.utf8.count) + suffix
+                XCTAssertEqual(Data(addition.template.name.utf8), Data(expected.utf8))
+                XCTAssertEqual(addition.template.name.utf8.count, 1_024)
+            }
+            let bytes = try TemplateTransfer.encode(.init(templates: plan.templates)).count
+            XCTAssertNoThrow(try TemplateTransfer.makeImportPlan(
+                bundle: bundle, existing: existing, limits: .init(maximumFileBytes: bytes)
+            ))
+            XCTAssertThrowsError(try TemplateTransfer.makeImportPlan(
+                bundle: bundle, existing: existing, limits: .init(maximumFileBytes: bytes - 1)
+            )) {
+                XCTAssertEqual($0 as? TemplateTransferError, .fileTooLarge(maximumBytes: bytes - 1))
+            }
+        }
+    }
+
+    func testCanonicallyEquivalentTruncatedPrefixesShareSearchAndPreserveSourceBytes() throws {
+        func permutations(_ remaining: [String]) -> [String] {
+            guard !remaining.isEmpty else { return [""] }
+            return remaining.indices.flatMap { index -> [String] in
+                var rest = remaining
+                let first = rest.remove(at: index)
+                return permutations(rest).map { first + $0 }
+            }
+        }
+        let marks = ["\u{0334}", "\u{0321}", "\u{031B}", "\u{0323}", "\u{0300}", "\u{0315}"]
+        let prefixes = permutations(marks).prefix(256).map { "a" + $0 }
+        XCTAssertEqual(Set(prefixes).count, 1)
+        XCTAssertEqual(Set(prefixes.map { Data($0.utf8) }).count, 256)
+        let names = prefixes.enumerated().map {
+            $0.element + String(repeating: "Q", count: 1_007) + String(format: "%04d", $0.offset)
+        }
+        XCTAssertEqual(Set(names).count, 256)
+        XCTAssertTrue(names.allSatisfy { $0.utf8.count == 1_024 })
+        let existing = names.map { record($0, body: "old").makeTemplate() }
+        let sources = names.enumerated().map { record($0.element, body: "new \($0.offset)") }
+        let originalLanguage = try XCTUnwrap(QuickFileLanguage(rawValue: QuickFileLocalization.identifier))
+        defer { QuickFileLocalization.apply(originalLanguage) }
+        for language in [QuickFileLanguage.simplifiedChinese, .english] {
+            QuickFileLocalization.apply(language)
+            var candidateCount = 0
+            let plan = try TemplateTransfer.makeImportPlan(
+                bundle: .init(templates: sources), existing: existing,
+                didGenerateNameCandidate: { candidateCount += 1 }
+            )
+            XCTAssertEqual(candidateCount, 256)
+            XCTAssertEqual(plan.addedCount, 256)
+            XCTAssertEqual(plan.skippedCount, 0)
+            XCTAssertEqual(plan.renamedCount, 256)
+            XCTAssertEqual(plan.additions.map(\.sourceIndex), Array(0..<256))
+            XCTAssertEqual(plan.additions.map { Data($0.originalName.utf8) }, names.map { Data($0.utf8) })
+            XCTAssertEqual(plan.additions.map(\.template.content), sources.map(\.content))
+            for (index, addition) in plan.additions.enumerated() {
+                let suffix: String
+                if language == .simplifiedChinese {
+                    suffix = index == 0 ? "（导入）" : "（导入 \(index + 1)）"
+                } else {
+                    suffix = index == 0 ? " (Imported)" : " (Imported \(index + 1))"
+                }
+                let prefix = prefixes[index]
+                let expected = prefix + String(repeating: "Q", count: 1_024 - prefix.utf8.count - suffix.utf8.count) + suffix
+                XCTAssertEqual(Data(addition.template.name.utf8), Data(expected.utf8))
+                XCTAssertEqual(addition.template.name.utf8.count, 1_024)
+            }
+        }
+    }
+
+    func testRenameFamiliesKeepCanonicalEquivalentFirstCandidatesByteDistinct() throws {
+        let composed = String(repeating: "é", count: 4)
+        let decomposed = String(repeating: "e\u{301}", count: 4)
+        let sources = [record(composed, body: "first"), record(decomposed, body: "second"),
+                       record(composed, body: "third")]
+        var candidateCount = 0
+        let plan = try TemplateTransfer.makeImportPlan(
+            bundle: .init(templates: sources), existing: [record(composed).makeTemplate()],
+            limits: .init(maximumNameBytes: 24), didGenerateNameCandidate: { candidateCount += 1 }
+        )
+        let expected = [composed + "（导入）", String(repeating: "e\u{301}", count: 3) + "（导入 2）",
+                        composed + "（导入 2）"]
+        XCTAssertEqual(plan.additions.map { Data($0.template.name.utf8) }, expected.map { Data($0.utf8) })
+        XCTAssertEqual(plan.additions.map { Data($0.originalName.utf8) }, sources.map { Data($0.name.utf8) })
+        XCTAssertEqual(plan.additions.map(\.template.content), sources.map(\.content))
+        XCTAssertEqual(candidateCount, 3)
+        XCTAssertEqual(plan.skippedCount, 0)
+    }
+
+    func testInterleavedTruncatedFamiliesFillTheirOwnFirstNumberingHoles() throws {
+        let left = String(repeating: "A", count: 1_023)
+        let right = String(repeating: "B", count: 1_023)
+        let originalNames = [left + "X", left + "Y", right + "X", right + "Y"]
+        func renamed(_ prefix: String, _ number: Int) -> String {
+            let suffix = number == 1 ? "（导入）" : "（导入 \(number)）"
+            return String(prefix.prefix(1_024 - suffix.utf8.count)) + suffix
+        }
+        let occupied = [renamed(left, 2), renamed(left, 4), renamed(right, 1), renamed(right, 3)]
+        let existing = (originalNames + occupied).map { record($0).makeTemplate() }
+        let sourceNames = [originalNames[0], originalNames[2], originalNames[1], originalNames[3],
+                           originalNames[0], originalNames[2]]
+        let sources = sourceNames.enumerated().map { record($0.element, body: "new \($0.offset)") }
+        var candidateCount = 0
+        let plan = try TemplateTransfer.makeImportPlan(
+            bundle: .init(templates: sources), existing: existing,
+            didGenerateNameCandidate: { candidateCount += 1 }
+        )
+        let expected = [renamed(left, 1), renamed(right, 2), renamed(left, 3),
+                        renamed(right, 4), renamed(left, 5), renamed(right, 5)]
+        XCTAssertEqual(plan.additions.map(\.template.name), expected)
+        XCTAssertEqual(plan.additions.map(\.originalName), sourceNames)
+        XCTAssertEqual(plan.additions.map(\.template.content), sources.map(\.content))
+        XCTAssertEqual(candidateCount, 10)
+        XCTAssertEqual(plan.skippedCount, 0)
+    }
+
+    func testRenameSearchSharesPrefixesThatOnlyConvergeWithNumberedSuffixes() throws {
+        let originalLanguage = try XCTUnwrap(QuickFileLanguage(rawValue: QuickFileLocalization.identifier))
+        defer { QuickFileLocalization.apply(originalLanguage) }
+        for language in [QuickFileLanguage.simplifiedChinese, .english] {
+            QuickFileLocalization.apply(language)
+            let firstSuffix = language == .simplifiedChinese ? "（导入）" : " (Imported)"
+            let numberedSuffix = language == .simplifiedChinese ? "（导入 2）" : " (Imported 2)"
+            let commonPrefix = String(repeating: "Q", count: 1_024 - numberedSuffix.utf8.count)
+            let codes = (0..<64).map { String(format: "%02X", $0) }
+            let names = codes.map { commonPrefix + $0 + String(repeating: "R", count: numberedSuffix.utf8.count - 2) }
+            let occupied = codes.map { commonPrefix + $0 + firstSuffix }
+            let existing = (names + occupied).map { record($0, body: "old").makeTemplate() }
+            let sources = names.enumerated().map { record($0.element, body: "new \($0.offset)") }
+            var candidateCount = 0
+            let plan = try TemplateTransfer.makeImportPlan(
+                bundle: .init(templates: sources), existing: existing,
+                didGenerateNameCandidate: { candidateCount += 1 }
+            )
+            XCTAssertEqual(candidateCount, 128)
+            XCTAssertEqual(plan.addedCount, 64)
+            XCTAssertEqual(plan.skippedCount, 0)
+            XCTAssertEqual(plan.additions.map(\.originalName), names)
+            for (index, addition) in plan.additions.enumerated() {
+                let suffix = language == .simplifiedChinese ? "（导入 \(index + 2)）" : " (Imported \(index + 2))"
+                XCTAssertEqual(addition.template.name,
+                               String(repeating: "Q", count: 1_024 - suffix.utf8.count) + suffix)
+            }
+        }
+    }
+
+    func testSharedRenameSearchChecksHolesAcrossSuffixWidthBoundaries() throws {
+        let prefix = String(repeating: "A", count: 1_023)
+        let originals = [prefix + "X", prefix + "Y"]
+        func renamed(_ number: Int) -> String {
+            let suffix = number == 1 ? "（导入）" : "（导入 \(number)）"
+            return String(repeating: "A", count: 1_024 - suffix.utf8.count) + suffix
+        }
+        let occupiedNumbers = Array(1...8) + [10, 12] + Array(14...98) + [100, 102]
+        let existing = (originals + occupiedNumbers.map(renamed)).map { record($0).makeTemplate() }
+        let sources = (0..<6).map { record(originals[$0 % 2], body: "new \($0)") }
+        var candidateCount = 0
+        let plan = try TemplateTransfer.makeImportPlan(
+            bundle: .init(templates: sources), existing: existing,
+            didGenerateNameCandidate: { candidateCount += 1 }
+        )
+        XCTAssertEqual(plan.additions.map(\.template.name), [9, 11, 13, 99, 101, 103].map(renamed))
+        XCTAssertEqual(plan.additions.map(\.originalName), sources.map(\.name))
+        XCTAssertEqual(candidateCount, 103)
+        XCTAssertEqual(plan.skippedCount, 0)
+    }
+
+    func testRenameSearchRejectsSuffixWhenNoWholeFirstGraphemeFits() throws {
+        let name = "a" + String(repeating: "\u{20D0}", count: 337)
+        XCTAssertEqual(name.count, 1)
+        let sources = [record(name, body: "first"), record(name, body: "second")]
+        var candidateCount = 0
+        XCTAssertThrowsError(try TemplateTransfer.makeImportPlan(
+            bundle: .init(templates: sources), existing: [record(name).makeTemplate()],
+            didGenerateNameCandidate: { candidateCount += 1 }
+        )) {
+            XCTAssertEqual($0 as? TemplateTransferError, .fieldTooLarge(
+                index: 1, field: QuickFileLocalization.text(.init("改名后的名称")), maximumBytes: 1_024
+            ))
+        }
+        XCTAssertEqual(candidateCount, 2)
+    }
+
     func testRenameCursorRestartsWhenLanguageChangesBetweenSourceNames() throws {
         let originalLanguage = try XCTUnwrap(QuickFileLanguage(rawValue: QuickFileLocalization.identifier))
         defer { QuickFileLocalization.apply(originalLanguage) }
@@ -386,7 +593,7 @@ final class TemplateTransferTests: XCTestCase {
         }
         XCTAssertEqual(plan.additions.map(\.template.name), expected)
         XCTAssertEqual(plan.additions.map(\.originalName), [left, right, left])
-        XCTAssertEqual(candidateCount, 5)
+        XCTAssertEqual(candidateCount, 3)
         XCTAssertEqual(plan.skippedCount, 0)
     }
 
