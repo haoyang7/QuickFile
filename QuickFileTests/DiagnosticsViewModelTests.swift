@@ -2036,6 +2036,107 @@ final class DiagnosticsViewModelTests: XCTestCase {
         XCTAssertEqual(model.recentExtensionFailures.first?.failure, failure)
     }
 
+    func testConsoleFeedbackPreservesHistoryReadErrorWithEmptyAndRetainedRecords() async throws {
+        for hasPreviousRecords in [false, true] {
+            let historyURL = temporaryDirectory.appendingPathComponent("history-\(hasPreviousRecords).json")
+            let store = FinderExtensionActivityStore(defaults: defaults, failureHistoryFileURL: historyURL)
+            try store.record(.menuPrepared)
+            if hasPreviousRecords {
+                try store.record(.fileCreationFailed, failure: FinderExtensionActivityFailure(
+                    reason: .writeFailed, errorDomain: nil, errorCode: nil
+                ))
+            }
+            let model = makeActivityModel(store: store)
+            await model.refreshRuntimeStatus()
+            let previousFailures = model.recentExtensionFailures
+            let corruptHistory = Data("private-corrupt-history".utf8)
+            try corruptHistory.write(to: historyURL)
+            await model.refreshRuntimeStatus()
+            let readError = try XCTUnwrap(model.activityStoreMessage)
+            XCTAssertFalse(model.latestActivityReadFailed)
+            XCTAssertTrue(model.activityStoreHasError)
+            XCTAssertFalse(model.isSharedStoreAvailable)
+
+            for consoleOpened in [false, true] {
+                model.openConsole(using: { consoleOpened })
+                XCTAssertTrue(model.activityStoreHasError)
+                XCTAssertTrue(model.activityStoreMessage?.contains(readError) == true)
+                XCTAssertEqual(model.recentExtensionFailures, previousFailures)
+                XCTAssertEqual(try Data(contentsOf: historyURL), corruptHistory)
+            }
+
+            try JSONEncoder().encode([FinderExtensionActivity]()).write(to: historyURL)
+            await model.refreshRuntimeStatus()
+            XCTAssertFalse(model.activityStoreHasError)
+            XCTAssertTrue(model.isSharedStoreAvailable)
+            XCTAssertNil(model.activityStoreMessage)
+        }
+    }
+
+    func testConsoleFeedbackPreservesBothReadErrorsAndClearOnlyResolvesHistoryError() async throws {
+        let historyURL = temporaryDirectory.appendingPathComponent("failures.json")
+        let latestURL = historyURL.appendingPathExtension("latest-v2.json")
+        let store = FinderExtensionActivityStore(defaults: defaults, failureHistoryFileURL: historyURL)
+        try store.record(.menuPrepared)
+        let originalLatest = try Data(contentsOf: latestURL)
+        try Data("private-corrupt-history".utf8).write(to: historyURL)
+        let corruptLatest = Data("private-corrupt-latest".utf8)
+        try corruptLatest.write(to: latestURL)
+        let model = makeActivityModel(store: store)
+        await model.refreshRuntimeStatus()
+        let readErrors = try XCTUnwrap(model.activityStoreMessage)
+        XCTAssertTrue(model.latestActivityReadFailed)
+        XCTAssertTrue(model.activityStoreHasError)
+
+        for consoleOpened in [false, true] {
+            model.openConsole(using: { consoleOpened })
+            XCTAssertTrue(model.activityStoreHasError)
+            XCTAssertTrue(model.activityStoreMessage?.contains(readErrors) == true)
+        }
+
+        await model.clearFailureHistory()
+        XCTAssertTrue(try store.recentFailures().isEmpty)
+        XCTAssertEqual(try Data(contentsOf: latestURL), corruptLatest)
+        XCTAssertTrue(model.latestActivityReadFailed)
+        XCTAssertTrue(model.activityStoreHasError)
+        XCTAssertEqual(model.activityStoreMessage,
+                       QuickFileLocalization.text(.init("无法读取最近活动，请稍后刷新。")) + "\n" +
+                       QuickFileLocalization.text(.init("失败历史已清空；最近扩展活动状态仍保留。")))
+        XCTAssertFalse(model.diagnosticSummary.contains("private-corrupt"))
+        XCTAssertFalse(model.diagnosticSummary.contains(temporaryDirectory.path))
+
+        try originalLatest.write(to: latestURL)
+        await model.refreshRuntimeStatus()
+        XCTAssertFalse(model.activityStoreHasError)
+        XCTAssertTrue(model.isSharedStoreAvailable)
+        XCTAssertNil(model.activityStoreMessage)
+    }
+
+    func testFailedHistoryClearAndConsoleSuccessCannotHideHistoryReadError() async throws {
+        let historyURL = temporaryDirectory.appendingPathComponent("failures.json")
+        let store = FinderExtensionActivityStore(defaults: defaults, failureHistoryFileURL: historyURL)
+        try store.record(.menuPrepared)
+        try Data("corrupt-history".utf8).write(to: historyURL)
+        let model = makeActivityModel(store: store)
+        await model.refreshRuntimeStatus()
+        let readError = try XCTUnwrap(model.activityStoreMessage)
+        try FileManager.default.removeItem(at: historyURL)
+        try FileManager.default.createDirectory(at: historyURL, withIntermediateDirectories: false)
+
+        await model.clearFailureHistory()
+        XCTAssertTrue(model.activityStoreHasError)
+        model.openConsole(using: { true })
+        XCTAssertTrue(model.activityStoreHasError)
+        XCTAssertTrue(model.activityStoreMessage?.contains(readError) == true)
+        XCTAssertThrowsError(try store.recentFailures())
+
+        try FileManager.default.removeItem(at: historyURL)
+        try JSONEncoder().encode([FinderExtensionActivity]()).write(to: historyURL)
+        await model.refreshRuntimeStatus()
+        XCTAssertFalse(model.activityStoreHasError)
+        XCTAssertNil(model.activityStoreMessage)
+    }
+
     func testConsoleOpenResultIsPresentedAsState() {
         let viewModel = DiagnosticsViewModel(
             extensionEnabledProvider: { false },

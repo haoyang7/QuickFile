@@ -248,10 +248,10 @@ public enum TemplateTransfer {
         let candidates = existing.compactMap { incomingNames.contains($0.name) ? TransferTemplate($0) : nil }
         var seen = Set(candidates)
         var names = Set(existing.map(\.name))
-        // Names only accumulate within this plan. For the same original bytes,
-        // every earlier candidate stays occupied; equivalent Unicode spellings
-        // can truncate differently and must keep independent cursors.
+        // Keep the raw-name fast path, and share progress when truncation gives
+        // different originals equivalent prefixes for a suffix byte budget.
         var nextSuffixByName: [Data: Int] = [:]
+        var nextSuffixByPrefix: [Int: [String: Int]] = [:]
         var suffixLocale: Locale?
         var additions: [TemplateImportPlan.Item] = []
         var skipped = 0
@@ -262,27 +262,46 @@ public enum TemplateTransfer {
                 let locale = QuickFileLocalization.locale
                 if suffixLocale != locale {
                     nextSuffixByName.removeAll(keepingCapacity: true)
+                    nextSuffixByPrefix.removeAll(keepingCapacity: true)
                     suffixLocale = locale
                 }
                 let nameBytes = Data(source.name.utf8)
                 var suffixNumber = nextSuffixByName[nameBytes, default: 1]
-                repeat {
+                var prefixesBySuffixBytes: [Int: String] = [:]
+                while true {
                     // Keep this collision search in the cursor's language even
                     // if settings change while a candidate is being checked.
                     var resource: LocalizedStringResource = suffixNumber == 1 ? .init("（导入）") : .init("（导入 \(suffixNumber)）")
                     resource.locale = locale
                     let suffix = String(localized: resource)
-                    // A long valid name must remain within the exported-name limit
-                    // after suffixing. Shorten only the previewed imported name.
-                    name = fittingName(source.name, suffix: suffix, maximumBytes: limits.maximumNameBytes)
-                    didGenerateNameCandidate()
-                    guard !name.isEmpty else {
+                    let suffixBytes = suffix.utf8.count
+                    let prefix: String
+                    if let cached = prefixesBySuffixBytes[suffixBytes] {
+                        prefix = cached
+                    } else {
+                        prefix = fittingName(source.name, suffix: "", maximumBytes: limits.maximumNameBytes - suffixBytes)
+                        prefixesBySuffixBytes[suffixBytes] = prefix
+                    }
+                    guard !prefix.isEmpty else {
+                        didGenerateNameCandidate()
                         throw TemplateTransferError.fieldTooLarge(
                             index: index, field: QuickFileLocalization.text(.init("改名后的名称")), maximumBytes: limits.maximumNameBytes
                         )
                     }
+                    if let next = nextSuffixByPrefix[suffixBytes]?[prefix], next > suffixNumber {
+                        // Supported suffixes only grow in byte length. A cached
+                        // successor may cross that boundary; recompute its prefix.
+                        suffixNumber = next
+                        continue
+                    }
+                    name = prefix + suffix
+                    didGenerateNameCandidate()
                     suffixNumber += 1
-                } while names.contains(name)
+                    // This candidate is occupied or will be inserted immediately
+                    // below. Names never leave this plan's local collision set.
+                    nextSuffixByPrefix[suffixBytes, default: [:]][prefix] = suffixNumber
+                    if !names.contains(name) { break }
+                }
                 nextSuffixByName[nameBytes] = suffixNumber
             }
             names.insert(name)
